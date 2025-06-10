@@ -8,7 +8,7 @@ Checks performed:
 - YAML syntax correctness
 - Required metadata fields:
     - name
-    - id (must be a valid UUIDv4, unique within each source tree)
+    - id (must be a 7-digit number in range 1200001-1300000, unique within each source tree)
     - description
     - type (must be 'detection')
     - detection_id (string or empty)
@@ -27,7 +27,6 @@ import os
 import sys
 import yaml
 import re
-import uuid
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -62,7 +61,7 @@ def check_yaml_syntax(filepath):
         return False, None, str(e)
 
 
-def validate_playbook_fields(filepath, content, seen_uuids):
+def validate_playbook_fields(filepath, content, seen_ids):
     errors = []
     if not isinstance(content, dict):
         errors.append("Top-level YAML is not a mapping (dict)")
@@ -74,14 +73,14 @@ def validate_playbook_fields(filepath, content, seen_uuids):
     # Field-specific checks
     if "id" in content:
         try:
-            playbook_uuid = uuid.UUID(str(content["id"]))
-            if playbook_uuid.version != 4:
-                errors.append("id is not a UUIDv4")
-            if content["id"] in seen_uuids:
+            playbook_id = int(content["id"])
+            if not (1200001 <= playbook_id <= 1300000):
+                errors.append("id must be a 7-digit number in range 1200001-1300000")
+            if content["id"] in seen_ids:
                 errors.append("id is not unique across playbooks")
-            seen_uuids.add(content["id"])
-        except Exception:
-            errors.append("id is not a valid UUID")
+            seen_ids.add(content["id"])
+        except (ValueError, TypeError):
+            errors.append("id is not a valid 7-digit number")
     if "name" in content and not str(content["name"]).strip():
         errors.append("name is empty")
     if "description" in content and not str(content["description"]).strip():
@@ -99,13 +98,13 @@ def validate_playbook_fields(filepath, content, seen_uuids):
     return errors
 
 
-def validate_file(filepath, seen_uuids):
+def validate_file(filepath, seen_ids):
     syntax_ok, content, syntax_err = check_yaml_syntax(filepath)
     errors = []
     if not syntax_ok:
         errors.append(f"YAML syntax error: {syntax_err}")
         return filepath, errors
-    errors.extend(validate_playbook_fields(filepath, content, seen_uuids))
+    errors.extend(validate_playbook_fields(filepath, content, seen_ids))
     # Additional checks for normalized directory
     # Use normalized_dir variable from SRC_DIRS
     normalized_dir = dict(SRC_DIRS)["normalized"]
@@ -138,11 +137,11 @@ def main():
     files = find_yaml_files()
     results = []
     for label, src_dir in SRC_DIRS:
-        seen_uuids = set()
+        seen_ids = set()
         these_files = files[label]
         print(f"Validating {len(these_files)} playbook files in {src_dir}...")
         with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as executor:
-            futures = {executor.submit(validate_file, f, seen_uuids): f for f in these_files}
+            futures = {executor.submit(validate_file, f, seen_ids): f for f in these_files}
             for future in as_completed(futures):
                 filepath, errors = future.result()
                 if errors:
@@ -189,7 +188,7 @@ def main():
             print("No staged YAML files to validate.")
             sys.exit(0)
         results = []
-        seen_uuids = set()
+        seen_ids = set()
         print(f"Validating {len(files_to_check)} staged playbook files...")
         with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as executor:
             futures = {executor.submit(validate_file, f, seen_uuids): f for f in files_to_check}
@@ -210,11 +209,11 @@ def main():
         files = find_yaml_files()
         results = []
         for label, src_dir in SRC_DIRS:
-            seen_uuids = set()
+            seen_ids = set()
             these_files = files[label]
             print(f"Validating {len(these_files)} playbook files in {src_dir}...")
             with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as executor:
-                futures = {executor.submit(validate_file, f, seen_uuids): f for f in these_files}
+                futures = {executor.submit(validate_file, f, seen_ids): f for f in these_files}
                 for future in as_completed(futures):
                     filepath, errors = future.result()
                     if errors:

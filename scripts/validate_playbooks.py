@@ -15,7 +15,7 @@ Checks performed:
     - detection_category (string or empty)
     - detection_type (must be 'sigma', 'yara', or 'nids')
     - contributors (non-empty list)
-    - date (YYYY-MM-DD format)
+    - created (YYYY-MM-DD format)
 - Uniqueness of the `id` field within each source tree (public and normalized)
 
 Usage:
@@ -32,7 +32,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 REQUIRED_FIELDS = [
-    "name", "id", "description", "type", "detection_id", "detection_category", "detection_type", "contributors", "date"
+    "name", "id", "description", "type", "detection_id", "detection_category", "detection_type", "contributors", "created"
 ]
 VALID_DETECTION_TYPES = {"sigma", "yara", "nids"}
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -92,9 +92,9 @@ def validate_playbook_fields(filepath, content, seen_ids):
     if "contributors" in content:
         if not isinstance(content["contributors"], list) or not content["contributors"]:
             errors.append("contributors must be a non-empty list")
-    if "date" in content:
-        if not DATE_RE.match(str(content["date"])):
-            errors.append("date must be in YYYY-MM-DD format")
+    if "created" in content:
+        if not DATE_RE.match(str(content["created"])):
+            errors.append("created must be in YYYY-MM-DD format")
     return errors
 
 

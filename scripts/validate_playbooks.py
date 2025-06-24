@@ -33,6 +33,49 @@ class LiteralStr(str):
 yaml.add_representer(LiteralStr, represent_literal_str)
 
 
+def fix_query_format_in_file(file_path: Path) -> bool:
+    """
+    Fix query format in file using string replacement to avoid YAML reformatting.
+    Converts dictionary-format queries to literal block scalar format.
+    Returns True if any fixes were made.
+    """
+    try:
+        # Read the original file content
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        original_content = content
+        import re
+        
+        # Simpler approach: Look for "query:" followed by newline and indented content (not starting with | or |-)
+        # Match: "    query:\n      aggregation: false" but not "    query: |\n" or "    query: |-\n"
+        def fix_query_block(match):
+            indent = match.group(1)
+            query_content = match.group(2)
+            return f"{indent}query: |\n{query_content}"
+        
+        # Pattern: capture indentation, then "query:", then newline, then indented content that doesn't start with |
+        pattern = re.compile(
+            r'^(\s*)query:\s*\n((?:\1\s+(?!\|).*\n?)+)',
+            re.MULTILINE
+        )
+        
+        # Apply the replacement
+        content = pattern.sub(fix_query_block, content)
+        
+        # Only write if content changed
+        if content != original_content:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            return True
+        
+        return False
+        
+    except Exception as e:
+        print(f"Error fixing query format in {file_path}: {e}")
+        return False
+
+
 class QueryCache:
     """Cache for Sigma query validation results to avoid duplicate validation"""
     def __init__(self):
@@ -184,27 +227,38 @@ def validate_single_playbook(file_path: Path, fixup: bool = False, reset_dir: Op
             file_modified = True
         
         if file_modified and fixup:
-            # Write back to file with fixes
-            success = True
-            try:
-                with open(file_path, 'w') as f:
-                    # Define custom representer for literal blocks
-                    def literal_str_representer(dumper, data):
-                        if '\n' in data:
-                            return dumper.represent_scalar('tag:yaml.org,2002:str', data, style='|')
-                        return dumper.represent_scalar('tag:yaml.org,2002:str', data)
-                    
-                    # Use SafeDumper with custom string handling
-                    yaml.add_representer(str, literal_str_representer, Dumper=yaml.SafeDumper)
-                    yaml.add_representer(LiteralStr, represent_literal_str, Dumper=yaml.SafeDumper)
-                    
-                    # Use the fixed playbook from validation_result if available, otherwise use the modified playbook
-                    playbook_to_write = validation_result['playbook'] if isinstance(validation_result, dict) and validation_result.get('fixed') else playbook
-                    yaml.dump(playbook_to_write, f, Dumper=yaml.SafeDumper, default_flow_style=False, sort_keys=False, allow_unicode=True, width=1000)
-                file_errors.append(f"✅ File updated with fixes")
-            except Exception as e:
-                file_errors.append(f"❌ Failed to write fixes to file: {e}")
-                success = False
+            # Check if we have query format fixes or other fixes
+            has_query_format_fixes = any("Converted query from dictionary format" in error for error in file_errors)
+            
+            if has_query_format_fixes:
+                # Use string-based fixing to preserve file structure
+                success = fix_query_format_in_file(file_path)
+                if success:
+                    file_errors.append(f"✅ File updated with query format fixes")
+                else:
+                    file_errors.append(f"❌ Failed to apply query format fixes")
+            else:
+                # Write back to file with other fixes using YAML dump
+                success = True
+                try:
+                    with open(file_path, 'w') as f:
+                        # Define custom representer for literal blocks
+                        def literal_str_representer(dumper, data):
+                            if '\n' in data:
+                                return dumper.represent_scalar('tag:yaml.org,2002:str', data, style='|')
+                            return dumper.represent_scalar('tag:yaml.org,2002:str', data)
+                        
+                        # Use SafeDumper with custom string handling
+                        yaml.add_representer(str, literal_str_representer, Dumper=yaml.SafeDumper)
+                        yaml.add_representer(LiteralStr, represent_literal_str, Dumper=yaml.SafeDumper)
+                        
+                        # Use the fixed playbook from validation_result if available, otherwise use the modified playbook
+                        playbook_to_write = validation_result['playbook'] if isinstance(validation_result, dict) and validation_result.get('fixed') else playbook
+                        yaml.dump(playbook_to_write, f, Dumper=yaml.SafeDumper, default_flow_style=False, sort_keys=False, allow_unicode=True, width=1000)
+                    file_errors.append(f"✅ File updated with fixes")
+                except Exception as e:
+                    file_errors.append(f"❌ Failed to write fixes to file: {e}")
+                    success = False
         else:
             success = metadata_valid and validation_result
         stats = {
@@ -750,9 +804,8 @@ class PlaybookValidator:
                 else:
                     # Query is in dictionary format instead of literal block scalar - fix if fixup enabled
                     if fixup:
-                        # Convert dictionary to YAML string and wrap in LiteralStr
-                        query_yaml = yaml.dump(question['query'], default_flow_style=False, width=1000).strip()
-                        question['query'] = LiteralStr(query_yaml)
+                        # Don't modify the playbook object to avoid YAML reformatting
+                        # Instead, we'll do string-based fixing at the file level
                         playbook_modified = True
                         file_errors.append(f"✅ FIXED: Question {i}: Converted query from dictionary format to literal block scalar format")
                     else:

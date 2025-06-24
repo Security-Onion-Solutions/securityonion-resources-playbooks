@@ -166,7 +166,7 @@ def validate_single_playbook(file_path: Path, fixup: bool = False, reset_dir: Op
             return result
         
         # Validate metadata
-        metadata_valid = validator.validate_metadata(playbook, file_path.name, file_errors)
+        metadata_valid = validator.validate_metadata(playbook, file_path, file_errors)
         
         # Validate questions and queries
         validation_result = validator.validate_questions_with_fixup(playbook, file_path.name, file_errors, fixup, query_cache)
@@ -472,14 +472,19 @@ class PlaybookValidator:
             
             return False
     
-    def validate_metadata(self, playbook: Dict, filename: str, file_errors: List[str]) -> bool:
+    def validate_metadata(self, playbook: Dict, file_path: Path, file_errors: List[str]) -> bool:
         """Validate playbook metadata against requirements"""
+        import re
+        
+        # Check if this is an individual folder playbook
+        is_individual = 'individual' in str(file_path).lower()
+        
         required_fields = {
             'name': str,
             'id': int,
             'description': str,
             'type': str,
-            'detection_id': int,
+            'detection_id': (int, str),  # Allow both int and str (for UUIDs)
             'detection_category': str,
             'detection_type': str,
             'contributors': list,
@@ -507,22 +512,57 @@ class PlaybookValidator:
                 self.stats['metadata_errors'] += 1
                 valid = False
         
-        # Check detection_id and detection_category relationship
-        if 'detection_id' in playbook and 'detection_category' in playbook:
-            # If detection_id is not empty (non-zero), detection_category should be empty
-            if playbook['detection_id'] != 0 and playbook['detection_category'] != "":
-                if getattr(self, 'fixup', False):
-                    # Fix by setting detection_category to empty string
-                    playbook['detection_category'] = ""
-                    file_errors.append("✅ FIXED: Set detection_category to empty string since detection_id is not empty")
+        # Additional validation for detection_id based on detection_type
+        if 'detection_id' in playbook and 'detection_type' in playbook:
+            detection_id = playbook['detection_id']
+            detection_type = playbook['detection_type']
+            
+            if detection_type == 'sigma':
+                # For sigma, detection_id should be a UUID string or empty
+                if isinstance(detection_id, str):
+                    if detection_id == '':
+                        # Allow empty string for category playbooks
+                        pass
+                    else:
+                        # Validate UUID format for non-empty strings
+                        uuid_pattern = re.compile(r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$', re.IGNORECASE)
+                        if not uuid_pattern.match(detection_id):
+                            file_errors.append(f"For sigma detection_type, detection_id should be a valid UUID or empty string, got '{detection_id}'")
+                            valid = False
+                elif isinstance(detection_id, int) and detection_id == 0:
+                    # Allow 0 for category playbooks
+                    pass
                 else:
-                    file_errors.append(f"If detection_id is not empty ({playbook['detection_id']}), detection_category should be empty, got '{playbook['detection_category']}'")
+                    file_errors.append(f"For sigma detection_type, detection_id should be a UUID string, empty string, or 0, got {type(detection_id).__name__}")
+                    valid = False
+            else:
+                # For nids and yara, detection_id should be an integer
+                if not isinstance(detection_id, int):
+                    file_errors.append(f"For {detection_type} detection_type, detection_id should be an integer, got {type(detection_id).__name__}")
                     valid = False
         
+        # Check detection_id and detection_category relationship
+        if 'detection_id' in playbook and 'detection_category' in playbook:
+            detection_id = playbook['detection_id']
+            detection_category = playbook['detection_category']
+            
+            # Only apply category removal logic for individual folder playbooks
+            if is_individual:
+                # If detection_id is not empty (non-zero for int, non-empty for string), detection_category should be empty
+                is_empty_id = (isinstance(detection_id, int) and detection_id == 0) or (isinstance(detection_id, str) and detection_id == "")
+                if not is_empty_id and detection_category != "":
+                    if getattr(self, 'fixup', False):
+                        # Fix by setting detection_category to empty string
+                        playbook['detection_category'] = ""
+                        file_errors.append("✅ FIXED: Set detection_category to empty string for individual playbook since detection_id is not empty")
+                    else:
+                        file_errors.append(f"Individual playbooks with non-empty detection_id ({detection_id}) should have empty detection_category, got '{detection_category}'")
+                        valid = False
+        
         # Specific validations
-        if 'name' in playbook:
-            if 'ET' not in playbook['name'] and 'GPL' not in playbook['name']:
-                file_errors.append("Name should include ET or GPL category (e.g., 'ET MALWARE', 'ET EXPLOIT')")
+        if 'name' in playbook and 'detection_type' in playbook and playbook['detection_type'] == 'nids':
+            if not playbook['name'].startswith(('ET ', 'GPL ')):
+                file_errors.append("NIDS rule names should be prepended with 'ET ' or 'GPL ' (e.g., 'ET MALWARE', 'GPL EXPLOIT')")
                 valid = False
         
         if 'id' in playbook:
@@ -535,9 +575,11 @@ class PlaybookValidator:
             file_errors.append(f"Type should be 'detection', got '{playbook['type']}'")
             valid = False
         
-        if 'detection_type' in playbook and playbook['detection_type'] != 'nids':
-            file_errors.append(f"Detection type should be 'nids', got '{playbook['detection_type']}'")
-            valid = False
+        if 'detection_type' in playbook:
+            valid_detection_types = ['sigma', 'nids', 'yara']
+            if playbook['detection_type'] not in valid_detection_types:
+                file_errors.append(f"Detection type should be one of {valid_detection_types}, got '{playbook['detection_type']}'")
+                valid = False
         
         if 'contributors' in playbook:
             if not isinstance(playbook['contributors'], list) or 'SecurityOnionSolutions' not in playbook['contributors']:

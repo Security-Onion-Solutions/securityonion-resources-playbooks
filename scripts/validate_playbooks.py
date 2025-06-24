@@ -665,6 +665,10 @@ class PlaybookValidator:
                     valid = False
                     structural_errors = True
                     continue
+                else:
+                    # Query is in dictionary format instead of literal block scalar
+                    file_errors.append(f"Question {i}: Query should use literal block scalar format (query: |) instead of dictionary format")
+                    valid = False
             
             # Collect query for batch validation if it exists
             if 'query' in question:
@@ -743,6 +747,17 @@ class PlaybookValidator:
                     valid = False
                     structural_errors = True
                     continue
+                else:
+                    # Query is in dictionary format instead of literal block scalar - fix if fixup enabled
+                    if fixup:
+                        # Convert dictionary to YAML string and wrap in LiteralStr
+                        query_yaml = yaml.dump(question['query'], default_flow_style=False, width=1000).strip()
+                        question['query'] = LiteralStr(query_yaml)
+                        playbook_modified = True
+                        file_errors.append(f"✅ FIXED: Question {i}: Converted query from dictionary format to literal block scalar format")
+                    else:
+                        file_errors.append(f"Question {i}: Query should use literal block scalar format (query: |) instead of dictionary format")
+                        valid = False
             
             # Collect query for batch validation if it exists
             if 'query' in question:
@@ -755,7 +770,10 @@ class PlaybookValidator:
             
         if batch_success:
             # All queries passed batch validation
-            return valid
+            if playbook_modified and fixup:
+                return {"fixed": True, "playbook": playbook}
+            else:
+                return valid
         else:
             # Batch validation failed or we had structural errors - validate individually
             # This allows us to identify which specific queries failed

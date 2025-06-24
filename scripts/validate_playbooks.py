@@ -477,7 +477,10 @@ class PlaybookValidator:
         import re
         
         # Check if this is an individual folder playbook
-        is_individual = 'individual' in str(file_path).lower()
+        file_path_str = str(file_path).lower()
+        is_individual = 'individual' in file_path_str
+        is_category = 'category' in file_path_str
+        is_engine = 'engine' in file_path_str
         
         required_fields = {
             'name': str,
@@ -512,33 +515,44 @@ class PlaybookValidator:
                 self.stats['metadata_errors'] += 1
                 valid = False
         
-        # Additional validation for detection_id based on detection_type
+        # Additional validation for detection_id based on detection_type and directory
         if 'detection_id' in playbook and 'detection_type' in playbook:
             detection_id = playbook['detection_id']
             detection_type = playbook['detection_type']
             
-            if detection_type == 'sigma':
-                # For sigma, detection_id should be a UUID string or empty
+            # Category and engine directories should have empty detection_id
+            if is_category or is_engine:
+                expected_empty = (isinstance(detection_id, str) and detection_id == '') or (isinstance(detection_id, int) and detection_id == 0)
+                if not expected_empty:
+                    file_errors.append(f"Category and engine playbooks should have empty detection_id, got '{detection_id}'")
+                    valid = False
+            elif detection_type == 'sigma':
+                # For sigma individual playbooks, detection_id should be a UUID string
                 if isinstance(detection_id, str):
                     if detection_id == '':
-                        # Allow empty string for category playbooks
-                        pass
+                        # Empty string only allowed for category/engine (already handled above)
+                        file_errors.append("Individual sigma playbooks should have a valid UUID for detection_id, got empty string")
+                        valid = False
                     else:
                         # Validate UUID format for non-empty strings
                         uuid_pattern = re.compile(r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$', re.IGNORECASE)
                         if not uuid_pattern.match(detection_id):
-                            file_errors.append(f"For sigma detection_type, detection_id should be a valid UUID or empty string, got '{detection_id}'")
+                            file_errors.append(f"For sigma detection_type, detection_id should be a valid UUID, got '{detection_id}'")
                             valid = False
                 elif isinstance(detection_id, int) and detection_id == 0:
-                    # Allow 0 for category playbooks
-                    pass
+                    # 0 only allowed for category/engine (already handled above)
+                    file_errors.append("Individual sigma playbooks should have a valid UUID for detection_id, got 0")
+                    valid = False
                 else:
-                    file_errors.append(f"For sigma detection_type, detection_id should be a UUID string, empty string, or 0, got {type(detection_id).__name__}")
+                    file_errors.append(f"For sigma detection_type, detection_id should be a UUID string, got {type(detection_id).__name__}")
                     valid = False
             else:
-                # For nids and yara, detection_id should be an integer
+                # For nids and yara individual playbooks, detection_id should be a non-zero integer
                 if not isinstance(detection_id, int):
                     file_errors.append(f"For {detection_type} detection_type, detection_id should be an integer, got {type(detection_id).__name__}")
+                    valid = False
+                elif detection_id == 0:
+                    file_errors.append(f"Individual {detection_type} playbooks should have a non-zero detection_id, got 0")
                     valid = False
         
         # Check detection_id and detection_category relationship
@@ -622,7 +636,15 @@ class PlaybookValidator:
         
         for i, question in enumerate(playbook['questions'], 1):
             # Validate question structure
-            required_q_fields = ['question', 'context', 'range', 'query']
+            base_required_fields = ['question', 'context', 'query']
+            
+            # Check if range is required (not needed if query contains document_id)
+            range_required = True
+            if 'query' in question and isinstance(question['query'], str):
+                if 'document_id' in question['query']:
+                    range_required = False
+            
+            required_q_fields = base_required_fields + (['range'] if range_required else [])
             
             has_structural_error = False
             for field in required_q_fields:
@@ -692,7 +714,15 @@ class PlaybookValidator:
         
         for i, question in enumerate(playbook['questions'], 1):
             # Validate question structure
-            required_q_fields = ['question', 'context', 'range', 'query']
+            base_required_fields = ['question', 'context', 'query']
+            
+            # Check if range is required (not needed if query contains document_id)
+            range_required = True
+            if 'query' in question and isinstance(question['query'], str):
+                if 'document_id' in question['query']:
+                    range_required = False
+            
+            required_q_fields = base_required_fields + (['range'] if range_required else [])
             
             has_structural_error = False
             for field in required_q_fields:

@@ -6,13 +6,14 @@ Playbook Normalization Script for Security Onion
 - Writes normalized files to securityonion-normalized/, preserving directory structure.
 - Uses scripts/patterns_sigma.yaml for Sigma rules and engine/engine_sigma.yaml.
 - Uses scripts/patterns_nids.yaml for NIDS rules and engine/engine_nids.yaml.
+- Uses scripts/patterns_yara.yaml for YARA rules and engine/engine_yara.yaml.
 - Deletes orphaned normalized files when source files are deleted.
 - Supports --all (full run), --staged (pre-commit).
 
 Directory conventions:
 - Source playbooks: public/
 - Normalized playbooks: securityonion-normalized/
-- Pattern files: scripts/patterns_sigma.yaml, scripts/patterns_nids.yaml
+- Pattern files: scripts/patterns_sigma.yaml, scripts/patterns_nids.yaml, scripts/patterns_yara.yaml
 """
 import os
 import sys
@@ -28,6 +29,7 @@ SRC_DIR = BASE_DIR / "public"
 DST_DIR = BASE_DIR / "securityonion-normalized"
 PATTERNS_SIGMA = BASE_DIR / "scripts/patterns_sigma.yaml"
 PATTERNS_NIDS = BASE_DIR / "scripts/patterns_nids.yaml"
+PATTERNS_YARA = BASE_DIR / "scripts/patterns_yara.yaml"
 
 # Helper: Load patterns from YAML
 def load_patterns(yaml_path):
@@ -48,6 +50,8 @@ def get_pattern_file(src_path):
         return PATTERNS_SIGMA
     elif rel_str.startswith("nids/") or rel_str == "engine/engine_nids.yaml":
         return PATTERNS_NIDS
+    elif rel_str.startswith("yara/") or rel_str == "engine/engine_yara.yaml":
+        return PATTERNS_YARA
     else:
         return None
 

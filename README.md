@@ -14,11 +14,19 @@
 
 ## Playbook ID Numbering Scheme
 
-Playbook IDs use a 7-digit numbering system:
-- **Range**: 1,000,000 - 1,999,999 (reserved for Security Onion Playbooks)
-- **Starting Point**: 1,200,001
-- **Format**: 7-digit number (e.g., 1200001, 1200002, 1200003)
-- **Assignment**: Start at 1,200,001 and increment sequentially
+Playbook IDs use a 7-digit numbering system with organized ranges by type:
+
+### **Range Allocation:**
+- **Overall Range**: 1,000,000 - 1,999,999 (reserved for Security Onion Playbooks)
+- **NIDS Indidivual Range**: 1,200,001 - 1,499,999 (individual NIDS detection playbooks)
+- **Sigma Indidivual Range**: 1,500,001 - 1,599,999 (individual Sigma detection playbooks)  
+- **Category/Engine Range**: 1,600,001 - 1,999,999 (category and engine-level playbooks)
+
+### **Assignment Guidelines:**
+- **Individual detection playbooks**: Use appropriate range (NIDS or Sigma)
+- **Category-level playbooks**: Use 1,600,001+ range
+- **Engine-level playbooks**: Use 1,600,001+ range
+- **Format**: 7-digit number (e.g., 1200001, 1500001, 1600001)
 
 ## How to Use the Validation Script
 

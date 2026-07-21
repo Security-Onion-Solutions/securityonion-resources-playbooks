@@ -1,0 +1,482 @@
+name: Elise Backdoor Activity
+id: fb719a10-ebf6-40db-96ad-e713d93fa506
+description: |
+  Detects process activity tied to the loader and cleanup routines of the Elise backdoor. The rule fires on any one of
+  three alternative branches: either the alerting process runs from an Image path ending in
+  \Microsoft\Network\svchost.exe, or its command line contains both \Windows\Caches\NavShExt.dll and /c del, or its
+  command line ends in the NavShExt.dll path under AppData\Roaming\Microsoft\Windows\Caches (long or 8.3 form) and also
+  contains the ',Setting' export name — that last branch requires both parts in the same command line. The behaviour
+  behind the branches is a DLL staged under a user-writable AppData directory, executed through an exported function by
+  a host process, and a command-shell deletion of that DLL once it has been loaded. Investigation should establish which
+  branch matched, whether the NavShExt.dll on disk is the Norton shell-extension library it borrows its name from or an
+  unrelated payload, which process loaded or deleted it, and whether the same pattern appears on other hosts.
+type: detection
+detection_id: e507feb7-5f73-4ef6-a970-91bb6f6d744f
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-17
+questions:
+- question: >-
+    Did this event fire on either the relocated svchost.exe image, the NavShExt.dll deletion command, or the NavShExt.dll
+    AppData path combined with the ',Setting' export?
+  context: >-
+    The rule accepts three alternative branches, and which one matched sets the direction of the rest of the
+    investigation. An Image ending in \Microsoft\Network\svchost.exe means a binary carrying the name of a core Windows
+    host process is running from a path that is not System32, so binary provenance and signing are the load-bearing
+    follow-ups. A command line carrying both \Windows\Caches\NavShExt.dll and /c del is a shell deleting the staged DLL,
+    which makes on-disk recovery and the write history the load-bearing follow-ups, since the file may already be gone.
+    The third branch needs both parts together — a command line ending in the AppData\Roaming\Microsoft\Windows\Caches
+    NavShExt.dll path (long or 8.3 MICROS~1 form) and containing ',Setting' — and describes the DLL being executed
+    through a named export, which makes the load event and the loading process the load-bearing follow-ups. Read the
+    full command line and Image and record the branch before moving on.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - alert
+  - process_creation
+- question: Is this user and host expected to run code out of AppData\Roaming\Microsoft\Windows\Caches?
+  context: >-
+    The Caches directory under a roaming profile is not a location Windows or installed software executes libraries
+    from, and no routine administrative task deletes a DLL out of it with a command shell. Establishing whether the
+    account and host have any role that would put code in a user-writable profile directory is usually the quickest way
+    to separate a developer or packaging workflow from staged execution.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: Did the alerting process or its children write, rename, or delete files, and is NavShExt.dll still on disk?
+  context: >-
+    The deletion branch of this rule exists because the loader removes the DLL after it has been loaded, so the window
+    for retrieving the file is short. This query lists file activity attributable to the alerting process and its direct
+    children, which shows whether the library was written, replaced, or removed and whether other files were staged
+    alongside it. If the DLL is gone, shift to shadow copies, backups, and the recycle bin, and treat the load and write
+    events as the surviving record of its existence.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+  answer_sources:
+  - file_event
+  - manual_review
+- question: What did the alerting command actually do? Decode its arguments, target path, and export name.
+  context: >-
+    Read the full argument list rather than the matched substring. Note whether the path is the long
+    AppData\Roaming\Microsoft\Windows\Caches form or the 8.3 MICROS~1 form, whether an export name such as ',Setting' is
+    appended after the DLL path, and whether a /c del is removing the same library that was just loaded. This query
+    returns every execution of the alerting binary on the host within the window, so a staged sequence of load-then-
+    delete invocations appears together rather than as one isolated row.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: Which process wrote NavShExt.dll under the Caches directory, and what does the file itself contain?
+  context: >-
+    NavShExt.dll is the filename of a Norton shell-extension library, and the name is reused here to make a payload in a
+    user profile directory read as vendor software. Identify the writing process and the write time, then examine the
+    file itself — size, signing status, exported function names, embedded strings, packer artifacts — to establish
+    whether it is the vendor library relocated or an unrelated binary borrowing the name. The path is taken from the
+    rule's own command-line values rather than from the alert, because a process_creation event carries no file path of
+    its own.
+  range: +/-24h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith: \Windows\Caches\NavShExt.dll
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+  answer_sources:
+  - file_event
+  - manual_review
+  - safe_environment
+  - external_threat_intel
+- question: Was NavShExt.dll loaded into a process on this host, and what are its hash and signing status?
+  context: >-
+    A library records its hash and signature on the load event, not on the file write, so the load is where the identity
+    of the DLL can be settled. Check which process loaded it, whether the loader is the relocated svchost.exe or a
+    generic host binary, and whether the module is signed by the shell-extension vendor whose filename it carries or is
+    unsigned or signed by an unrelated party. Submit the hash to threat intel; if the file was deleted before it ever
+    loaded, no load event exists and the write event plus the command line are the remaining evidence.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|endswith: \Windows\Caches\NavShExt.dll
+      condition: selection
+    fields:
+      - Image
+      - ImageLoaded
+      - Signed
+      - Signature
+      - SignatureStatus
+      - Hashes
+  answer_sources:
+  - process_creation
+  - external_threat_intel
+- question: What process spawned this one, and is that parent chain expected?
+  context: >-
+    The parent identifies how the command was invoked. A shell deleting a DLL under a roaming profile is normally
+    launched by whatever loaded that DLL, so a parent that is itself running from a user-writable path, an Office
+    application, a script host, or a browser child points at delivery rather than administration. A parent of
+    explorer.exe points at a user double-clicking something. Walk up one further level if the immediate parent is itself
+    unexpected.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Has a NavShExt.dll under a Caches directory been written anywhere else in the environment?
+  context: >-
+    Deliberately omitting the host scope turns this into a fleet-wide count of the same filename at the same relative
+    path over 90 days. Several hosts writing it, with a consistent writing process, is what a deployed vendor component
+    looks like; one host, or a scattered handful with unrelated writers, is what staging by an operator looks like. The
+    path is hardcoded from the rule's command-line values because the alerting event is a process creation and carries
+    no file path.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        TargetFilename|endswith: \Windows\Caches\NavShExt.dll
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - file_event
+- question: What child processes did this binary spawn afterward?
+  context: >-
+    The processes launched after the alerting execution show what the activity led to. A loader that has just executed a
+    staged DLL commonly follows with discovery commands, a further copy or deletion, or a network-capable utility.
+    Absence of children is itself informative for the deletion branch, where the shell's only job was to remove the
+    file.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: >-
+    When this host has previously fired the rule's pattern, what parents and users drove that activity, and does the
+    current alert fit that history?
+  context: >-
+    This query counts the rule's own selection criteria scoped to the alerting host over 14 days, so the parent and user
+    distribution describes how this specific pattern has run here rather than how the binary is generally used. For a
+    pattern this narrow the expected answer is no prior events at all, which makes the current alert a first occurrence.
+    Prior events with a consistent parent and account would instead point at something in the environment that
+    legitimately writes and removes a library at this path.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_other_svchost:
+        Image|endswith: \Microsoft\Network\svchost.exe
+      selection_other_del:
+        CommandLine|contains|all:
+        - \Windows\Caches\NavShExt.dll
+        - /c del
+      selection_dll_path:
+        CommandLine|endswith:
+        - \AppData\Roaming\MICROS~1\Windows\Caches\NavShExt.dll
+        - \AppData\Roaming\Microsoft\Windows\Caches\NavShExt.dll
+      selection_dll_function:
+        CommandLine|contains: ',Setting'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (1 of selection_other_* or all of selection_dll_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+  answer_sources:
+  - process_creation
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: >-
+    This counts the rule's selection criteria scoped to the alerting account over 90 days, grouped by host, so the
+    result is that account's history of this specific pattern rather than its general use of command shells. An account
+    that has never produced it is a different situation from one that produces it routinely across many hosts; weigh the
+    count against what the role actually involves. If the alert fired under SYSTEM, LOCAL SERVICE, or a computer
+    account, the account attributes nothing and the parent-process history is the meaningful pivot instead.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_other_svchost:
+        Image|endswith: \Microsoft\Network\svchost.exe
+      selection_other_del:
+        CommandLine|contains|all:
+        - \Windows\Caches\NavShExt.dll
+        - /c del
+      selection_dll_path:
+        CommandLine|endswith:
+        - \AppData\Roaming\MICROS~1\Windows\Caches\NavShExt.dll
+        - \AppData\Roaming\Microsoft\Windows\Caches\NavShExt.dll
+      selection_dll_function:
+        CommandLine|contains: ',Setting'
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (1 of selection_other_* or all of selection_dll_*) and _pb_scope
+    fields:
+    - host.name
+  always_include: true
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+- question: >-
+    Has this parent process historically driven the rule's pattern on this host or across the environment, or is the
+    parent new for this activity?
+  context: >-
+    When the alert fires under a service principal, user identity attributes nothing and the launch mechanism does. This
+    counts the 90-day history of the alerting parent driving this same pattern, grouped by host. A parent already
+    accounting for large numbers of prior events is automation; a parent that is new or rare for this pattern is the
+    deviation worth chasing, and for a pattern this specific an empty result means the launch mechanism has no prior
+    history at all.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_other_svchost:
+        Image|endswith: \Microsoft\Network\svchost.exe
+      selection_other_del:
+        CommandLine|contains|all:
+        - \Windows\Caches\NavShExt.dll
+        - /c del
+      selection_dll_path:
+        CommandLine|endswith:
+        - \AppData\Roaming\MICROS~1\Windows\Caches\NavShExt.dll
+        - \AppData\Roaming\Microsoft\Windows\Caches\NavShExt.dll
+      selection_dll_function:
+        CommandLine|contains: ',Setting'
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (1 of selection_other_* or all of selection_dll_*) and _pb_scope
+    fields:
+    - host.name
+  always_include: true
+  answer_sources:
+  - process_creation
+- question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the account's activity across every host in the alert window shows whether the execution is confined to one
+    endpoint or is one step in a sequence spanning several. The same account running command shells, script hosts, or
+    remote-execution utilities on other hosts in the same window widens the scope of the investigation.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  always_include: true
+  answer_sources:
+  - process_creation
+- question: Did this same parent-driven pattern fire on other hosts in the same window, or is the activity isolated?
+  context: >-
+    Under a service principal a user-wide sweep returns routine agent telemetry rather than an answer, so the pivot is
+    the launch mechanism. This counts the rule's pattern under the alerting parent, fleet-wide, in the alert window.
+    Several hosts in the same window points at something pushed or scheduled across the environment; a single host
+    points at a trigger local to that endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_other_svchost:
+        Image|endswith: \Microsoft\Network\svchost.exe
+      selection_other_del:
+        CommandLine|contains|all:
+        - \Windows\Caches\NavShExt.dll
+        - /c del
+      selection_dll_path:
+        CommandLine|endswith:
+        - \AppData\Roaming\MICROS~1\Windows\Caches\NavShExt.dll
+        - \AppData\Roaming\Microsoft\Windows\Caches\NavShExt.dll
+      selection_dll_function:
+        CommandLine|contains: ',Setting'
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (1 of selection_other_* or all of selection_dll_*) and _pb_scope
+    fields:
+    - host.name
+  always_include: true
+  answer_sources:
+  - process_creation
+- question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Execution of a staged library rarely stands alone. Aggregating every process on the host in the surrounding window
+    by binary and parent collapses routine telemetry into high-count rows and leaves novel parent-child pairs visible at
+    low counts. Look for the delivery step before the alert — a document, archive, or installer parent — and for
+    discovery, credential access, or persistence steps after it. Off-hours execution with no interactive user session is
+    worth noting.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+  answer_sources:
+  - process_creation
+  - file_event
+  - registry_event
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host reconstruct the stages that preceded this one. A staged DLL has to arrive and be
+    launched before it can be loaded and deleted, so prior alerts covering document or script execution, archive
+    extraction into a profile directory, or defense tampering are the ones that fill in how the file got there.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+  answer_sources:
+  - alert
+- question: >-
+    Have other hosts fired the rule's pattern in the past week, and does the cross-host distribution look like
+    automation or one-off activity?
+  context: >-
+    This counts the rule's own selection criteria fleet-wide with no host scope, so the result is how many endpoints
+    have produced this pattern rather than how common the binaries involved are. Multiple hosts within a short span
+    indicates the same staged component reached several endpoints and turns a single-host investigation into an
+    environment-wide one. A single host keeps the containment decision local. Compare the host list against the account
+    and parent history before concluding.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_other_svchost:
+        Image|endswith: \Microsoft\Network\svchost.exe
+      selection_other_del:
+        CommandLine|contains|all:
+        - \Windows\Caches\NavShExt.dll
+        - /c del
+      selection_dll_path:
+        CommandLine|endswith:
+        - \AppData\Roaming\MICROS~1\Windows\Caches\NavShExt.dll
+        - \AppData\Roaming\Microsoft\Windows\Caches\NavShExt.dll
+      selection_dll_function:
+        CommandLine|contains: ',Setting'
+      condition: 1 of selection_other_* or all of selection_dll_*
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation

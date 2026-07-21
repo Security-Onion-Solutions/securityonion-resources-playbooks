@@ -1,0 +1,378 @@
+name: Potential Persistence Via Scrobj.dll COM Hijacking
+id: 70a258cc-3183-41da-8325-940119ff92f0
+description: |
+  Detects a COM class registration whose InprocServer32 default value is set to C:\WINDOWS\system32\scrobj.dll, the
+  Windows Script Component runtime. When a CLSID is served by scrobj.dll, instantiating that COM object makes the DLL
+  read a ScriptletURL value from the same key and execute the referenced scriptlet — which can be a remote .sct file —
+  giving an attacker event-triggered persistence that fires whenever the hijacked class is invoked (commonly paired
+  with a TreatAs redirect of a class instantiated at logon). Legitimate Windows Script Component registrations use the
+  same mechanism, so the investigation should determine which CLSID was pointed at scrobj.dll, where the companion
+  scriptlet reference points, and whether the hijack was subsequently triggered.
+type: detection
+detection_id: fe20dda1-6f37-4379-bbe0-a98d400cae90
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-10
+questions:
+- question: Does the registry write match a CLSID InprocServer32 value being pointed at scrobj.dll?
+  context: The rule fires when a registry value whose path ends in InprocServer32\(Default) is set to
+    C:\WINDOWS\system32\scrobj.dll. Confirm both the key path and the value data match — the alert should show which
+    CLSID's in-process server was redirected to the scriptlet runtime.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this user or host expected to register script components?
+  context: Windows Script Components legitimately register scrobj.dll as their InprocServer32, typically during
+    software installation or by developers building scriptlet-based components. A developer machine or a host in a
+    deployment window makes this plausible; the same write on an ordinary workstation or server with no install
+    activity deserves the full trigger-and-payload checks. When the user is a machine account or missing, pivot on the
+    writing process instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Was this COM registration part of a documented software deployment?
+  context: Some line-of-business or administrative software registers scriptlet-backed COM components during
+    installation. A deployment record or packaging manifest that covers this host around the alert time supports a
+    legitimate install; the absence of any deployment context leaves the registration unexplained.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What started the process that wrote this registry value, and is that chain expected?
+  context: The writer's origin distinguishes an installer chain from post-exploitation activity. An installer under
+    explorer.exe or a deployment agent is consistent with software registration; a script host, Office application,
+    or unrecognized binary writing CLSID keys points toward a hijack. If the parent linkage is unavailable on the
+    registry event, pivot from the writing process's own creation event to recover its parent.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What other processes did the responsible process spawn?
+  context: A process that performs this action rarely stops there. Listing the children it launched shows
+    whether the activity was an isolated change or one step in a longer chain - payload execution,
+    additional persistence, or follow-on tooling. Note this shows what the acting process started,
+    not what started alongside it. Sibling processes cannot be identified from this telemetry,
+    because registry and library events do not record the acting process's parent.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Which CLSID was pointed at scrobj.dll, and is it a class a real application owns?
+  context: The hijacked class determines when the payload fires. A CLSID under HKCU\Software\Classes takes precedence
+    over the HKLM registration of the same class, so a per-user write silently overrides a system component for that
+    user without elevation. Look up the CLSID from the key path — a well-known class that other software instantiates
+    at logon or startup is the classic persistence choice, while a newly invented CLSID typically pairs with a TreatAs
+    redirect or a manual trigger.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Were ScriptletURL or TreatAs values written on this host around the alert?
+  context: scrobj.dll resolves the script to execute from a ScriptletURL value in the hijacked key — a remote URL
+    means the payload is fetched at trigger time, a local path means a scriptlet was dropped on disk. A TreatAs value
+    written nearby redirects a legitimate, frequently instantiated class to the scrobj.dll-backed CLSID, which is how
+    the hijack gets triggered at logon. Either companion value turns this registration from ambiguous into a
+    configured persistence chain.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains:
+          - '\ScriptletURL'
+          - '\TreatAs'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- question: What does the scriptlet referenced by the hijacked class contain?
+  context: The .sct scriptlet is the actual payload — retrieve it from the ScriptletURL destination or its on-disk
+    path in a safe environment and analyze it for obfuscation, encoded commands, embedded URLs, and download-execute
+    logic. The writing process's command line shown here may itself reveal the registration mechanics, such as a
+    regsvr32 invocation naming the scriptlet.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Which processes loaded scrobj.dll after the modification, and is it the genuine signed system DLL?
+  context: The hijack firing is visible as scrobj.dll being loaded by whatever process instantiated the hijacked
+    class — explorer, Office applications, or svchost for logon-triggered classes, or rundll32 launched with -sta or
+    -localserver and a CLSID for a manual trigger. Confirm the loaded DLL is the Microsoft-signed system copy from
+    System32; an unsigned or oddly located file of the same name is a different and worse problem. Loading processes
+    that have no business hosting script components indicate the persistence is live.
+  range: +7d
+  query: |
+    aggregation: true
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|endswith: '\scrobj.dll'
+      condition: selection
+    fields:
+      - Image
+      - Signed
+      - Signature
+      - Hashes
+- question: Did the registering process drop a local scriptlet or payload to disk?
+  context: When ScriptletURL points at a local path, the .sct file is usually written in the same session as the
+    registry change by the registering process or its children. Finding the dropped scriptlet gives you the payload
+    directly. The file-write event carries no hash; if the file is present, retrieve it for analysis or hash it from
+    a later execution.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Was this InprocServer32 value modified again after the alert?
+  context: Re-modification history shows whether the hijack stuck. A later write restoring the original server DLL
+    suggests the legitimate application reclaimed its class or cleanup occurred; no further writes means the class
+    still resolves to scrobj.dll. Key and value deletions are not observable in this telemetry, so judge persistence
+    from the modification history and the DLL-load evidence rather than expecting a removal event.
+  range: +7d
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- question: What other registry modifications occurred on this host in the same session?
+  context: A COM hijack rarely lands alone — the same session typically writes ThreadingModel, ScriptletURL, or
+    TreatAs values, and may add other persistence or configuration changes. A legitimate component registration
+    instead shows a coherent installer writing many related application keys. The triggering key will appear in the
+    results; the signal is what else changed with it.
+  range: +/-30m
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - User
+- question: What other activity occurred on this host around the time of the alert?
+  context: The minutes around the registration reveal how it fits into a larger sequence — payload staging before,
+    trigger testing after, or an installer chain explaining the whole thing. Repetitive agent telemetry collapses
+    into high-count rows in the aggregation; novel parent-child pairs at low counts are what to scan for.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Which processes normally load scrobj.dll on this host?
+  context: Historical load patterns calibrate the post-alert view — scriptlet runtimes are loaded legitimately by
+    hosts that use Windows Script Components, and an environment where scrobj.dll loads regularly under the same
+    processes reads differently from one where it has never loaded before. New loading processes appearing only after
+    the registry change are the ones tied to the hijack.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|endswith: '\scrobj.dll'
+      condition: selection
+    fields:
+      - Image
+- question: Has this CLSID's InprocServer32 value been modified before on this host?
+  context: A class server that has pointed at the same application DLL for months and suddenly changed to scrobj.dll
+    is the hijack pattern in miniature — the prior Details values show what the class is supposed to resolve to and
+    give you the original DLL for restoration. Zero history means the CLSID itself is new to the host.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - Details
+      - Image
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections — download activity, script execution, defense tampering — may reveal how the
+    registering binary arrived and what stage of an operation this registration represents. Persistence installation
+    typically follows initial access and precedes longer-term objectives.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Was the same CLSID pointed at scrobj.dll on other hosts?
+  context: The identical class hijacked across multiple hosts in a short window indicates either a software rollout
+    that registers the same component everywhere — the writing process and account should match deployment tooling —
+    or the same implant deployed laterally. A single-host modification points toward targeted persistence. Compare
+    Details values across hosts.
+  range: +/-24h
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+      - Details
+- question: Were other persistence mechanisms installed on this host around the registration?
+  context: The detected activity is itself registry-based persistence; attackers who establish one foothold commonly
+    stack backups using different techniques — scheduled tasks, services, Run keys, BITS jobs, or WMI subscriptions.
+    Persistence tool executions clustered around the COM hijack indicate deliberate foothold-building.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine

@@ -1,0 +1,503 @@
+name: Suspicious PrinterPorts Creation (CVE-2020-1048)
+id: 2b0e55ad-c0e0-4f46-b0e7-fee1c29fb3b8
+description: |
+  Fires on either of two independent command-line branches: an `Add-PrinterPort -Name` invocation whose
+  arguments also contain `.exe`, `.dll`, or `.bat`, or any command line referencing the `Generic / Text Only`
+  printer driver. Printer ports are stored as registry values under the Print Spooler's Ports key, and the
+  spooler service performs that privileged write on the caller's behalf; because the port target is not
+  validated server-side (CVE-2020-1048), an unprivileged user can register a "file port" that points at an
+  executable path and then print attacker-controlled bytes into it, which the spooler replays across reboots
+  and service restarts. Routine printer installation produces the same cmdlets, so the investigation should
+  determine which branch fired, what filesystem path the port targets, whether a printer was bound to that
+  port and printed to, and whether the resulting file was later loaded or executed.
+type: detection
+detection_id: cc08d590-8b90-413a-aff6-31d1a99678d7
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-17
+questions:
+- question: 'Does the command line match either branch of this rule: an Add-PrinterPort -Name command that also references a .exe, .dll, or .bat path, or a command referencing the Generic / Text Only driver?'
+  context: >-
+    The rule fires on two independent branches and which one fired changes what to look at. The
+    Add-PrinterPort branch requires both the cmdlet and an executable-extension path in the same command
+    line, so the port target is already visible and is the artifact to triage. The Generic / Text Only branch
+    fires on the driver reference alone with no path constraint; it marks the driver-install step of the same
+    pattern, and the port target must be recovered from the surrounding printer-setup commands or from the
+    spooler's Ports registry values. Note the branch before spending time on the rest of the investigation.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - alert
+  - process_creation
+- question: Is this user and host expected to install printers or create printer ports?
+  context: >-
+    Printer setup is routine on workstations and print servers and unusual almost everywhere else. An
+    unprivileged account can add a port because the spooler does the privileged write for it, so local
+    administrator rights are not the discriminator here; the discriminator is whether this account and this
+    machine have any reason to be configuring printing at all.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: Does the user or administrator recall installing a printer or adding a printer port on this host?
+  context: >-
+    The documented benign case for this pattern is a routine printer port install. If the user recalls
+    setting up a printer and the port target is an ordinary TCP/IP, LPT, or share destination, the alert
+    closes quickly. If nobody recalls it, ask whether a print driver deployment ran unattended, and treat the
+    port target path as unexplained until it is accounted for.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - organizational_knowledge
+  - manual_review
+- question: Does the timing of this printer-port creation align with normal work hours or a documented deployment window?
+  context: >-
+    Printer configuration is user-facing work that normally happens while someone is at the machine, or
+    inside a scheduled deployment window on a managed fleet. Port creation on a workstation outside the
+    user's working hours, or on a server with no printing role and no maintenance window open, removes the
+    most common benign explanation and makes the port target path the next thing to resolve.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - organizational_knowledge
+  - asset_inventory
+- question: What port name was registered, and what filesystem path does it target?
+  context: >-
+    Add-PrinterPort -Name accepts a filesystem path as the port target. A port named for a path rather than a
+    device is a file port, which means every job printed to it writes bytes to that path; a target under
+    System32, the spooler tracing directory, or any location the account can reach is the payload
+    destination. The full operation spans several sequential invocations that together form one action:
+    adding the port, installing the driver, binding them into a printer, and printing. This query returns the
+    printer-setup commands on this host in the alert window so the sequence can be read as a whole.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_printer:
+        CommandLine|contains:
+          - 'Add-PrinterPort'
+          - 'Remove-PrinterPort'
+          - 'Get-PrinterPort'
+          - 'Add-Printer'
+          - 'Set-Printer'
+          - 'Out-Printer'
+          - 'Generic / Text Only'
+          - 'prnport'
+          - 'printui'
+      condition: selection and selection_printer
+    fields:
+      - CommandLine
+      - Image
+      - CurrentDirectory
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: Was the command obfuscated, and what absolute path does the port argument resolve to once it is expanded?
+  context: >-
+    The cmdlet name is readable, but the argument that matters is the port target path, and that argument is
+    frequently assembled at runtime through string concatenation, backtick escaping, variable substitution,
+    or environment-variable expansion, so the literal path never appears in the command line. Expand the
+    argument by hand and record the absolute path the port points at. The extension that path ends in decides
+    what the port can be used for: a .dll or .exe under a system directory is a load-on-start target, while a
+    .bat or a file under a user-writable directory is a script or staging target.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: Did a printer port registry value change on this host, and what file path does the value name?
+  context: >-
+    The spooler service performs the port write on the caller's behalf, so the durable artifact is a value
+    under the Print Spooler's Ports key rather than anything owned by the calling process. A port value
+    holding a filesystem path, especially one ending in .dll or .exe, is a file port and is what makes the
+    pattern persistent, because the spooler re-reads the key and replays queued jobs after a reboot or
+    service restart. Compare the value data against the path recovered from the command line; a port present
+    in the registry that nobody can account for is the artifact to remove.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains: '\Windows NT\CurrentVersion\Ports'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+  answer_sources:
+  - registry_event
+  - manual_review
+- question: Did the print spooler or a PowerShell process load an unsigned module on this host around the alert?
+  context: >-
+    Writing bytes through a file port only matters once something loads them. The spooler service loads
+    modules from system paths when it starts, so a port aimed at a DLL under a system directory becomes code
+    execution inside a privileged service the next time the service restarts. The interpreter side of this
+    technique leaves the equivalent trace: a .NET assembly loaded into the PowerShell process rather than a
+    file on disk. Review the loaded module path and signer for both. If image-load events are not collected
+    in this environment, treat zero results as a visibility gap rather than evidence nothing loaded.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\spoolsv.exe'
+          - '\powershell.exe'
+          - '\pwsh.exe'
+      filter_signed:
+        Signed: 'true'
+      condition: selection and not filter_signed
+    fields:
+      - ImageLoaded
+      - Signature
+      - SignatureStatus
+      - Signed
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: Did PowerShell script block logging capture the full printer-setup script?
+  context: >-
+    Event ID 4104 records the deobfuscated script text PowerShell actually executed. For this pattern that is
+    the whole sequence in one place, including the resolved port path that runtime string assembly hides from
+    the command line, the driver install, the printer binding, and the print operation that writes the
+    payload bytes. If PowerShell operational logs are not ingested in this environment, treat zero results as
+    a visibility gap rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+  answer_sources:
+  - powershell_script_block
+- question: Were PowerShell execution or logging controls weakened on this host before the printer port was created?
+  context: >-
+    Execution policy bypasses, AMSI patching, engine downgrade to version 2, and real-time monitoring changes
+    are preparation steps rather than the payload, and they are frequently the only readable part of an
+    otherwise obfuscated operation. Finding one shortly before a printer port was registered separates a
+    scripted operation from an administrator setting up printing at a console.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: What process spawned the interpreter that created the printer port, and is that parent chain expected?
+  context: >-
+    Printer setup driven by a person normally descends from explorer.exe or a management console; printer
+    setup driven by deployment tooling descends from a service, agent, or scheduler process. A parent such as
+    an Office application, a script host, a browser, or a remote-execution service means the printing API was
+    reached from something other than printer administration, which is the pivot the rest of the
+    investigation hangs on. Walk further up the tree from the parent if the immediate parent is itself a
+    generic interpreter.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: When this host has previously fired the rule's pattern, what parents and users normally drive that activity, and does the current alert fit that pattern?
+  context: >-
+    Printer ports are created legitimately, so the question is not whether the pattern has been seen here but
+    whether it has been seen from this parent and this account. The query mirrors the rule's selection
+    structure scoped to this host, so the resulting parent and user distribution reflects how this specific
+    firing pattern has historically run on the machine rather than generic interpreter usage. A new parent, an
+    unexpected account, or a first-ever occurrence on a host that has printed for years is the deviation worth
+    chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection1:
+        CommandLine|contains: Add-PrinterPort -Name
+      selection2:
+        CommandLine|contains:
+        - .exe
+        - .dll
+        - .bat
+      selection3:
+        CommandLine|contains: Generic / Text Only
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: ((selection1 and selection2) or selection3) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+  answer_sources:
+  - process_creation
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: >-
+    The query mirrors the rule's selection structure scoped to this user, so the result is a 90-day history of
+    this account producing this specific pattern, aggregated by host. A desktop support account that registers
+    printer ports across many machines every week is doing its job; an account that has never touched printing
+    and produced this pattern once is the case to work. Weigh the count against the role rather than against
+    the raw number.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection1:
+        CommandLine|contains: Add-PrinterPort -Name
+      selection2:
+        CommandLine|contains:
+        - .exe
+        - .dll
+        - .bat
+      selection3:
+        CommandLine|contains: Generic / Text Only
+      _pb_scope:
+        User|expand: '%User%'
+      condition: ((selection1 and selection2) or selection3) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+  always_include: true
+- question: Has this parent process historically driven the rule's pattern on this host or across the environment, or is the parent new for this activity?
+  context: >-
+    When the alert fires under SYSTEM or another service principal, user identity does not attribute the
+    behavior and the launch mechanism does. The query mirrors the rule's selection structure scoped to the
+    alerting parent process, so the result is the 90-day history of this parent driving this specific pattern
+    rather than generic co-occurrence. A parent that already accounts for thousands of prior events is
+    printer-management or deployment automation; a parent that is new for this pattern is the deviation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection1:
+        CommandLine|contains: Add-PrinterPort -Name
+      selection2:
+        CommandLine|contains:
+        - .exe
+        - .dll
+        - .bat
+      selection3:
+        CommandLine|contains: Generic / Text Only
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: ((selection1 and selection2) or selection3) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  always_include: true
+- question: What else did this user do across the environment around this time?
+  context: >-
+    Tracking the account's activity across all hosts in the alert window shows whether the printer-port
+    creation sits inside a wider session of activity or stands alone. The same account touching several hosts
+    in the same window points at an operator working through a set of machines; a single host with nothing
+    else around it points at a one-off local action. If the alert fired under a service principal this view
+    returns routine agent telemetry and the parent-scoped view is the meaningful one.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+  always_include: true
+- question: Did this same parent-driven pattern fire on other hosts in the same window, or is the activity isolated to this host?
+  context: >-
+    Under a service principal, asking what else the user did returns agent telemetry from every host. The
+    meaningful question is whether the same launch mechanism produced the same pattern elsewhere: the query
+    mirrors the rule's selection structure scoped to the alerting parent process, fleet-wide, in the alert
+    window. Several hosts in the same window points at scheduled or pushed printer deployment; a single host
+    points at a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection1:
+        CommandLine|contains: Add-PrinterPort -Name
+      selection2:
+        CommandLine|contains:
+        - .exe
+        - .dll
+        - .bat
+      selection3:
+        CommandLine|contains: Generic / Text Only
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: ((selection1 and selection2) or selection3) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  always_include: true
+- question: Have other hosts fired the rule's pattern in the past week, and does the cross-host distribution look like consistent automation or one-off activity?
+  context: >-
+    The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count
+    of this firing pattern rather than generic interpreter usage. Many hosts producing the same pattern points
+    at scripted printer deployment or vendor automation, which is the ordinary explanation and can be
+    confirmed against the deployment tooling. One host, or a small unrelated set, points at manual operator
+    activity and raises the value of resolving the port target path.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection1:
+        CommandLine|contains: Add-PrinterPort -Name
+      selection2:
+        CommandLine|contains:
+        - .exe
+        - .dll
+        - .bat
+      selection3:
+        CommandLine|contains: Generic / Text Only
+      condition: (selection1 and selection2) or selection3
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    A printer port that targets an executable path is a persistence and privilege-escalation step, and steps
+    like that usually follow something. Earlier detections on the same host covering script execution, defense
+    tampering, or credential access place this event in a sequence and indicate how the account came to be
+    running printing cmdlets. An isolated alert with a clean preceding timeline is more consistent with the
+    routine printer-install explanation.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+  answer_sources:
+  - alert

@@ -1,0 +1,335 @@
+name: Audio Capture via PowerShell
+id: 40bada38-ab17-4dc7-905c-81415bf5fa88
+description: |
+  Detects PowerShell command lines that invoke the AudioDeviceCmdlets module — Get-AudioDevice, Set-AudioDevice, Write-AudioDevice, Toggle-AudioDevice, or the WindowsAudioDevice-Powershell-Cmdlet name. These cmdlets wrap the Windows Core Audio API to enumerate recording devices, query mute/volume state, and stream live microphone power levels, which is exactly the reconnaissance an operator performs to confirm a microphone is live before capturing audio. The same cmdlets are dual-use: administrators use them for headset and default-device switching. Investigation should confirm which cmdlet and switches ran, whether the recording device or stream was queried, who and what launched PowerShell, and whether any audio file write or capture tool followed.
+type: detection
+detection_id: 932fb0d8-692b-4b0f-a26e-5643a50fe7d6
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the command line contain one of the AudioDeviceCmdlets invocations this rule detects?
+  context: Before investing investigation time, confirm the alert is a true positive by reading the full command line and checking which audio cmdlet fired — WindowsAudioDevice-Powershell-Cmdlet, Toggle-AudioDevice, Get-AudioDevice, Set-AudioDevice, or Write-AudioDevice. Note any switches, because recording-oriented switches such as -Recording, -RecordingMute, -RecordingVolume, -RecordingStream, or -RecordingMeter point at the microphone rather than playback devices.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Is this user and host expected to run audio-device management cmdlets?
+  context: Legitimate administrative activity can trigger this detection — headset switching, default-device configuration, and audio troubleshooting all use the same cmdlets. Knowing whether the user role and host function involve audio device management is often the fastest way to separate routine operations from collection activity. A server or a user with no audio-administration role querying the recording device is harder to explain.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What exactly did the audio cmdlet do — which device was targeted, and was the recording device or stream queried?
+  context: The full command line reveals whether this was a benign default-device switch or microphone reconnaissance. Get-AudioDevice -List enumerates devices; -Recording, -RecordingMute, and -RecordingVolume probe whether the microphone is enabled and how loud it is; Write-AudioDevice -RecordingStream and -RecordingMeter surface live capture levels; Set-AudioDevice changes the default. Read the switches and any -ID or -Index value to identify the exact device acted on.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains:
+        - WindowsAudioDevice-Powershell-Cmdlet
+        - Toggle-AudioDevice
+        - 'Get-AudioDevice '
+        - 'Set-AudioDevice '
+        - 'Write-AudioDevice '
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Was the command encoded or obfuscated, and what does it decode to?
+  context: PowerShell's -EncodedCommand (-enc) parameter, string concatenation, backtick escaping, and variable substitution can hide the audio cmdlet behind base64 or obfuscation. Decoding reveals the actual cmdlet sequence — whether the audio query is a standalone action or one step inside a larger script that also imports the module, writes captured audio to disk, or chains a separate capture tool.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did PowerShell script block logging capture the full script content around this execution?
+  context: Script block logging records the deobfuscated script content that PowerShell actually executes, even when the command line is encoded or obfuscated. It can reveal an Import-Module AudioDeviceCmdlets step, the full set of -Recording switches used, and any loop that streams microphone levels. If PowerShell operational logs are not ingested in this environment, treat zero results as a visibility gap rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Did the PowerShell process behind this cmdlet, or a process it spawned, write any file to this host around the time of the call?
+  context: Elastic Defend has no cross-process handle telemetry, so the original question - whether a
+    process opened a handle into the Windows audio stack - cannot be answered here; a zero-row result
+    is a visibility gap, not evidence that capture failed. Re-anchoring on the alerting PowerShell process
+    and its children for any file write gives a broader corroborating signal than the audio-extension
+    check alone, since capture tooling staged or downloaded by the surrounding script would also surface
+    here.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Were audio files written to user-accessible or temp directories on this host after the cmdlet ran?
+  context: The collection stage of audio capture leaves audio files — common extensions include .wav, .mp3, .m4a, and .wma — typically written to user media folders, the user profile, or temp paths. A capture file appearing on this host in the window after the audio cmdlet ran moves the disposition from reconnaissance toward actual recording. Legitimate apps such as conferencing software also write audio, so weigh the writing process against the host's expected software.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains:
+        - '.wav'
+        - '.mp3'
+        - '.m4a'
+        - '.wma'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: What process spawned this PowerShell instance, and is that parent chain expected?
+  context: The parent process reveals how PowerShell was invoked. Interactive administration usually descends from explorer.exe or a terminal; automation descends from services.exe, a scheduled-task host, or a management agent. Unusual parents such as mshta.exe, wscript.exe, winword.exe, or excel.exe suggest the audio query was driven by a macro or downloaded script rather than an administrator.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What other tools ran on this host shortly after the audio cmdlet, especially a dedicated capture or upload utility?
+  context: Audio device probing is often a precursor step, and once the microphone is confirmed live the operator runs a separate capture tool (SoundRecorder, ffmpeg) and later stages or uploads the recording. Reconnaissance, archiving, or outbound-transfer tools spawned in the minutes after the cmdlet provide the broader picture of whether collection completed.
+  range: +4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Was any captured or staged data moved off this host after the audio activity?
+  context: Collection is followed by staging and exfiltration — a recording is archived locally, then moved to a staging location or sent over the network. Archive files (.zip, .rar, .7z) created on this host after the audio activity, or outbound transfers in the same window, reveal whether captured audio left the environment and by what path.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains:
+        - '.zip'
+        - '.rar'
+        - '.7z'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - WindowsAudioDevice-Powershell-Cmdlet
+        - Toggle-AudioDevice
+        - 'Get-AudioDevice '
+        - 'Set-AudioDevice '
+        - 'Write-AudioDevice '
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - WindowsAudioDevice-Powershell-Cmdlet
+        - Toggle-AudioDevice
+        - 'Get-AudioDevice '
+        - 'Set-AudioDevice '
+        - 'Write-AudioDevice '
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or collection spread across multiple endpoints. If the same user queried audio devices or ran related tooling on more than one host, the scope of activity is broader than a single workstation.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  always_include: true
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - WindowsAudioDevice-Powershell-Cmdlet
+        - Toggle-AudioDevice
+        - 'Get-AudioDevice '
+        - 'Set-AudioDevice '
+        - 'Write-AudioDevice '
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: When this host has previously fired the audio-cmdlet pattern, what parents and users drove it, and does this alert fit?
+  context: Even dual-use tooling has a normal pattern. The query mirrors the rule's selection scoped to this host, so the parent and user distribution reflects how this specific audio-cmdlet pattern has historically run here. A new parent process, an unexpected user account, or an unusual command-line structure is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - WindowsAudioDevice-Powershell-Cmdlet
+        - Toggle-AudioDevice
+        - 'Get-AudioDevice '
+        - 'Set-AudioDevice '
+        - 'Write-AudioDevice '
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Have other hosts run the audio-cmdlet pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: The query mirrors the rule's selection with no host scope, giving a fleet-wide count of this specific firing pattern rather than generic PowerShell usage. Many hosts running the same audio cmdlets points to scripted deployment or vendor automation; one host or a small unrelated set points to manual operator activity. Use the host distribution to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - WindowsAudioDevice-Powershell-Cmdlet
+        - Toggle-AudioDevice
+        - 'Get-AudioDevice '
+        - 'Set-AudioDevice '
+        - 'Write-AudioDevice '
+      condition: selection
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance, credential access — may reveal the attack stages that preceded the audio activity and help reconstruct the timeline leading to collection.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

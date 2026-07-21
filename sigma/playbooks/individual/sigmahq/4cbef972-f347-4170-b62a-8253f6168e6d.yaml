@@ -1,0 +1,392 @@
+name: UAC Bypass Using IDiagnostic Profile
+id: e16c8735-beab-4cef-8cf9-7b0e2ddae937
+description: |
+  Detects the IDiagnosticProfileUAC bypass technique, which abuses an auto-elevated COM
+  object hosted by DllHost.exe to run a child process at High or System integrity without a
+  consent prompt. The rule fires when DllHost.exe carries the auto-elevated CLSID on its
+  command line and spawns a child at elevated integrity. Legitimate auto-elevation paths
+  exist for some Windows maintenance tasks, so the investigation should confirm the COM
+  object was driven by a non-elevated actor and determine what the elevated child went on
+  to do.
+type: detection
+detection_id: 4cbef972-f347-4170-b62a-8253f6168e6d
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- question: Did this process spawn from DllHost.exe carrying the auto-elevated COM CLSID at High or System integrity?
+  context: Before investing investigation time, confirm the alert is a true positive. Verify the parent is DllHost.exe, its
+    command line contains the auto-elevated Processid CLSID, and the integrity level is High or System. This is the exact
+    signature of the IDiagnosticProfile auto-elevation path.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - IntegrityLevel
+- question: Is this user and host expected to invoke an auto-elevated COM object to obtain elevation?
+  context: Legitimate administrative or maintenance activity can drive auto-elevated COM objects. Knowing whether the user
+    role and host function are consistent with this behavior is often the fastest path to distinguishing a true positive from
+    a routine operation that happened to traverse the same elevation path.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What drove DllHost.exe to host this COM object, and what spawned DllHost.exe itself?
+  context: The DllHost.exe parent reveals how the auto-elevation was initiated. DllHost.exe is launched by the COM surrogate
+    infrastructure on demand, so the meaningful question is what non-elevated process requested instantiation of the auto-elevated
+    CLSID. Walk upward from the DllHost.exe parent to find the originating, non-elevated process that drove the bypass.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- question: What did the elevated child process do? Decode its full command line.
+  context: The child spawned at elevated integrity is the payload of the bypass. Decode any flags, encoded content, file paths,
+    or URLs on its command line to identify what action was taken with the newly acquired High or System integrity. Scoping
+    to all executions of this binary on the host within a tight window captures multi-step operations that form a single logical
+    action.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Were registry modifications made to set up a UAC bypass on this host?
+  context: Many UAC bypass families write a command to a registry key that an auto-elevated process reads and executes. The
+    IDiagnostic Profile path is COM-driven rather than registry-driven, so populated rows here suggest a different or additional
+    bypass attempt rather than this technique's mechanism. Common targets include HKCU\Software\Classes\ms-settings\Shell,
+    mscfile\shell, and HKCU\Environment keys.
+  range: -15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\reg.exe'
+          - '\powershell.exe'
+          - '\cmd.exe'
+        CommandLine|contains:
+          - 'ms-settings'
+          - 'mscfile'
+          - 'Classes\exefile'
+          - 'Classes\Folder'
+          - 'Environment'
+          - 'Shell\Open\command'
+          - 'DelegateExecute'
+      condition: selection
+    fields:
+      - CommandLine
+      - Image
+- question: Did the auto-elevated COM surrogate load an unsigned or unexpected DLL around the time of the alert?
+  context: COM-based auto-elevation bypasses frequently plant a DLL that the auto-elevated surrogate loads from a path the
+    non-elevated user can write. An image load into DllHost.exe from a user-writable directory, or an unsigned module loaded
+    by the elevated surrogate, is the artifact that distinguishes abuse from a benign auto-elevated maintenance task. If image
+    load events are not collected in this environment, treat zero results as a visibility gap rather than evidence nothing
+    loaded.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: '\DllHost.exe'
+      filter_main_signed:
+        Signed: 'true'
+      condition: selection and not filter_main_signed
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+- question: Did the elevated child, or a process it spawned, write a dump-like artifact to disk, consistent with having its token or memory read or duplicated for reuse?
+  context: After elevation, an actor may open a handle into the High or System integrity process to manipulate its token,
+    duplicate the elevated context for reuse, or read its memory. That handle open is not observable here - this data
+    source carries no cross-process access telemetry - so a zero result does not mean the elevated child's token or
+    memory was never accessed; it only means the elevated child's process tree did not drop a dump file. Any dump-like
+    artifact written by the elevated child or its children is the one indirect signal available that its elevated
+    context was harvested rather than the bypass being a one-shot launch.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What action was performed with elevated privileges after the bypass?
+  context: 'UAC bypass is a means to an end. Attackers elevate to perform actions that require high integrity: installing persistence,
+    dumping credentials, tampering with security tools, or accessing protected resources. Examining processes that ran at High
+    or System integrity on this host shortly after the bypass reveals the objective.'
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        IntegrityLevel:
+          - 'High'
+          - 'System'
+          - 'S-1-16-16384'
+          - 'S-1-16-12288'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - IntegrityLevel
+- question: What other child processes did DllHost.exe spawn on this host?
+  context: A compromised or attacker-driven surrogate may spawn multiple tools in sequence. Seeing every child of DllHost.exe
+    on this host reveals the full scope of activity launched through the auto-elevation path, beyond the single process that
+    triggered the alert.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: What other activity is associated with DllHost.exe around the same time on this host?
+  context: Beyond child processes, the surrogate may have generated file writes or registry modifications that staged the bypass.
+    Examining surrounding activity from the same parent on this host helps reconstruct how the elevation was set up and what
+    it touched.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Does DllHost.exe normally spawn this child binary at elevated integrity on this host?
+  context: DllHost.exe routinely hosts COM objects, but the specific pairing of this auto-elevated CLSID spawning this child
+    binary at High or System integrity is the discriminator. Zero or very low historical counts for this parent-child pairing
+    indicate a novel elevation path rather than routine COM surrogate activity.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \DllHost.exe
+        ParentCommandLine|contains: ' /Processid:{12C21EA7-2EB8-4B55-9249-AC243DA8C666}'
+        IntegrityLevel:
+        - High
+        - System
+        - S-1-16-16384
+        - S-1-16-12288
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \DllHost.exe
+        ParentCommandLine|contains: ' /Processid:{12C21EA7-2EB8-4B55-9249-AC243DA8C666}'
+        IntegrityLevel:
+        - High
+        - System
+        - S-1-16-16384
+        - S-1-16-12288
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints.
+    If the same user drove similar elevation or follow-on activity on other hosts, the scope of the operation may be larger
+    than a single host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \DllHost.exe
+        ParentCommandLine|contains: ' /Processid:{12C21EA7-2EB8-4B55-9249-AC243DA8C666}'
+        IntegrityLevel:
+        - High
+        - System
+        - S-1-16-16384
+        - S-1-16-12288
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate context: what led to
+    this event, what happened after, and whether it is part of a larger sequence. Look for reconnaissance, privilege escalation,
+    or persistence mechanisms.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host, such as reconnaissance, credential access, or defense tampering, may reveal
+    the attack stages that preceded this elevation and help reconstruct the full timeline. Privilege escalation rarely happens
+    as a first action.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Were other privilege escalation techniques attempted on this host?
+  context: Attackers who attempt one UAC bypass often try multiple methods until one succeeds, especially if the OS version
+    or configuration blocks certain techniques. Finding multiple bypass attempts from the same user or process confirms deliberate
+    privilege escalation activity rather than a false positive.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - rule.name
+      - rule.uuid
+      - event.severity_label

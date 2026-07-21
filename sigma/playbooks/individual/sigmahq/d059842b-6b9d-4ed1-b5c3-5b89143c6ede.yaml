@@ -1,0 +1,417 @@
+name: File Download Via Bitsadmin
+id: c3d48c8b-df4a-4e96-a5d5-3bd6fb2539a2
+description: |
+  Detects bitsadmin.exe (or a binary whose PE OriginalFileName is bitsadmin.exe) invoked in a way
+  consistent with downloading a file via the Background Intelligent Transfer Service. The rule fires
+  when the bitsadmin image runs AND at least one of the following is present: a ' /transfer ' switch, or one of ' /create '/' /addfile ' together with an http reference on the command line. bitsadmin is a
+  Microsoft-signed utility that requires only user-level privileges and runs transfers in the
+  background under the BITS service, so it is used both for legitimate updater/CDN traffic and as a
+  living-off-the-land download primitive. Determine which command branch fired, whether a file landed
+  on disk, what that payload is, and whether the job left a persistent download/notify task behind.
+type: detection
+detection_id: d059842b-6b9d-4ed1-b5c3-5b89143c6ede
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- question: Does the bitsadmin command line match this rule — either a /transfer switch, or /create or /addfile together with an http reference?
+  context: >-
+    Confirm the alert is a true positive by reviewing the exact command and image against the rule.
+    The rule fires on bitsadmin.exe (or a binary whose OriginalFileName is bitsadmin.exe) when EITHER of these is present — a ' /transfer ' switch, or one of ' /create '/' /addfile ' together with the string http. Note which branch fired — a /transfer or http branch points at an active download,
+    while a bare /create or /addfile may be job setup that has not yet pulled the file.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to download files with command-line transfer tools?
+  context: >-
+    Legitimate administrative activity triggers many download detections. Knowing whether this user's
+    role and this host's function routinely involve pulling files via bitsadmin or similar tools is
+    often the fastest way to separate routine operations from operator activity.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Decode the full bitsadmin command — what job name, source URL, destination path, and switches were used?
+  context: >-
+    The command line carries the operation. Identify the BITS verbs in play (/create, /addfile,
+    /transfer, /resume, /complete) and pull out the source URL or UNC, the local destination path,
+    and the job name. Watch for /SetNotifyCmdLine, /setcustomheaders, or /setminretrydelay — these
+    turn a download into a download-then-execute or a long-lived retrying job rather than a one-shot
+    transfer.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What process spawned bitsadmin, and is that parent chain expected for a download?
+  context: >-
+    The parent reveals how the transfer was launched. User-driven bitsadmin typically descends from
+    explorer.exe or an interactive shell; an updater or management agent has its own stable parent.
+    Parents such as a script host, an Office application, or a web server worker process point to
+    automated or exploitation-driven invocation rather than an administrator at a console.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Did a background BITS transfer to an external destination follow this command on the host?
+  context: >-
+    A bitsadmin command queues the work, but the bytes move later under the BITS service rather than
+    from bitsadmin.exe itself. Correlating outbound connections on the host in the window after the
+    command confirms whether the transfer actually executed and reveals the destination address.
+    External, non-corporate destinations carry more weight than connections to known update or CDN
+    endpoints.
+  range: +1h
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+      filter_local:
+        DestinationIp|cidr:
+          - '10.0.0.0/8'
+          - '172.16.0.0/12'
+          - '192.168.0.0/16'
+          - '127.0.0.0/8'
+      condition: selection and not filter_local
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationPort
+- question: Did a file actually land at the destination path after the transfer?
+  context: >-
+    A download command does not guarantee the file arrived — network errors, blocked URLs, or
+    security controls may have stopped the transfer. Confirming a file-creation event at the target
+    path establishes whether the operation progressed past delivery.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: If the file bitsadmin downloaded was executed, what is its hash and reputation?
+  context: >-
+    The hash for a reputation lookup is recorded when the payload runs, not when bitsadmin stages it under the
+    user's profile or a temp directory — file-creation events carry no hash. BITS transfers are often decoupled
+    from execution, so this family-scoped query (the alerting process's children and siblings) may be empty; when
+    the payload runs as part of the same command it appears here with its hash. Otherwise retrieve the staged file
+    from its path and hash it manually, and check the host's later process activity.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_children:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      selection_siblings:
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - Image
+      - Hashes
+- question: What other file activity occurred in the destination directory around the transfer?
+  context: >-
+    Operators often stage several files in the same directory, or the downloaded file triggers
+    further writes — extraction, decompression, or additional pulls. Directory-level file activity
+    reveals the broader scope of the delivery beyond the single named file.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Does the on-disk image name match the bitsadmin PE metadata, and what does the hash resolve to?
+  context: >-
+    This rule fires on either the image name ending in bitsadmin.exe or a PE OriginalFileName of
+    bitsadmin.exe, so a renamed copy of the utility can trigger it. Compare the Image path against
+    OriginalFileName — a mismatch means the binary was renamed to blend in. The hash enables a
+    reputation lookup to confirm whether this is the genuine Microsoft-signed utility or a substituted
+    binary.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Hashes
+- question: Was bitsadmin executed from its expected System32 or SysWOW64 path?
+  context: >-
+    The genuine utility lives at C:\Windows\System32\bitsadmin.exe or C:\Windows\SysWOW64\bitsadmin.exe.
+    A copy running from a user-writable directory such as a profile, Downloads, Temp, or AppData
+    suggests the binary was relocated or renamed to evade path-based allowlists, which is more
+    suspicious than execution from the canonical system path.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- question: How often has this host fired this bitsadmin download pattern over the past 90 days, and what command structures are typical?
+  context: >-
+    A download pattern with no prior history on a host is more suspicious than one seen regularly under
+    stable parents. The query mirrors the rule's selection scoped to this host, so the count reflects
+    the rule's specific firing pattern rather than generic bitsadmin usage. The command-line projection
+    lets you compare typical invocation patterns against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \bitsadmin.exe
+      - OriginalFileName: bitsadmin.exe
+      selection_cmd:
+        CommandLine|contains: ' /transfer '
+      selection_cli_1:
+        CommandLine|contains:
+        - ' /create '
+        - ' /addfile '
+      selection_cli_2:
+        CommandLine|contains: http
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection_img and (selection_cmd or all of selection_cli_*)) and _pb_scope
+    fields:
+    - CommandLine
+- question: Have other hosts fired this bitsadmin download pattern in the past week, and does the spread look like automation or one-off activity?
+  context: >-
+    The query mirrors the rule's selection with no host scope, so the result is a fleet-wide count of
+    this firing pattern rather than generic use of the binary. Many hosts firing the same pattern
+    points to scripted deployment or vendor automation; one host or a small unrelated set points to
+    manual operator activity. Use the host distribution to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \bitsadmin.exe
+      - OriginalFileName: bitsadmin.exe
+      selection_cmd:
+        CommandLine|contains: ' /transfer '
+      selection_cli_1:
+        CommandLine|contains:
+        - ' /create '
+        - ' /addfile '
+      selection_cli_2:
+        CommandLine|contains: http
+      condition: selection_img and (selection_cmd or all of selection_cli_*)
+    fields:
+    - host.name
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \bitsadmin.exe
+      - OriginalFileName: bitsadmin.exe
+      selection_cmd:
+        CommandLine|contains: ' /transfer '
+      selection_cli_1:
+        CommandLine|contains:
+        - ' /create '
+        - ' /addfile '
+      selection_cli_2:
+        CommandLine|contains: http
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection_img and (selection_cmd or all of selection_cli_*)) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \bitsadmin.exe
+      - OriginalFileName: bitsadmin.exe
+      selection_cmd:
+        CommandLine|contains: ' /transfer '
+      selection_cli_1:
+        CommandLine|contains:
+        - ' /create '
+        - ' /addfile '
+      selection_cli_2:
+        CommandLine|contains: http
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection_img and (selection_cmd or all of selection_cli_*)) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Alerts rarely occur in isolation. Activity surrounding the transfer reveals the immediate context —
+    what led to it, what followed, and whether it is part of a larger sequence. Novel parent-child
+    pairs stand out at low counts against repetitive agent telemetry; watch for reconnaissance,
+    privilege escalation, or persistence installation in the same window.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Was a persistent BITS job or other process-based persistence installed on this host after the download?
+  context: >-
+    BITS jobs survive reboots and can keep retrying transfers or fire a notify command on completion,
+    making the download itself a persistence mechanism. Operators also stack backup footholds via
+    scheduled tasks, services, registry Run keys, or WMI. Enumerating persistence-tool executions in
+    the surrounding window shows whether the download was a one-off or part of a foothold. Running
+    bitsadmin /list /allusers /verbose on the host enumerates every queued BITS job, including
+    long-lived ones an operator left behind.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- question: Were any other download or transfer LOLBins used on this host recently?
+  context: >-
+    Operators who use one download LOLBin often use several. If bitsadmin pulled a file, check whether
+    certutil, curl, expand, esentutl, or similar transfer utilities also ran on the host. Multiple
+    distinct download tools performing the same objective strengthens the case for operator activity
+    over a single benign invocation.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\certutil.exe'
+          - '\curl.exe'
+          - '\esentutl.exe'
+          - '\expand.exe'
+          - '\extrac32.exe'
+          - '\makecab.exe'
+          - '\replace.exe'
+          - '\hh.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine

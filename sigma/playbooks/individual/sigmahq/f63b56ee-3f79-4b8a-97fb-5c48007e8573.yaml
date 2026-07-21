@@ -1,0 +1,397 @@
+name: New DNS ServerLevelPluginDll Installed Via Dnscmd.EXE
+id: 15145b28-ed62-4853-8d0f-96f7c2dc5cf0
+description: |
+  Detects dnscmd.exe run with both /config and /serverlevelplugindll, which writes a DLL path into the
+  ServerLevelPluginDll registry value (HKLM\SYSTEM\CurrentControlSet\services\DNS\Parameters). After a DNS
+  service restart, dns.exe loads that DLL in SYSTEM context, so on a domain controller this provides code
+  execution as SYSTEM and a privilege-escalation/persistence path for an account with write access to the DNS
+  server object. Legitimate writes to this value are rare administrator-driven plugin deployments; investigation
+  should confirm who ran the command, what DLL path was registered, whether that DLL was loaded by dns.exe, and
+  whether the change was authorized.
+type: detection
+detection_id: f63b56ee-3f79-4b8a-97fb-5c48007e8573
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- question: Does the dnscmd command line contain both /config and /serverlevelplugindll, and what DLL path was supplied?
+  context: Confirm the alert is real by reviewing the exact command line against the detection criteria — the rule
+    fires only when dnscmd.exe runs with both /config and /serverlevelplugindll. The argument after
+    /serverlevelplugindll is the DLL path being registered; a UNC path (\\host\share\name.dll) or a path outside
+    System32 is the value that will be loaded by dns.exe after a service restart.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Is this user and host expected to register a DNS server plugin DLL via dnscmd?
+  context: Registering a ServerLevelPluginDll is a rare administrative action normally limited to DNS server
+    maintenance on a domain controller. Knowing whether the account holds delegated write access to the DNS
+    server object (for example DnsAdmins membership) and whether this host is a DNS server is often the fastest
+    way to separate an authorized plugin deployment from an escalation attempt.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What DLL path was written to the ServerLevelPluginDll registry value, and is it a UNC or non-System32 location?
+  context: The dnscmd command populates HKLM\SYSTEM\CurrentControlSet\services\DNS\Parameters\ServerLevelPluginDll
+    (REG_SZ) with the supplied DLL path. The value data is what dns.exe will LoadLibrary after a service restart,
+    so it determines what runs as SYSTEM. A UNC path or a path under a user-writable directory is the actionable
+    detail; a missing or empty value means the write may not have taken effect.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- question: What process spawned dnscmd.exe, and what started that parent?
+  context: dnscmd is normally launched by an interactive administrator shell (cmd.exe or powershell.exe under an
+    admin logon) or by a deployment tool. A parent such as a script host, an Office application, or a remote-execution
+    service handler points toward operator activity rather than routine DNS administration. Tracing the parent's own
+    origin shows whether the chain began with a legitimate logon or with a remote/automated trigger.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What other child processes did the same parent spawn around this time?
+  context: If the parent that launched dnscmd also spawned other tooling, the broader objective becomes visible.
+    A parent that additionally ran service-control commands (sc stop/start dns, dnscmd /restart) or credential and
+    discovery tools alongside the plugin registration indicates an orchestrated escalation rather than an isolated
+    administrative command.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Was a plugin DLL written to disk or to a share on this host around the time of the registration?
+  context: The registered path must be reachable by the DNS server before the DLL can load. A DLL file created on
+    this host (or staged to a local share) near the registration is the payload itself — the writing process and
+    the exact path are recorded, but there is no hash or content field on the write event, so confirming what the
+    DLL actually is requires retrieving the file and hashing it manually. If the DLL arrived by download it may
+    also carry a Zone.Identifier marker as a separate file-creation event on the same path. Absence of a local
+    write suggests the DLL lives on a remote UNC share, which the image-load check then confirms.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains: .dll
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: Did dns.exe load a non-Microsoft or UNC-path DLL after the registration?
+  context: The registry write alone does nothing until the DNS service restarts; the proof of execution is dns.exe
+    loading the registered DLL in SYSTEM context. A module loaded into dns.exe from a UNC path or that is unsigned
+    confirms the plugin took effect. The presence of side-effect loads (icmp.dll, oleaut32.dll) alongside an
+    unexpected module is the fingerprint of a configured server-level plugin.
+  range: +/-12h
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: \dns.exe
+      filter_microsoft:
+        Signed: 'true'
+        SignatureStatus: Valid
+      condition: selection and not filter_microsoft
+    fields:
+      - ImageLoaded
+      - Signed
+      - SignatureStatus
+      - Hashes
+- question: Were other registry modifications made on this host in the same window?
+  context: An operator who registers a DNS plugin DLL often makes adjacent registry changes — service start-type
+    edits, security-setting changes, or additional persistence keys. Clusters of registry writes from the same host
+    and window reveal whether the plugin registration was a single action or part of a wider configuration change.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_reg:
+        Image|endswith:
+          - '\reg.exe'
+          - '\regedit.exe'
+        CommandLine|contains:
+          - ' add '
+          - ' delete '
+          - ' import '
+          - '/s '
+      condition: selection and selection_reg
+    fields:
+      - CommandLine
+- question: Does the registered DLL exist on disk at the registered path, and what is its hash?
+  context: The persistence is only effective if the DLL referenced by ServerLevelPluginDll is present and exports
+    DnsPluginInitialize, DnsPluginQuery, and DnsPluginCleanup — dns.exe refuses to start otherwise. Confirming the
+    file exists at the registered path and capturing its hash determines whether the mechanism is armed and what
+    would run as SYSTEM on the next service restart.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: Was dnscmd.exe executed from its expected System32 path?
+  context: dnscmd.exe normally runs from C:\Windows\System32. Execution from a user-writable or temp directory
+    suggests the binary was copied or renamed to evade path-based allowlists, which would shift the assessment
+    toward deliberate operator activity rather than routine DNS administration.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- question: Were other persistence or service-tampering LOLBins used on this host recently?
+  context: Operators who register a DNS plugin DLL for persistence often pair it with other living-off-the-land
+    tooling — service control, scheduled tasks, or registry edits via signed system binaries. Finding sc.exe,
+    schtasks.exe, reg.exe, or similar binaries used for persistence or service manipulation in the same period
+    strengthens the case for intentional activity over a one-off administrative command.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+          - '\netsh.exe'
+          - '\wevtutil.exe'
+          - '\bcdedit.exe'
+          - '\vssadmin.exe'
+          - '\diskshadow.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- question: How often has this host run the dnscmd plugin-registration pattern over the past 90 days, and what command structures are typical?
+  context: A ServerLevelPluginDll registration with no prior history on this host is more suspicious than one seen
+    regularly under stable administration. The query mirrors the rule's selection scoped to this host, so the count
+    reflects the specific firing pattern rather than generic dnscmd usage; the command-line projection lets typical
+    invocation patterns be compared against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \dnscmd.exe
+        CommandLine|contains|all:
+        - /config
+        - /serverlevelplugindll
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \dnscmd.exe
+        CommandLine|contains|all:
+        - /config
+        - /serverlevelplugindll
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \dnscmd.exe
+        CommandLine|contains|all:
+        - /config
+        - /serverlevelplugindll
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: After identifying the account, check its activity across all hosts in the surrounding window. The same
+    user touching multiple DNS servers or domain controllers, or running discovery and credential tooling
+    elsewhere, indicates the scope reaches beyond this single host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \dnscmd.exe
+        CommandLine|contains|all:
+        - /config
+        - /serverlevelplugindll
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: A privilege-escalation foothold on a DNS server or domain controller is rarely the first step. Earlier
+    detections on the same host — credential access, discovery, or defense tampering — may reveal how the operator
+    gained the position to register the plugin and help reconstruct the timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: When this host has previously run the dnscmd plugin-registration pattern, what parents and users drove it, and does the current alert fit?
+  context: The query mirrors the rule's selection scoped to this host, so the resulting parent and user distribution
+    reflects how this specific firing pattern has historically run here rather than generic dnscmd usage. A new
+    parent process or an unexpected account is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \dnscmd.exe
+        CommandLine|contains|all:
+        - /config
+        - /serverlevelplugindll
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User

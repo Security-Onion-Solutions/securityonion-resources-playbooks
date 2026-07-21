@@ -1,0 +1,431 @@
+name: Potential SNAKE Malware Persistence Service Execution
+id: 214f5c1c-c68c-4a5b-a557-c83e6772d4cd
+description: |
+  Detects a process_creation event that satisfies three conditions together: the parent Image ends in \services.exe, the
+  child Image starts with C:\Windows\WinSxS\, and that same child Image ends in \WerFault.exe. WerFault.exe is the Windows
+  Error Reporting handler; it normally runs from C:\Windows\System32\ and is started by svchost.exe or by the faulting
+  application, not by the service control manager, and a copy executing out of the side-by-side component store means a
+  Windows service was registered to point at that path. SNAKE malware persists exactly this way — a service whose image
+  path is a WerFault.exe under WinSxS, which then loads its encrypted queue file and a kernel driver. The investigation
+  should establish which service registration started the process, what its registry entries and image path contain, what
+  command line the process ran with, whether a driver load or other persistence followed, and whether the same
+  parent-driven pattern appears on other hosts.
+type: detection
+detection_id: f7536642-4a08-4dd9-b6d5-c3286d8975ed
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-17
+questions:
+- question: Does the alerting event show services.exe starting a WerFault.exe that lives under C:\Windows\WinSxS\?
+  context: >-
+    Before investing investigation time, confirm the alert is a true positive. All three parts of the pattern must hold
+    on the same event — the parent path ending in \services.exe, and the child path both beginning with
+    C:\Windows\WinSxS\ and ending in \WerFault.exe. Read the exact Image and ParentImage on the triggering event. A
+    WerFault.exe under System32, or a WinSxS binary with a different parent, is not what this rule fires on.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+- question: Is this host expected to run a Windows service whose image path is a binary inside the component store?
+  context: >-
+    A process started by the service control manager runs under whatever account the service was configured with, which
+    is normally SYSTEM, so the recorded user rarely attributes the activity — the useful judgment is about the host.
+    Windows Error Reporting itself is a service, but its registration points at System32, not at the component store,
+    and installers do not normally register services against WinSxS payload paths. Determine whether this host's role,
+    installed software, or any sanctioned maintenance accounts for such a registration.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Is services.exe expected to spawn this WerFault.exe, and what started services.exe itself?
+  context: >-
+    services.exe spawning a child means a service was started, so the parent-child pairing is the core signal here and
+    the question is which registration produced it rather than whether the parent is compromised. services.exe is
+    started by wininit.exe at boot and runs for the life of the session, so its own creation record typically predates
+    the alert by hours or days — a grandparent that is anything other than wininit.exe would itself indicate the process
+    is not the real service control manager.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What other child processes did this same services.exe instance start around the alert?
+  context: >-
+    Every service start on the host appears as a child of this one services.exe instance, so this view is a list of what
+    the service control manager launched in the window. Most entries are routine platform and vendor services; scan for
+    other registrations whose image paths sit outside System32 and Program Files, for service binaries with names that
+    imitate a platform component, and for script hosts or interpreters started as services. Several unfamiliar service
+    starts clustered around the alert point at a set of registrations installed together.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: What full command line and working directory did this component-store WerFault.exe run with?
+  context: >-
+    The genuine error-reporting binary is invoked with the faulting process id and an event handle, and it exits once
+    the report is written. A service-started copy under the component store runs with whatever arguments the service
+    registration supplied, and the arguments are what identify the operation — a payload or queue file path, a
+    configuration blob, or no arguments at all for a binary that reads its instructions from disk. Record any file path
+    that appears, because it is the artifact to recover and examine. The window covers every execution of this binary on
+    the host, so repeated starts of the same path are visible as a restart loop or a service configured to auto-restart.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Did the Security channel record a service installation on this host, and what image path and account does it name?
+  context: >-
+    A process cannot be started by the service control manager without a service registration, so the install record is
+    the provenance of this execution. Event 4697 names the service, the file the service runs, its start type, and the
+    account it runs under, and it names the account that performed the installation — which is the identity worth
+    pursuing, since the started process itself runs as SYSTEM. A service whose file path points into the component store
+    rather than System32, an auto-start type, and a service name that imitates a platform component are the entries to
+    expand. An installation earlier than this window means the registration predates the alert and the service was
+    merely started; if the Security channel is not collected in this environment, zero results is a visibility gap
+    rather than evidence that nothing was installed.
+  range: -30d
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4697
+      condition: selection
+    fields:
+      - SubjectUserName
+      - ServiceName
+      - ServiceFileName
+      - ServiceType
+      - ServiceStartType
+      - ServiceAccount
+- question: Does the System channel show a service being installed on this host, and does its image path match the alerting binary?
+  context: >-
+    Event 7045 is the service control manager's own record of a new service and is emitted independently of Security
+    channel auditing, so it is the corroborating view when audit policy does not cover service installation. It carries
+    the service name, the image path, the start type, and the account. Match the image path against the alerting
+    WinSxS WerFault.exe path — a match identifies the registration that produced this execution and gives the service
+    name to remove. Compare the install time to the alert: a registration made minutes before points at a fresh
+    installation, while one made weeks earlier points at a foothold that has been starting at every boot since.
+  range: -30d
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: system
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 7045
+      condition: selection
+    fields:
+      - ServiceName
+      - ImagePath
+      - StartType
+      - AccountName
+- question: What service registry entries were written under CurrentControlSet\Services on this host around the alert?
+  context: >-
+    Service registration is a registry operation, and the values under \CurrentControlSet\Services\ are the durable
+    record of how the binary gets started — ImagePath names the file, Start controls whether it runs at boot, and Type
+    identifies it as a user-mode service or a kernel driver. These writes appear even when no service-install tooling
+    ran, because a registration can be created by writing the key directly. Look for a key whose ImagePath resolves to
+    the alerting component-store path, for Start values changed on an existing key rather than a new key created, and
+    for the process that performed the write, which is the installer to trace back.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains: '\CurrentControlSet\Services\'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- question: Did any kernel driver load on this host around the alert, and is it accounted for by installed software?
+  context: >-
+    The service execution stage of this implant family is followed by a kernel driver load, which is how the component
+    obtains kernel-level access and hides its files, registry keys, and network activity. Driver loads are low volume on
+    a stable host, so most of what returns here is the routine set from endpoint agents, storage and virtualization
+    tooling, and hardware utilities. The entries worth expanding are a driver loading from outside
+    %SystemRoot%\System32\drivers\, an unsigned, expired, distrusted, or invalid signing status, and a driver with no
+    corresponding installed product. The load event carries the module hash directly, so a reputation lookup needs no
+    execution pivot.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: driver_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+      - SignatureStatus
+      - Hashes
+- question: Has services.exe started this component-store WerFault.exe on this host before?
+  context: >-
+    This counts how often the alerting parent-child pairing has occurred on this host over 90 days. Zero or a handful of
+    prior events makes this a novel service start and points the investigation at a recent registration. A steady daily
+    count means the service has been starting for some time, which does not make it legitimate — it dates the foothold
+    and tells the analyst how far back the timeline needs to reach. Compare the command lines across the returned rows:
+    an unchanging invocation is consistent with a fixed service registration.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Has this specific WinSxS binary path ever executed on this host outside the alerting event?
+  context: >-
+    The component store holds servicing payloads that are copied to System32 and executed from there, so a path inside
+    WinSxS running as a process at all is the deviation this counts. The scope is the exact alerting path rather than
+    the name WerFault.exe, so routine error-reporting activity out of System32 does not contribute. Zero history means
+    first execution of this file. Any history is grouped by account: executions under an account other than SYSTEM would
+    mean something started the binary directly rather than through the service control manager.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- always_include: true
+  question: Has this account previously produced the rule's pattern, and does that history fit its role?
+  context: >-
+    The query mirrors the rule's selection scoped to this account, so the result is its 90-day history of this specific
+    firing pattern aggregated by host, not generic use of WerFault.exe. An account that has never produced the pattern
+    is a different case from one that produces it routinely. Because the process is started by the service control
+    manager, the account will normally be SYSTEM and this count will reflect the mechanism rather than a person; read it
+    alongside the parent-anchored history, which attributes the launch.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \services.exe
+        Image|startswith: C:\Windows\WinSxS\
+        Image|endswith: \WerFault.exe
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+- always_include: true
+  question: Has the alerting parent process driven this pattern before on this host or across the environment?
+  context: >-
+    When the alert fires under a service principal, account identity does not attribute the behavior; the launch
+    mechanism does. The query mirrors the rule's selection scoped to the alerting parent, giving the 90-day history of
+    that parent driving this exact pattern across hosts rather than generic parent-and-binary co-occurrence. Every
+    Windows host runs services.exe, so a count spread evenly across the estate would mean a registration that exists
+    everywhere, which for a component-store image path is not an expected platform behavior; concentration on one or a
+    few hosts points at where the registration was installed.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \services.exe
+        Image|startswith: C:\Windows\WinSxS\
+        Image|endswith: \WerFault.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- always_include: true
+  question: What else did this account do across the environment around this time?
+  context: >-
+    Tracking the account's activity across all hosts in the alert window shows whether the same identity was active on
+    other endpoints, which widens the scope of what needs containment. When the alert fires under SYSTEM or a machine
+    account — the expected case for a service start — this returns platform and agent telemetry from every host and the
+    result is not attributive; treat the parent-anchored fleet view as the meaningful answer in that situation. A
+    non-service account here would instead be the finding, since it would mean the binary was reached outside the
+    service path.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+- always_include: true
+  question: Did the same parent-driven pattern fire on other hosts in the same window, or is the activity isolated to this host?
+  context: >-
+    Under a service principal, asking what else the account did returns platform-agent noise, because every host runs
+    SYSTEM-owned services constantly. The meaningful question is whether the same launch mechanism produced the same
+    pattern elsewhere: the query mirrors the rule's selection scoped to the alerting parent process, fleet-wide, in the
+    alert window. Several hosts firing together points at a registration pushed by a deployment mechanism or triggered
+    on a schedule; a single host points at a host-local trigger such as a reboot or a manual service start.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \services.exe
+        Image|startswith: C:\Windows\WinSxS\
+        Image|endswith: \WerFault.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- question: What other process activity occurred on this host around the time of the alert?
+  context: >-
+    A service start rarely happens in isolation — the tooling that created the registration, the process that dropped
+    the service binary, or follow-on hands-on activity typically executes in the same window. Aggregating by child and
+    parent image pairs collapses repetitive agent telemetry into high-count rows while novel pairs stand out at low
+    counts. Scan those low-count rows for service-control and registry utilities, archive extractors, script
+    interpreters, and binaries running from paths outside System32 and Program Files.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Is this parent-child spawning pattern occurring on other hosts in the environment?
+  context: >-
+    This drops the host filter and counts the same services.exe-to-WerFault.exe pairing across the estate in the last
+    day, grouped by host. Multiple hosts carrying the pattern means the registration exists in more than one place,
+    which changes the response from a single-host cleanup to an estate-wide hunt for the service name and image path. A
+    single host is more consistent with targeted installation. Compare the returned command lines across hosts:
+    identical invocations point at one distribution mechanism, differing ones at separate installations.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+      - CommandLine
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host — initial access, defense tampering, credential access, or reconnaissance — may
+    reveal the stages that preceded this service execution and help reconstruct the timeline. Persistence installation
+    follows execution and administrative access, so an earlier alert naming the process that installed the service
+    shortens the path to the entry point. An isolated alert with no precursors points the investigation instead at when
+    the service was registered.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

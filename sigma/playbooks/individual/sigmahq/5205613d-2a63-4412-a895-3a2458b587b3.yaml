@@ -1,0 +1,378 @@
+name: Network Connection Initiated By AddinUtil.EXE
+id: 41e9a268-537d-4221-829e-1673c2ee7d72
+description: |
+  Detects addinutil.exe, the .NET add-in pipeline cache utility, initiating a network
+  connection. The tool maintains local add-in caches and has no routine need for network
+  access; because it is Microsoft-signed, attackers abuse it for proxy execution (T1218) —
+  a crafted AddIns.store file in a directory passed via the -AddinRoot or -PipelineRoot
+  switch is deserialized by an unsafe .NET formatter when the cache is read, running
+  arbitrary code inside the trusted binary, with the network connection typically being
+  payload retrieval or command-and-control. The investigation identifies how addinutil was
+  invoked and from what working directory, the store file it processed, what loaded and ran
+  inside the process, and whether the destination is attacker infrastructure.
+type: detection
+detection_id: 5205613d-2a63-4412-a895-3a2458b587b3
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-09
+questions:
+- question: Do the destination and initiating process match what this rule detects, an outbound connection initiated by addinutil.exe?
+  context: |
+    Confirm the alert from the exact destination address and port, the outbound direction,
+    and an initiating image ending in \addinutil.exe. Also check the image path itself —
+    the utility legitimately lives only under C:\Windows\Microsoft.NET\Framework\,
+    Framework64\, or WinSxS\; a copy running from anywhere else is a masquerade rather than
+    the signed system tool. Addinutil performs local cache maintenance and does not
+    normally initiate network activity at all.
+  range: +/-5m
+  answer_sources:
+  - alert
+  - network_connection
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationIp|expand: '%dst_ip%'
+      condition: selection
+    fields:
+      - Image
+      - Initiated
+- question: Is this host expected to run the .NET add-in deployment utility at all?
+  context: |
+    Addinutil rebuilds the add-in pipeline cache for applications built on the .NET
+    System.AddIn model, so it appears on developer workstations, build machines, and hosts
+    during installs of software that ships add-in pipelines. On most workstations and
+    servers it never runs. Even where its execution is plausible, the tool works against
+    local pipeline directories — a plausible user or host explains the execution, not the
+    network connection.
+  range: +/-30d
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What process spawned addinutil.exe, and is that parent chain expected?
+  context: |
+    Legitimate invocations come from installers, build tooling, or a developer's shell. A
+    parent that is an Office application, a script host, a browser, or a binary running
+    from a user-writable path points at a delivery chain rather than development or install
+    activity — the technique's staging typically has something else create the store file
+    and then launch the utility. The parent's own command line shows what it was doing when
+    it invoked addinutil.
+  range: +/-30d
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - Image
+      - CommandLine
+- question: What arguments and working directory did addinutil.exe run with?
+  context: |
+    The switches carry the technique. Reading the add-in cache deserializes the contents of
+    an AddIns.store file with a .NET formatter that is equivalent to executing the file as
+    a binary, so a -AddinRoot or -PipelineRoot argument pointing at a user-controlled
+    directory (under \AppData\Local\Temp\, \Desktop\, \Downloads\, \Users\Public\, or
+    \Windows\Temp\) hands the utility a crafted store file to execute. Watch especially for
+    the dot form (-AddinRoot:. or -PipelineRoot:.), which consumes the working directory —
+    that makes CurrentDirectory the payload location.
+  range: +/-5m
+  answer_sources:
+  - process_creation
+  - manual_review
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Was an AddIns.store file written to this host before the alert, and by what process?
+  context: |
+    The technique's chain is store-file drop, then addinutil execution, then the network
+    connection — usually within minutes. An AddIns.store write outside the .NET Framework
+    pipeline directories, particularly in the folder named by the -AddinRoot or
+    -PipelineRoot argument or the process working directory, surfaces the staged payload;
+    the writing process is the dropper and becomes the next pivot of the investigation.
+  range: -1h
+  answer_sources:
+  - file_event
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith: '\AddIns.store'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: What non-Microsoft modules did this addinutil.exe instance load?
+  context: |
+    A crafted store file executes in-process — the deserialization gadget runs inside
+    addinutil rather than as a separate binary, so the module list is often the decisive
+    evidence. A Microsoft-signed system tool loading an unsigned DLL, or one signed by an
+    unexpected publisher, from a user-writable path is the technique executing. DLL load
+    events carry the hash directly; capture it for a reputation lookup.
+  range: +/-5m
+  answer_sources:
+  - external_threat_intel
+  - manual_review
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+      - SignatureStatus
+      - Hashes
+- question: What is the destination, and what do WHOIS, passive DNS, and threat intelligence reveal about it?
+  context: |
+    Addinutil has no business destination, so the endpoint itself carries much of the
+    verdict. Check the address's ownership and hosting profile, passive-DNS history, TLS
+    certificate details, and threat-intelligence listings — recently registered
+    infrastructure, consumer VPS hosting, or known command-and-control listings point to an
+    attacker endpoint. The port adds signal too, since raw high ports are more
+    characteristic of C2 than 443.
+  range: +/-5m
+  answer_sources:
+  - external_threat_intel
+  - manual_review
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationIp|expand: '%dst_ip%'
+      condition: selection
+    fields:
+      - DestinationPort
+      - Initiated
+- question: Does this host normally communicate with this destination?
+  context: |
+    A first-time connection to this address is a stronger signal than one the host has made
+    routinely for months. Recurring history at regular intervals suggests either an
+    established beacon (if it traces to addinutil or another unexpected process) or routine
+    business traffic (if it traces to a browser or updater); the Image grouping shows
+    which process has been driving the history.
+  range: -90d
+  answer_sources:
+  - network_connection
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationIp|expand: '%dst_ip%'
+      condition: selection
+    fields:
+      - DestinationPort
+      - Image
+- question: What other destinations has addinutil.exe contacted from this host in the past day?
+  context: |
+    A deserialization payload frequently retrieves a second stage from one address and then
+    beacons to different infrastructure, so the alerting destination may not be the only
+    one. Multiple distinct destinations from the same unexpected binary map the rest of the
+    contacted infrastructure, while many repeats to a single address at steady intervals
+    profile the activity as beaconing rather than a one-time download.
+  range: -24h
+  answer_sources:
+  - network_connection
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+        Image|endswith: \addinutil.exe
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+- question: What child processes did addinutil.exe spawn afterward?
+  context: |
+    Legitimate addinutil executions spawn essentially nothing beyond conhost.exe and, on a
+    crash, werfault.exe. Command interpreters, script hosts, or binaries in user-writable
+    paths appearing as children are the deserialized payload acting. No children is also
+    common — the payload can run entirely inside the addinutil process — in which case the
+    module-load and network views carry the post-execution evidence instead.
+  range: +4h
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Does this host normally run addinutil.exe?
+  context: |
+    On developer or build machines the utility may appear with framework or product
+    installs under known users; on most hosts it never runs. Zero or near-zero history
+    makes this execution first-time-on-host, which raises the weight of every other
+    finding, while regular history under the same user suggests an established workflow
+    that still needs the network connection explained.
+  range: -90d
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: When this host has fired this addinutil network pattern before, what programs and users drove it?
+  context: |
+    The query mirrors the rule's selection scoped to this host, so the resulting
+    program/user distribution reflects the host's history of addinutil initiating network
+    connections specifically — not generic use of the binary. The Image column will show
+    addinutil.exe itself; a steady history under one service account may reveal a documentable
+    local behavior, while a first-time fire or a new user relative to that history is the
+    deviation worth chasing. Network events carry no parent lineage — pivot to the
+    addinutil.exe start event if ancestry matters.
+  range: -14d
+  answer_sources:
+  - network_connection
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        Initiated: 'true'
+        Image|endswith: \addinutil.exe
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - Image
+    - User
+- question: Have other hosts fired this addinutil network pattern in the past week?
+  context: |
+    The query mirrors the rule's selection with no host scope, so the result is a
+    fleet-wide count of addinutil-initiated connections rather than the binary's generic
+    footprint. Many hosts firing consistently points to scripted deployment or a product
+    behavior worth documenting; one host, or a small cluster sharing the same destination,
+    points at targeted delivery. Compare destinations across firing hosts before dismissing
+    a multi-host result as vendor behavior.
+  range: -7d
+  answer_sources:
+  - network_connection
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        Initiated: 'true'
+        Image|endswith: \addinutil.exe
+      condition: selection
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: |
+    Aggregated parent-child process pairs around the alert reveal the surrounding sequence
+    — the dropper or archive extraction before the fire, staged execution after it. Novel
+    low-count pairs stand out against repetitive agent noise and help decide whether this
+    was an isolated execution or one step in a longer chain.
+  range: +/-15m
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: |
+    Earlier detections — a suspicious download, archive extraction, script-host execution,
+    or other proxy-execution activity — may capture the delivery of the store file that
+    addinutil then processed, and help reconstruct the timeline from arrival to the
+    outbound connection.
+  range: -6h
+  answer_sources:
+  - alert
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

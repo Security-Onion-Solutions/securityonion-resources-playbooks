@@ -1,0 +1,401 @@
+name: Remote DLL Load Via Rundll32.EXE
+id: cb13dc56-9f81-477a-9842-a31f1be03807
+description: |
+  Detects rundll32.exe loading a DLL whose path begins with a UNC prefix (\\), meaning the module is served from a remote
+  SMB/WebDAV share rather than a local disk path. rundll32 is a legitimate proxy for running exported DLL functions, but
+  loading a module directly from a remote share is uncommon for normal software and is a known proxy-execution and
+  payload-delivery pattern: an operator who can place a DLL on a reachable share can execute it through a signed Microsoft
+  binary without first writing it to local disk. The investigation should confirm the exact remote module path and its
+  signing and reputation, identify the process that launched rundll32 and how the share reference reached it, and determine
+  whether the load led to child processes, additional module loads, or the same pattern on other hosts.
+type: detection
+detection_id: f40017b3-cb2e-4335-ab5d-3babf679c1de
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-10
+questions:
+- question: Does the alerting load match what this rule detects — a rundll32.exe process loading a module from a remote UNC path?
+  context: >-
+    Confirm the alert is a true positive by reviewing the exact loaded module path (ImageLoaded) and the loading process
+    (Image) against the rule's criteria: the loader is rundll32.exe and the module path begins with a UNC prefix (\\),
+    i.e. it lives on a remote share rather than local disk. The library event carries the module's signing status and hash
+    directly, so read those on the triggering event as well before deciding whether the remote path is expected.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|endswith|expand: '%ImageLoaded%'
+      condition: selection
+    fields:
+      - Image
+      - ImageLoaded
+- question: Is this user and host expected to run rundll32.exe against a module hosted on a remote share?
+  context: >-
+    Legitimate administrative activity and some installers invoke rundll32, but loading a DLL directly from a UNC path is
+    rare for routine software. Knowing whether the account and host normally reach out to file shares to run code — versus
+    running everything from local disk — is often the fastest way to separate a benign deployment from proxy execution.
+    User attribution is present on the load event but may be a machine account or SYSTEM for service-driven loads; when it
+    is, pivot on the loading process instead.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Did rundll32 or its child processes write any files to local disk that are still available for analysis?
+  context: >-
+    A remote-DLL load frequently stages follow-on artifacts locally — a copied module, a decoded payload, or a dropped
+    script. Correlating file writes to the alerting process and its direct children shows what landed on disk and whether
+    it is still present for hashing, sandbox submission, or content review. The remote module itself lives on the share
+    referenced in the module path; capture it from that share directly, since file writes to the local disk will not
+    include it. File paths are correlated by process lineage rather than a static path list because process file-path
+    fields are not populated by the endpoint telemetry.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What process launched rundll32.exe, and how did the remote share path reach that parent?
+  context: >-
+    The immediate parent reveals how rundll32 was invoked and whether the remote path came from a user opening a delivered
+    file. A document handler, archiver, browser, or script host as parent points to a user-execution delivery chain, where
+    the parent's command line often carries the opened file or the UNC reference; explorer.exe or a service points to a
+    different origin. Identifying the parent and its command line enables blocking the delivery path and searching for
+    other recipients.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+- question: Did the same detection fire on other hosts, pointing to a broader delivery campaign?
+  context: >-
+    A remote module served from a share can be delivered to many endpoints at once. Correlating this rule across all hosts
+    shows how many systems loaded a remote DLL via rundll32 and which users were involved, revealing campaign breadth and
+    additional systems that need investigation. Widespread firing from the same share or parent suggests scripted
+    deployment; a single host suggests targeted or manual activity.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        rule.uuid|expand: '%rule_uuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Is the parent application that launched rundll32 up to date with security patches?
+  context: >-
+    Some remote-DLL proxy chains begin with an exploited handler application that loads a crafted file and reaches out to a
+    remote module — a pattern associated with theme-file and document parsing vulnerabilities. Confirming the parent
+    application's patch level indicates whether exploitation of a known CVE was possible and whether other similarly
+    unpatched hosts are exposed. If the parent is an interactive shell or explorer rather than a document handler, patch
+    status is less relevant and the origin of the share reference matters more.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+- question: What module path and exported function did rundll32 invoke — decode its full command line?
+  context: >-
+    rundll32's command line names the module it loads and the entry point it calls (a named export or a #ordinal); for a
+    remote load the module argument is the UNC path. Decoding it confirms which routine ran, whether the target is
+    addressed by ordinal rather than a named export (a common obfuscation), and whether the arguments reference a WebDAV or
+    SMB host or an inline scriptlet. The library event carries no command line, so this pivots to the process record by
+    ProcessGuid.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What modules did rundll32 load in this session, and are any from remote, non-canonical, or user-writable paths?
+  context: >-
+    The full set of modules a process loads tells the operator's story when the command line alone is opaque. Beyond the
+    flagged remote module, look for additional DLLs pulled from the same share or from %TEMP%, AppData, ProgramData, or
+    Public — side-loading and staging signals — and for system DLL names resolved from non-system paths, which indicates
+    search-order hijacking. Scoping to the loading process's ProcessGuid returns every module it mapped around the alert.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+      - SignatureStatus
+      - Hashes
+- question: For the remote module rundll32 loaded, what is its signing status, hash, and threat-intel reputation?
+  context: >-
+    Module reputation distinguishes a routine third-party DLL staged on a share from a side-loaded malicious one. A
+    genuinely signed module loaded from an unexpected remote location may still be benign, but an unsigned module — or one
+    carrying a Microsoft-style filename with no valid signature — is a strong masquerading signal. The hash surfaced on the
+    load event supports a reputation lookup that can identify a known loader. Scoping on the module path shows its signing
+    and hash wherever it has loaded on this host.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|endswith|expand: '%ImageLoaded%'
+      condition: selection
+    fields:
+      - Hashes
+      - Signed
+      - Signature
+      - SignatureStatus
+      - Image
+- question: What child processes did rundll32 spawn after loading the remote module?
+  context: >-
+    The processes rundll32 launches reveal the actual impact of the loaded module. A benign proxy load rarely spawns
+    interactive tooling; a malicious one often starts cmd.exe, powershell.exe, or other living-off-the-land binaries for
+    post-exploitation, or launches additional stages. Absence of children does not clear the load, since the payload may
+    run entirely inside the rundll32 process.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Has this specific remote module been loaded on this host before, and by which processes?
+  context: >-
+    A first-time load of this module on the host is a stronger anomaly than a recurring one. If the same module path has
+    been loaded repeatedly over the past 90 days by the same process, the current load is probably routine; if this is the
+    first occurrence, or the module has only ever been loaded by unrelated processes, the load is anomalous and warrants
+    the reputation and origin checks.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|endswith|expand: '%ImageLoaded%'
+      condition: selection
+    fields:
+      - Image
+- question: When this host has previously loaded a remote DLL via rundll32, what programs and users drove it, and does the current alert fit that pattern?
+  context: >-
+    Even a pattern that recurs on a host can be abused. This query mirrors the rule's selection
+    — rundll32 loading a UNC-path module — scoped to this host, so the resulting program and
+    user distribution reflects how this specific firing pattern has historically run here, not
+    generic rundll32 usage. A new acting program process, an unexpected user account, or a
+    first-ever occurrence is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \rundll32.exe
+        ImageLoaded|startswith: \\\\
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - Image
+    - User
+- question: Have other hosts loaded a remote DLL via rundll32 in the past week, and does the distribution look like automation or one-off activity?
+  context: >-
+    This query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of the same
+    remote-DLL-via-rundll32 pattern rather than generic rundll32 usage. Many hosts firing the pattern points to scripted
+    deployment or vendor automation reaching a common share; one host or a small unrelated set points to manual operator
+    activity. Use the host distribution to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \rundll32.exe
+        ImageLoaded|startswith: \\\\
+      condition: selection
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Alerts rarely occur in isolation. Examining the process activity in the minutes surrounding the load reveals what led
+    to it and what happened next — reconnaissance, credential access, persistence installation, or data staging — and
+    whether the remote-DLL load is one step in a larger sequence. Aggregating by process and parent collapses routine agent
+    noise while novel parent-child pairs stand out at low counts.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host — defense tampering, reconnaissance, credential access, or an initial delivery
+    alert — may reveal the stages that preceded the remote-DLL load and help reconstruct the timeline. The sequence of
+    alerts on a host frequently tells the fuller story of how the activity began.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Were any other proxy-execution LOLBins used on this host recently?
+  context: >-
+    Operators who proxy code through one signed binary often reach for several. If rundll32 was used to load a remote
+    module, check whether regsvr32, mshta, msiexec, or similar proxy-execution binaries also ran on the host in the same
+    window — finding multiple proxy-execution LOLBins performing related actions strengthens the case for malicious
+    activity over a benign one-off.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\regsvr32.exe'
+          - '\mshta.exe'
+          - '\msbuild.exe'
+          - '\cmstp.exe'
+          - '\msiexec.exe'
+          - '\forfiles.exe'
+          - '\pcalua.exe'
+          - '\presentationhost.exe'
+          - '\control.exe'
+          - '\infdefaultinstall.exe'
+          - '\msdt.exe'
+          - '\mavinject.exe'
+          - '\wmic.exe'
+          - '\xwizard.exe'
+          - '\ie4uinit.exe'
+          - '\installutil.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- question: Was rundll32.exe executed from its expected System32 or SysWOW64 path?
+  context: >-
+    rundll32 running from outside System32 or SysWOW64 may indicate the binary was copied or renamed to evade path-based
+    allowlists. Compare the on-disk Image path and the OriginalFileName of the triggering process against the expected
+    Windows locations; a rundll32 launched from a user directory alongside a remote module load compounds the concern.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- question: How often has this host loaded a remote DLL via rundll32 over the past 90 days, and what command-line structures are typical?
+  context: >-
+    A remote-DLL-via-rundll32 pattern with no prior history on a host is more suspicious than one seen regularly under
+    stable parents. This query mirrors the rule's selection scoped to this host, so the count reflects the specific firing
+    pattern rather than generic rundll32 usage. Comparing the historical command-line structures against the alerting one
+    shows whether the invocation form is consistent with past benign activity or a departure from it.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \rundll32.exe
+        ImageLoaded|startswith: \\\\
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - CommandLine

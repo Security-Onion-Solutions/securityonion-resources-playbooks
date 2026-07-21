@@ -1,0 +1,461 @@
+name: Potential SharePoint ToolShell CVE-2025-53770 Exploitation - File Create
+id: 3c25abe7-2cb1-4a01-ad0f-aebb8c850ea7
+description: |
+  Detects creation of a file under the SharePoint Web Server Extensions LAYOUTS directory whose name
+  matches known ToolShell webshell artifacts (spinstall.aspx, a spinstall<char>.aspx variant, or
+  debug_dev.js), the post-exploitation signature of CVE-2025-53770. The rule fires only when a written
+  TargetFilename begins with the Common Files\Microsoft Shared\Web Server Extensions path (or its (x86)
+  variant) AND contains a \15\TEMPLATE\LAYOUTS\ or \16\TEMPLATE\LAYOUTS\ segment AND ends with one of
+  those webshell names. In this chain the IIS worker w3wp.exe spawns cmd.exe and then encoded
+  powershell.exe, which base64-decodes and writes the .aspx webshell that leaks the SharePoint ASP.NET
+  MachineKey used to forge signed ViewState payloads for persistent unauthenticated RCE; investigate the
+  writing process lineage, the web request that triggered it, the webshell contents, the server's patch
+  status, and any outbound callback.
+type: detection
+detection_id: ba479447-721f-42a9-9af2-6dcd517bbdb3
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-10
+questions:
+- question: Does the created file path and the writing process match the ToolShell webshell drop this rule detects?
+  context: >-
+    Before investing investigation time, confirm the alert is a true positive by reviewing the exact
+    TargetFilename and the responsible process. The rule fires only when all three conditions hold
+    together: the written path begins with C:\Program Files\Common Files\Microsoft Shared\Web Server
+    Extensions\ (or the (x86) variant) AND contains a \15\TEMPLATE\LAYOUTS\ or \16\TEMPLATE\LAYOUTS\
+    segment AND ends with \spinstall.aspx, a \spinstall<char>.aspx variant, or \debug_dev.js. A write
+    that matches the LAYOUTS path but a different filename is not this pattern. On a patched,
+    uncompromised SharePoint server these webshell filenames should never be created.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this host a SharePoint server, and is the writing account expected to create files in the LAYOUTS directory?
+  context: >-
+    Legitimate SharePoint operation writes into the LAYOUTS directory only through its own service
+    processes during patching or feature deployment. A write here on a host that is not a SharePoint
+    server, or by an interactive user, is inconsistent with normal operation. The webshell is typically
+    written by the IIS application-pool identity (a service or machine account) through the w3wp.exe ->
+    cmd.exe -> powershell.exe chain, so when User is a machine or service account judge by the writing
+    process and the host role rather than the account name.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this SharePoint server patched against CVE-2025-53770 and the related ToolShell vulnerabilities?
+  context: >-
+    CVE-2025-53770, together with CVE-2025-49706 and CVE-2025-49704, allows unauthenticated remote code
+    execution against on-premises SharePoint Server; SharePoint Online is not affected. An unpatched
+    Subscription Edition, 2019, or 2016 server confirms exploitation was possible and flags other
+    unpatched SharePoint hosts as at risk. Remediation requires the July 2025 security updates, enabling
+    AMSI integration, rotating the ASP.NET machine keys, and restarting IIS - key rotation matters
+    because a leaked MachineKey lets an attacker forge signed ViewState payloads even after the code
+    vulnerability is patched.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+- question: What web request triggered this drop, and does it match the ToolShell exploitation pattern?
+  context: >-
+    Initial access here is a crafted HTTP request to the SharePoint LAYOUTS endpoints -
+    characteristically a POST to /_layouts/15/ToolPane.aspx (DisplayMode=Edit&a=/ToolPane.aspx) carrying
+    a Referer of /_layouts/SignOut.aspx to bypass authentication, followed by a GET for the dropped
+    webshell. The originating source IP and request identify the exploiting client for perimeter blocking
+    and show whether other public SharePoint endpoints received the same request pattern. Confirming the
+    request requires reviewing the server's own web request logs and looking for spikes in 4xx/5xx
+    responses (for example more than a handful of 5xx per client within a few minutes) and known
+    exploit-like inputs; the process query here only anchors the parent chain and timeline.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+- question: What process wrote the webshell, and what is the parent chain above it?
+  context: >-
+    The file event carries the writing process's identifiers but no command line, so pivot by ProcessGuid
+    to that process to read its Image, full command, and parents. The ToolShell signature is w3wp.exe ->
+    cmd.exe -> powershell.exe, where the PowerShell command carries an -EncodedCommand that base64-decodes
+    and writes the webshell to disk. Decode that encoded command to recover the exact bytes written and
+    confirm the drop was scripted by the IIS worker rather than an administrator action. A SharePoint
+    application pool legitimately spawns a known short list of children; w3wp.exe spawning a command shell
+    is not part of normal operation.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What does the dropped webshell file contain?
+  context: >-
+    Read the .aspx or .js contents from disk. The spinstall-family webshell extracts and returns the
+    SharePoint ASP.NET MachineKey material - ValidationKey, validation algorithm, DecryptionKey,
+    decryption algorithm, and CompatibilityMode - as a short body of the form
+    [A-Z0-9]{64}|HMACSHA256|[A-Z0-9]{64}|Auto|Framework20SP1 in response to a simple GET; the
+    debug_dev.js variant instead iterates web.config files and dumps their contents. Confirm which
+    capability the file implements, because a leaked MachineKey enables forged ViewState RCE that survives
+    patching. Content retrieval is manual from the host or endpoint tooling.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: What is the webshell file's hash, and does it match known-malicious ToolShell indicators?
+  context: >-
+    File-creation events carry no hash, and an .aspx webshell is compiled and served in-process by the
+    IIS worker rather than launched as a standalone process, so retrieve the file from its on-disk LAYOUTS
+    path and hash it manually. Compare the SHA256 against known ToolShell artifacts - the widely reported
+    spinstall0.aspx webshell has SHA256
+    92bb4ddb98eeaf11fc15bb32e71d0a63256a0ed826a03ba293ce3a8bf057a514 - and submit unknown hashes to
+    threat intelligence. A match confirms the known webshell; a near-miss suggests a modified or rotated
+    variant.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_direct:
+        Image|endswith|expand: '%TargetFilename%'
+      selection_interpreter:
+        CommandLine|contains|expand: '%TargetFilename%'
+      condition: selection and 1 of selection_*
+    fields:
+      - Image
+      - CommandLine
+      - Hashes
+- question: What other files did the responsible process write around the alert?
+  context: >-
+    A process that drops one webshell often drops several - additional spinstall variants, debug_dev.js
+    for web.config dumping, or staged .NET module payloads. The breadth and paths of the writing process's
+    other file activity distinguish a single artifact from a broader post-exploitation stage and enumerate
+    what else needs review and removal. The correlation covers the writer and its direct children, since
+    the encoded PowerShell may delegate the writes.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What else has been written to the SharePoint LAYOUTS directory recently, and by which processes?
+  context: >-
+    The LAYOUTS directory under Web Server Extensions is served by the SharePoint IIS application and
+    legitimately receives files only from SharePoint's own patching and provisioning processes. Other
+    recent arrivals there - especially .aspx or script files written by w3wp.exe, cmd.exe, or
+    powershell.exe - reveal whether this is an isolated drop or a directory under active use by the
+    exploit, and surface additional webshells that share the location.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains: '\TEMPLATE\LAYOUTS\'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: Is the webshell still on disk, or was it deleted or renamed after the alert?
+  context: >-
+    The webshell's post-alert lifecycle drives next steps. A webshell still on disk can be retrieved,
+    hashed, and analyzed, and must be removed; a file deleted shortly after creation suggests the
+    operators rotated to a different payload or cleaned up after harvesting the MachineKey and shifts the
+    investigation to what ran in between. Interpret the operation type on each subsequent event on this
+    path.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Did this SharePoint host make outbound connections to external addresses around the time of the drop?
+  context: >-
+    After harvesting the MachineKey the operators retrieve it over the network and frequently establish an
+    outbound callback or download follow-on tooling; the final stage of this exploitation chain is an
+    optional egress from the host. External-bound connections from a SharePoint server that has no routine
+    reason to initiate them - especially to unfamiliar addresses shortly after the webshell write - are
+    the egress signal. Correlate connection times against the drop within a short horizon (on the order of
+    fifteen minutes) and exclude known-good update and telemetry destinations.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+      filter_internal:
+        DestinationIp|cidr:
+          - '10.0.0.0/8'
+          - '172.16.0.0/12'
+          - '192.168.0.0/16'
+          - '127.0.0.0/8'
+      condition: selection and not filter_internal
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+- question: Did the IIS worker process load any non-standard or unsigned modules around the alert?
+  context: >-
+    Beyond the .aspx webshell, this chain has been observed loading .NET module payloads directly into the
+    IIS worker to evade file-based detection as webshells are disclosed. Modules loaded by w3wp.exe that
+    are unsigned, signed by an unexpected party, or new to the host point to an in-memory or on-disk .NET
+    payload rather than the file-drop variant. Load events carry the module path and signing status
+    directly, so review the signer and first-seen status of any w3wp.exe module loads near the drop.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: '\w3wp.exe'
+      filter_signed:
+        Signed: 'true'
+        SignatureStatus: 'Valid'
+      condition: selection and not filter_signed
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+      - SignatureStatus
+- question: Did this same detection fire on other SharePoint servers?
+  context: >-
+    Exploitation of this vulnerability has been broad and largely indiscriminate, spraying the same
+    request across many internet-facing SharePoint servers. The same rule firing on other hosts reveals
+    how many servers were compromised and now need the same investigation, MachineKey rotation, and
+    webshell removal. Group by host to size the affected fleet.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        rule.uuid|expand: '%rule_uuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- always_include: true
+  question: Has the account on this event produced this webshell-drop pattern before, and does that fit its role?
+  context: >-
+    The query mirrors the rule's exact LAYOUTS webshell-drop selection scoped to this user over 90 days,
+    aggregated by host - not generic file activity by the account. A SharePoint application-pool or
+    service identity that has never produced this pattern before is the expected case for a genuine
+    compromise; any prior history would instead point to repeated testing or a benign trigger. Weigh the
+    count against whether the account is a service principal that should never be writing these files.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        TargetFilename|startswith:
+        - C:\Program Files\Common Files\Microsoft Shared\Web Server Extensions\
+        - C:\Program Files (x86)\Common Files\Microsoft Shared\Web Server Extensions\
+        TargetFilename|contains:
+        - \15\TEMPLATE\LAYOUTS\
+        - \16\TEMPLATE\LAYOUTS\
+        TargetFilename|endswith:
+        - \spinstall.aspx
+        - \spinstall?.aspx
+        - \debug_dev.js
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: Has this program historically driven the webshell-drop pattern on this host or across the environment?
+  context: >-
+    When the alert fires under a service or machine account, identity does not attribute the behavior -
+    the launch mechanism does. This query mirrors the rule's drop selection scoped to the alerting program over 90 days, so the result is that program's history of producing this specific pattern. A new
+    or rare program for this pattern is the deviation worth chasing; a program that already accounts for many
+    prior events would indicate established automation rather than exploitation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        TargetFilename|startswith:
+        - C:\Program Files\Common Files\Microsoft Shared\Web Server Extensions\
+        - C:\Program Files (x86)\Common Files\Microsoft Shared\Web Server Extensions\
+        TargetFilename|contains:
+        - \15\TEMPLATE\LAYOUTS\
+        - \16\TEMPLATE\LAYOUTS\
+        TargetFilename|endswith:
+        - \spinstall.aspx
+        - \spinstall?.aspx
+        - \debug_dev.js
+      _pb_scope:
+        Image|endswith|expand: '%Image%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: What else did this account do across the environment around the time of the alert?
+  context: >-
+    Tracking the account's activity on all hosts in a tight window reveals whether the compromise extended
+    beyond this server - reuse of forged ViewState tokens, lateral movement, or follow-on tooling under
+    the same identity. If the alert fires under a machine or service account this view is dominated by
+    routine agent telemetry, in which case the parent-driven fleet view is the meaningful pivot.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- always_include: true
+  question: Did this same program-driven webshell-drop pattern fire on other hosts in the same window?
+  context: >-
+    Under a service principal, an account-wide view returns agent-telemetry noise, so the meaningful
+    question is whether the same launch mechanism dropped this webshell elsewhere at the same time. This
+    query mirrors the rule's drop selection scoped to the alerting program, fleet-wide, in the
+    alert window. Multiple hosts in the same window points to coordinated mass exploitation; a single host
+    points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        TargetFilename|startswith:
+        - C:\Program Files\Common Files\Microsoft Shared\Web Server Extensions\
+        - C:\Program Files (x86)\Common Files\Microsoft Shared\Web Server Extensions\
+        TargetFilename|contains:
+        - \15\TEMPLATE\LAYOUTS\
+        - \16\TEMPLATE\LAYOUTS\
+        TargetFilename|endswith:
+        - \spinstall.aspx
+        - \spinstall?.aspx
+        - \debug_dev.js
+      _pb_scope:
+        Image|endswith|expand: '%Image%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    The webshell drop is one stage of a longer chain that begins with the crafted authentication-bypass
+    request and the IIS worker spawning a shell. Earlier detections on this host - reconnaissance
+    requests, encoded PowerShell execution, or defense-tampering attempts - help place the drop in
+    sequence and reveal how far the operation progressed before the webshell landed.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

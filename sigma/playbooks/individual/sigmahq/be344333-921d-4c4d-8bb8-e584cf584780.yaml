@@ -1,0 +1,396 @@
+name: Potentially Suspicious Event Viewer Child Process
+id: c22b2286-ab5b-4735-b6cb-f0c90dc8cd6b
+description: |
+  Detects eventvwr.exe spawning a child process that is not the expected Microsoft Management Console (mmc.exe) or a crash-reporting WerFault.exe. eventvwr.exe is a Microsoft-signed, auto-elevating binary; on a clean system it launches only mmc.exe to load the Event Viewer snap-in. A medium-integrity user can hijack a registry value under HKCU\Software\Classes that the auto-elevated process reads before the system default, causing eventvwr.exe to launch an arbitrary command at high integrity without a consent prompt and without dropping a file to disk. The rule fires when an eventvwr.exe child matches AND the child is not one of the benign mmc.exe / WerFault.exe images. Investigation should confirm what child ran, whether a registry hijack set it up, and what was done with the elevated privileges.
+type: detection
+detection_id: be344333-921d-4c4d-8bb8-e584cf584780
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- question: Did eventvwr.exe spawn a child process that is not mmc.exe or WerFault.exe?
+  context: >-
+    Before investing investigation time, confirm the alert is a true positive. The rule fires when eventvwr.exe is the parent
+    AND the child image is not one of the benign system binaries (mmc.exe, WerFault.exe). Read the alerting event and confirm
+    the parent is eventvwr.exe and the child is some other executable, since a non-MMC child of eventvwr.exe is the core tell
+    for this elevation-bypass pattern.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+- question: Is this user and host expected to launch a non-MMC process from eventvwr.exe?
+  context: >-
+    Legitimate use of Event Viewer launches only mmc.exe. There is no routine workflow in which eventvwr.exe spawns a command
+    interpreter, script host, or other executable, so very few users or hosts have a legitimate reason to produce this pattern.
+    Knowing whether this is an administrator running a known tool versus an ordinary user session is often the fastest path
+    to a disposition.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What exactly did the child process do? Decode its full command line.
+  context: >-
+    The child of eventvwr.exe inherits high integrity through the bypass, so its command line is the payload that ran with
+    elevated privileges. Decode every flag, encoded blob, path, and URL. Common follow-on children are powershell.exe, cmd.exe,
+    or wscript.exe carrying a download or in-memory execution stage. The query returns all executions of this child binary
+    on the host within a short window so multi-step operations are visible together.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What launched eventvwr.exe, and was that itself a normal action?
+  context: >-
+    eventvwr.exe is normally launched interactively from the shell or a management console. If a script interpreter, an Office
+    application, or an automation process spawned eventvwr.exe, that suggests eventvwr.exe was invoked deliberately as the
+    auto-elevation vehicle rather than opened by an administrator. This retrieves the eventvwr.exe instance's own event so
+    its parent and command line can be read.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- question: Were registry modifications made to set up this UAC bypass?
+  context: >-
+    The eventvwr.exe bypass works by planting a command in HKCU\Software\Classes\mscfile\shell\open\command, which the auto-elevated
+    process reads before the system default and executes at high integrity. This query looks backward for reg.exe, powershell.exe,
+    or cmd.exe writing the mscfile or related shell-open-command keys under HKCU. Finding the write confirms the bypass mechanism
+    and reveals the exact payload that was elevated.
+  range: -15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\reg.exe'
+          - '\powershell.exe'
+          - '\cmd.exe'
+        CommandLine|contains:
+          - 'ms-settings'
+          - 'mscfile'
+          - 'Classes\exefile'
+          - 'Classes\Folder'
+          - 'Environment'
+          - 'Shell\Open\command'
+          - 'DelegateExecute'
+      condition: selection
+    fields:
+      - CommandLine
+      - Image
+- question: Was a shell-open-command value written under HKCU\Software\Classes shortly before the alert?
+  context: >-
+    The bypass leaves a registry-set artifact independent of which process wrote it. On a clean system HKCU\Software\Classes\mscfile\shell\open\command
+    does not exist and resolves to mmc.exe via the system view; a value present there pointing at anything other than mmc.exe
+    is the hijack itself. This checks registry set-value events on the host for shell-open-command writes under the per-user
+    Classes hive, the redirection root that this technique abuses.
+  range: -15m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains:
+          - 'Software\Classes\mscfile\shell\open\command'
+          - 'Software\Classes\ms-settings\Shell\Open\command'
+          - 'Software\Classes\exefile\shell\open\command'
+          - 'Software\Classes\Folder\shell\open\command'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- question: What action was performed with elevated privileges after the bypass?
+  context: >-
+    Bypassing the consent prompt is a means to an end. Examine high-integrity processes that ran on this host shortly after
+    the alert to see what the elevation was used for: installing persistence, dumping credentials, tampering with security
+    tooling, or modifying protected resources. High or System integrity child processes appearing after the eventvwr.exe child
+    reveal the operator's objective.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        IntegrityLevel:
+          - 'High'
+          - 'System'
+          - 'S-1-16-16384'
+          - 'S-1-16-12288'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - IntegrityLevel
+- question: Were other privilege escalation techniques attempted on this host?
+  context: >-
+    Operators who try one auto-elevation bypass often attempt several until one succeeds, since OS version or configuration
+    can block individual methods. This surfaces other detections on the host so repeated bypass or escalation attempts from
+    the same session can be seen together, which distinguishes deliberate privilege-escalation activity from an isolated false
+    positive.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - rule.name
+      - rule.uuid
+      - event.severity_label
+- question: Has eventvwr.exe spawned this child binary on this host before?
+  context: >-
+    Some parent-child relationships are routine, but eventvwr.exe spawning anything other than mmc.exe is not. Historical frequency
+    of this exact eventvwr.exe-to-child pairing on this host distinguishes a novel, never-seen spawn from an established (if
+    unusual) local pattern. Zero or very low counts indicate a first-time relationship worth chasing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What other child processes did eventvwr.exe spawn around this time?
+  context: >-
+    A single hijacked eventvwr.exe launch can spawn several tools in sequence. Listing all children of eventvwr.exe on this
+    host reveals whether the elevated execution led to reconnaissance, credential access, or persistence beyond the one child
+    that triggered the alert, exposing the full scope of activity initiated through this elevation.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Does this host normally run the spawned child binary at all?
+  context: >-
+    Separate from how it was launched, a child binary that has never run on this host is more suspicious than one that runs
+    regularly under normal workflows. A high historical count means the binary is common here and the eventvwr.exe parent is
+    the only anomaly; a zero count means both the binary and its launch path are novel on this host.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \eventvwr.exe
+      filter_main_generic:
+        Image|endswith:
+        - :\Windows\System32\mmc.exe
+        - :\Windows\System32\WerFault.exe
+        - :\Windows\SysWOW64\WerFault.exe
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \eventvwr.exe
+      filter_main_generic:
+        Image|endswith:
+        - :\Windows\System32\mmc.exe
+        - :\Windows\System32\WerFault.exe
+        - :\Windows\SysWOW64\WerFault.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the user's activity across all hosts reveals whether the elevation attempt is isolated or part of broader hands-on
+    activity. If the same user triggered similar tooling or alerts on multiple endpoints in the same window, the scope of compromise
+    may be larger than this one host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \eventvwr.exe
+      filter_main_generic:
+        Image|endswith:
+        - :\Windows\System32\mmc.exe
+        - :\Windows\System32\WerFault.exe
+        - :\Windows\SysWOW64\WerFault.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+- question: Is this eventvwr.exe spawning pattern occurring on other hosts?
+  context: >-
+    The same eventvwr.exe-to-child relationship appearing on multiple hosts may indicate a pushed bypass or lateral movement
+    pattern, while a single occurrence is more likely a targeted action. An environment-wide comparison helps calibrate severity
+    and identify the scope of the activity.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+      - CommandLine
+- question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Alerts rarely occur in isolation. Aggregating process activity around the alert surfaces what led to this event and what
+    followed it, and whether it is part of a larger sequence. Novel parent-child pairs stand out at low counts against the
+    high-count rows of routine agent and OS telemetry.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host, such as defense tampering, reconnaissance, or registry modification, may reveal the
+    attack stages that preceded this elevation attempt and help reconstruct the timeline. The sequence of alerts often tells
+    the story of how the operator reached the point of attempting a UAC bypass.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

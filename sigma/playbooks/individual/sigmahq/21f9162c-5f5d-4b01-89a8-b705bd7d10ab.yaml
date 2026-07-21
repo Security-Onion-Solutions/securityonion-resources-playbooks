@@ -1,0 +1,550 @@
+name: Import PowerShell Modules From Suspicious Directories
+id: 4a022940-c271-4677-b802-fc39c8525e9f
+description: >-
+  Detects PowerShell script blocks (Script Block Logging, Event ID 4104) whose content
+  imports a module with Import-Module or its ipmo alias from $Env:Temp, $Env:Appdata, or
+  C:\Users\Public — user-writable staging directories rather than the standard module
+  paths. Attackers stage credential-access and post-exploitation tooling as modules in
+  these locations and import them into a session to expose their functions; some
+  developer workflows and installers unpack a module to a temporary path and import it
+  from there legitimately. The investigation should recover the full script, locate the
+  module file on disk and what wrote it, determine what the imported functions did after
+  the import, and establish whether the pattern is new to the user, the host, and the
+  fleet.
+type: detection
+detection_id: 21f9162c-5f5d-4b01-89a8-b705bd7d10ab
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-17
+questions:
+- question: Does the script block import a module from a Temp, Appdata, or Users\Public path?
+  context: >-
+    The rule fires when script content contains Import-Module or its ipmo alias followed
+    by a path beginning with $Env:Temp, $Env:Appdata, or C:\Users\Public. Long scripts are
+    split across multiple 4104 events, so read every chunk of the alerting block in
+    sequence/total order and confirm the match is a real module import from one of these
+    user-writable staging paths rather than an incidental string, such as a path inside a
+    comment, help text, or a script that merely inspects those directories.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - ScriptBlockText
+  answer_sources:
+  - alert
+  - ps_script
+- question: Is this user or host expected to load PowerShell modules from Temp, Appdata, or Public directories?
+  context: >-
+    Some developer workflows, packaging tools, and vendor installers unpack a module to a
+    temporary directory and import it from there during setup, and blocks logged under
+    SYSTEM often come from deployment or agent tooling. Check the user's role, the host's
+    function, and the on-disk script path shown here against known automation before
+    treating the import as attacker staging.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - host.name
+      - user.name
+      - Path
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: Is the script that performed the import still on disk, and what process wrote it?
+  context: >-
+    A file-based script block records its on-disk path, and the file-creation event for
+    that path names the process and account that staged the script — retrieve the file
+    before cleanup so it can be hashed, sandboxed, and reviewed beyond what the 4104
+    events captured. An empty result usually means the block ran interactively or in
+    memory with no recorded path, which for content importing from a staging directory is
+    itself worth noting; the module path named inside the script text is then the artifact
+    to preserve.
+  range: +/-24h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+  answer_sources:
+  - file_event
+  - manual_review
+- question: What does the full script do with the module it imports?
+  context: >-
+    Reassemble every chunk of the block (sequence/total order) and read the complete
+    script. The 4104 channel records what PowerShell actually compiles, so -EncodedCommand
+    wrappers are already unwrapped; only in-script obfuscation such as string
+    concatenation, format operators, and backticks still needs manual decoding. Identify
+    the exact module path passed to Import-Module or ipmo, the functions the script calls
+    after the import, and any URLs, file paths, or credential stores those calls touch —
+    credential-dumping and post-exploitation tooling is commonly staged as a module in
+    these directories and invoked by function name immediately after import.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - powershell.sequence
+      - powershell.total
+      - ScriptBlockText
+  answer_sources:
+  - ps_script
+  - manual_review
+- question: What module file was written to the staging directory, and what does it contain?
+  context: >-
+    The imported module's path exists only in the script text, so this survey anchors on
+    module file extensions and the staging directories the rule names rather than on a
+    field from the alert — match the path you read in the script block against these file
+    events to find the module and the process that wrote it. Retrieve the file and review
+    its content: exported function names, encoded strings, embedded URLs or IP addresses,
+    and, for a binary module, its signing status. Modules that read credential stores or
+    registry hives typically reveal that intent in their function names and strings.
+  range: +/-24h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains:
+          - '\Temp\'
+          - '\AppData\'
+          - '\Users\Public\'
+      selection_ext:
+        TargetFilename|endswith:
+          - '.psm1'
+          - '.psd1'
+          - '.ps1'
+          - '.dll'
+      condition: selection and selection_ext
+    fields:
+      - TargetFilename
+      - Image
+      - User
+  answer_sources:
+  - file_event
+  - manual_review
+  - safe_environment
+  - external_threat_intel
+- question: Did the PowerShell host load a binary module from Temp, AppData, or Users\Public?
+  context: >-
+    Importing a .dll module loads it into the PowerShell process, and the load event
+    carries the DLL's hash and signature — submit the hash to threat intelligence and
+    examine an unsigned or unexpectedly-signed DLL in a staging directory as the probable
+    payload. Script modules (.psm1/.psd1) produce no load event and no hash here, so an
+    empty result alongside a script-module import is expected rather than exonerating;
+    hash those manually from their on-disk path instead.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+          - '\powershell_ise.exe'
+        ImageLoaded|contains:
+          - '\Temp\'
+          - '\AppData\'
+          - '\Users\Public\'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+      - SignatureStatus
+      - Hashes
+  answer_sources:
+  - external_threat_intel
+  - manual_review
+- question: Which process launched the PowerShell host that compiled this script?
+  context: >-
+    Script block events carry no process linkage, so recover the launch context from
+    process telemetry on this host around the alert. An office application, browser, or
+    unusual service binary as the parent points to delivery through a document or
+    download; explorer.exe or a terminal fits interactive use. The command line may itself
+    contain the Import-Module or ipmo statement, and flags that script delivery typically
+    sets, such as -nop, -w hidden, or -enc, distinguish scripted delivery from routine
+    administration and from .NET automation hosting.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+          - '\powershell_ise.exe'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - CommandLine
+      - User
+  answer_sources:
+  - process_creation
+- question: Did the PowerShell session spawn follow-on processes after the module was imported?
+  context: >-
+    A 4104 event records script content, not outcome. If the imported module's functions
+    launched utilities, staged further payloads, or reached the network, that activity
+    appears as children of the user's PowerShell hosts shortly after the block was logged.
+    The event carries no process link, so this pivots by host, user, and time; under
+    SYSTEM the user anchor is broad because deployment tooling shares it — weigh
+    individual children rather than the raw count.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        User|expand: '%User%'
+        ParentImage|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+          - '\powershell_ise.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+  answer_sources:
+  - process_creation
+- question: What other PowerShell script activity occurred on this host around the alert?
+  context: >-
+    Attacker use of a staged module rarely appears as a single block — the download or
+    write of the module, the import, and the invocation of its functions often log as
+    separate script blocks in a short window, and surrounding blocks may contain the
+    plaintext function calls the alerting fragment lacks. The log.level column shows how
+    complete this picture is: verbose events mean full Script Block Logging is on, while
+    warning-only means the host records just the automatically-flagged subset.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - user.name
+      - log.level
+      - Path
+      - ScriptBlockText
+  answer_sources:
+  - ps_script
+- question: Is full script block logging enabled on this host, or only suspicious-content capture?
+  context: >-
+    PowerShell logs script blocks at verbose level when the Script Block Logging policy is
+    enabled, and only automatically-flagged suspicious content (at warning level) when it
+    is not. On a warning-only host this alert shows a fragment of the host's PowerShell
+    activity, not all of it, and absence of other 4104 evidence is not absence of
+    activity. The level distribution calibrates how much weight every other script-block
+    query in this investigation can carry.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - log.level
+  answer_sources:
+  - ps_script
+- question: Were PowerShell security controls bypassed or weakened before this import ran?
+  context: >-
+    Importing tooling from a staging directory is often preceded by disabling the controls
+    that would block or record it. Common precursors include execution-policy overrides
+    (-ExecutionPolicy Bypass, -ep bypass), AMSI bypass (AmsiUtils, amsiInitFailed),
+    real-time monitoring changes (Set-MpPreference, DisableRealtimeMonitoring), and
+    downgrade to PowerShell version 2, which lacks script block logging. Any of these on
+    the host in the preceding hour reads as preparation for the alerting import rather
+    than routine administration.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    A module import from a staging directory is a mid-chain step: the module had to arrive
+    first, and its functions typically act afterward. Earlier detections on the same host
+    — download activity, defense tampering, credential access — mark the stages that led
+    up to the import and help reconstruct the timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+  answer_sources:
+  - alert
+- question: Has this exact script block run on this host before?
+  context: >-
+    The hash matches byte-identical content only, so zero history is strong evidence this
+    exact script is new to the host, while a block that has recurred for months fits
+    deployment tooling or vendor automation. A trivially edited variant hashes
+    differently, so history says nothing about near-variants. On hosts without full Script
+    Block Logging the history contains only automatically-flagged blocks, which weakens an
+    empty result.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_hash|expand: '%script_block_hash%'
+      condition: selection
+    fields:
+      - user.name
+      - Path
+  answer_sources:
+  - ps_script
+- question: Has this user previously imported modules from these staging paths, and does that fit their role?
+  always_include: true
+  context: >-
+    The query mirrors the rule's selection scoped to this user, returning their 90-day
+    history of module imports from Temp, Appdata, or Users\Public, aggregated by host.
+    Developers and packaging or deployment engineers may produce this pattern
+    legitimately; a first-ever occurrence from a user whose role involves no module
+    development or tooling work reads differently. Weigh the count against what the user's
+    job plausibly involves.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: ps_script
+      definition: 'Requirements: Script Block Logging must be enabled'
+    detection:
+      selection:
+        ScriptBlockText|contains:
+        - Import-Module "$Env:Temp\
+        - Import-Module '$Env:Temp\
+        - Import-Module $Env:Temp\
+        - Import-Module "$Env:Appdata\
+        - Import-Module '$Env:Appdata\
+        - Import-Module $Env:Appdata\
+        - Import-Module C:\Users\Public\
+        - ipmo "$Env:Temp\
+        - ipmo '$Env:Temp\
+        - ipmo $Env:Temp\
+        - ipmo "$Env:Appdata\
+        - ipmo '$Env:Appdata\
+        - ipmo $Env:Appdata\
+        - ipmo C:\Users\Public\
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+- question: Which hosts have produced this module-import pattern in the past 90 days, and is the alerting host among them?
+  always_include: true
+  context: >-
+    When the alert fires under SYSTEM or another service principal, user identity does not
+    attribute behavior, and script block events carry no process identity to pivot on, so
+    the pattern itself is the pivot. The query mirrors the rule's selection fleet-wide
+    over 90 days, aggregated by host. A pattern that routinely appears on many hosts fits
+    installer or vendor automation that unpacks modules to temporary paths; one that has
+    never appeared before, or only on this host, is the deviation worth chasing. Only
+    hosts shipping the PowerShell channel (and, for non-flagged content, with full Script
+    Block Logging enabled) can appear here.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: ps_script
+      definition: 'Requirements: Script Block Logging must be enabled'
+    detection:
+      selection:
+        ScriptBlockText|contains:
+        - Import-Module "$Env:Temp\
+        - Import-Module '$Env:Temp\
+        - Import-Module $Env:Temp\
+        - Import-Module "$Env:Appdata\
+        - Import-Module '$Env:Appdata\
+        - Import-Module $Env:Appdata\
+        - Import-Module C:\Users\Public\
+        - ipmo "$Env:Temp\
+        - ipmo '$Env:Temp\
+        - ipmo $Env:Temp\
+        - ipmo "$Env:Appdata\
+        - ipmo '$Env:Appdata\
+        - ipmo $Env:Appdata\
+        - ipmo C:\Users\Public\
+      condition: selection
+    fields:
+    - host.name
+  answer_sources:
+  - ps_script
+- question: What else did this user do across the network around this time?
+  always_include: true
+  context: >-
+    If the same account was active on several hosts in this window, the staged module may
+    be one step of movement between them, and the per-host binary summary shows what else
+    the account ran. When the alert fired under SYSTEM or another service principal this
+    view fills with routine service activity; in that case the fleet-wide import-pattern
+    question is the meaningful breadth check.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+- question: Did this module-import pattern fire on other hosts in the same window, or is it isolated to this host?
+  always_include: true
+  context: >-
+    The query mirrors the rule's selection fleet-wide in the alert window, aggregated by
+    host — the meaningful breadth check when user identity is a service principal and no
+    process identity exists on this channel. Several hosts in the same window points to
+    scheduled or pushed automation, which change records should corroborate; a single host
+    points to a host-local trigger. Coverage is policy-gated per host, so absence
+    elsewhere is weak evidence.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: ps_script
+      definition: 'Requirements: Script Block Logging must be enabled'
+    detection:
+      selection:
+        ScriptBlockText|contains:
+        - Import-Module "$Env:Temp\
+        - Import-Module '$Env:Temp\
+        - Import-Module $Env:Temp\
+        - Import-Module "$Env:Appdata\
+        - Import-Module '$Env:Appdata\
+        - Import-Module $Env:Appdata\
+        - Import-Module C:\Users\Public\
+        - ipmo "$Env:Temp\
+        - ipmo '$Env:Temp\
+        - ipmo $Env:Temp\
+        - ipmo "$Env:Appdata\
+        - ipmo '$Env:Appdata\
+        - ipmo $Env:Appdata\
+        - ipmo C:\Users\Public\
+      condition: selection
+    fields:
+    - host.name
+  answer_sources:
+  - ps_script
+- question: Did this exact script block run on other hosts in the environment?
+  context: >-
+    Byte-identical content across many hosts points to deployment tooling, GPO logon
+    scripts, or vendor agents; the same block on a small set of unrelated hosts is the
+    distribution lateral movement produces. This complements the pattern-based fleet
+    queries: the hash matches this exact script only, so together they distinguish a
+    pushed file from a technique in use. Only hosts that logged the block can appear, so
+    absence elsewhere on a default-logging fleet is weak evidence.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        powershell.file.script_block_hash|expand: '%script_block_hash%'
+      condition: selection
+    fields:
+      - host.name
+      - user.name
+      - Path
+  answer_sources:
+  - ps_script

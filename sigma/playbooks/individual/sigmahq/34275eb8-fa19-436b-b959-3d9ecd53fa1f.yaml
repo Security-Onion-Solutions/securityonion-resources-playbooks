@@ -1,0 +1,417 @@
+name: Loaded Module Enumeration Via Tasklist.EXE
+id: bd5ab494-2e96-49ce-9145-58cd145176b3
+description: |
+  Detects tasklist.exe enumerating which processes have loaded a specific module
+  (rdpcorets.dll) via the -m flag. This is the reconnaissance step used to locate the
+  svchost.exe instance hosting the Terminal Services / RDP connection so its process
+  memory can be dumped to recover plaintext RDP credentials directly from that process
+  — a path that bypasses LSASS-focused credential-theft detections. The rule fires when
+  the image resolves to tasklist.exe AND the command line carries the -m (module) flag
+  AND the command line references rdpcorets.dll, so confirm all three before treating it
+  as a true positive. Determine whether the located process was subsequently opened or
+  dumped, which account ran the enumeration, and whether credential reuse or lateral
+  movement followed.
+type: detection
+detection_id: 34275eb8-fa19-436b-b959-3d9ecd53fa1f
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the command line show tasklist.exe run with the -m module flag against rdpcorets.dll?
+  context: Before investing investigation time, confirm the alert is a true positive. The
+    rule fires only when all three criteria match together — the image resolves to
+    tasklist.exe, the command line includes the -m (loaded-module) flag, and the command
+    line references rdpcorets.dll. Review the exact command line and image against these
+    criteria; a tasklist run without -m or against a different module is a different action.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to enumerate which processes have loaded an RDP-core module?
+  context: Querying for the process that loaded the Terminal Services RDP-core module is a
+    narrow, targeted action — it is not part of routine troubleshooting. Knowing whether
+    this user role and host function plausibly involve RDP diagnostics or remote-session
+    administration is often the fastest way to separate a true positive from a rare but
+    legitimate operation.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What was the full enumeration command, and does it confirm the operator was locating the RDP-hosting process?
+  context: This enumeration locates the svchost.exe instance hosting the Terminal Services
+    / RDP connection — the process whose memory holds the connecting user's plaintext
+    password, distinct from LSASS. Decode the full command line to confirm the target
+    module and flag, and determine whether the same actor went on to open or dump the
+    located process. The method used to dump it (procdump, a comsvcs.dll MiniDump call via
+    rundll32, or direct memory access) reveals operator sophistication.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did the account that ran this enumeration go on to write a process-memory dump-style file anywhere on the network?
+  context: The enumeration only finds the process identifier; the credential theft happens
+    when something opens that svchost.exe with full access rights and reads or dumps its
+    memory, and that handle open has no equivalent telemetry in this environment — a zero
+    result there is a visibility gap, not evidence no dump occurred. This pivots on the
+    account instead — a dump-style file written under this user's session, on any host in the
+    fleet, ties the actor who ran the lookup to the artifact the read leaves behind, which
+    the host-scoped file search below does not capture if the dump happened elsewhere.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      filter_ext:
+        TargetFilename|endswith:
+          - '.dmp'
+          - '.dump'
+          - '.bin'
+      condition: selection and filter_ext
+    fields:
+      - host.name
+      - Image
+      - TargetFilename
+- question: Was a process-memory dump file written on this host in the hours after the enumeration?
+  context: Recovering the RDP password requires dumping the located process to disk and
+    searching it for strings, so a dump artifact written close in time to the enumeration
+    is a strong corroborating signal. Look for newly created .dmp files or large files in
+    user-writable or temp locations. Pair the writer process with the account that ran the
+    enumeration to see whether the same actor staged a dump.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith: '.dmp'
+      condition: selection
+    fields:
+      - Image
+      - TargetFilename
+      - User
+- question: Which accounts may be exposed through the RDP-host process, and do any have elevated privileges?
+  context: The memory of the svchost.exe hosting Terminal Services can contain the plaintext
+    credentials of whichever user is or was connected over RDP to this host. Identify which
+    accounts have active or recent RDP sessions to this host; if any are domain admins or
+    privileged service accounts, the exposure warrants escalation and credential rotation
+    rather than monitoring alone.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Were outbound remote-access connections (RDP, SMB, WinRM, SSH) initiated from this host after
+    this event?
+  context: Credential theft is typically followed by lateral movement. The query returns outbound connections
+    from this host to remote-access ports -- 3389 (RDP), 445 (SMB/PsExec), 5985/5986 (WinRM), 22 (SSH)
+    -- in the hours after the event; the originating Image and User show what drove each connection. Two
+    limits to keep in mind -- credentials exfiltrated and replayed from another machine will not appear
+    here (check security 4624 logons on suspected targets for this account and any accounts with sessions
+    on this host), and the query requires Sysmon network telemetry (EID 3); if that is not collected from
+    this host, treat zero rows as a visibility gap, not as evidence no movement occurred.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
+- question: What process spawned this tasklist enumeration, and is that parent chain normal?
+  context: A module enumeration run from cmd.exe spawned by explorer.exe reflects interactive
+    use; the same command spawned by a script interpreter, wmiprvse.exe, wsmprovhost.exe,
+    or an unexpected remote-execution parent points to automated post-compromise activity.
+    The remote credential-theft pattern this rule targets is often driven over a remote
+    shell, so an unusual parent here raises the weight of the alert.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+- question: Did other reconnaissance commands run on this host around the same time?
+  context: A single module enumeration may be isolated, but several reconnaissance binaries
+    in rapid succession — whoami, net, ipconfig, netstat, query — is a signature of
+    hands-on post-compromise enumeration. Reconnaissance clustered with this RDP-host lookup
+    suggests an operator orienting before staging the memory dump. Three or more distinct
+    recon binaries within fifteen minutes typically indicates automated reconnaissance.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_recon:
+        Image|endswith:
+          - '\whoami.exe'
+          - '\systeminfo.exe'
+          - '\ipconfig.exe'
+          - '\net.exe'
+          - '\net1.exe'
+          - '\nltest.exe'
+          - '\dsquery.exe'
+          - '\nbtstat.exe'
+          - '\arp.exe'
+          - '\netstat.exe'
+          - '\qprocess.exe'
+          - '\query.exe'
+          - '\quser.exe'
+          - '\hostname.exe'
+          - '\nslookup.exe'
+          - '\adfind.exe'
+          - '\csvde.exe'
+          - '\ldifde.exe'
+          - '\dnscmd.exe'
+          - '\cmdkey.exe'
+          - '\setspn.exe'
+      condition: selection and selection_recon
+    fields:
+      - Image
+      - User
+- question: When this host previously ran tasklist against rdpcorets.dll, what parents and users drove it, and does this alert fit?
+  context: Even common tools can be abused. The query mirrors the rule's selection structure
+    scoped to this host — the resulting parent/user distribution reflects how this specific
+    firing pattern (not generic tasklist usage) has historically run here. A new parent
+    process, an unexpected user account, or a first-ever appearance of this exact module
+    lookup is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_img:
+      - Image|endswith: \tasklist.exe
+      - OriginalFileName: tasklist.exe
+      selection_flags:
+        CommandLine|contains|windash: -m
+      selection_module:
+        CommandLine|contains: rdpcorets.dll
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Have other hosts run tasklist against rdpcorets.dll in the past week, and does the spread look like automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result
+    is a fleet-wide count of this exact RDP-host lookup (not generic tasklist usage). Many
+    hosts firing the same pattern can point to a scripted survey or vendor tooling; one host
+    or a small unrelated set points to manual operator activity. Because this module lookup
+    is rarely a legitimate diagnostic, even a low cross-host count deserves scrutiny.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_img:
+      - Image|endswith: \tasklist.exe
+      - OriginalFileName: tasklist.exe
+      selection_flags:
+        CommandLine|contains|windash: -m
+      selection_module:
+        CommandLine|contains: rdpcorets.dll
+      condition: all of selection_*
+    fields:
+    - host.name
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_img:
+      - Image|endswith: \tasklist.exe
+      - OriginalFileName: tasklist.exe
+      selection_flags:
+        CommandLine|contains|windash: -m
+      selection_module:
+        CommandLine|contains: rdpcorets.dll
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_img:
+      - Image|endswith: \tasklist.exe
+      - OriginalFileName: tasklist.exe
+      selection_flags:
+        CommandLine|contains|windash: -m
+      selection_module:
+        CommandLine|contains: rdpcorets.dll
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or
+    parallel activity on multiple endpoints. If the same user ran this RDP-host lookup or
+    related credential-access actions on several hosts in this window, the scope of
+    compromise may be larger than the single alerting host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_img:
+      - Image|endswith: \tasklist.exe
+      - OriginalFileName: tasklist.exe
+      selection_flags:
+        CommandLine|contains|windash: -m
+      selection_module:
+        CommandLine|contains: rdpcorets.dll
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the alert reveals the
+    immediate context: what led to this enumeration, what happened after, and whether it is
+    part of a larger sequence. Look for reconnaissance, process-dumping tooling, or
+    credential-staging steps surrounding the event.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense
+    tampering, reconnaissance, remote access, or other credential-access activity — may
+    reveal the attack stages that preceded this enumeration and help reconstruct the full
+    timeline leading up to a planned memory dump.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

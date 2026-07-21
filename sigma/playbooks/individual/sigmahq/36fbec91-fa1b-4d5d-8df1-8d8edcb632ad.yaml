@@ -1,0 +1,509 @@
+name: Code Executed Via Office Add-in XLL File
+id: fc40aade-4b96-4db3-aa84-4f5f40e7b9e3
+description: >-
+  Detects a PowerShell script block (Script Block Logging, Event ID 4104) that instantiates
+  an Office application COM object and calls its RegisterXLL method — the content pattern of
+  commands like (new-object -ComObject excel.application).RegisterXLL('payload.xll'), which
+  load and execute code from an Excel add-in (XLL) file. Adversaries use this to run a
+  dropped or downloaded XLL immediately and, when the add-in is also registered in Office
+  startup locations, to persist across Office sessions (T1137.006); legitimate automation
+  rarely loads XLLs through COM from PowerShell. The investigation should recover the full
+  script, identify the XLL path and how that file arrived, check whether add-in registry or
+  startup-folder persistence was configured, and examine what the Excel process executed
+  after the load.
+type: detection
+detection_id: 36fbec91-fa1b-4d5d-8df1-8d8edcb632ad
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-17
+questions:
+- question: Does the script block create an Office COM object and call RegisterXLL, as this rule requires?
+  context: >-
+    The rule fires only when the script content contains all four substrings together —
+    'new-object ', '-ComObject ', '.application', and '.RegisterXLL' — the pattern of
+    PowerShell instantiating an Office application COM object and loading an XLL add-in
+    through it. Long scripts are split across multiple 4104 events, so read every chunk of
+    the alerting block in sequence/total order and confirm the RegisterXLL call is real
+    usage rather than an incidental mention of these strings in, for example, a security
+    tool's own script content.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - ScriptBlockText
+  answer_sources:
+  - alert
+  - ps_script
+- question: Is this user and host expected to run PowerShell that automates Office applications?
+  context: >-
+    COM automation of Excel from PowerShell appears legitimately in reporting and
+    data-processing automation, but calling RegisterXLL through it is rare outside add-in
+    deployment tooling and offensive tradecraft. Check the user's role, the host's
+    function, and the on-disk script path shown here against known automation; blocks
+    logged under SYSTEM often come from deployment or agent tooling, which the script path
+    usually identifies.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - host.name
+      - user.name
+      - Path
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: What does the full script do, and what does any encoded or obfuscated content decode to?
+  context: >-
+    Reassemble every chunk of the block (sequence/total order) and read the complete
+    script. The 4104 channel records what PowerShell actually compiles, so -EncodedCommand
+    wrappers are already unwrapped; only in-script obfuscation (string concatenation,
+    format operators, backticks) still needs manual decoding. Identify the file path passed
+    to RegisterXLL, any download step that fetched the add-in (Invoke-WebRequest, iwr,
+    Net.WebClient, IEX), which Office application COM object was created, and anything else
+    the script stages around the load. The XLL path and any URLs found here drive the file
+    and network follow-ups.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - powershell.sequence
+      - powershell.total
+      - ScriptBlockText
+  answer_sources:
+  - ps_script
+  - manual_review
+- question: Does the alerting script exist on disk, and what process wrote it there?
+  context: >-
+    When the block ran from a file, its path is recorded on the event. A script calling
+    RegisterXLL from a user-writable or staging location (Temp, AppData, ProgramData,
+    Downloads) implies a delivery step that wrote it — find the file-creation event to
+    identify the process and account that staged it. This pattern also commonly runs as a
+    one-line command with no script file at all; in that case no path is recorded and this
+    query returns nothing, which for this content points to interactive or in-memory
+    delivery rather than an absence of activity.
+  range: +/-24h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - EventType
+      - TargetFilename
+      - Image
+      - User
+  answer_sources:
+  - file_event
+  - manual_review
+- question: Were Office add-in files written on this host around the alert?
+  context: >-
+    The add-in path appears only inside the script text — no alert field resolves to it,
+    and script-block events carry no process linkage to correlate file writes — so this
+    surveys add-in file activity on the host by extension (.xll, .wll, .vsto); the anchor
+    is content-derived. Compare any hits against the path named in the script. Note which
+    process wrote the file and whether the destination is an Office trusted or startup
+    location (XLSTART, Addins, Templates) versus a staging directory like Temp or
+    Downloads: a write into a trusted path is what turns a one-time load into persistence.
+  range: +/-24h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith:
+          - '.xll'
+          - '.wll'
+          - '.vsto'
+      condition: selection
+    fields:
+      - TargetFilename
+      - EventType
+      - Image
+      - User
+  answer_sources:
+  - file_event
+- question: Were Office add-in registry keys modified on this host around the alert?
+  context: >-
+    RegisterXLL loads the add-in only for the running Excel instance; making it reload on
+    every Office launch typically requires an OPEN value under the Excel Options key, an
+    entry under the Office Addins keys, or a file in a trusted startup path. These keys are
+    version- and application-specific (the path segment between Office and the application
+    name varies by installed version), so the query matches Office add-in key patterns
+    broadly. A write here near the alert shows the load was made durable — identify the
+    writing process and the value data, which normally contains the add-in path.
+  range: +/-24h
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection_office:
+        host.name|expand: '%hostname%'
+        TargetObject|contains: '\Microsoft\Office\'
+      selection_addin:
+        TargetObject|contains:
+          - '\Excel\Options'
+          - '\Addins'
+          - '\Add-in Manager'
+      condition: selection_office and selection_addin
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - User
+  answer_sources:
+  - registry_event
+- question: What child processes did Excel spawn on this host around the alert?
+  context: >-
+    RegisterXLL executes the add-in's code inside the Excel process the script created, and
+    an add-in registered for startup reloads each time Excel launches — so execution
+    evidence concentrates in the windows when Excel starts. Excel spawning command
+    interpreters or script hosts (powershell.exe, cmd.exe, mshta.exe, rundll32.exe,
+    wscript.exe) is abnormal for spreadsheet work and is the typical downstream trace of a
+    malicious add-in. An Excel parent whose command line shows /automation or /e flags is
+    the COM-created instance from the alerting script rather than a user-opened window.
+  range: +/-24h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: '\excel.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentCommandLine
+      - User
+  answer_sources:
+  - process_creation
+- question: Did the PowerShell session spawn follow-on activity after the script ran?
+  context: >-
+    A 4104 event records script content, not outcome. If the script staged further tooling
+    beyond the Office COM automation — downloading additional payloads, launching helpers,
+    installing other persistence — that activity appears as children of the user's
+    PowerShell hosts shortly after the block was logged. The event carries no process link,
+    so this pivots by host, user, and time. Under SYSTEM the user anchor is broad because
+    deployment tooling shares it; weigh individual children rather than the raw count.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        User|expand: '%User%'
+        ParentImage|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+          - '\powershell_ise.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+  answer_sources:
+  - process_creation
+- question: Were PowerShell security controls bypassed or weakened before this execution?
+  context: >-
+    Operators often weaken controls before running a loader. Common precursors include AMSI
+    bypass (patching amsi.dll via AmsiUtils or amsiInitFailed), execution-policy overrides
+    (-ExecutionPolicy Bypass, -ep bypass), real-time monitoring changes (Set-MpPreference,
+    DisableRealtimeMonitoring), and downgrade to PowerShell version 2, which lacks script
+    block logging. Any of these on the host in the preceding hour reads as preparation for
+    the alerting block rather than routine administration.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: What other PowerShell script activity occurred on this host around the alert?
+  context: >-
+    Attacker PowerShell rarely runs as a single block — reconnaissance, staging, and
+    follow-on tooling produce a cluster of script blocks in a short window, and surrounding
+    blocks often contain plaintext the alerting fragment lacks, such as the download source
+    or the add-in path. The log.level column shows how complete this picture is: verbose
+    events mean full Script Block Logging is on, while warning-only means the host records
+    just the automatically-flagged subset.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - user.name
+      - log.level
+      - Path
+      - ScriptBlockText
+  answer_sources:
+  - ps_script
+- question: Is full script block logging enabled on this host, or only suspicious-content capture?
+  context: >-
+    PowerShell logs script blocks at verbose level when the Script Block Logging policy is
+    enabled, and only automatically-flagged suspicious content (at warning level) when it
+    is not. On a warning-only host this alert shows a fragment of the host's PowerShell
+    activity, not all of it — surrounding benign-looking blocks may simply not have been
+    logged. The level distribution calibrates how much weight every other script-block
+    query in this investigation can carry.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - log.level
+  answer_sources:
+  - ps_script
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Alerts rarely happen in isolation. Earlier detections on the same host — initial
+    delivery, defense tampering, reconnaissance, or other persistence installation — may
+    reveal the stages that preceded this event and help reconstruct the timeline. An XLL
+    load staged from PowerShell is usually a mid-chain step: something delivered the script
+    or the add-in first.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+  answer_sources:
+  - alert
+- question: Has this exact script block run on this host before?
+  context: >-
+    The hash matches byte-identical content only, so zero history is strong evidence this
+    exact script is new to the host, while a block that has recurred for months fits
+    deployment tooling or vendor automation — some add-in deployment scripts legitimately
+    re-run on a schedule. A trivially edited variant hashes differently, so history says
+    nothing about near-variants. On hosts without full Script Block Logging the history
+    contains only automatically-flagged blocks, which weakens an empty result.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_hash|expand: '%script_block_hash%'
+      condition: selection
+    fields:
+      - user.name
+      - Path
+  answer_sources:
+  - ps_script
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  always_include: true
+  context: >-
+    The query mirrors the rule's selection scoped to this user — the result is the user's
+    90-day history of script blocks combining COM object creation with RegisterXLL,
+    aggregated by host, not generic PowerShell use. Add-in deployment or automation staff
+    may produce this pattern legitimately; a first-ever occurrence from a user whose role
+    involves no Office automation reads differently. Weigh the count against what the
+    user's job plausibly involves.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: ps_script
+      definition: 'Requirements: Script Block Logging must be enabled'
+    detection:
+      selection:
+        ScriptBlockText|contains|all:
+        - 'new-object '
+        - '-ComObject '
+        - .application
+        - .RegisterXLL
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+- question: Which hosts have historically produced this script pattern, and is the alerting host among them?
+  always_include: true
+  context: >-
+    When the alert fires under SYSTEM or another service principal, user identity does not
+    attribute behavior, and script-block events carry no process identity to pivot on — so
+    the pattern itself is the pivot. The query mirrors the rule's selection fleet-wide over
+    90 days, aggregated by host. A pattern that routinely appears on many hosts fits
+    deployed add-in tooling or a vendor product; one that has never appeared before, or
+    only on this host, is the deviation worth chasing. Only hosts shipping the PowerShell
+    channel (and, for non-flagged content, with full Script Block Logging enabled) can
+    appear here.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: ps_script
+      definition: 'Requirements: Script Block Logging must be enabled'
+    detection:
+      selection:
+        ScriptBlockText|contains|all:
+        - 'new-object '
+        - '-ComObject '
+        - .application
+        - .RegisterXLL
+      condition: selection
+    fields:
+    - host.name
+  answer_sources:
+  - ps_script
+- question: What else did this user do across the network around this time?
+  always_include: true
+  context: >-
+    If the same account was active on several hosts in this window, the add-in load may be
+    one step of movement between them, and the per-host binary summary shows what else the
+    account ran. When the alert fired under SYSTEM or another service principal this view
+    fills with routine service activity; in that case the fleet-wide script-pattern
+    question is the meaningful breadth check.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+- question: Did this same script pattern fire on other hosts in the same window, or is it isolated to this host?
+  always_include: true
+  context: >-
+    The query mirrors the rule's selection fleet-wide in the alert window, aggregated by
+    host — the meaningful breadth check when user identity is a service principal and no
+    process identity exists on this channel. Several hosts loading XLLs through COM in the
+    same window points to scheduled or pushed automation, which change records should
+    corroborate; a single host points to a host-local trigger. Coverage is policy-gated per
+    host, so absence elsewhere is weak evidence.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: ps_script
+      definition: 'Requirements: Script Block Logging must be enabled'
+    detection:
+      selection:
+        ScriptBlockText|contains|all:
+        - 'new-object '
+        - '-ComObject '
+        - .application
+        - .RegisterXLL
+      condition: selection
+    fields:
+    - host.name
+  answer_sources:
+  - ps_script
+- question: Did this exact script block run on other hosts in the environment?
+  context: >-
+    Byte-identical content across many hosts points to deployment tooling, GPO logon
+    scripts, or vendor agents; the same block on a small set of unrelated hosts is the
+    distribution lateral movement produces. This complements the pattern-based fleet
+    queries: the hash matches this exact script only, so together they distinguish "this
+    file was pushed" from "this technique is in use". Only hosts that logged the block can
+    appear, so absence elsewhere on a default-logging fleet is weak evidence.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        powershell.file.script_block_hash|expand: '%script_block_hash%'
+      condition: selection
+    fields:
+      - host.name
+      - user.name
+      - Path
+  answer_sources:
+  - ps_script

@@ -1,0 +1,393 @@
+name: Suspicious DLL Loaded via CertOC.EXE
+id: d9846bd9-bf9a-4f4d-864e-82323af4b877
+description: |
+  Detects certoc.exe invoked with the -LoadDLL flag against a DLL path that lives in a user-writable
+  location (AppData\Local\Temp, Desktop, Downloads, Users\Public, Windows\Tasks, or Windows\Temp).
+  CertOC.exe is a signed Microsoft binary whose -LoadDLL option will load and execute code from an
+  arbitrary DLL, making it a proxy-execution path that bypasses application-control rules keyed on the
+  loading process. Legitimate certificate-installation workflows do not load DLLs from temp or download
+  directories, so the combination of the trusted binary, the -LoadDLL flag, and an untrusted path is the
+  signal to investigate. Determine which DLL was loaded, where it came from, what process drove the
+  invocation, and whether code execution or network activity followed.
+type: detection
+detection_id: 84232095-ecca-4015-b0d7-7726507ee793
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- question: Did certoc.exe run with the -LoadDLL flag against a DLL in a user-writable path?
+  context: Confirm the alert is a true positive by reviewing the full command line. The rule fires only
+    when all three conditions hold together — the image is certoc.exe (or OriginalFileName CertOC.exe),
+    the command line contains the -LoadDLL flag, and the referenced path is under AppData\Local\Temp,
+    Desktop, Downloads, Users\Public, Windows\Tasks, or Windows\Temp. Note the exact DLL path; it drives
+    the downstream content and origin questions.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to install certificates or load DLLs with certoc.exe?
+  context: Certificate-management tooling is typically run by a narrow set of administrators or by
+    automation, and legitimate certoc.exe usage installs certificates rather than loading DLLs from
+    temp or download folders. If the user role and host function do not involve certificate operations,
+    the proxy-execution interpretation strengthens.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What exactly did certoc.exe load? Decode the full command line and identify the DLL path and any other flags.
+  context: The command line carries the operational detail — the absolute path of the loaded DLL, the
+    directory it was dropped into, and whether additional certoc flags (for example -GetCACAPS, which
+    retrieves files from a remote URL) are present. Parse the path against the known user-writable
+    locations and note the DLL file name for hash and content lookup.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|contains|windash: ' -LoadDLL '
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What is in the loaded DLL? Check signing status, strings, imports, and known malware indicators.
+  context: The DLL referenced on the command line is the payload certoc.exe executed. Retrieve it from
+    the host or EDR and examine its signing status, embedded strings, imports, and packer signatures.
+    A DLL dropped into a temp or download directory and loaded through a signed proxy binary is rarely
+    a legitimate certificate component.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What is the hash of the DLL certoc.exe loaded, and does threat intel flag it?
+  context: A DLL's hash is recorded when it is loaded. This reads the modules certoc.exe loaded and returns
+    their hashes -- the DLL pulled in by -LoadDLL appears here; submit it to VirusTotal, Hybrid Analysis, or
+    internal threat intel to determine whether it is known malicious, known benign, or previously unseen. If
+    image_load telemetry is not ingested in this environment, treat an empty result as a visibility gap and
+    hash the DLL by hand from its on-disk path (see the evidence-preservation step).
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Hashes
+      - Hashes
+- question: Is the loaded DLL still on disk for analysis?
+  context: If the DLL referenced on the command line still exists on disk, it can be hashed, submitted
+    to a sandbox, and reviewed for content. Proxy-execution payloads are often deleted after running,
+    so capture the artifact promptly if it is still present.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What process spawned certoc.exe and is that parent chain expected?
+  context: The parent process reveals how certoc.exe was invoked. Legitimate certificate operations are
+    usually launched interactively (explorer.exe, an admin console) or by a management agent. Parents
+    such as cmd.exe, powershell.exe, wscript.exe, mshta.exe, or an Office application point to scripted
+    or operator-driven proxy execution rather than routine certificate maintenance.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What DLLs did certoc.exe load on this host, and are they unsigned or located in user-writable paths?
+  context: certoc.exe -LoadDLL maps the target DLL into the certoc process. The image-load record
+    confirms which module was actually loaded and its signing status — the load-side counterpart to the
+    command-line evidence. An unsigned DLL, or one loaded from a temp or download directory, confirms the
+    proxy-execution behavior the command line implied. If image-load events are not collected in this
+    environment, treat zero results as a visibility gap rather than evidence nothing loaded.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+- question: Did certoc.exe make any outbound network connections around the time of the alert?
+  context: Beyond -LoadDLL, certoc.exe can retrieve remote files (for example via -GetCACAPS), and a
+    loaded DLL may itself initiate command-and-control. Outbound connections from certoc.exe indicate the
+    binary was used to stage a payload or beacon, not just to load a local DLL. If network telemetry is
+    not collected for this host, treat zero results as a visibility gap.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- question: What child processes did certoc.exe spawn afterward?
+  context: The code inside a loaded DLL frequently launches follow-on processes. Children such as cmd.exe,
+    powershell.exe, rundll32.exe, or certutil.exe spawned by certoc.exe indicate the loaded DLL executed
+    post-exploitation actions rather than performing a benign certificate task.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Does this host normally run certoc.exe?
+  context: certoc.exe is present on Windows but is rarely executed interactively outside certificate
+    management. Zero or very low historical counts over 90 days indicate first-time or rare use, which
+    raises the weight of the current alert.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: When this host has previously fired this rule's pattern, what parents and users drove it, and does the current alert fit?
+  context: The query mirrors the rule's full selection structure scoped to this host, so the resulting
+    parent and user distribution reflects how this specific certoc -LoadDLL pattern has run here before.
+    A new parent process, an unexpected user account, or an unusual command-line structure is the deviation
+    worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \certoc.exe
+      - OriginalFileName: CertOC.exe
+      selection_cli:
+        CommandLine|contains|windash: ' -LoadDLL '
+      selection_paths:
+        CommandLine|contains:
+        - \Appdata\Local\Temp\
+        - \Desktop\
+        - \Downloads\
+        - \Users\Public\
+        - C:\Windows\Tasks\
+        - C:\Windows\Temp\
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \certoc.exe
+      - OriginalFileName: CertOC.exe
+      selection_cli:
+        CommandLine|contains|windash: ' -LoadDLL '
+      selection_paths:
+        CommandLine|contains:
+        - \Appdata\Local\Temp\
+        - \Desktop\
+        - \Downloads\
+        - \Users\Public\
+        - C:\Windows\Tasks\
+        - C:\Windows\Temp\
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \certoc.exe
+      - OriginalFileName: CertOC.exe
+      selection_cli:
+        CommandLine|contains|windash: ' -LoadDLL '
+      selection_paths:
+        CommandLine|contains:
+        - \Appdata\Local\Temp\
+        - \Desktop\
+        - \Downloads\
+        - \Users\Public\
+        - C:\Windows\Tasks\
+        - C:\Windows\Temp\
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning
+    multiple endpoints. If the same user triggered similar activity on several hosts, the scope of the
+    operation may be larger than the single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \certoc.exe
+      - OriginalFileName: CertOC.exe
+      selection_cli:
+        CommandLine|contains|windash: ' -LoadDLL '
+      selection_paths:
+        CommandLine|contains:
+        - \Appdata\Local\Temp\
+        - \Desktop\
+        - \Downloads\
+        - \Users\Public\
+        - C:\Windows\Tasks\
+        - C:\Windows\Temp\
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering,
+    reconnaissance, or credential access — may reveal the attack stages that preceded this proxy
+    execution and help reconstruct the timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

@@ -1,0 +1,446 @@
+name: Potential LSASS Process Dump Via Procdump
+id: a106ed45-fba5-4ea7-a973-64c7cd7643d3
+description: |
+  Detects a process whose command line combines a ProcDump memory-dump mode
+  flag (-ma full, -mm mini, or -mp miniplus) with an LSASS-related process
+  marker (ls, keyiso, or samss). The rule fires only when both a dump-mode flag
+  AND an LSASS marker are present on the same command line. ProcDump is a signed
+  Microsoft utility used legitimately to capture diagnostic dumps, but the same
+  syntax captures the full memory of lsass.exe, which holds plaintext passwords,
+  NTLM hashes, and Kerberos tickets for offline credential extraction. Because
+  the rule matches only on the command line and not on the image name, the
+  binary carrying these flags may be procdump.exe, a renamed copy, or a
+  different tool reusing ProcDump syntax. The investigation should confirm the
+  exact dump mode and LSASS target, identify the binary and parent that launched
+  it, determine whether a dump artifact reached disk, assess which accounts the
+  dump could expose, and check whether the same pattern appears elsewhere on the
+  host or fleet.
+type: detection
+detection_id: 5afee48e-67dd-4e03-a783-f74259dcf998
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the command line combine a ProcDump dump-mode flag (-ma, -mm, or
+    -mp) with an LSASS process marker (ls, keyiso, or samss), matching what this
+    rule detects?
+  context: Before investing investigation time, confirm the alert is a true
+    positive. The rule fires only when both conditions hold on the same command
+    line - a memory-dump mode flag (-ma full, -mm mini, -mp miniplus) AND an
+    LSASS-related marker (ls for lsass, keyiso for the CNG key isolation service,
+    samss for the SAM service). Read the exact command line, note which dump mode
+    and which marker are present, and confirm whether an output dump path is
+    specified.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Is this user and host expected to capture process memory dumps of
+    security-sensitive system services?
+  context: Capturing a full memory dump of LSASS is rarely a routine operation. A
+    small set of developers, support engineers, and crash-diagnostics workflows
+    legitimately dump process memory, but almost none target lsass.exe by name.
+    Knowing whether the acting account and host function involve crash-dump
+    collection or runtime troubleshooting is often the fastest way to separate a
+    benign diagnostic capture from deliberate credential theft.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What binary actually carried these dump flags, and is it really
+    ProcDump or a renamed copy of it?
+  context: The rule constrains only the command line, not the image, so any
+    executable can carry ProcDump-style dump flags. Compare the Image path (the
+    name on disk) against OriginalFileName (embedded PE metadata) - a file named
+    something innocuous whose metadata reads procdump indicates a renamed copy
+    staged to evade name-based detection, while a tool reusing the same flag
+    syntax under different metadata is a different finding. The file hash enables
+    a reputation lookup to confirm whether this is the genuine signed Sysinternals
+    binary, a known-good copy, or an unknown sample.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Hashes
+- question: Which dump mode and which LSASS marker were used, and does this amount
+    to a full LSASS memory capture?
+  context: The dump mode determines how much credential material is exposed. -ma
+    writes every page of process memory (a complete LSASS image suitable for
+    offline credential extraction), -mp writes private and read/write regions but
+    silently upgrades CLR processes to full, and -mm writes a mini dump with
+    stacks and referenced memory. The marker identifies the target - ls maps to
+    lsass.exe, keyiso to the CNG key isolation service, samss to the SAM service.
+    Read the full command line to confirm which mode and target were specified and
+    whether an output .dmp path was given.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did the ProcDump process itself, or any child process it spawned, write
+    any file to disk around the time of the alert, regardless of extension?
+  context: The handle-open against lsass.exe with broad access that a memory dump
+    requires is not observable here — Elastic Defend records no cross-process
+    handle-access telemetry equivalent to Sysmon EID 10, so the read itself cannot
+    be confirmed or ruled out from a zero-row result. What is observable is the
+    file the dump produces. This query scopes file writes specifically to the
+    dumping process and its children rather than a host-wide search, so it also
+    catches a custom output name or extension passed via ProcDump's -o flag that a
+    fixed .dmp check would miss. A zero-row result here does not prove the read
+    never happened - it may only mean the file was written outside this process
+    tree or moved before file-event telemetry captured it.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Was a memory dump file written to disk on this host shortly after the
+    alert?
+  context: A successful dump leaves a file on disk. ProcDump's default output is
+    named after the target process with a timestamp (for example
+    lsass_YYMMDD_HHMMSS.dmp), and operators frequently redirect output to staging
+    directories such as the user temp folder or C:\Windows\Temp. A .dmp artifact
+    appearing in a user-writable or temp location right after the launch confirms
+    the dump completed and gives the file that would be carried off for offline
+    extraction. Locating the artifact is also a remediation step - it must be
+    removed and the exposed accounts rotated.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith: '.dmp'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - User
+- question: What process spawned the dumping process, and is that parent chain
+    expected?
+  context: The parent process reveals how the dump was launched and who decided to
+    run it. Interactive diagnostics usually show a console shell or an admin tool
+    started by explorer.exe; an unexpected parent such as a script host, a remote
+    administration service, or an Office application points to automated or
+    operator-driven credential theft. Trace the parent and, where possible, walk
+    further up the tree to see what staged the dumping process.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Which accounts may be exposed by this dump, and do any have elevated
+    privileges?
+  context: The severity of an LSASS dump depends on which credentials were resident
+    in memory at the time. Any interactive logon, service account, or scheduled
+    task running on the host since the last reboot may have left a password,
+    NTLM hash, or Kerberos ticket in LSASS. Enumerate the accounts that have
+    logged on to this host and check their privilege level - domain admin or
+    broadly privileged service accounts require incident escalation and credential
+    rotation, while a single standard-user session is a smaller exposure.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Were outbound remote-access connections (RDP, SMB, WinRM, SSH) initiated from this host after
+    this event?
+  context: Credential theft is typically followed by lateral movement. The query returns outbound connections
+    from this host to remote-access ports -- 3389 (RDP), 445 (SMB/PsExec), 5985/5986 (WinRM), 22 (SSH)
+    -- in the hours after the event; the originating Image and User show what drove each connection. Two
+    limits to keep in mind -- credentials exfiltrated and replayed from another machine will not appear
+    here (check security 4624 logons on suspected targets for this account and any accounts with sessions
+    on this host), and the query requires Sysmon network telemetry (EID 3); if that is not collected from
+    this host, treat zero rows as a visibility gap, not as evidence no movement occurred.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_flags:
+        CommandLine|contains|windash:
+        - ' -ma '
+        - ' -mm '
+        - ' -mp '
+      selection_process:
+        CommandLine|contains:
+        - ' ls'
+        - ' keyiso'
+        - ' samss'
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_flags:
+        CommandLine|contains|windash:
+        - ' -ma '
+        - ' -mm '
+        - ' -mp '
+      selection_process:
+        CommandLine|contains:
+        - ' ls'
+        - ' keyiso'
+        - ' samss'
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around the time of the
+    alert?
+  context: Tracking the acting account's activity across all hosts reveals whether
+    the dump was a single event or part of activity spanning multiple endpoints.
+    Credential dumping is frequently followed by movement to additional systems
+    using the stolen material, so the same user appearing on other hosts in this
+    window expands the scope of the incident beyond one machine.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_flags:
+        CommandLine|contains|windash:
+        - ' -ma '
+        - ' -mm '
+        - ' -mp '
+      selection_process:
+        CommandLine|contains:
+        - ' ls'
+        - ' keyiso'
+        - ' samss'
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining the activity surrounding the
+    dump reveals what led to it and what followed - the parent that staged the
+    tool, reconnaissance, defense tampering, or follow-on execution that used the
+    captured credentials. Novel parent-child pairs at low counts are what to scan
+    for against the high-count noise of routine system processes.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host - reconnaissance, initial execution,
+    or defense tampering - may reveal the attack stages that preceded the LSASS
+    dump and help reconstruct the full timeline. Credential dumping is usually a
+    mid-chain step, so prior alerts give the context for how the operator reached
+    the point of harvesting credentials.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: When this host has previously fired the rule's ProcDump LSASS-dump
+    pattern, what parents and users normally drive it, and does the current alert
+    fit?
+  context: Even sanctioned diagnostics can in principle match this pattern. This
+    query mirrors the rule's selection structure scoped to this host, so the
+    resulting parent and user distribution reflects how this specific firing
+    pattern has historically run here, not generic ProcDump activity. A new parent
+    process, an unexpected account, or a first-ever occurrence is the anomaly worth
+    chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_flags:
+        CommandLine|contains|windash:
+        - ' -ma '
+        - ' -mm '
+        - ' -mp '
+      selection_process:
+        CommandLine|contains:
+        - ' ls'
+        - ' keyiso'
+        - ' samss'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Have other hosts fired the rule's ProcDump LSASS-dump pattern in the
+    past week, and does the cross-host distribution look like consistent automation
+    or one-off activity?
+  context: This query mirrors the rule's selection structure with no host scope, so
+    the result is a fleet-wide count of the ProcDump LSASS-dump pattern rather than
+    generic process activity. Many hosts firing the same pattern points to a build
+    or diagnostics pipeline that runs it by design; one host or a small unrelated
+    set points to manual operator activity. Use the host distribution to calibrate
+    severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_flags:
+        CommandLine|contains|windash:
+        - ' -ma '
+        - ' -mm '
+        - ' -mp '
+      selection_process:
+        CommandLine|contains:
+        - ' ls'
+        - ' keyiso'
+        - ' samss'
+      condition: all of selection_*
+    fields:
+    - host.name

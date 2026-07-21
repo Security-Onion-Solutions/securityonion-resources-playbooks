@@ -1,0 +1,380 @@
+name: Potential LethalHTA Technique Execution
+id: 7b8f4c2e-9d1a-4e63-8a72-1f0c6b4d5e90
+description: |
+  Detects mshta.exe spawned by svchost.exe, the process-lineage signature left when an HTA payload is
+  executed through DCOM activation of the htafile COM object rather than by a user double-clicking a file.
+  In normal operation mshta.exe is launched interactively or by a script host (explorer.exe, a browser, an
+  Office application), not by svchost.exe; an svchost parent means the htafile object was instantiated
+  out-of-process, fetched HTA content (JScript or VBScript) from a URL via a URL moniker, and ran it outside
+  the usual browser security context. The rule fires when ParentImage ends in svchost.exe AND Image ends in
+  mshta.exe; the investigation should determine where the HTA came from, what its script did, whether a
+  payload was written or further processes were spawned, and whether the same DCOM-activation pattern reached
+  other hosts.
+type: detection
+detection_id: ed5d72a6-f8f4-479d-ba79-02f6a80d7471
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- question: Was mshta.exe spawned directly by svchost.exe on this host?
+  context: Confirm the alert is a true positive by reviewing the exact parent-child pair. The rule fires only
+    when the immediate parent of mshta.exe ends in svchost.exe AND the child image ends in mshta.exe. An
+    svchost parent for mshta.exe is the lineage left by out-of-process DCOM activation of the htafile COM
+    object; verify both elements appear and note the full mshta command line, which is often empty or a bare
+    URL under this activation path.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+- question: Is this host expected to run mshta.exe via service-hosted activation?
+  context: Legitimate mshta.exe use is interactive or script-driven and does not normally run as a child of
+    svchost.exe. DCOM activation of the htafile object requires workstation-to-workstation RPC, so this pattern
+    is most consistent with lateral movement. Knowing whether the host has any sanctioned automation that
+    activates HTA content remotely is often the fastest way to separate a true positive from an unusual but
+    expected operation.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Which svchost.exe instance launched mshta.exe, and what service group and parent does it belong to?
+  context: The parent-child relationship is the core signal for this detection. DCOM out-of-process activation
+    routes through the svchost.exe instance hosting the RPC/DCOM service group, so identifying that specific
+    svchost instance and confirming it traces back to services.exe distinguishes genuine service-hosted
+    activation from a masqueraded or relocated svchost. Note the svchost command line (the -k service group)
+    and where the instance itself came from.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What did mshta.exe execute -- decode the command line and identify any HTA URL, file path, or
+    inline script.
+  context: The full command line shows what mshta.exe was pointed at. Look for an http or https URL, a UNC or
+    local file path, or inline javascript/vbscript content. Under DCOM activation via IPersistMoniker the HTA
+    URL is delivered through a URL moniker rather than the command line, so an empty or bare command line does
+    not mean nothing ran -- in that case the fetched content must be recovered from the host cache or network
+    evidence instead. Decode any base64 or obfuscated script fragments present.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Did mshta.exe make an outbound connection to an external destination around the time of the alert?
+  context: When the htafile object loads a URL moniker, mshta.exe fetches the HTA content over HTTP or HTTPS,
+    so a remote-loaded HTA produces an outbound connection from mshta.exe itself. Review the destination
+    address, port, and hostname; an external or otherwise uncommon destination is the retrieval worth
+    confirming, while no outbound connection points to a UNC or local HTA source instead. The NOT filter
+    excludes loopback and link-local noise.
+  range: +/-10m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: '\mshta.exe'
+        Initiated: 'true'
+      filter_local:
+        DestinationIp|cidr:
+          - '127.0.0.0/8'
+          - '169.254.0.0/16'
+      condition: selection and not filter_local
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+      - Image
+- question: Was an HTA cache file written under the systemprofile INetCache directory after the alert?
+  context: mshta.exe caches fetched HTA content under the local-service profile at
+    config\systemprofile\AppData\Local\Microsoft\Windows\INetCache\IE, so a remote-loaded HTA leaves a cached
+    file there even when nothing reached the command line. Recover the cached file and inspect it for the
+    string ActiveXObject and for embedded JScript or VBScript, which reveals what the HTA actually did. Absence
+    of a cache entry alongside an outbound connection points to in-memory or beacon-tunneled delivery.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains: '\config\systemprofile\AppData\Local\Microsoft\Windows\INetCache'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: What child processes did this mshta.exe instance spawn after it ran, and what are their hashes?
+  context: An HTA that executes script content typically launches something -- a command interpreter, another
+    script host, a signed binary used for further proxy execution, or a freshly written executable. Children
+    such as cmd.exe, powershell.exe, rundll32.exe, regsvr32.exe, or an unexpected binary indicate the HTA
+    progressed past load into payload execution; submit the hash of any spawned binary to threat intel for
+    reputation. Scope to the exact mshta.exe instance so the results are this activation's children, not
+    unrelated activity.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - Hashes
+      - CommandLine
+- question: What other child processes did this same svchost.exe instance spawn around the time of the alert?
+  context: The svchost.exe instance that hosts the DCOM service group activates other COM objects too, so its
+    children in the alert window reveal whether mshta.exe was an isolated activation or one of several
+    remotely triggered processes. Multiple unusual children from the same svchost instance -- particularly
+    other proxy-execution binaries -- points to repeated DCOM-based activation rather than a single event.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: How often has this host previously seen svchost.exe spawn mshta.exe over the past 90 days?
+  context: An svchost.exe to mshta.exe lineage with no prior history on a host is more notable than one that
+    recurs under stable conditions. The query mirrors the rule's selection scoped to this host, so the count
+    reflects this specific DCOM-activation pattern rather than generic mshta.exe usage. Any nonzero history
+    deserves review of the command-line structures, since this pairing is rarely a legitimate routine.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \svchost.exe
+        Image|endswith: \mshta.exe
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - CommandLine
+- question: Was mshta.exe executed from its expected System32 or SysWOW64 path?
+  context: mshta.exe run from a path outside System32 or SysWOW64 may indicate the binary was copied or renamed
+    to evade path-based allowlists, which is independent of the DCOM-activation signal. Compare the Image path
+    and OriginalFileName against the expected location; a relocated or renamed mshta.exe alongside the svchost
+    parent compounds the concern.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- question: Were any other proxy-execution LOLBins run on this host recently?
+  context: Operators who use one signed binary for proxy execution often use several. If mshta.exe ran a remote
+    HTA, check whether rundll32.exe, regsvr32.exe, msbuild.exe, installutil.exe, or similar binaries were also
+    used to run code on this host, which would point to a broader proxy-execution effort rather than a single
+    activation. mshta.exe is excluded from the list since it is the alerting binary.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\rundll32.exe'
+          - '\regsvr32.exe'
+          - '\msbuild.exe'
+          - '\cmstp.exe'
+          - '\installutil.exe'
+          - '\msiexec.exe'
+          - '\forfiles.exe'
+          - '\pcalua.exe'
+          - '\presentationhost.exe'
+          - '\control.exe'
+          - '\infdefaultinstall.exe'
+          - '\msdt.exe'
+          - '\mavinject.exe'
+          - '\wmic.exe'
+          - '\xwizard.exe'
+          - '\ie4uinit.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \svchost.exe
+        Image|endswith: \mshta.exe
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \svchost.exe
+        Image|endswith: \mshta.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did the account this alert fired under do across the network around this time?
+  context: Tracking the account's activity across all hosts can reveal lateral movement or activity spanning
+    multiple endpoints. If the same account drove similar activity on more than one host in this window, the
+    scope may be larger than a single endpoint. Under a service account this view returns broad telemetry, so
+    the launch-mechanism cross-host view is the more reliable read.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \svchost.exe
+        Image|endswith: \mshta.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining activity around the alert reveals what led to this
+    event, what happened after, and whether it is part of a larger sequence. Look for inbound RPC-driven
+    activity, reconnaissance, credential access, or persistence surrounding the mshta.exe activation.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host -- reconnaissance, credential access, defense tampering, or
+    inbound remote-service activity -- may reveal the stages that preceded this event and help reconstruct the
+    timeline. A remotely activated HTA that follows earlier suspicious activity reads very differently from one
+    that appears in isolation.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

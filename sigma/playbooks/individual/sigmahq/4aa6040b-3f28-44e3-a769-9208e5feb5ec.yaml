@@ -1,0 +1,410 @@
+name: Suspicious Rundll32 Execution With Image Extension
+id: 57d68415-54d8-4a1a-8d39-c5df69858a8b
+description: |
+  Detects rundll32.exe executed with a command line that references a file carrying an image extension
+  (.png, .jpg, .gif, .ico, .bmp, .tif and similar), where the matched Image ends in rundll32.exe or the
+  OriginalFileName is RUNDLL32.exe. The rule fires when both the binary identity and the image-extension
+  argument are present together. A signed system binary loading a payload whose extension claims to be an
+  image is a common masquerade: the file is treated as an image by the user but contains an executable DLL
+  that rundll32 maps and runs, proxying execution through a trusted process. Legitimate rundll32 usage loads
+  .dll/.cpl libraries, so an image-extension argument is unusual; the investigation should decode the full
+  command line, identify the referenced file and its real content, trace the parent that launched rundll32,
+  and determine what executed afterward.
+type: detection
+detection_id: 4aa6040b-3f28-44e3-a769-9208e5feb5ec
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the alerting event show rundll32.exe (or a binary whose OriginalFileName is RUNDLL32.exe) with a command line referencing an image-extension file?
+  context: Confirm the alert is a true positive before investing further time. Both conditions must hold together for this rule to fire — the process is rundll32.exe (by Image path or OriginalFileName) and the command line contains an image extension such as .png, .jpg, .gif, .ico, .bmp, or .tif. Verify both in the triggering event.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to run rundll32.exe against files with image extensions?
+  context: Legitimate rundll32 invocations load .dll or .cpl libraries; pointing it at a file with an image extension is not a routine administrative pattern. Knowing whether the user role and host function would plausibly produce this is often the fastest way to separate a true positive from an unusual but benign tool invocation.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What file does the rundll32 command line reference, and what entry point or arguments follow it?
+  context: The full command line reveals the masquerade. Identify the referenced image-extension file and its on-disk path, then decode any export/entry point, ordinal, or trailing arguments rundll32 was told to call. A file with an image extension that is invoked as a DLL entry point indicates the extension is cover for executable content rather than a real image.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What process spawned this rundll32 instance, and is that parent chain expected?
+  context: The parent process shows how rundll32 was invoked. Proxy execution of a masqueraded payload is frequently launched by a document handler or scripting host — explorer.exe following a user click, an Office application, mshta.exe, wscript.exe, cscript.exe, or a command shell — rather than a normal installer or service path. An unexpected parent shifts the disposition toward malicious delivery.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What child processes did this rundll32 instance spawn afterward?
+  context: Processes spawned by rundll32 reveal the actual impact of the proxied payload. Legitimate library hosting rarely spawns children; masqueraded execution often launches cmd.exe, powershell.exe, or additional download or staging tools for post-exploitation. Unexpected children point to an active execution chain.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Was the image-extension file referenced on the command line written to disk shortly before this alert, and by what process?
+  context: A payload that masquerades as an image is usually dropped to disk just before rundll32 runs it. Locating the write event identifies the dropper — a document handler, a script, or a download tool — and its parent chain, which often matters more than the rundll32 step itself. Scope the file-event search to the referenced path or directory rather than all file activity on the host.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - User
+      - EventType
+- question: What modules did this rundll32 instance load, and were any loaded from a user-writable or unusual location?
+  context: The image-extension file is mapped into rundll32 as a DLL. Loaded-module events confirm whether a non-standard module was mapped and from where — a module loaded out of a user temp, Downloads, AppData, or other user-writable directory is the executable content the rule's command-line pattern implies. Modules loaded only from System32 or signed library paths point toward a benign invocation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+- question: Did this rundll32 instance make any outbound network connections?
+  context: Proxy-execution payloads run through rundll32 frequently reach out to retrieve a second stage or to establish command and control. An external connection from rundll32 — especially to an address outside the environment's known ranges — corroborates malicious use; rundll32 hosting a local library normally generates no outbound traffic. Review the destination and the process that owns the connection.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        Initiated: 'true'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- question: When this host has previously fired the rule's pattern, what parents and users normally drive that activity, and does the current alert fit that pattern?
+  context: Even on hosts where this pattern has appeared before, the parent/user distribution it normally runs under is the baseline. The query mirrors the rule's selection scoped to this host, so the result reflects the rule's specific firing pattern rather than generic rundll32 usage. A new parent process, an unexpected user account, or an unusual command-line structure is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \rundll32.exe
+      - OriginalFileName: RUNDLL32.exe
+      selection_cli:
+        CommandLine|contains:
+        - .bmp
+        - .cr2
+        - .eps
+        - .gif
+        - .ico
+        - .jpeg
+        - .jpg
+        - .nef
+        - .orf
+        - .png
+        - .raw
+        - .sr2
+        - .tif
+        - .tiff
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \rundll32.exe
+      - OriginalFileName: RUNDLL32.exe
+      selection_cli:
+        CommandLine|contains:
+        - .bmp
+        - .cr2
+        - .eps
+        - .gif
+        - .ico
+        - .jpeg
+        - .jpg
+        - .nef
+        - .orf
+        - .png
+        - .raw
+        - .sr2
+        - .tif
+        - .tiff
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \rundll32.exe
+      - OriginalFileName: RUNDLL32.exe
+      selection_cli:
+        CommandLine|contains:
+        - .bmp
+        - .cr2
+        - .eps
+        - .gif
+        - .ico
+        - .jpeg
+        - .jpg
+        - .nef
+        - .orf
+        - .png
+        - .raw
+        - .sr2
+        - .tif
+        - .tiff
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the same user triggered similar activity on other hosts, the scope of the activity may be larger than a single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \rundll32.exe
+      - OriginalFileName: RUNDLL32.exe
+      selection_cli:
+        CommandLine|contains:
+        - .bmp
+        - .cr2
+        - .eps
+        - .gif
+        - .ico
+        - .jpeg
+        - .jpg
+        - .nef
+        - .orf
+        - .png
+        - .raw
+        - .sr2
+        - .tif
+        - .tiff
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate context — what led to this event, what happened after, and whether it is part of a larger sequence. Look for the dropper that produced the masqueraded file, reconnaissance, privilege escalation, or persistence installation in the same window.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Were any other proxy-execution LOLBins used on this host recently?
+  context: Attackers who use one proxy-execution LOLBin often use several. If rundll32 was abused to run a masqueraded payload, check whether regsvr32, mshta, msbuild, installutil, msiexec, or similar binaries were also used to execute arbitrary code on this host. Finding multiple proxy-execution LOLBins in the same window strengthens the case for malicious activity.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\regsvr32.exe'
+          - '\mshta.exe'
+          - '\msbuild.exe'
+          - '\cmstp.exe'
+          - '\msiexec.exe'
+          - '\wmic.exe'
+          - '\forfiles.exe'
+          - '\pcalua.exe'
+          - '\presentationhost.exe'
+          - '\control.exe'
+          - '\installutil.exe'
+          - '\infdefaultinstall.exe'
+          - '\msdt.exe'
+          - '\mavinject.exe'
+          - '\ie4uinit.exe'
+          - '\xwizard.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- question: Was rundll32.exe executed from its expected System32 or SysWOW64 path?
+  context: rundll32 executed from outside System32 or SysWOW64 may indicate the binary was copied or renamed to evade path-based allowlists. Compare the Image path against the standard locations and check that OriginalFileName still resolves to RUNDLL32.exe — a renamed copy in a user-writable directory is more suspicious than the in-place system binary.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- question: How often has this host fired the rule's rundll32 pattern over the past 90 days, and what command-line structures are typical?
+  context: A LOLBin pattern with no prior history on a host is more suspicious than one used daily under stable parents. The query mirrors the rule's selection scoped to this host, so the count reflects the rule's specific firing pattern rather than generic rundll32 usage. The command-line projection lets the analyst compare typical invocation patterns against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \rundll32.exe
+      - OriginalFileName: RUNDLL32.exe
+      selection_cli:
+        CommandLine|contains:
+        - .bmp
+        - .cr2
+        - .eps
+        - .gif
+        - .ico
+        - .jpeg
+        - .jpg
+        - .nef
+        - .orf
+        - .png
+        - .raw
+        - .sr2
+        - .tif
+        - .tiff
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - CommandLine

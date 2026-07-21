@@ -1,0 +1,347 @@
+name: HackTool - Potential Remote Credential Dumping Activity Via CrackMapExec Or Impacket-Secretsdump
+id: d057ab69-c085-4c5d-9501-f016901024e9
+description: |
+  Detects the default on-disk artifact of remote credential dumping with CrackMapExec or Impacket-secretsdump: a service host process (svchost.exe) writing a randomly named eight-character .tmp file into C:\Windows\System32. These tools authenticate to a target over SMB and use Remote Registry access to save the SYSTEM, SECURITY, and SAM registry hives to a temporary path on the target for offline parsing of local account hashes, LSA secrets, and cached domain credentials; the random .tmp file written by svchost is the staged hive copy. Because the write is driven by an inbound authenticated session rather than a local process the analyst can trace by lineage, the investigation should establish which remote host connected, which credential stores were staged, whether the copies were cleaned up, which accounts are exposed, and whether the same credentials were then used to move to other hosts. Legitimate causes are rare, so an unexplained match on a domain controller or a server holding privileged accounts should be treated as a credential-exposure event until shown otherwise.
+type: detection
+detection_id: 6e2a900a-ced9-4e4a-a9c2-13e706f9518a
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-09
+questions:
+- question: Did svchost.exe write a randomly named .tmp file into System32 on this host?
+  context: >-
+    The rule fires when a process ending in svchost.exe writes a file matching an eight-character random name ending in .tmp directly under C:\Windows\System32 — the default staging path these remote-dumping tools use for saved registry hives. Confirm the writing process is svchost and read the exact file name and path. This location and naming are not where legitimate software stages temporary files, so a genuine match is the on-disk trace of a registry hive being copied for extraction.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - Image
+      - TargetFilename
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this host one that would plausibly see this file written, and under what account?
+  context: >-
+    A domain controller, a file server, or any host holding privileged local or domain accounts is a high-value target for credential extraction, and a match there is more serious than one on a general workstation. Read the account attributed to the write; because the activity is driven by a remote session through the service host, this is frequently SYSTEM or a machine account rather than the true operator, so weigh the host's role and the remote source over the local account name.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this activity part of an authorized penetration test or red team engagement?
+  context: >-
+    Remote credential-dumping tools are staples of authorized security assessments. Before deeper analysis, check whether a penetration test or red team exercise covering this host or network segment is active. An engagement whose scope, source, and timing match resolves the alert; its absence keeps this a live credential-exposure investigation. The re-displayed event is the alerting service-host write and carries no operator command line — match it against engagement records rather than reading intent from it.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Which credential stores were staged for extraction on this host?
+  context: >-
+    These tools save the SYSTEM, SECURITY, and SAM registry hives to a temporary path so account hashes, LSA secrets, and cached domain credentials can be parsed offline; on a domain controller the target may instead be the directory database. The service-host command line shown here is the generic service invocation and does not name the stores — read the staged .tmp files and any sibling hive copies to determine which stores were captured. Each store maps to a different exposure: SAM to local account hashes, SECURITY to LSA secrets and cached logons, the directory database to domain-wide credentials.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What is the content of the staged .tmp file — is it a registry hive?
+  context: >-
+    Retrieve and inspect the staged file. A saved registry hive begins with the regf signature and contains recognizable hive structure; confirming the .tmp is a SYSTEM, SECURITY, or SAM hive copy rather than a benign temporary file establishes that credential material was extracted. Note the file's size and structure, and preserve it as evidence. The file-write event itself carries no hash, so identification is by content and structure retrieved from the host.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: Which remote host opened an inbound SMB or RPC session to this host around the time of the write?
+  context: >-
+    This dumping runs over an authenticated network session — SMB on port 445 and the RPC endpoint mapper on 135 — driving Remote Registry to save the hives, so the true actor is the remote source, not a local process. Inbound connections to this host in the surrounding window identify the connecting address; that source is the operator's foothold and the next host to scope. Endpoint network telemetry may not capture every inbound flow, so treat an empty result as a visibility limit rather than proof no session occurred, and corroborate with authentication records for the same window.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'false'
+        DestinationPort:
+          - 445
+          - 135
+      condition: selection
+    fields:
+      - SourceIp
+      - SourcePort
+      - DestinationPort
+      - Image
+- question: Were outbound remote-access connections initiated from this host after this event?
+  context: >-
+    Once credentials are extracted they are commonly reused to reach further hosts. Outbound sessions from this host after the write — RDP on 3389, SMB on 445, WinRM on 5985 or 5986, SSH on 22 — may show the harvested credentials being exercised. Read the destinations and the initiating account; a spread of new outbound sessions to hosts this one does not normally contact points to credential reuse in progress.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
+- question: Which accounts are exposed by the staged stores, and do any hold elevated privileges?
+  context: >-
+    The impact of this event is set by which credentials the captured stores contain. Enumerate the local accounts in the SAM hive, the service and cached-logon secrets in the SECURITY hive, and — on a domain controller — the domain accounts reachable through the directory database. Identify any that hold administrative or domain-privileged rights; those must be treated as compromised and prioritized for password resets. The service-host command line re-displayed here does not carry this detail, so build the account list from the host's role and the stores identified as staged.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Is the staged .tmp file still on disk, or was it deleted after the alert?
+  context: >-
+    These tools restore the target to its original state after extraction, deleting the staged hive copies and disabling any service they enabled, so an early deletion of the .tmp is expected cleanup rather than a sign the alert is benign. If the file is still present it can be retrieved and confirmed as a hive; if it was deleted within minutes of creation, that self-cleanup pattern reinforces the remote-dump interpretation and shifts focus to the network source and the accounts exposed.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What is the parent of the service host that wrote the file, and does the service context fit a remote-registry operation?
+  context: >-
+    The service host is normally a child of services.exe, so the parent lineage alone rarely distinguishes this activity; the more telling detail is which service the host instance is running. A svchost instance hosting Remote Registry writing hive files aligns with the remote-dump path. If the parent process identifier resolves to NODATA on this alert, fall back to the service host on this host with a short time window and correlate against the inbound session.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - Image
+      - CommandLine
+- question: What other files did this process write or delete around the alert?
+  context: >-
+    A hive dump usually produces more than one file — SYSTEM, SECURITY, and SAM are each saved, and a directory-database copy may accompany them. Enumerating every file this process and its direct children wrote in the surrounding window exposes the full set of staged copies and where they landed. Several randomly named files appearing together under System32 confirm a multi-store extraction rather than an isolated write.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What else has been written into System32 on this host recently, and by which processes?
+  context: >-
+    The System32 directory has a small set of processes that legitimately write there, so other recent arrivals in the same location — especially additional randomly named temporary files from the service host — reveal whether this is an isolated write or part of active staging. The aggregation groups by path and writing process; an unfamiliar writer producing several short-named files is the signal to follow.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains: '\Windows\System32\'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- always_include: true
+  question: Has this account previously produced this write pattern, and does that history fit its role?
+  context: >-
+    This counts how often the attributed account has produced the rule's exact pattern — the service host writing a random .tmp into System32 — over the past three months, grouped by host. Because the activity is remote-driven and usually attributed to SYSTEM or a machine account, weigh the result together with the parent-driven view rather than on its own; a first-ever occurrence for the account and host is the anomaly worth chasing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        Image|endswith: \svchost.exe
+        TargetFilename|re: \\Windows\\System32\\[a-zA-Z0-9]{8}\.tmp$
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: Has this program historically driven this write pattern, or is the launch mechanism new for this activity?
+  context: >-
+    When the alert is attributed to a service or machine account, the meaningful pivot is the launch mechanism. This counts how often the alerting program has driven the same service-host-writes-a-random-.tmp pattern over the past three months, grouped by host. A program that already accounts for many prior events is routine service behavior; a new or rare program for this pattern is the deviation. Emit this alongside the account-history view — they answer different questions and neither replaces the other.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        Image|endswith: \svchost.exe
+        TargetFilename|re: \\Windows\\System32\\[a-zA-Z0-9]{8}\.tmp$
+      _pb_scope:
+        Image|endswith|expand: '%Image%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: What else did this account do across the environment around this time?
+  context: >-
+    Tracking the attributed account's activity across all hosts in the surrounding window shows whether this write is isolated or part of activity spanning multiple endpoints. When the alert is attributed to SYSTEM, LOCAL SERVICE, NETWORK SERVICE, or a machine account, this account-pivot returns unbounded service-telemetry volume and the parent-driven cross-host view is the one to trust for scope.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- always_include: true
+  question: Did this same program-driven pattern fire on other hosts in the same window, or is it isolated to this host?
+  context: >-
+    Under a service or machine account, asking what the account did across the environment returns service-telemetry noise, so the meaningful question is whether the same launch mechanism produced the write elsewhere. This counts the same service-host-writes-a-random-.tmp pattern scoped to the alerting program across all hosts in the alert window. Several hosts in the same window points to a pushed or scripted sweep across the environment; a single host points to a targeted extraction. Emit this alongside the account-pivot view — the pair is not deduplicable.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        Image|endswith: \svchost.exe
+        TargetFilename|re: \\Windows\\System32\\[a-zA-Z0-9]{8}\.tmp$
+      _pb_scope:
+        Image|endswith|expand: '%Image%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: When this host has previously produced this write pattern, what programs and accounts drove it, and does the current alert fit?
+  context: >-
+    The useful comparison is against the host's own history of the same pattern. This mirrors
+    the rule's selection scoped to this host and returns the program and account distribution
+    of prior service-host-writes-a-random-.tmp events here — expect svchost.exe itself in the
+    Image column. On most hosts this pattern has never occurred, so any history is itself
+    informative; a first-ever occurrence or an unfamiliar account is the anomaly to pursue, and
+    since file events carry no parent lineage, pivot to the svchost.exe start event for ancestry.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        Image|endswith: \svchost.exe
+        TargetFilename|re: \\Windows\\System32\\[a-zA-Z0-9]{8}\.tmp$
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - Image
+    - User
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host — an inbound authentication anomaly, reconnaissance, Remote Registry service enablement, or a suspicious service creation — may reveal the stages that preceded this extraction and place it in a timeline. A hive-staging write following an earlier lateral-movement or authentication alert reads very differently from one with no prior activity on the host.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

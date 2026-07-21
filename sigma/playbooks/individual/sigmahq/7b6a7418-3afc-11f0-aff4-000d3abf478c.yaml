@@ -1,0 +1,376 @@
+name: Obfuscated PowerShell MSI Install via WindowsInstaller COM
+id: 0fb8e297-2273-4097-82fa-c61e28c8b060
+description: |
+  Detects PowerShell, PowerShell ISE, or pwsh executions whose command line contains all of -ComObject, InstallProduct(, .Insert(, and UILevel together. This pattern reflects use of the WindowsInstaller.Installer COM object to silently install an MSI, where the class name and URL are reassembled at runtime with .Insert() to defeat static keyword matching and UILevel suppresses the install UI. Legitimate software deployment rarely constructs the installer COM object this way from a script host with string-repair obfuscation, so confirm what MSI is being installed, from where it is fetched, what the installer subsequently loads or spawns, and whether the launching parent chain looks like a user paste-and-run.
+type: detection
+detection_id: 7b6a7418-3afc-11f0-aff4-000d3abf478c
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the command line match this rule's pattern — a script host whose arguments contain -ComObject, InstallProduct(, .Insert(, and UILevel together?
+  context: Confirm the alert is a true positive by reviewing the full command line and the launching binary. The rule fires only when the image is powershell.exe, powershell_ise.exe, or pwsh.exe (or carries one of those original file names) AND the command line contains all four COM-install obfuscation tokens. Verify all four tokens are present and that the .Insert() calls are reassembling an installer class name or a URL.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to install MSI packages by scripting the WindowsInstaller COM object?
+  context: Software deployment is normally driven by management tooling or msiexec directly, not by a script host constructing the installer COM object with runtime string repair. Knowing whether this user role and host function ever perform script-driven installs is often the fastest way to separate a tooling quirk from operator activity.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What does this command line actually do once the obfuscation is resolved — which installer class is rebuilt, what URL is fetched, and what UILevel is set?
+  context: Resolve every .Insert() call to recover the real strings. The technique reassembles 'indowsInstaller.Installer' into WindowsInstaller.Installer and repairs a deliberately broken URL scheme (for example htps:// back to https://) at runtime. Record the recovered install URL, the UILevel value (a setting of none/quiet means the install runs with no user prompt), and any InstallProduct arguments. These are the concrete indicators for the rest of the investigation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|contains|all:
+          - -ComObject
+          - InstallProduct(
+          - .Insert(
+          - UILevel
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What is the deobfuscated string the .Insert() calls reconstruct, and what payload location does it point to?
+  context: This command does not use -EncodedCommand; the obfuscation is string-level — characters are removed from the COM class name and from the URL scheme and reinserted at runtime via .Insert() and conditional StartsWith() checks. Reconstruct the strings by hand to recover the true installer ProgID and the install source. The recovered URL is the next-stage fetch location and should be checked against reputation and against the destinations seen in network telemetry.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did PowerShell script block logging capture the fully resolved script content for this execution?
+  context: Script block logging records the deobfuscated script PowerShell actually compiled, so the .Insert()-repaired class name and URL appear in cleartext even though the command line hid them. This is ground truth for what ran. If PowerShell operational logs are not ingested in this environment, treat zero results as a visibility gap rather than evidence nothing executed, and fall back to manual reconstruction of the command line.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Were PowerShell or endpoint security controls disabled or bypassed on this host in the hour before this execution?
+  context: A hidden-window COM install is frequently preceded by weakening of protections — execution policy bypass, AMSI patching, real-time monitoring disabled, or a PowerShell downgrade to v2. Finding these precursor events on the same host strengthens the case that the install is part of operator activity rather than a benign deployment.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: What process spawned this script host, and does that parent chain look like a user paste-and-run rather than managed deployment?
+  context: The parent reveals how the install was launched. A managed deployment is normally driven by management agents or a service host. A chain rooted in explorer.exe or a command shell launched directly by the user — especially one whose command line was typed or pasted — points to a social-engineering paste-and-run that tricked the user into executing the one-liner. Walk up to the parent's own parent if the immediate parent is a generic shell.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Did the installed MSI or its side-loaded components land any files on disk that are still available for analysis?
+  context: A COM-driven install can drop the MSI payload and the application it side-loads into user-writable locations such as a public profile or a roaming application data folder. If those files are still present, they enable hashing, reputation lookups, and content review. File paths referenced by the command and by the install should be checked against file-creation events on this host.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What outbound connections did this host make to retrieve the MSI or a follow-on payload around the time of the alert?
+  context: The WindowsInstaller COM object fetches the MSI directly from the install URL, so the install URL recovered from the command line should correspond to an outbound connection from this host. After the MSI runs, side-loaded components commonly reach out again to fetch the next stage. Correlate the destinations here with the URL recovered during decoding, and treat connections to previously unseen external hosts as the payload retrieval.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+      filter_local:
+        DestinationIp|cidr:
+          - '10.0.0.0/8'
+          - '172.16.0.0/12'
+          - '192.168.0.0/16'
+          - '127.0.0.0/8'
+      condition: selection and not filter_local
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationHostname
+      - DestinationPort
+- question: What modules did msiexec or the installed application load on this host shortly after this execution, and were any loaded from a user-writable path?
+  context: A malicious MSI commonly bundles a legitimate signed application together with a malicious DLL, so the install completes and then the trusted application side-loads the attacker DLL from a user-writable directory. Module loads from a roaming application data folder or a public profile, or unsigned modules loaded by a normally-signed application, are the side-loading signal that follows this install pattern.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      filter_system:
+        ImageLoaded|startswith:
+          - 'C:\Windows\System32\'
+          - 'C:\Windows\SysWOW64\'
+      condition: selection and not filter_system
+    fields:
+      - Image
+      - ImageLoaded
+      - Signed
+      - Signature
+- question: What child processes did this script host spawn afterward, and did any of them invoke msiexec or a download utility?
+  context: The install proceeds by handing off to msiexec, and the next-stage fetch is often performed by a built-in download utility such as curl.exe. Children like msiexec.exe, curl.exe, or another script host launched moments after this execution reveal the actual impact and show whether the install progressed past the initial COM call.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: When this host has previously matched this rule's COM-install pattern, what parents and users drove it, and does the current alert fit that history?
+  context: The query mirrors the rule's selection structure scoped to this host, so the parent and user distribution reflects how this specific obfuscated-install pattern (not generic PowerShell usage) has run here before. A new parent process, an unexpected user account, or a first-ever appearance of the pattern is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell_ise.exe
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - PowerShell_ISE.EXE
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_cli:
+        CommandLine|contains|all:
+        - -ComObject
+        - InstallProduct(
+        - .Insert(
+        - UILevel
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell_ise.exe
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - PowerShell_ISE.EXE
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_cli:
+        CommandLine|contains|all:
+        - -ComObject
+        - InstallProduct(
+        - .Insert(
+        - UILevel
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell_ise.exe
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - PowerShell_ISE.EXE
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_cli:
+        CommandLine|contains|all:
+        - -ComObject
+        - InstallProduct(
+        - .Insert(
+        - UILevel
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around the time of this alert?
+  context: Tracking the user's activity across all hosts reveals whether the same account drove similar activity on other endpoints. If the same user triggered comparable script-host execution elsewhere, the scope is wider than this single host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell_ise.exe
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - PowerShell_ISE.EXE
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_cli:
+        CommandLine|contains|all:
+        - -ComObject
+        - InstallProduct(
+        - .Insert(
+        - UILevel
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: A paste-and-run install rarely stands alone. Earlier detections on the same host — defense tampering, reconnaissance, or other execution alerts — may reveal the stages that preceded this event and help reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

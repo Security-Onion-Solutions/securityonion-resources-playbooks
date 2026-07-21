@@ -1,0 +1,344 @@
+name: OneNote.EXE Execution of Malicious Embedded Scripts
+id: c188b27d-1f16-41c9-8ed0-0662782b6486
+description: |
+  Detects onenote.exe spawning a command interpreter or script host (cmd.exe, cscript.exe, mshta.exe, powershell.exe, pwsh.exe, or wscript.exe) with a command line referencing the OneNote attachment-export directories \exported\ or \onenoteofflinecache_files\. This is the launch behavior of a malicious .one document: when a user clicks an embedded link, OneNote writes the embedded payload to one of those directories and the chosen interpreter runs it. Legitimate OneNote use rarely shells out to script interpreters from these paths, so the investigation focuses on identifying the .one file, decoding what the interpreter executed, and finding any follow-on payload or network activity it produced.
+type: detection
+detection_id: 84b1706c-932a-44c4-ae28-892b28a25b94
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- question: Did onenote.exe spawn a script interpreter with a command line referencing \exported\ or \onenoteofflinecache_files\?
+  context: Confirm the alert is a true positive by reviewing the triggering event. The rule fires only when onenote.exe is the parent, the child is cmd.exe, cscript.exe, mshta.exe, powershell.exe, pwsh.exe, or wscript.exe, and the command line contains one of the OneNote export directories. Verify all three conditions hold against the alert.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Is this user and host expected to open OneNote documents that launch script interpreters?
+  context: OneNote shelling out to a command interpreter or script host is not a routine end-user action. Knowing whether the user role and host function involve scripted automation tied to OneNote helps separate an unusual-but-benign workflow from attachment-borne execution.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What .one file was opened, and was it received via email or downloaded from a link?
+  context: The execution begins when a user opens a malicious OneNote document and clicks an embedded link. Identifying the .one file and how it arrived — an email attachment or a downloaded link — enables blocking the sender or URL at the perimeter and searching for other recipients. The parent command line and the export path in the child command line point to the originating document.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+- question: Is onenote.exe expected to spawn this interpreter on this host, and what spawned onenote.exe itself?
+  context: The onenote.exe-to-interpreter relationship is the core signal. Tracing onenote.exe's own parent reveals whether the chain started from a user opening an attachment (explorer.exe, outlook.exe) or from something less expected. A grandparent that is itself an email or browser process supports an attachment-delivery story.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What other child processes did this onenote.exe instance spawn?
+  context: A malicious .one document may drop and run more than one payload. Examining all children of the same onenote.exe instance reveals whether multiple interpreters or tools were launched, which points to staged execution rather than a single benign action.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: What exactly did the interpreter run from the OneNote export directory? Decode the command line.
+  context: The full command line reveals what the exported payload does. Decode any flags, encoded content, file paths, or URLs, and identify the exported script or executable referenced under \exported\ or \onenoteofflinecache_files\. This scopes to interpreter activity tied to those export paths on the host so multi-step invocations are visible together.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains:
+          - \exported\
+          - \onenoteofflinecache_files\
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - CurrentDirectory
+- question: If the interpreter was PowerShell, was the command encoded or obfuscated, and what does it decode to?
+  context: Embedded OneNote payloads frequently use PowerShell's -EncodedCommand (-enc) parameter or string concatenation, backtick escaping, and variable substitution to hide intent. Base64-encoded commands are the most common form. Decoding reveals the actual payload — download cradles, reverse shells, or in-memory execution of .NET assemblies. If the interpreter was cmd, wscript, cscript, or mshta, examine the referenced script file instead.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did PowerShell script block logging capture the full script content?
+  context: Script block logging records the deobfuscated script content PowerShell actually executes, even when the command line is encoded or obfuscated, providing ground truth about what ran. If PowerShell operational logs are not ingested in this environment, treat zero results as a visibility gap rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Were PowerShell security controls bypassed or weakened before this execution?
+  context: Attackers often disable or bypass PowerShell security controls before running a payload. Common techniques include AMSI bypass (patching amsi.dll in memory), execution policy changes (Set-ExecutionPolicy or -ep bypass), constrained language mode escape, and downgrade attacks (powershell.exe v2, which lacks logging). Finding these precursor events strengthens the case for malicious activity.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: What file did the interpreter write or read under the OneNote export directories?
+  context: When a user clicks an embedded link, OneNote exports the payload to \exported\ or \onenoteofflinecache_files\ before the interpreter runs it. File events under those directories reveal the exact dropped payload — its name, extension, and write time — which is the artifact to hash, submit, and hunt for across other hosts.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains:
+          - \exported\
+          - \onenoteofflinecache_files\
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: Did the interpreter make outbound network connections after running the exported payload?
+  context: Embedded OneNote payloads commonly fetch a second-stage download or beacon to command-and-control after the interpreter launches. Outbound connections from the interpreter that are not to known internal infrastructure point to payload retrieval or C2; correlate the destination with the decoded command line to confirm what was contacted.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      filter_local:
+        DestinationIp|cidr:
+          - 10.0.0.0/8
+          - 172.16.0.0/12
+          - 192.168.0.0/16
+          - 127.0.0.0/8
+      condition: selection and not filter_local
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \onenote.exe
+        Image|endswith:
+        - \cmd.exe
+        - \cscript.exe
+        - \mshta.exe
+        - \powershell.exe
+        - \pwsh.exe
+        - \wscript.exe
+        CommandLine|contains:
+        - \exported\
+        - \onenoteofflinecache_files\
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \onenote.exe
+        Image|endswith:
+        - \cmd.exe
+        - \cscript.exe
+        - \mshta.exe
+        - \powershell.exe
+        - \pwsh.exe
+        - \wscript.exe
+        CommandLine|contains:
+        - \exported\
+        - \onenoteofflinecache_files\
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity across multiple endpoints. If the same user triggered similar activity on multiple hosts, the scope of the incident may be larger than the single alerting host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \onenote.exe
+        Image|endswith:
+        - \cmd.exe
+        - \cscript.exe
+        - \mshta.exe
+        - \powershell.exe
+        - \pwsh.exe
+        - \wscript.exe
+        CommandLine|contains:
+        - \exported\
+        - \onenoteofflinecache_files\
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Did this same detection fire on other hosts or for other users?
+  context: Phishing campaigns rarely target a single user. If one employee received a malicious OneNote document, others likely did too. Correlating this detection across the environment reveals campaign breadth and identifies additional hosts that need investigation.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        rule.uuid|expand: '%rule_uuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — reconnaissance, defense tampering, or credential access — may reveal the stages that preceded this execution and help reconstruct the timeline of how the document was opened and what followed.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

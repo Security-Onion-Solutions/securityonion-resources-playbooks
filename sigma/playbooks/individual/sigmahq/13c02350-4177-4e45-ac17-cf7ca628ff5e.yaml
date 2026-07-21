@@ -1,0 +1,530 @@
+name: Files With System DLL Name In Unsuspected Locations
+id: 19e0a03e-a4eb-41bb-83a0-c95804bfdd3f
+description: |
+  Detects a file named secur32.dll or tdh.dll being written to a location outside the directories
+  where those system DLLs normally live. The rule fires when the written path ends in one of those
+  two names AND the path does not fall under the servicing and system directories the rule excludes
+  (System32, SysWOW64, WinSxS, SoftwareDistribution, uus, $WINDOWS.~BT, $WinREAgent). A DLL carrying
+  a system DLL's name in an application or user-writable directory is the precondition for
+  search-order hijacking and sideloading (T1574, T1036.005): an executable in that directory resolves
+  the DLL by name from its own folder before the copy in System32, so a nearby program loads the
+  planted file instead of the genuine one. Third-party software also legitimately bundles its own
+  build of a system DLL next to its executable, which is the dominant benign pattern.
+  The investigation should determine which process wrote the file, what directory it landed in,
+  whether the file on disk is the genuine Microsoft DLL or a same-named impostor, and whether any
+  process subsequently loaded it.
+type: detection
+detection_id: 13c02350-4177-4e45-ac17-cf7ca628ff5e
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-16
+questions:
+- question: Was a file named secur32.dll or tdh.dll written outside the Windows system and servicing directories, and which process wrote it?
+  context: >-
+    Confirm the alert before investing investigation time. Check the exact directory the file landed
+    in, the operation performed (created, modified, renamed), and the responsible process. The rule
+    excludes System32, SysWOW64, WinSxS, SoftwareDistribution, uus, $WINDOWS.~BT and $WinREAgent, so
+    the path shown here is by construction somewhere else. The signer columns describe the writing
+    process, not the DLL — read them for coherence with the directory being written to rather than as
+    a verdict.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+  answer_sources:
+  - alert
+  - file_event
+
+- question: Is this user and host expected to install or update software that ships its own copy of a system DLL?
+  context: >-
+    Application installers, updaters and self-contained runtimes routinely place their own build of a
+    system DLL beside the executable that uses it. Knowing whether the account and the host function
+    line up with a software install or update at this moment is often the fastest way to separate
+    routine packaging from a planted file. When the account is a machine or service principal, judge
+    by the writing process and the host's role instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+
+- question: Is the DLL still on disk, or was it deleted or renamed after the alert?
+  context: >-
+    The file's post-alert lifecycle drives the next steps. A DLL still on disk can be retrieved,
+    hashed, and compared against the genuine copy in System32; a file deleted seconds after creation
+    points to a dropper that cleans up after the load, and shifts the investigation to what loaded it
+    in between. A rename shortly after the write can also indicate staging under a temporary name.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+  answer_sources:
+  - file_event
+  - manual_review
+
+- question: What is the actual identity of the process that wrote this DLL, based on its metadata and hash?
+  context: >-
+    The file event names the writing process by path but says nothing about what that program really
+    is. Its own start event carries the embedded OriginalFileName and the hash. Compare the name on
+    disk against the OriginalFileName in the PE metadata — a mismatch means the writer itself is
+    renamed. The hash supports a reputation lookup to tell a known installer or updater apart from a
+    novel binary. A recognised installer writing a bundled DLL beside its own product is a different
+    finding from an unknown binary placing a system DLL name into an application directory.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Hashes
+  answer_sources:
+  - process_creation
+  - external_threat_intel
+
+- question: Has a file with this DLL name arrived on this host before, and which processes placed it?
+  context: >-
+    A DLL bearing a system name does not appear spontaneously — it is copied, extracted from an
+    archive, downloaded, or written by an installer. Thirty days of prior arrivals of the same
+    filename on this host, together with the process that wrote each one, separate a recurring
+    install or update pattern from a first-ever appearance. A single writer that recurs on every
+    application update is packaging; a one-off write by an unfamiliar process is the arrival worth
+    tracing back.
+  range: -30d
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+  answer_sources:
+  - file_event
+  - process_creation
+
+- question: What did the writing process go on to spawn after it dropped this DLL?
+  context: >-
+    Planting a DLL under a system name is a setup step, not an end state — the payload runs when a
+    nearby executable resolves the name and loads it. The child processes of the writing process show
+    whether the drop was followed by launching the program that would consume it, by a loader utility,
+    or by nothing at all. An installer whose children are its own setup helpers reads differently from
+    a writer that immediately starts an executable sitting in the same directory as the new DLL.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+
+- question: What process wrote this DLL, and what launched that process?
+  context: >-
+    The file event names the acting process but not its origin. Its own start event reveals the parent
+    and the full command line. Legitimate writers have predictable parents — services.exe or msiexec
+    for an install, explorer.exe for a user-driven unpack. A parent such as a script host, an Office
+    application, or a remote-access tool points at delivery rather than packaging, and the command
+    line often names the archive or source path the DLL came out of.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+  answer_sources:
+  - process_creation
+
+- question: Is the file on disk the genuine system DLL, or a different binary carrying its name?
+  context: >-
+    This is the question the rule exists to raise, and the file-write event cannot answer it — a file
+    creation carries no hash or signature. Retrieve the file from the path shown and compare it
+    against the copy in System32 — file size, exported function list, PE version resource, and
+    Authenticode signer. A genuine Microsoft build placed beside a third-party application is
+    bundling; a same-named binary with different exports, no signature, or an unrelated signer is a
+    planted DLL. Check the imports and embedded strings for network addresses or loader stubs while
+    the file is in hand.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - User
+  answer_sources:
+  - file_event
+  - manual_review
+  - safe_environment
+  - external_threat_intel
+
+- question: Did any process load a DLL with this name from a non-system path, and who signed the loaded image?
+  context: >-
+    A DLL carries its signer and hash on the load event, so the load is where the impostor question
+    gets answered — the write event never can. Read the signer against what the name claims: the
+    genuine secur32.dll and tdh.dll are Microsoft-signed, so an unsigned image, an untrusted signature
+    status, or a third-party signer under a Microsoft DLL name is the planted-file case. Submit the
+    hash for a reputation lookup. Also read the loading process path — if the loader sits in the same
+    directory as the written DLL, the search order resolved the planted copy before the System32 one.
+    If nothing loaded it, the file is staged but not yet consumed.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Image
+      - Signed
+      - Signature
+      - SignatureStatus
+      - Hashes
+  answer_sources:
+  - image_load
+  - external_threat_intel
+
+- question: After the DLL was written, did any process reference it on the command line?
+  context: >-
+    A planted DLL is normally consumed implicitly, by a program in the same directory resolving the
+    name — but it can also be invoked explicitly through a loader utility such as rundll32.exe or
+    regsvr32.exe, or registered by an installer. Command lines that name the file in the hours after
+    the write show that explicit path, and identify the export that was called. No results here do not
+    mean the DLL was unused; implicit loads leave no command-line trace and appear only in load
+    telemetry.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+
+- question: What other files did the responsible process write or delete around the alert?
+  context: >-
+    A process that drops one DLL under a system name often drops a set — a loader, a renamed host
+    executable, and a configuration file unpacked together into the same directory. The breadth,
+    paths, and extensions of the writer's other file activity tell an isolated bundled DLL apart from
+    a staged directory, and enumerate what else needs review. For installers and updaters, volume by
+    itself is not the signal — read where the writes land.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+  answer_sources:
+  - file_event
+
+- question: What other DLLs have been written to non-system locations on this host recently, and by which processes?
+  context: >-
+    Location drives suspicion for a DLL. The rule pins no single directory, so the useful frame is the
+    host's whole recent pattern of DLL writes outside the system and servicing directories the rule
+    excludes. Application directories, Temp, ProgramData, and per-user AppData each have a small set of
+    processes that legitimately deliver DLLs there. Other recent arrivals under the same directory as
+    the alerting file — especially an executable beside it — show whether this is one bundled component
+    or a directory being staged.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith: '.dll'
+      filter_main_generic:
+        TargetFilename|contains:
+        - C:\$WINDOWS.~BT\
+        - C:\$WinREAgent\
+        - C:\Windows\SoftwareDistribution\
+        - C:\Windows\System32\
+        - C:\Windows\SysWOW64\
+        - C:\Windows\WinSxS\
+        - C:\Windows\uus\
+      condition: selection and not 1 of filter_main_*
+    fields:
+      - TargetFilename
+      - Image
+  answer_sources:
+  - file_event
+
+- question: Is a file with this DLL name being written on other hosts in the environment?
+  context: >-
+    The same system DLL name landing in unusual locations across several hosts points to a package
+    rollout or a distribution step rather than a host-local event. If one vendor installer accounts for
+    every host, the pattern is packaging. If the name appears on a small set of unrelated hosts, or in
+    a different directory on each, the distribution is worth reconstructing along with its timeline.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        TargetFilename|endswith|expand: '%file_basename%'
+      condition: selection
+    fields:
+      - host.name
+      - TargetFilename
+      - Image
+  answer_sources:
+  - file_event
+
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: >-
+    The query mirrors the rule's own selection scoped to this user — the result is that account's
+    90-day history of writing these system DLL names outside the system directories, not generic file
+    activity, aggregated by host. An account that has never produced this pattern is a different
+    finding from one that produces it on every software update. Weigh the count against the user's role
+    and whether they install or build software.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        TargetFilename|endswith:
+        - \secur32.dll
+        - \tdh.dll
+      filter_main_generic:
+        TargetFilename|contains:
+        - C:\$WINDOWS.~BT\
+        - C:\$WinREAgent\
+        - C:\Windows\SoftwareDistribution\
+        - C:\Windows\System32\
+        - C:\Windows\SysWOW64\
+        - C:\Windows\WinSxS\
+        - C:\Windows\uus\
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+  always_include: true
+  answer_sources:
+  - file_event
+  - organizational_knowledge
+
+- question: Has this program historically produced the rule's pattern on this host or across the environment, or is it new for this activity?
+  context: >-
+    File writes frequently land under SYSTEM or a machine account, where user identity attributes
+    nothing, and a file event carries no parent to pivot on. The acting program is the meaningful
+    pivot: the query mirrors the rule's selection scoped to the writing binary, so the result is that
+    program's 90-day history of placing these DLL names outside the system directories. A writer that
+    already accounts for thousands of prior events is vendor or OS automation; one that is new or rare
+    for this pattern is the deviation to chase.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        TargetFilename|endswith:
+        - \secur32.dll
+        - \tdh.dll
+      filter_main_generic:
+        TargetFilename|contains:
+        - C:\$WINDOWS.~BT\
+        - C:\$WinREAgent\
+        - C:\Windows\SoftwareDistribution\
+        - C:\Windows\System32\
+        - C:\Windows\SysWOW64\
+        - C:\Windows\WinSxS\
+        - C:\Windows\uus\
+      _pb_scope:
+        Image|endswith|expand: '%Image%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+  always_include: true
+  answer_sources:
+  - file_event
+
+- question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the account's activity across every host in the alert window shows whether the DLL write
+    is an isolated event or one step in a sequence the same identity is driving elsewhere. The same
+    account producing installs, archive extraction, or remote execution on several hosts at once
+    widens the scope. When the alert fires under SYSTEM or a machine account this view returns routine
+    service telemetry and carries little weight.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  always_include: true
+  answer_sources:
+  - process_creation
+
+- question: Did this same program produce this pattern on other hosts in the same window, or is the activity isolated to this host?
+  context: >-
+    Under a service principal, asking what else the user did returns service telemetry from every
+    host, and a file event carries no parent to pivot on. The program is the pivot: the query mirrors
+    the rule's selection scoped to the writing binary, fleet-wide, in the alert window. Several hosts
+    in the same window points to scheduled or pushed automation such as a package deployment; a single
+    host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        TargetFilename|endswith:
+        - \secur32.dll
+        - \tdh.dll
+      filter_main_generic:
+        TargetFilename|contains:
+        - C:\$WINDOWS.~BT\
+        - C:\$WinREAgent\
+        - C:\Windows\SoftwareDistribution\
+        - C:\Windows\System32\
+        - C:\Windows\SysWOW64\
+        - C:\Windows\WinSxS\
+        - C:\Windows\uus\
+      _pb_scope:
+        Image|endswith|expand: '%Image%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+  always_include: true
+  answer_sources:
+  - file_event
+
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    A planted DLL is usually preceded by delivery — an archive extracted, a download written to disk,
+    or a remote execution creating the directory it landed in. Earlier detections on the same host help
+    reconstruct how the file got there and whether the write is one stage of a longer sequence rather
+    than a standalone software install.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+  answer_sources:
+  - alert

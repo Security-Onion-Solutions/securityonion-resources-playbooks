@@ -1,0 +1,512 @@
+name: PowerShell Execution With Potential Decryption Capabilities
+id: 85843504-e8f8-47f1-87f1-ce22fca7e4dd
+description: |
+  Detects a powershell.exe or pwsh.exe invocation whose command line combines a
+  directory-listing cmdlet (Get-ChildItem, dir, gci, ls), a content-reading
+  cmdlet (Get-Content, gc, cat, type, ReadAllBytes), and a specific pipeline that
+  enumerates *.lnk files and carves bytes out of them - either piping a recursive
+  *.lnk listing through -Skip, or selecting an .lnk via -ExpandProperty and writing
+  a sliced byte range with WriteAllBytes. This pattern is the self-extracting
+  loader stage of a shortcut-delivered intrusion: a malicious .LNK is read by
+  PowerShell, a fixed-size header is stripped off, and the remaining bytes are
+  written out as an archive or payload that is then expanded and executed. The
+  same cmdlets appear in legitimate scripting, so the investigation should confirm
+  the full command line carves bytes from an .lnk, identify what was written and
+  executed next, determine which parent launched the shell, and establish whether
+  this user, host, and fleet have run the pattern before.
+type: detection
+detection_id: 434c08ba-8406-4d15-8b24-782cb071a691
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the command line run PowerShell that lists, reads, and carves bytes
+    from an .lnk file, matching all parts of what this rule detects?
+  context: Before investing investigation time, confirm the alert is a true positive.
+    The rule fires only when a single powershell.exe or pwsh.exe command line contains
+    all of - a directory-listing cmdlet (Get-ChildItem, dir, gci, ls), a content-read
+    cmdlet (Get-Content, gc, cat, type, ReadAllBytes), and a pipeline that enumerates
+    *.lnk and either runs -Recurse with -Skip or selects FullName via -ExpandProperty
+    and calls WriteAllBytes on a sliced byte range. Read the exact command line and
+    confirm each element is present rather than an incidental cmdlet match.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to run PowerShell that reads and carves
+    bytes from shortcut files?
+  context: Legitimate administrative scripting rarely enumerates *.lnk files and writes
+    a sliced byte range from them. Knowing whether the acting account and the host
+    function involve scripting, packaging, or installer work that would plausibly
+    manipulate shortcut bytes is often the fastest path to separating a benign script
+    from a self-extracting loader stage.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What did this PowerShell command actually do - which .lnk was read, how
+    many bytes were skipped, and where were the carved bytes written?
+  context: The full command line reveals the loader mechanics. Decode the pipeline -
+    which *.lnk was matched (often by an exact .length value), how many leading bytes
+    were stripped with -Skip or an array slice such as $bytes[8192..($bytes.length)],
+    and the destination path passed to WriteAllBytes (frequently a temporary archive
+    under the user profile). The byte offset and output path identify the payload the
+    shortcut was carrying.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains:
+          - '.lnk'
+          - WriteAllBytes
+          - ReadAllBytes
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Does the command fetch and decode an embedded payload, and what does the
+    carved output decode or expand to?
+  context: This pattern is a plain-text self-extractor rather than an -EncodedCommand
+    payload, so the readable command line is the ground truth. Trace what happens to
+    the bytes carved from the .lnk - whether they are written as an archive and passed
+    to Expand-Archive, decrypted in place, or executed directly. Identify the
+    destination file and any program launched from it, since the extracted content is
+    the next stage the shortcut was delivering.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did PowerShell script block logging capture the full deobfuscated script
+    content for this execution?
+  context: Script block logging records the deobfuscated script PowerShell actually
+    executed, including the full byte-carving and extraction logic even when the
+    command line is wrapped or split across variables. This provides ground truth
+    about the loader's behavior. If PowerShell operational logs are not ingested in
+    this environment, treat zero results as a visibility gap rather than evidence
+    nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Were PowerShell security controls bypassed or weakened before this
+    execution?
+  context: Loader stages delivered through shortcut files often clear the path first -
+    setting an execution-policy bypass, patching AMSI in memory, or downgrading to
+    PowerShell v2 to avoid logging. Finding these precursor events on the host shortly
+    before the carving command strengthens the case that the extraction was the
+    payload stage of a deliberate intrusion rather than incidental scripting.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: What process spawned this PowerShell instance, and is that parent chain
+    expected?
+  context: The parent process reveals how the carving command was invoked. A shortcut
+    delivered to a user is launched by explorer.exe when double-clicked, but the
+    resulting PowerShell is frequently spawned from the .lnk target itself; an
+    unexpected parent such as a script host, mshta.exe, an archive tool, or an Office
+    application points to a delivery chain rather than deliberate administration. The
+    parent is where the loader command originated.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What did this PowerShell instance spawn afterward, such as an archive
+    extractor or a freshly written executable?
+  context: The bytes carved from the .lnk are typically written as an archive,
+    expanded, and then executed - so the children of this PowerShell process show
+    what the loader actually delivered. Look for Expand-Archive activity, a newly
+    dropped signed program used for side-loading, or any executable launched from a
+    temporary or user-writable path immediately after the carving. These children are
+    the next stage the shortcut was carrying.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_img:
+        Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_cli_dir:
+        CommandLine|contains:
+        - 'Get-ChildItem '
+        - 'dir '
+        - 'gci '
+        - 'ls '
+      selection_cli_gc:
+        CommandLine|contains:
+        - 'Get-Content '
+        - 'gc '
+        - 'cat '
+        - 'type '
+        - ReadAllBytes
+      selection_cli_specific:
+      - CommandLine|contains|all:
+        - ' ^| '
+        - \*.lnk
+        - -Recurse
+        - '-Skip '
+      - CommandLine|contains|all:
+        - ' -ExpandProperty '
+        - \*.lnk
+        - WriteAllBytes
+        - ' .length '
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_img:
+        Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_cli_dir:
+        CommandLine|contains:
+        - 'Get-ChildItem '
+        - 'dir '
+        - 'gci '
+        - 'ls '
+      selection_cli_gc:
+        CommandLine|contains:
+        - 'Get-Content '
+        - 'gc '
+        - 'cat '
+        - 'type '
+        - ReadAllBytes
+      selection_cli_specific:
+      - CommandLine|contains|all:
+        - ' ^| '
+        - \*.lnk
+        - -Recurse
+        - '-Skip '
+      - CommandLine|contains|all:
+        - ' -ExpandProperty '
+        - \*.lnk
+        - WriteAllBytes
+        - ' .length '
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the acting account's activity across all hosts reveals whether the
+    shortcut-loader execution was a single event or part of activity spanning multiple
+    endpoints. If the same user triggered similar activity on other hosts, the scope
+    of the incident is larger than one machine.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_img:
+        Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_cli_dir:
+        CommandLine|contains:
+        - 'Get-ChildItem '
+        - 'dir '
+        - 'gci '
+        - 'ls '
+      selection_cli_gc:
+        CommandLine|contains:
+        - 'Get-Content '
+        - 'gc '
+        - 'cat '
+        - 'type '
+        - ReadAllBytes
+      selection_cli_specific:
+      - CommandLine|contains|all:
+        - ' ^| '
+        - \*.lnk
+        - -Recurse
+        - '-Skip '
+      - CommandLine|contains|all:
+        - ' -ExpandProperty '
+        - \*.lnk
+        - WriteAllBytes
+        - ' .length '
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining the activity surrounding the
+    carving command reveals what led to it and what followed - the parent that staged
+    the shortcut, the archive extraction, or follow-on execution of the dropped
+    payload. Novel parent-child pairs at low counts are what to scan for against the
+    high-count noise of routine system processes.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host - phishing-attachment execution, user
+    execution of a downloaded file, or defense tampering - may reveal the delivery
+    stages that preceded the shortcut loader and help reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: When this host has previously fired the rule's .lnk-carving PowerShell
+    pattern, what parents and users normally drive it, and does the current alert fit?
+  context: Even legitimate packaging scripts can read and rewrite shortcut bytes. This
+    query mirrors the rule's full selection structure scoped to this host, so the
+    resulting parent and user distribution reflects how this specific firing pattern
+    has historically run here, not generic PowerShell activity. A new parent process,
+    an unexpected account, or a first-ever occurrence is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_img:
+        Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_cli_dir:
+        CommandLine|contains:
+        - 'Get-ChildItem '
+        - 'dir '
+        - 'gci '
+        - 'ls '
+      selection_cli_gc:
+        CommandLine|contains:
+        - 'Get-Content '
+        - 'gc '
+        - 'cat '
+        - 'type '
+        - ReadAllBytes
+      selection_cli_specific:
+      - CommandLine|contains|all:
+        - ' ^| '
+        - \*.lnk
+        - -Recurse
+        - '-Skip '
+      - CommandLine|contains|all:
+        - ' -ExpandProperty '
+        - \*.lnk
+        - WriteAllBytes
+        - ' .length '
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Have other hosts fired the rule's .lnk-carving PowerShell pattern in the
+    past week, and does the cross-host distribution look like automation or one-off
+    activity?
+  context: This query mirrors the rule's full selection structure with no host scope,
+    so the result is a fleet-wide count of the .lnk read-and-write firing pattern
+    rather than generic PowerShell activity. Many hosts firing the same pattern points
+    to a packaging pipeline or a pushed shortcut campaign; one host or a small
+    unrelated set points to manual or targeted activity. Use the host distribution to
+    calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_img:
+        Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_cli_dir:
+        CommandLine|contains:
+        - 'Get-ChildItem '
+        - 'dir '
+        - 'gci '
+        - 'ls '
+      selection_cli_gc:
+        CommandLine|contains:
+        - 'Get-Content '
+        - 'gc '
+        - 'cat '
+        - 'type '
+        - ReadAllBytes
+      selection_cli_specific:
+      - CommandLine|contains|all:
+        - ' ^| '
+        - \*.lnk
+        - -Recurse
+        - '-Skip '
+      - CommandLine|contains|all:
+        - ' -ExpandProperty '
+        - \*.lnk
+        - WriteAllBytes
+        - ' .length '
+      condition: all of selection_*
+    fields:
+    - host.name

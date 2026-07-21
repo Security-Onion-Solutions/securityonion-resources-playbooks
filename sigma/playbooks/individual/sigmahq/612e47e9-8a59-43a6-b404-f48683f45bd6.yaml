@@ -1,0 +1,303 @@
+name: ServiceDll Hijack
+id: 38a0f9fd-bae0-465c-a4e8-9f3129f383ac
+description: |
+  Detects a modification to the ServiceDll value under a service's Parameters key (HKLM\System\CurrentControlSet\Services\<name>\Parameters\ServiceDll). The ServiceDll value names the DLL that svchost.exe loads when the shared service host starts, so repointing it persists an attacker payload that runs inside a SYSTEM-privileged service host at each boot. The rule fires when the modified key path contains \System\, ControlSet, and \Services\ AND ends with \Parameters\ServiceDll, excluding a small set of known-good writes (the print spooler PrintConfig.dll, the NTDS ntdsa.dll on a domain controller, servicing writes by poqexec, and the Safetica STAgent DLL set via regsvr32). Legitimate service installs and updates also write this value, so the investigation should determine which service was altered, what DLL path the value now points to, whether that DLL exists on disk and is signed, whether it was subsequently loaded, and which process performed the write. Registry value deletion is not observable in this telemetry, so judge cleanup from the key's re-modification history and whether the DLL loaded, not from a delete event.
+type: detection
+detection_id: 612e47e9-8a59-43a6-b404-f48683f45bd6
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-09
+questions:
+- question: Do the modified registry key path and value data match a ServiceDll change this rule detects?
+  context: >-
+    Before investing investigation time, confirm the alert is a true positive. The rule fires when the modified key path (TargetObject) contains \System\, ControlSet, and \Services\ AND ends with \Parameters\ServiceDll, and the write is not one of the excluded known-good cases: the print spooler PrintConfig.dll, the NTDS ntdsa.dll on a domain controller, a servicing write by poqexec, or the Safetica STAgent DLL set by regsvr32. Read the exact key path (which names the affected service), the value data (Details, the DLL path svchost will load), and the writing process, then confirm the write is none of the excluded benign cases before proceeding.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this user and host expected to modify a service's ServiceDll value?
+  context: >-
+    Legitimate service installers and update routines occasionally rewrite a ServiceDll value, but routine workstation and server use rarely touches it. Knowing whether the account and host function fit service-configuration activity is often the fastest path to separating a true positive from a software install or servicing operation. User attribution is present on roughly 94% of endpoint registry events; when it is a machine account (HOST$) or SYSTEM, pivot on the writing process (Image) instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Which service was modified, and is its ServiceDll a known persistence location?
+  context: >-
+    The key path names the affected service under \Services\<name>\Parameters\ServiceDll, and the ServiceDll value tells svchost.exe which DLL to load when that service starts. The service name is part of the tuning surface for this technique: a rarely-touched core service, or an obscure or recently created service name, changes how the write reads. Read the exact key path and the writing process here, and let the value-decoding question carry the DLL-path analysis.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: What DLL path is written to the ServiceDll value, and where does it resolve?
+  context: >-
+    The Details field holds the DLL path svchost.exe will load for the service. Extract the target path and confirm where it resolves: a legitimate service DLL almost always sits under system32, while a hijack repoints the value to a user-writable or uncommon directory such as Temp, AppData, ProgramData, or a user profile folder. Note environment-variable syntax like %systemroot% in the value, which resolves at load time. Details is absent for binary or empty value data (roughly 79% of registry modifications carry it); missing data here does not clear the alert.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- question: Does the DLL named in the ServiceDll value exist on disk, and was it dropped in this session?
+  context: >-
+    ServiceDll persistence is only effective if the DLL exists at the path the value names. Correlating file activity by the registry-writing process and its children shows whether that DLL was created in the same session as the key write — for example a drop into C:\Users\Public or an AppData folder immediately before the ServiceDll value was set. The file-write event carries no hash; if the DLL is present, hash it from a later load or retrieve it for a reputation lookup. If the file is absent, the persistence is staged but not yet armed.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Was the DLL named in the ServiceDll value loaded on this host, and is it signed?
+  context: >-
+    A ServiceDll change takes effect when the service next starts and svchost.exe loads the named DLL. Confirm whether a load of that DLL path occurred on this host and inspect its signing state: an unsigned or mismatched-signer DLL loaded from a user-writable path is the persistence payload executing inside a SYSTEM-privileged service host. Load events carry the DLL hash and code-signing fields directly, so no execution pivot is needed. If the ServiceDll value uses environment-variable syntax, substitute the resolved path before comparing; a load with no matching path means the service has not restarted since the write.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|contains|expand: '%Details%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+      - SignatureStatus
+      - Hashes
+- question: Is the affected service currently running, and under what account?
+  context: >-
+    A modified ServiceDll may not load until the service is (re)started, or the service may have been stopped after detection. Checking the current status of the affected service reveals whether the persistence is active. Shared service-host services typically run as LocalSystem with full privileges; a service running under a specific account instead indicates the access level involved. Inspect the service status directly on the host (for example with sc query or sc qc against the service name from the alert key path).
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Were other registry modifications made on this host in the same window?
+  context: >-
+    Actors who repoint a ServiceDll often make several changes together — flipping the service Start value to auto, altering the service's ImagePath, or disabling a security policy. Clusters of registry writes from the same process within a short window reveal the full scope of the configuration change and whether the ServiceDll swap landed alongside a Start-type change on the same service or other objectives. The triggering key appears in the results; the signal is what else was modified. If the host is registry-noisy, narrow to the writing process from the alert or to service and security-relevant hive paths.
+  range: +/-30m
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - User
+- question: What process wrote this ServiceDll value, and what started that process?
+  context: >-
+    The writing process (Image on the alert) is the immediate actor; tracing its own parent reveals whether the chain is legitimate — services.exe, an installer launched by msiexec, or a trusted management agent — or suspicious, such as a script host or Office application spawning the process that set the value. If the parent process identifier resolves to NODATA, fall back to the writing process name and host with a time window.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - Image
+      - CommandLine
+- question: Has this service's ServiceDll value been modified before on this host?
+  context: >-
+    A first-time write to a ServiceDll value is more suspicious than one that changes as part of routine servicing. Compare the historical Details values on this host: a value that has never been touched, or one that suddenly points to a user-writable folder after a history of system32 paths, stands out. Zero history indicates a value that has never been modified before this event.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - Details
+      - Image
+- question: What other process activity occurred on this host around the time of the alert?
+  context: >-
+    Persistence rarely lands in isolation. Aggregating process activity around the write surfaces what led to it and what followed — reconnaissance, a download or dropper, privilege escalation, or additional persistence. Novel parent-child pairs stand out at low counts against the high-count agent and OS telemetry that dominates the host.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host — defense tampering, reconnaissance, credential access, or a suspicious download — may reveal the stages that preceded the ServiceDll write and help reconstruct the timeline. A service-persistence write following an earlier execution or tampering alert reads very differently from one with no prior activity.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Were other process-based persistence mechanisms installed on this host?
+  context: >-
+    Attackers rarely rely on a single persistence mechanism. After establishing one foothold (the ServiceDll change), they commonly install backup mechanisms using different techniques — scheduled tasks, other services, registry Run keys, BITS jobs, or WMI subscriptions. Multiple persistence installations in the same timeframe point to intentional stacking rather than isolated administrative action.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- question: Were files dropped to Startup folders or scheduled-task definition paths on this host?
+  context: >-
+    File-based persistence bypasses process-based detection: dropping an executable or script into a Startup folder or a path named by a Run value achieves autostart without running reg or a scheduling tool. File-event monitoring captures these drops even when the standard persistence utilities are avoided, and a Startup-folder drop alongside the ServiceDll write points to stacked persistence.
+    Run-key persistence itself is a registry write, not a file drop, so it does not appear in file telemetry; this query covers Startup folders and scheduled-task definition files, and Run-key writes surface in registry questions instead.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist_paths:
+        TargetFilename|contains:
+          - '\Start Menu\Programs\Startup\'
+          - '\Windows\System32\Tasks\'
+          - '\Windows\Tasks\'
+      condition: selection and selection_persist_paths
+    fields:
+      - TargetFilename
+      - Image
+- question: Was there a change ticket, deployment, or documented approval for this service change?
+  context: >-
+    Many organizations require change tickets for service configuration changes and persistence-relevant modifications. A corresponding ticket or deployment record suggests authorized activity, such as a software install or a patch that rewrites a ServiceDll; the absence of one when policy requires it points toward unauthorized persistence. This check can quickly close a false positive or escalate a true one.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Does the user or an administrator recall installing software or making a change that would set this value?
+  context: >-
+    Direct confirmation from the person behind the account is often the fastest way to establish legitimacy. If an administrator recalls installing or servicing the affected service, the DLL path should match that product; if no one recalls the action, the credentials may be compromised or the write may be automated malware. When the action confirms, capture why it was done and what DLL was expected to load.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine

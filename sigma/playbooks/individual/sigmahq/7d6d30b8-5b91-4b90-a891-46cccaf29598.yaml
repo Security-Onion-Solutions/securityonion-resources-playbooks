@@ -1,0 +1,402 @@
+name: Program Executed Using Proxy/Local Command Via SSH.EXE
+id: 800133bc-44b7-4406-8de6-b625bb0eb773
+description: |
+  Detects ssh.exe being used as a proxy to launch other programs. The rule fires when EITHER ssh.exe was spawned by
+  sshd.exe, OR the process matches ssh.exe by Image/Product/import hash, OR the command line carries the ProxyCommand=
+  directive or the PermitLocalCommand=yes plus LocalCommand pair. Any one branch is sufficient. ProxyCommand runs a local
+  command during connection setup (it fires even if the connection ultimately fails), and LocalCommand runs a local command
+  after a successful connection; both let an operator chain arbitrary execution into an otherwise innocuous ssh invocation.
+  Legitimate administrators use these directives to tunnel through bastions or run pre/post-connect scripts, so the
+  investigation should determine what command the directive actually executes, what spawned ssh.exe, and whether the user
+  and host are expected to use OpenSSH this way.
+type: detection
+detection_id: 7d6d30b8-5b91-4b90-a891-46cccaf29598
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Did ssh.exe fire on the sshd.exe parent branch, the ssh.exe binary branch, or the ProxyCommand/LocalCommand command-line branch?
+  context: >-
+    Confirm the alert by reviewing the exact event against the rule's three branches: a parent of sshd.exe, an ssh.exe
+    Image/Product/import-hash match, or a command line containing ProxyCommand= (or PermitLocalCommand=yes together with
+    LocalCommand). Any one branch alone fires the rule, so note which one matched — the command-line branch points directly
+    at proxy-execution and makes the embedded command the load-bearing artifact, while the parent or binary-only branch may
+    be a plain ssh session that still warrants checking the command line for a directive.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+      - Hashes
+      - Product
+- question: Is this user and host expected to run OpenSSH ssh.exe with proxy or local-command directives?
+  context: >-
+    Legitimate administration through bastions or jump hosts uses ProxyCommand and post-connect scripts use LocalCommand,
+    so a sysadmin or automation account on a host that routinely runs OpenSSH is a different disposition than a workstation
+    or service account that has no reason to invoke ssh.exe this way. Knowing the user role and host function is often the
+    fastest path to separating a true positive from routine SSH tunneling.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Is the parent of ssh.exe expected, and what started that parent?
+  context: >-
+    The rule's parent branch fires specifically when sshd.exe spawned ssh.exe, but ssh.exe can also be launched
+    interactively or by a script. Tracing the parent's own origin reveals whether the chain is legitimate (a user shell or
+    an admin tool launching ssh) or suspicious (a macro-spawned interpreter or an unexpected service launching ssh.exe to
+    drive a ProxyCommand). If ParentProcessGuid resolves to NODATA, pivot on host.name plus ParentImage within the alert window.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What other child processes did the same parent spawn around the alert?
+  context: >-
+    A ProxyCommand or LocalCommand executes its payload as a child of ssh.exe, and the parent that launched ssh.exe may
+    have launched additional tools. Examining siblings of the same parent reveals the full scope of activity from that
+    parent — multiple unexpected children point to orchestration rather than a single benign ssh session.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: What command does the ProxyCommand or LocalCommand directive actually run? Decode the full ssh.exe command line.
+  context: >-
+    The directive payload is the operational core of this technique. Read the full command line and extract whatever follows
+    ProxyCommand= or LocalCommand= — it may be an interpreter, a download-and-execute one-liner, netcat/socat, or a shell
+    spawn. The host-plus-binary scope catches sequential ssh.exe invocations within a few minutes that together form one
+    operation; a ProxyCommand fires during connection setup even when the connection fails, so the payload runs regardless
+    of whether ssh actually reached a host.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Does the ssh.exe command line carry a ProxyCommand= or PermitLocalCommand=yes/LocalCommand directive?
+  context: >-
+    Proxy-execution LOLBin abuse hides the real action inside the -o directives rather than in the binary name. Confirming
+    whether the alerting command line contains ProxyCommand= or the PermitLocalCommand=yes plus LocalCommand pair separates
+    a plain ssh session (binary or parent branch only) from one that is explicitly chaining local execution. A match here
+    makes the embedded payload the artifact to decode and pivot on.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+        Image|endswith|expand: '%Image%'
+      selection_proxy:
+        CommandLine|contains: 'ProxyCommand='
+      selection_local:
+        CommandLine|contains|all:
+          - 'PermitLocalCommand=yes'
+          - ' LocalCommand'
+      condition: selection_img and (selection_proxy or selection_local)
+    fields:
+      - host.name
+      - CommandLine
+      - User
+- question: What grandchild processes did ssh.exe spawn, and are they interpreters or system tools?
+  context: >-
+    A ProxyCommand or LocalCommand payload runs as a child of ssh.exe, so unexpected ssh.exe children — cmd.exe,
+    powershell.exe, regsvr32.exe, rundll32.exe, or other non-ssh binaries — are the direct evidence of proxy execution.
+    OpenSSH normally does not spawn these. Reviewing what ssh.exe launched on this host confirms whether the directive
+    actually executed a payload and what that payload was.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: '\ssh.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - User
+- question: Has ssh.exe been launched by this parent before on this host, or is this parent-binary pair new?
+  context: >-
+    Profiling the parent-child pairing separates routine OpenSSH usage from anomalous invocation. A parent that has launched
+    ssh.exe many times over the baseline window is established automation or interactive admin use; a parent that has never
+    spawned ssh.exe before — or sshd.exe spawning ssh.exe where no bastion forwarding is configured — is the deviation worth
+    chasing. Zero or very low counts indicate a first-time spawning relationship.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Does this host normally run ssh.exe at all?
+  context: >-
+    OpenSSH is an optional Windows feature and is absent on many endpoints. A host that has never run ssh.exe before, or
+    runs it only rarely, makes this execution far more notable than one on a host where admins use SSH routinely. Zero or
+    very low historical counts indicate first-time or rare execution.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent:
+        ParentImage: C:\Windows\System32\OpenSSH\sshd.exe
+      selection_cli_img:
+      - Image|endswith: \ssh.exe
+      - Product: OpenSSH for Windows
+      - Hashes|contains:
+        - IMPHASH=55b4964d29aad5438b9e950052dbbbc0
+        - IMPHASH=334d66c33503ccbf647c15b47c27eef4
+        - IMPHASH=27b0da080ef92afb37983d30d839141e
+        - IMPHASH=977eb4c263d384e47daa0712d34713ab
+        - IMPHASH=3eaadce9ae43d5a918bb082065815c3b
+        - IMPHASH=980fe6cf0d996ab1eedf877222e722aa
+        - IMPHASH=5f959422308ac3d721010d66647e100e
+        - IMPHASH=a49aaa3d03d1cd9c8dc7fca60f7f480b
+        - IMPHASH=dd335f759b6d5d6a8382b71dd9d65791
+      selection_cli_flags:
+      - CommandLine|contains: ProxyCommand=
+      - CommandLine|contains|all:
+        - PermitLocalCommand=yes
+        - ' LocalCommand'
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection_parent or all of selection_cli_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent:
+        ParentImage: C:\Windows\System32\OpenSSH\sshd.exe
+      selection_cli_img:
+      - Image|endswith: \ssh.exe
+      - Product: OpenSSH for Windows
+      - Hashes|contains:
+        - IMPHASH=55b4964d29aad5438b9e950052dbbbc0
+        - IMPHASH=334d66c33503ccbf647c15b47c27eef4
+        - IMPHASH=27b0da080ef92afb37983d30d839141e
+        - IMPHASH=977eb4c263d384e47daa0712d34713ab
+        - IMPHASH=3eaadce9ae43d5a918bb082065815c3b
+        - IMPHASH=980fe6cf0d996ab1eedf877222e722aa
+        - IMPHASH=5f959422308ac3d721010d66647e100e
+        - IMPHASH=a49aaa3d03d1cd9c8dc7fca60f7f480b
+        - IMPHASH=dd335f759b6d5d6a8382b71dd9d65791
+      selection_cli_flags:
+      - CommandLine|contains: ProxyCommand=
+      - CommandLine|contains|all:
+        - PermitLocalCommand=yes
+        - ' LocalCommand'
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection_parent or all of selection_cli_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the
+    same user triggered similar activity on other hosts, the scope is larger than a single SSH invocation.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent:
+        ParentImage: C:\Windows\System32\OpenSSH\sshd.exe
+      selection_cli_img:
+      - Image|endswith: \ssh.exe
+      - Product: OpenSSH for Windows
+      - Hashes|contains:
+        - IMPHASH=55b4964d29aad5438b9e950052dbbbc0
+        - IMPHASH=334d66c33503ccbf647c15b47c27eef4
+        - IMPHASH=27b0da080ef92afb37983d30d839141e
+        - IMPHASH=977eb4c263d384e47daa0712d34713ab
+        - IMPHASH=3eaadce9ae43d5a918bb082065815c3b
+        - IMPHASH=980fe6cf0d996ab1eedf877222e722aa
+        - IMPHASH=5f959422308ac3d721010d66647e100e
+        - IMPHASH=a49aaa3d03d1cd9c8dc7fca60f7f480b
+        - IMPHASH=dd335f759b6d5d6a8382b71dd9d65791
+      selection_cli_flags:
+      - CommandLine|contains: ProxyCommand=
+      - CommandLine|contains|all:
+        - PermitLocalCommand=yes
+        - ' LocalCommand'
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection_parent or all of selection_cli_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this user account driven other remote-access or proxy tooling across the environment?
+  context: >-
+    ssh.exe is a remote-access and tunneling tool, and an actor abusing it for proxy execution may also reach other hosts
+    with related tooling. If the same user account is running ssh.exe, plink, psexec, mstsc, or wmic across multiple hosts
+    in a short window, the scope of activity is broader than this single endpoint.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      selection_lateral:
+        Image|endswith:
+          - '\psexec.exe'
+          - '\psexec64.exe'
+          - '\mstsc.exe'
+          - '\ssh.exe'
+          - '\plink.exe'
+          - '\wmic.exe'
+      condition: selection and selection_lateral
+    fields:
+      - host.name
+      - Image
+- question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Alerts rarely occur in isolation. Examining activity around the alert reveals what led to this event and what happened
+    after, and whether it is part of a larger sequence. Look for reconnaissance, privilege escalation, or persistence
+    mechanisms accompanying the SSH execution.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host — defense tampering, reconnaissance, credential access — may reveal the attack
+    stages that preceded this event and help reconstruct the full timeline. Proxy execution through ssh.exe is often a
+    mid-chain action rather than the entry point.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

@@ -1,0 +1,424 @@
+name: Process Memory Dump via RdrLeakDiag.EXE
+id: 659eafe3-137c-4ad4-89c9-65909f85e489
+description: |
+  Detects the Microsoft resource-leak diagnostic tool rdrleakdiag.exe being used to dump
+  process memory. The rule fires when the binary (by Image name or OriginalFileName) runs
+  with a memory-dump flag (/memdmp or fullmemdmp) AND a target/output flag (/p for the
+  target PID and /o for the output directory) all present together. This is a living-off-
+  the-land credential-dumping pattern: an operator targets lsass.exe by PID and writes a
+  full minidump to disk (minidump_<pid>.dmp), which is then parsed offline to recover NTLM
+  hashes, Kerberos tickets, and plaintext credentials. The binary has a narrow legitimate
+  purpose, so the investigation should confirm the target process, locate the dump artifact,
+  and determine whether the credentials in the dumped process are now exposed.
+type: detection
+detection_id: edadb1e5-5919-4e4c-8462-a9e643b02c4b
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- question: Does the rdrleakdiag.exe command line carry a dump flag and a target/output flag together?
+  context: >-
+    Confirm the alert is a true positive by reviewing the exact command line. The rule fires
+    only when rdrleakdiag.exe (by Image name or OriginalFileName) runs with a dump flag
+    (/memdmp or fullmemdmp) AND a target/output flag (/p for the PID, /o for the output
+    directory) present in the same invocation. Read the /p value to see which process was
+    targeted and the /o value to see where the dump was written.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to run a memory-diagnostic tool against another process?
+  context: >-
+    Legitimate use of rdrleakdiag.exe is narrow — developers or support staff diagnosing a
+    resource leak in a specific application. Knowing whether this user role and host function
+    plausibly involve memory diagnostics is often the fastest way to separate a sanctioned
+    troubleshooting session from credential theft.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Which process was targeted by the dump, and was it lsass.exe?
+  context: >-
+    The /p flag names the PID rdrleakdiag.exe dumped. Resolve that PID to a process — if it is
+    lsass.exe, the dump contains NTLM hashes, Kerberos tickets and keys, and plaintext
+    credentials for every active logon session. Other targets (a line-of-business app being
+    debugged) carry far lower risk. The full command line also shows whether /fullmemdmp was
+    used, which captures the entire address space rather than a partial region.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did this specific rdrleakdiag.exe process, or a child of it, write any file — confirming the read side of the dump beyond the artifact already located by name?
+  context: >-
+    Dumping process memory requires rdrleakdiag.exe to first open a read handle to the
+    target, but that handle-open is not observable in this environment — there is no
+    telemetry channel that records it, regardless of what is collected, so the access mask
+    and confirmation that this exact process performed the read cannot be obtained directly.
+    This query scopes file-write activity to the alerting ProcessGuid and its children rather
+    than searching by filename pattern, which ties any output — including a renamed or moved
+    dump — specifically back to this execution. Treat an empty result as a coverage gap on
+    the handle-access step, not as proof no memory was read.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Where was the memory dump written, and does a minidump artifact exist at that path?
+  context: >-
+    The /o value is the output directory; a successful rdrleakdiag.exe dump creates
+    minidump_<pid>.dmp and results_<pid>.hlk in it. Operators commonly point /o at staging
+    directories such as %TEMP%, C:\Windows\Temp, C:\Users\Public, or C:\ProgramData. Locating
+    the .dmp confirms the dump succeeded and gives the analyst the artifact to scope for
+    exfiltration or deletion.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection_dmp:
+        TargetFilename|contains:
+          - minidump_
+          - results_
+      selection_ext:
+        TargetFilename|endswith:
+          - .dmp
+          - .hlk
+      condition: selection_dmp or selection_ext
+    fields:
+      - TargetFilename
+      - Image
+      - User
+- question: What process spawned rdrleakdiag.exe, and is that parent chain expected?
+  context: >-
+    The parent process reveals how the tool was launched. A direct interactive launch from
+    explorer.exe or a console differs from a launch under a web/application server, a script
+    host (wscript.exe, cscript.exe, mshta.exe), or a remote-execution service — the latter
+    point to hands-on-keyboard operator activity rather than local troubleshooting.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What child processes did rdrleakdiag.exe spawn afterward?
+  context: >-
+    Processes spawned by the tool reveal post-dump activity. A dump is usually followed by
+    staging or exfil steps — archiving utilities (WinRAR, 7z), copy operations, or a parser
+    being run against the .dmp. Unexpected children such as cmd.exe, powershell.exe, or
+    certutil.exe point to an active operator rather than a one-off diagnostic.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Were outbound remote-access connections (RDP, SMB, WinRM, SSH) initiated from this host after
+    this event?
+  context: Credential theft is typically followed by lateral movement. The query returns outbound connections
+    from this host to remote-access ports -- 3389 (RDP), 445 (SMB/PsExec), 5985/5986 (WinRM), 22 (SSH)
+    -- in the hours after the event; the originating Image and User show what drove each connection. Two
+    limits to keep in mind -- credentials exfiltrated and replayed from another machine will not appear
+    here (check security 4624 logons on suspected targets for this account and any accounts with sessions
+    on this host), and the query requires Sysmon network telemetry (EID 3); if that is not collected from
+    this host, treat zero rows as a visibility gap, not as evidence no movement occurred.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
+- question: Which accounts may be exposed in the dumped process, and do any have elevated privileges?
+  context: >-
+    The severity of an LSASS dump depends on which sessions were live on the host when memory
+    was captured. Any account with an active logon, cached credential, or service logon on this
+    host should be treated as potentially exposed. Domain admin, service, or other privileged
+    accounts present on the host require incident escalation and credential rotation; a single
+    standard-user session is lower impact.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Does this host normally run rdrleakdiag.exe?
+  context: >-
+    A binary that has never run on a host is more suspicious than one that appears regularly.
+    Zero or very low counts over the baseline window indicate first-time or rare execution,
+    which weighs against a routine-diagnostic explanation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: When this host previously ran rdrleakdiag.exe with these dump flags, what parents and users drove it, and does the current alert fit?
+  context: >-
+    Even a legitimate tool can be abused. This query mirrors the rule's full selection (dump
+    flag plus target/output flag) scoped to this host, so the resulting parent and user
+    distribution reflects how this specific dumping pattern has run here historically. A new
+    parent process, an unexpected user account, or an unusual command-line structure is the
+    deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \rdrleakdiag.exe
+      - OriginalFileName: RdrLeakDiag.exe
+      selection_cli_dump:
+        CommandLine|contains|windash:
+        - /memdmp
+        - fullmemdmp
+      selection_cli_output_process:
+        CommandLine|contains|windash:
+        - ' /o '
+        - ' /p '
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \rdrleakdiag.exe
+      - OriginalFileName: RdrLeakDiag.exe
+      selection_cli_dump:
+        CommandLine|contains|windash:
+        - /memdmp
+        - fullmemdmp
+      selection_cli_output_process:
+        CommandLine|contains|windash:
+        - ' /o '
+        - ' /p '
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \rdrleakdiag.exe
+      - OriginalFileName: RdrLeakDiag.exe
+      selection_cli_dump:
+        CommandLine|contains|windash:
+        - /memdmp
+        - fullmemdmp
+      selection_cli_output_process:
+        CommandLine|contains|windash:
+        - ' /o '
+        - ' /p '
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the user's activity across all hosts in the alert window reveals whether the dump is
+    an isolated action or part of broader hands-on activity. The same user driving similar
+    activity on multiple endpoints widens the likely scope of compromise.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \rdrleakdiag.exe
+      - OriginalFileName: RdrLeakDiag.exe
+      selection_cli_dump:
+        CommandLine|contains|windash:
+        - /memdmp
+        - fullmemdmp
+      selection_cli_output_process:
+        CommandLine|contains|windash:
+        - ' /o '
+        - ' /p '
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering,
+    reconnaissance, or initial execution — may reveal the stages that preceded the dump and help
+    reconstruct the timeline. A credential dump sitting at the end of a chain of earlier alerts
+    is a different disposition than one with no precursors.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Have other hosts run rdrleakdiag.exe with these dump flags in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: >-
+    This query mirrors the rule's full selection with no host scope, so the result is a fleet-wide
+    count of this specific dumping pattern rather than generic use of the binary. Many hosts firing
+    the same pattern suggests scripted deployment; one host or a small unrelated set points to
+    manual operator activity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \rdrleakdiag.exe
+      - OriginalFileName: RdrLeakDiag.exe
+      selection_cli_dump:
+        CommandLine|contains|windash:
+        - /memdmp
+        - fullmemdmp
+      selection_cli_output_process:
+        CommandLine|contains|windash:
+        - ' /o '
+        - ' /p '
+      condition: all of selection_*
+    fields:
+    - host.name

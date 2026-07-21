@@ -1,0 +1,442 @@
+name: Potential WerFault ReflectDebugger Registry Value Abuse
+id: 126e7258-a06c-48ed-9792-eaf15ea01a74
+description: |
+  Detects a registry value write landing on a key path ending in \Microsoft\Windows\Windows
+  Error Reporting\Hangs\ReflectDebugger. WerFault.exe reads this value when invoked with the
+  -pr switch and executes the path stored there, so an attacker who writes an executable path
+  into it (administrative rights are required for the HKLM key) gets the payload launched as a
+  child of a Microsoft-signed system binary each time the trigger command runs, commonly paired
+  with a low-privilege autostart entry whose data is a command like WerFault.exe -pr 1. The
+  value is almost never set legitimately, so the investigation should identify the writing
+  process and user, decode the path that was written, determine whether WerFault.exe ran in
+  reflective-debugger mode and the configured payload executed, and locate any companion
+  launcher persistence that would re-trigger it.
+type: detection
+detection_id: 0cf2e1c6-8d10-4273-8059-738778f981ad
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-03
+questions:
+- question: Does the modified registry path end with \Windows Error Reporting\Hangs\ReflectDebugger?
+  context: |
+    Before investing investigation time, confirm the alert is a true positive. The rule fires
+    on any registry value write whose key path (TargetObject) ends in \Microsoft\Windows\Windows
+    Error Reporting\Hangs\ReflectDebugger, in either the native HKLM SOFTWARE hive or the
+    WOW6432Node mirror. Review the exact path against the detection criteria before moving on
+    to the value data and the writing process.
+  range: +/-5m
+  answer_sources:
+  - alert
+  - registry_event
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this user and host expected to configure Windows Error Reporting debugger settings?
+  context: |
+    Writing under the HKLM WER Hangs key requires administrative rights, so the acting account
+    is either privileged or the write came from an elevated service or installer. A developer
+    or crash-analysis workstation where an engineer deliberately registers a reflective debugger
+    is the rare legitimate case; on ordinary endpoints and servers this value has no routine
+    reason to change. User attribution is present on most endpoint registry events; when it is
+    a machine account or missing, pivot on the writing process instead.
+  range: +/-5m
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: What path was written to the ReflectDebugger value, and what does it point to?
+  context: |
+    The value is a REG_SZ path that WerFault.exe reads and executes when started with -pr. A
+    path into a user-writable or staging location (Temp, AppData, ProgramData, Users\Public, a
+    network share) points to an attacker-controlled payload; a real debugger binary such as
+    cdb.exe or windbg.exe in a canonical install directory could be deliberate engineering
+    configuration. Value data is not recorded for binary or empty writes; if the Details field
+    is absent here, read the current value directly from the endpoint.
+  range: +/-5m
+  answer_sources:
+  - registry_event
+  - manual_review
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- question: What is the actual identity of the process that wrote the ReflectDebugger value?
+  context: |
+    The writer determines how the hijack was delivered. Compare the on-disk name (Image) against
+    the embedded PE metadata (OriginalFileName); a mismatch means a renamed tool performed the
+    write, which is the masquerading pattern this technique family covers. Expected writers are
+    reg.exe, an installer, or management tooling running elevated; an unsigned or renamed binary
+    executing from a user-writable path is the concerning case. Submit the hash for reputation
+    checking to distinguish a known tool from a novel implant.
+  range: +/-30d
+  answer_sources:
+  - process_creation
+  - external_threat_intel
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Hashes
+- question: How did the binary that wrote this registry value arrive on this host?
+  context: |
+    If the writer is not a stock operating-system utility, its file-creation history shows the
+    delivery mechanism, such as a browser or transfer-tool download, archive extraction, a copy
+    over an administrative session, or a dropper writing it. Zero results for built-in binaries
+    like reg.exe are expected, since those files predate the collection window; the answer
+    matters most when the writer is a third-party or unknown executable. The Image field in each
+    file event names the process that created the file.
+  range: -30d
+  answer_sources:
+  - file_event
+  - process_creation
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains|expand: '%file_name%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: What other processes did the writing binary spawn around this modification?
+  context: |
+    A process that plants the ReflectDebugger pointer usually performs companion setup in the
+    same session, such as staging the payload on disk, creating a launcher autostart, or making
+    further configuration changes through child utilities. The children of the writer reveal its
+    broader objective; an installer spawning expected setup helpers reads differently from a
+    loader spawning reg.exe, schtasks.exe, or script hosts in sequence.
+  range: +4h
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Is the ReflectDebugger location a known persistence or evasion mechanism?
+  context: |
+    Yes. The WER Hangs\ReflectDebugger value is a documented execution-hijack point. WerFault.exe
+    invoked as WerFault.exe -pr <value> reads this path and launches it, so whatever is written
+    here runs as a child of a signed system process and blends in as crash handling. Unlike a Run
+    key the value is inert until WerFault.exe is triggered with -pr, which makes it an on-demand
+    or logon-triggered second stage rather than a self-starting one. Judge the value data and
+    writing process against that mechanism.
+  range: +/-5m
+  answer_sources:
+  - registry_event
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: What process spawned the writer, and is that parent chain expected?
+  context: |
+    The parent shows how the write was initiated. An elevated administrative shell or deployment
+    agent driving reg.exe fits sanctioned change; a script host, Office application, or unknown
+    binary in the parent position points to delivered content or an implant making the change.
+    Long-running parents can start hours or days before the alert, which is why this lookup uses
+    a wide window.
+  range: +/-30d
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - Image
+      - CommandLine
+- question: Was an autostart entry written on this host that invokes WerFault.exe?
+  context: |
+    The hijacked value is inert until something runs WerFault.exe with -pr, and the documented
+    pattern pairs the privileged HKLM write with a low-privilege launcher, typically an HKCU Run
+    value whose data is a command like WerFault.exe -pr 1 so the payload fires at every logon.
+    This query surfaces Run-key writes whose value data references WerFault with the -pr switch.
+    If it returns nothing, widen to scheduled tasks, Startup-folder file writes, and other
+    autostart locations that could carry the same trigger command.
+  range: +/-24h
+  answer_sources:
+  - registry_event
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains: '\Microsoft\Windows\CurrentVersion\Run'
+        Details|contains|all:
+          - 'WerFault'
+          - '-pr'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - User
+- question: Did WerFault.exe run in reflective-debugger mode on this host after the write?
+  context: |
+    Activation of the hijack looks like a WerFault.exe invocation carrying the -pr switch,
+    distinct from the crash-reporting invocations that run constantly on Windows hosts. Note the
+    parent of any hit, since logon-triggered launchers surface under explorer.exe or userinit.exe,
+    and verify the WerFault.exe image path is the canonical System32 or SysWOW64 location; the
+    same binary staged elsewhere would itself be a relocated system utility. The trigger may fire
+    at the next logon rather than immediately, so absence within this window does not clear the
+    persistence.
+  range: +24h
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: '\WerFault.exe'
+        CommandLine|contains:
+          - '-pr '
+          - '/pr '
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- question: Did the executable configured in the ReflectDebugger value run?
+  context: |
+    When the trigger fires, WerFault.exe launches the configured path as its child, so the
+    payload executes under a Microsoft-signed parent, which is the masquerading effect of this
+    hijack. This query matches process creations whose image ends with the recorded value data;
+    if the value data was not recorded or includes arguments, take the binary name from the
+    value-decode results and search for it directly. Examine ParentImage on any hit, since
+    WerFault.exe as the parent of a non-debugger binary confirms the chain completed.
+  range: +24h
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Details%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+      - CommandLine
+- question: Were other registry modifications made on this host in the same session?
+  context: |
+    Operators who plant one registry mechanism often make several changes together, for example
+    the launcher Run-key entry this technique needs, security-tool tampering, or additional
+    autostart entries. The triggering key will appear in these results; the signal is what else
+    was modified in the same window and whether the same writing process or user drove multiple
+    security-relevant changes at once.
+  range: +/-30m
+  answer_sources:
+  - registry_event
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - User
+- question: What other process activity occurred on this host around the time of the alert?
+  context: |
+    Registry-side context is covered by the related-modifications question; this one profiles
+    the host's process activity in the same window. The aggregation collapses repetitive agent
+    and system noise into high-count rows so that novel parent-child pairs stand out at low
+    counts. Look for delivery, reconnaissance, or staging activity bracketing the registry
+    write, which places the hijack inside a larger sequence rather than an isolated change.
+  range: +/-15m
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Has the ReflectDebugger value been modified before on this host?
+  context: |
+    This value is almost never touched in normal operation, so zero prior history makes the
+    current write a first-time change worth full scrutiny, while repeated historical writes with
+    the same data may indicate management tooling or an engineering configuration. Registry
+    deletions are not recorded in this telemetry, so judge whether the hijack is still active
+    from the most recent write in this history and from payload execution, not from the absence
+    of later events.
+  range: -90d
+  answer_sources:
+  - registry_event
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - Details
+      - Image
+- question: Does this host normally run the process that performed this write?
+  context: |
+    A writer that has never executed on this host before is more suspicious than one that runs
+    regularly. For a common utility such as reg.exe the count will be high and the acting user
+    distribution is the useful part; for a third-party or unknown binary, zero or very low
+    historical counts indicate first-time execution that lines up with fresh delivery.
+  range: -90d
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: Was the ReflectDebugger value modified on other hosts in the environment?
+  context: |
+    The same write appearing across many hosts points to a software deployment, policy push, or
+    distributed tooling; the same attacker payload path appearing on several hosts points to
+    deliberate spread. Compare the Details values and writing processes across hosts, since an
+    identical non-standard executable path replicated to multiple machines changes this from a
+    single-host persistence finding to a multi-host operation.
+  range: -24h
+  answer_sources:
+  - registry_event
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+      - Details
+- question: Did other detections fire on this host in the hours before this alert?
+  context: |
+    Earlier detections on the same host, such as delivery of content, privilege escalation, or
+    defense tampering, may reveal how the actor obtained the administrative rights this write
+    requires and what stages preceded it. The order in which detections fired helps reconstruct
+    the timeline that led to the persistence attempt.
+  range: -6h
+  answer_sources:
+  - alert
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

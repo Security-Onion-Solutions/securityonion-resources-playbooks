@@ -1,0 +1,388 @@
+name: Potential Arbitrary Code Execution Via Node.EXE
+id: 28c5c152-f4c3-4b37-b81c-c226334305e6
+description: |
+  Detects node.exe executing inline JavaScript that wires a child process to a network
+  socket — the signature of a reverse shell run through a bundled Node.js interpreter. The
+  rule fires only when node.exe is invoked with -e or --eval AND the inline script combines
+  child_process, net.Socket, .connect, and .exec( in one command line. Because node.exe ships
+  with many signed applications (virtualization, document, and developer products), an
+  attacker can proxy arbitrary code execution through it without dropping their own binary.
+  Investigation should confirm the inline script is a socket-to-shell wiring, identify the
+  parent that launched node.exe, determine where it connected, and establish whether this
+  host or user has any legitimate reason to run Node one-liners.
+type: detection
+detection_id: 6640f31c-01ad-49b5-beb5-83498a5cd8bd
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the node.exe command line carry an inline -e or --eval script that wires child_process to a network socket?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule
+    requires node.exe invoked with -e or --eval AND an inline script that combines child_process,
+    net.socket, .connect, and .exec( in the same command line. All of these must be present
+    together. Read the full command line and confirm the script is spawning a process and piping
+    its stdio over a socket rather than performing a benign eval.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Is this user and host expected to run node.exe one-liner scripts?
+  context: Legitimate Node.js usage is concentrated on developer workstations, build agents, and
+    application servers that ship a bundled interpreter. A reverse-shell one-liner running under
+    a service account on an application gateway host, or on a workstation with no development
+    role, is far more suspicious than the same pattern on a build system. Knowing the user role
+    and host function is often the fastest path to a disposition.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Decode the inline node.exe script — what host, port, and command does it spawn and connect to?
+  context: The inline script reveals the operational intent. Parse the JavaScript passed after -e
+    or --eval to extract the destination address and port from the .connect() call, and the
+    command spawned via child_process.exec (commonly cmd.exe or powershell.exe). The host:port
+    pair is a network indicator to pivot on; the spawned command tells you what shell the
+    operator gained. The full host-scoped view captures any sequential node.exe invocations that
+    together form the operation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|contains:
+          - ' -e '
+          - ' --eval '
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What process spawned node.exe, and is that parent chain expected?
+  context: The parent reveals how node.exe was invoked. When a trusted application proxies code
+    execution, the interpreter is often launched by the application's own service or gateway
+    process after that process was driven by an exploit, rather than by a developer's shell or
+    a build orchestrator. A web-facing service or document application as the parent of a Node
+    reverse-shell one-liner points to exploitation of that parent.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Is the parent of node.exe a web-facing or document-handling service that should not normally spawn an interpreter?
+  context: Trusted Developer Utilities Proxy Execution depends on a signed parent running in a
+    non-developer context. A gateway, web application, or document-rendering service spawning
+    node.exe to run inline JavaScript is the parent-context anomaly worth chasing — these
+    processes normally never launch a script interpreter. Compare the parent against a known
+    list of orchestrators that legitimately run Node so a CI/CD agent does not read as
+    suspicious. This query returns the parent for this exact event.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - User
+- question: What outbound network connections did node.exe make, and where did they go?
+  context: The reverse-shell pattern wires the spawned process to a socket via .connect(), so a
+    successful fire is followed by node.exe initiating an outbound connection to the operator's
+    host and port. Identify the destination address, port, and whether the connection succeeded.
+    A connection to an external or otherwise unexpected endpoint, especially on a non-standard
+    high port, corroborates that the inline script established a live channel rather than failing
+    to connect.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        Initiated: 'true'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+      - Initiated
+- question: What child processes did node.exe spawn after it fired?
+  context: The inline script calls child_process.exec to launch a shell, so the immediate child
+    of node.exe is typically cmd.exe or powershell.exe acting as the interactive shell over the
+    socket. Subsequent descendants reveal what the operator did once the channel was live —
+    reconnaissance, credential access, downloads, or persistence. A clean fire with no spawned
+    children may indicate a connection that failed before a shell was established.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Does this host normally run node.exe at all?
+  context: A process that has never been seen on a host is more suspicious than one that runs
+    regularly. On a host with no development or Node-based application role, zero or very low
+    historical node.exe counts indicate first-time or rare execution and raise the weight of
+    this alert. On a host that legitimately ships a bundled interpreter, node.exe will appear
+    routinely and the inline-script specifics carry the signal instead.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: When this host has previously fired this node.exe reverse-shell pattern, what parents and users drove it, and does this alert fit?
+  context: Even bundled interpreters can be abused. The query mirrors the rule's selection
+    structure scoped to this host — the resulting parent and user distribution reflects how this
+    specific firing pattern has historically run here, not generic node.exe usage. A new parent
+    process, an unexpected user account, or an unusual command-line structure is the deviation worth
+    chasing. In practice this pattern should almost never have a benign history.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_main:
+        Image|endswith: \node.exe
+        CommandLine|contains:
+        - ' -e '
+        - ' --eval '
+      selection_action_reverse_shell:
+        CommandLine|contains|all:
+        - .exec(
+        - net.socket
+        - .connect
+        - child_process
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection_main and 1 of selection_action_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_main:
+        Image|endswith: \node.exe
+        CommandLine|contains:
+        - ' -e '
+        - ' --eval '
+      selection_action_reverse_shell:
+        CommandLine|contains|all:
+        - .exec(
+        - net.socket
+        - .connect
+        - child_process
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection_main and 1 of selection_action_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_main:
+        Image|endswith: \node.exe
+        CommandLine|contains:
+        - ' -e '
+        - ' --eval '
+      selection_action_reverse_shell:
+        CommandLine|contains|all:
+        - .exec(
+        - net.socket
+        - .connect
+        - child_process
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection_main and 1 of selection_action_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity
+    across multiple endpoints. If the same user triggered similar activity on multiple hosts, the
+    scope of compromise may be larger. Where the alert fires under a service or computer account,
+    this view returns broad agent-telemetry noise and the parent-plus-binary rollout view is the
+    meaningful answer instead.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_main:
+        Image|endswith: \node.exe
+        CommandLine|contains:
+        - ' -e '
+        - ' --eval '
+      selection_action_reverse_shell:
+        CommandLine|contains|all:
+        - .exec(
+        - net.socket
+        - .connect
+        - child_process
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection_main and 1 of selection_action_*) and _pb_scope
+    fields:
+    - host.name
+- question: Have other hosts fired this node.exe reverse-shell pattern in the past week, and does the spread look like automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is
+    a fleet-wide count of this exact firing pattern, not generic node.exe usage. Many hosts firing
+    the same inline-script pattern points to a scripted deployment touching multiple endpoints —
+    consistent with mass exploitation of a shared application; one host or a small unrelated set
+    points to a localized operator action. Use the host distribution and parent consistency to
+    calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_main:
+        Image|endswith: \node.exe
+        CommandLine|contains:
+        - ' -e '
+        - ' --eval '
+      selection_action_reverse_shell:
+        CommandLine|contains|all:
+        - .exec(
+        - net.socket
+        - .connect
+        - child_process
+      condition: selection_main and 1 of selection_action_*
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining activity around the alert reveals the
+    immediate context — what led to this event, what happened after, and whether it is part of a
+    larger sequence. Look for reconnaissance, credential access, or persistence mechanisms that
+    commonly follow a reverse shell once an operator has interactive access.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — exploitation
+    of a public-facing service, reconnaissance, or defense tampering — may reveal the stages that
+    preceded the Node reverse shell and help reconstruct the full timeline. Exploitation of a
+    bundled-interpreter parent is frequently preceded by a detectable hit on the exposed service.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

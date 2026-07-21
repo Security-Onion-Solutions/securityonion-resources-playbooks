@@ -1,0 +1,358 @@
+name: Veeam Backup Database Suspicious Query
+id: 070d6570-97c2-40d9-aa3e-75cc4f1ee61d
+description: |
+  Detects sqlcmd.exe executing a SELECT against the Veeam Backup configuration database with a FROM clause that targets credential- and infrastructure-bearing tables (BackupRepositories, Credentials, HostCreds, SmbFileShares, Ssh_creds, VSphereInfo). The rule fires only when BOTH the SQL-pattern selection (sqlcmd.exe + VeeamBackup + From) AND one of the sensitive table names are present in the command line. Legitimate use is rare and usually limited to Veeam administrators or vendor support performing documented database maintenance; the same pattern is also used to extract stored backup-repository and hypervisor credentials directly from the configuration database for reuse against backup infrastructure. Determine who ran the query, what tables and columns it read, where the output went, and whether the surrounding activity on the host looks like administration or hands-on-keyboard collection.
+type: detection
+detection_id: 696bfb54-227e-4602-ac5b-30d9d2053312
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the command line show sqlcmd.exe running a SELECT against the VeeamBackup database with a sensitive table in the FROM clause?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule requires both the SQL pattern (sqlcmd.exe with VeeamBackup and From) AND one of the sensitive table names (BackupRepositories, Backups, Credentials, HostCreds, SmbFileShares, Ssh_creds, VSphereInfo). Review the exact command line and confirm which table the query targeted.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Is this user and host expected to query the Veeam backup database directly with sqlcmd.exe?
+  context: Direct sqlcmd.exe access to the Veeam configuration database is normally limited to backup administrators or vendor support performing documented maintenance. Knowing whether the account and the host's role (backup server, management host) are consistent with this operation is often the fastest path to distinguishing routine administration from credential collection.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What did the full SQL query do? Decode the SELECT statement, the target table, and any columns or WHERE clause.
+  context: The full command line reveals exactly what was read from the database. Decode the SELECT to identify the target table and which columns were requested -- password or encrypted-credential columns (for example password_encrypted_data) on the Credentials or HostCreds tables indicate credential extraction rather than benign reporting. Note any output redirection (-o, :OUT, >) that writes results to a file.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|contains: 'VeeamBackup'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What process spawned sqlcmd.exe and is that parent chain expected?
+  context: The parent process reveals how the query was launched. Administrator-driven use typically descends from explorer.exe, a console shell, or a scheduled maintenance job. A parent such as the Veeam SQL service process (sqlservr.exe), cmd.exe or powershell.exe descending from a service, or an unexpected scripting host points to command execution through the backup application rather than an interactive administrator.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Which Veeam tables and columns were read, and do they hold credentials or backup-infrastructure data?
+  context: The technique reads targeted, sensitive records rather than broad file listings. The Credentials, HostCreds, and Ssh_creds tables store stored account secrets; BackupRepositories, SmbFileShares, and VSphereInfo hold backup-target and hypervisor connection data. A query selecting these tables -- especially encrypted-password columns -- determines which downstream systems (hypervisors, repositories, SMB/SSH targets) the extracted credentials could unlock and which owners need to be notified.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|contains:
+          - 'Credentials'
+          - 'HostCreds'
+          - 'Ssh_creds'
+          - 'BackupRepositories'
+          - 'SmbFileShares'
+          - 'VSphereInfo'
+      condition: selection
+    fields:
+      - CommandLine
+      - User
+- question: Was the query output written to a file, and was that file moved or transferred off the host afterward?
+  context: Extracted credential data is typically written to disk and then staged or exfiltrated. Check for files created by sqlcmd.exe (an -o output file or redirected results) in the same window, and pivot to network connections from the host to see whether the output was uploaded, copied to a share, or sent to an external host.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Did the query request encrypted-credential columns or redirect output, and how would the extracted secrets be decrypted?
+  context: Veeam stores credentials encrypted at rest; a query selecting columns such as password_encrypted_data retrieves ciphertext that an operator would still need to decrypt offline using the host's DPAPI keys or the Veeam master key. Confirm from the command line which columns were requested and whether results were redirected to a file, since that determines how readily the extracted secrets could be reused.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Does this host normally run sqlcmd.exe?
+  context: A backup or database server may run sqlcmd.exe routinely for maintenance, while a general-purpose workstation rarely does. Zero or very low historical counts indicate first-time or rare execution of the binary on this host and raise the weight of the alert.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: When this host has previously run sqlcmd against the Veeam database with these tables, what parents and users normally drive that activity, and does the current alert fit?
+  context: Even routine database tools get abused. The query mirrors the rule's selection structure scoped to this host -- the resulting parent/user distribution reflects how the rule's specific firing pattern (not generic sqlcmd usage) has historically run here. A new parent process, an unexpected user account, or a first-time appearance of this pattern is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_sql:
+        Image|endswith: \sqlcmd.exe
+        CommandLine|contains|all:
+        - VeeamBackup
+        - 'From '
+      selection_db:
+        CommandLine|contains:
+        - BackupRepositories
+        - Backups
+        - Credentials
+        - HostCreds
+        - SmbFileShares
+        - Ssh_creds
+        - VSphereInfo
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: What child processes did sqlcmd.exe spawn afterward?
+  context: sqlcmd.exe running a SELECT does not normally spawn children. Subsequent processes from this binary on the host -- a shell, powershell.exe, an archiving utility, or a network transfer tool -- would indicate the query was one step in a broader collection or exfiltration sequence rather than an isolated read.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_sql:
+        Image|endswith: \sqlcmd.exe
+        CommandLine|contains|all:
+        - VeeamBackup
+        - 'From '
+      selection_db:
+        CommandLine|contains:
+        - BackupRepositories
+        - Backups
+        - Credentials
+        - HostCreds
+        - SmbFileShares
+        - Ssh_creds
+        - VSphereInfo
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_sql:
+        Image|endswith: \sqlcmd.exe
+        CommandLine|contains|all:
+        - VeeamBackup
+        - 'From '
+      selection_db:
+        CommandLine|contains:
+        - BackupRepositories
+        - Backups
+        - Credentials
+        - HostCreds
+        - SmbFileShares
+        - Ssh_creds
+        - VSphereInfo
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity across multiple endpoints. If the same account queried backup databases or ran tools on additional hosts in the same window, the scope of the operation may extend beyond this one server.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_sql:
+        Image|endswith: \sqlcmd.exe
+        CommandLine|contains|all:
+        - VeeamBackup
+        - 'From '
+      selection_db:
+        CommandLine|contains:
+        - BackupRepositories
+        - Backups
+        - Credentials
+        - HostCreds
+        - SmbFileShares
+        - Ssh_creds
+        - VSphereInfo
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate context: what led to this database query, what happened after, and whether it is part of a larger sequence. Look for reconnaissance, privilege escalation, credential-access tooling, or data staging in the surrounding window.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Have other hosts run sqlcmd against the Veeam database with these tables in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of the rule's firing pattern (not generic sqlcmd usage). Many hosts firing the same pattern points to a scripted maintenance job or vendor automation; one host or a small unrelated set points to manual operator activity. Use the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_sql:
+        Image|endswith: \sqlcmd.exe
+        CommandLine|contains|all:
+        - VeeamBackup
+        - 'From '
+      selection_db:
+        CommandLine|contains:
+        - BackupRepositories
+        - Backups
+        - Credentials
+        - HostCreds
+        - SmbFileShares
+        - Ssh_creds
+        - VSphereInfo
+      condition: all of selection_*
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host -- public-facing exploitation, defense tampering, reconnaissance, or command execution through a service process -- may reveal the stages that preceded the database query and help reconstruct how access to the backup server was obtained.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

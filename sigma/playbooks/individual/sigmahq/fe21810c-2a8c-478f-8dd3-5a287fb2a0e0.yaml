@@ -1,0 +1,530 @@
+name: Suspicious Scripting in a WMI Consumer
+id: f429ded1-ad5b-4e78-be6d-877d96a66177
+description: |
+  Detects a WMI event consumer whose stored payload carries PowerShell or scripting content of
+  three alternative forms, any one of which fires the rule on its own: either the payload
+  combines new-object with net.webclient and .downloadstring, or it combines new-object with
+  net.webclient and .downloadfile, or it contains any single one of the markers ' iex(',
+  ' -nop ', ' -noprofile ', ' -decode ', ' -enc ', WScript.Shell, or
+  System.Security.Cryptography.FromBase64Transform. The first two branches are a download cradle
+  that pulls a stage from a remote host and either runs it in memory or writes it to disk; the
+  third is a set of individual markers for inline execution, profile and logging avoidance,
+  base64 handling, and shell object use. A WMI event consumer is one leg of a three-object
+  structure — an __EventFilter defines the trigger, an __EventConsumer holds the payload, and a
+  __FilterToConsumerBinding joins them — that lives in the WMI repository under root\subscription
+  rather than on disk, survives reboot, and executes as SYSTEM under WmiPrvSE.exe or scrcons.exe
+  when the filter condition matches. Legitimate management, inventory, and backup agents register
+  consumers too, and administrative scripts legitimately use these constructs, so the
+  investigation should determine which branch fired and what the payload does, whether the
+  consumer has already executed, whether a remote fetch or file drop followed, when and by what
+  process the subscription was registered, and whether the same subscription recurs across the
+  fleet as a deployed product would.
+type: detection
+detection_id: fe21810c-2a8c-478f-8dd3-5a287fb2a0e0
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-17
+questions:
+- question: Which branch of this rule did the consumer's payload match — a download cradle, or one of the standalone scripting markers?
+  context: >-
+    The rule fires on any one of three alternatives, and which one matched changes what the rest
+    of the investigation is looking for. Two branches require a full combination — new-object AND
+    net.webclient AND .downloadstring, or new-object AND net.webclient AND .downloadfile — and
+    both mean the payload retrieves content from a remote host, so the network and file-write
+    evidence carries the weight. The third branch matches on a single marker (' iex(', ' -nop ',
+    ' -noprofile ', ' -decode ', ' -enc ', WScript.Shell, or
+    System.Security.Cryptography.FromBase64Transform) and is the broadest of the three, so it
+    also collects the most administrative scripting; there the decoded payload content is what
+    settles it. Read the payload text from the consumer record itself. The objects are stored in
+    the WMI repository, so the payload is recovered from the subscription object or from the
+    registration record on the WMI activity channel, not from a file on disk.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Destination
+  answer_sources:
+  - alert
+  - manual_review
+- question: Is this user and host expected to register WMI event subscriptions that run scripts?
+  context: >-
+    Permanent WMI event subscriptions are registered by a narrow set of actors — management and
+    inventory agents, backup products, and a small number of Windows built-ins. A script-bearing
+    consumer on a host that runs none of those products, or registered under an interactive user
+    account, separates operator activity from routine agent behavior faster than any query. Note
+    that subscription registration and consumer execution both commonly run as SYSTEM even when a
+    person initiated them, so a SYSTEM attribution is not on its own evidence of an agent.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: What WMI subscription activity did this host's WMI activity log record, and when was this consumer registered?
+  context: >-
+    The native WMI activity operational log records permanent consumer registration under event
+    code 5861, filter-to-consumer activity under 5859, and temporary subscription registration
+    under 5860. The 5861 record is where the trigger condition and the payload become readable
+    together — its CONSUMER column carries the consumer definition and ESS the filter side,
+    while Query and NamespaceName on 5859/5860 rows carry the WQL trigger and namespace, with
+    message as the readable narrative on every row. The registration timestamp bounds how long
+    the consumer has been able to run, and a registration
+    followed shortly by deletion of the same objects is the pattern of one-shot lateral movement
+    rather than durable persistence. This channel is not collected on every host, and the alerting
+    event may itself originate from a source this environment does not ship; if this host does not
+    ship the channel, an empty result is a visibility gap rather than evidence that no
+    subscription exists, and the objects should be enumerated directly on the host against the
+    root\subscription namespace, where __EventFilter, __EventConsumer, and __FilterToConsumerBinding
+    instances can be listed and removed.
+  range: -30d
+  query: |
+    aggregation: false
+    logsource:
+      category: wmi_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID:
+          - 5859
+          - 5860
+          - 5861
+      condition: selection
+    fields:
+      - EventID
+      - winlog.user_data.CONSUMER
+      - winlog.user_data.ESS
+      - winlog.user_data.Query
+      - winlog.user_data.NamespaceName
+      - message
+  answer_sources:
+  - manual_review
+  - edr_console
+- question: What does the consumer's payload decode to, and what operation does the decoded content perform?
+  context: >-
+    Decode the payload the consumer stores and read what it actually does. The rule's markers name
+    the encoding to expect — ' -enc ' introduces a base64 PowerShell command,
+    System.Security.Cryptography.FromBase64Transform decodes base64 inside the script body itself,
+    and ' -decode ' is the certutil base64 flag. Layered encoding is common, so iterate until the
+    content is readable, and reconstruct strings built through Chr() chains, character
+    concatenation, or backtick escaping. The decoded content names the operation: a download
+    cradle and the URL it retrieves from, a reverse shell, an in-memory loader, or a
+    WScript.Shell call handing a command to the shell. ' -nop ' and ' -noprofile ' suppress the
+    user profile so the script runs without local customization, which also removes a source of
+    logging. Detonate nothing from a production host.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - manual_review
+  - safe_environment
+- question: What did WmiPrvSE.exe, scrcons.exe, or mofcomp.exe spawn on this host, and does any of it look unrelated to a management agent?
+  context: >-
+    The consumer object holds the payload but executes nothing itself — execution surfaces as a
+    child of WmiPrvSE.exe for a CommandLineEventConsumer or of scrcons.exe for an
+    ActiveScriptEventConsumer, running as SYSTEM, and mofcomp.exe appears when the subscription
+    arrived through a compiled MOF file. Those children are ordinary process creation events even
+    though the consumer registration is not, which makes this the pivot that shows whether the
+    subscription has already fired and is where the durable evidence for this rule lives.
+    Management agents produce a small, repeating set of children under these parents; a command
+    interpreter, a script host, an encoded PowerShell invocation, or a binary running from a
+    user-writable directory does not belong to that set. The generic form of this technique has
+    Office applications or mshta.exe launching wscript.exe or cscript.exe, but for a WMI consumer
+    the launcher is the provider host rather than a document container, so judge the parent
+    against the agent baseline instead. The interval between the subscription's registration and
+    the first such child bounds how long the consumer has been executing.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith:
+          - '\WmiPrvSE.exe'
+          - '\scrcons.exe'
+          - '\mofcomp.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - User
+  answer_sources:
+  - process_creation
+  - edr_console
+- question: Did any process on this host run a command line carrying the same download-cradle combination or scripting markers the rule fires on?
+  context: >-
+    A script-bearing consumer executes by handing its payload to an interpreter, and at that point
+    the payload becomes an ordinary command line even though the consumer record is not. This
+    query mirrors the rule's three alternatives against process command lines on the host,
+    preserving each branch — the two cradle branches require new-object together with
+    net.webclient and either .downloadstring or .downloadfile, and the marker branch matches any
+    single one of ' iex(', ' -nop ', ' -noprofile ', ' -decode ', ' -enc ', WScript.Shell, or
+    System.Security.Cryptography.FromBase64Transform. A hit whose parent is WmiPrvSE.exe or
+    scrcons.exe is the consumer running; a hit under an interactive shell is separate activity
+    worth its own timeline. Administrative scripting also lands here, so read the parent and the
+    full argument list rather than the count alone.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_cradle_string:
+        CommandLine|contains|all:
+          - 'new-object'
+          - 'net.webclient'
+          - '.downloadstring'
+      selection_cradle_file:
+        CommandLine|contains|all:
+          - 'new-object'
+          - 'net.webclient'
+          - '.downloadfile'
+      selection_markers:
+        CommandLine|contains:
+          - ' iex('
+          - ' -nop '
+          - ' -noprofile '
+          - ' -decode '
+          - ' -enc '
+          - 'WScript.Shell'
+          - 'System.Security.Cryptography.FromBase64Transform'
+      condition: selection and (selection_cradle_string or selection_cradle_file or selection_markers)
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - User
+  answer_sources:
+  - process_creation
+- question: Did a script host or the WMI provider host load a scripting engine library on this host?
+  context: >-
+    An ActiveScriptEventConsumer runs its script body inside scrcons.exe, which has to load an
+    engine to do it — vbscript.dll or jscript.dll for the language itself, and wbemdisp.dll,
+    wshom.ocx, or scrrun.dll for the object model the script reaches for. Those loads are recorded
+    on the endpoint independently of the WMI activity channel, so they corroborate that a script
+    consumer executed on hosts where that channel is not collected. wshom.ocx under scrcons.exe is
+    the load behind a WScript.Shell call, which is one of the markers this rule fires on, and
+    scrrun.dll indicates the script reached for file system objects rather than staying inside WMI.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\scrcons.exe'
+          - '\WmiPrvSE.exe'
+          - '\wscript.exe'
+          - '\cscript.exe'
+      selection_engine:
+        ImageLoaded|endswith:
+          - '\vbscript.dll'
+          - '\jscript.dll'
+          - '\jscript9.dll'
+          - '\wbemdisp.dll'
+          - '\wshom.ocx'
+          - '\scrrun.dll'
+      condition: selection and selection_engine
+    fields:
+      - Image
+      - ImageLoaded
+      - Signature
+      - SignatureStatus
+  answer_sources:
+  - process_creation
+  - edr_console
+- question: Did WMI subscription tooling or a MOF compilation run on this host around the alert?
+  context: >-
+    Subscription objects reach the WMI repository through a small set of paths — compiling a MOF
+    file with mofcomp.exe, wmic.exe invocations against root\subscription, or PowerShell calls
+    such as Register-WmiEvent, Set-WmiInstance, New-CimInstance, and Invoke-WmiMethod that create
+    __EventFilter, __EventConsumer, and __FilterToConsumerBinding instances. Seeing which of these
+    ran, with what arguments, identifies the registering process and often names the MOF or script
+    that carried the payload verbatim. Absence of all of them alongside a subscription
+    registration points at a process that drove the WMI API directly, or at a registration
+    performed remotely over DCOM from another host, in which case the tooling evidence lives on the
+    source host rather than this one.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_tool:
+        Image|endswith:
+          - '\mofcomp.exe'
+          - '\wmic.exe'
+          - '\wbemtest.exe'
+          - '\powershell.exe'
+          - '\pwsh.exe'
+      selection_wmi:
+        CommandLine|contains:
+          - '__EventFilter'
+          - '__EventConsumer'
+          - '__FilterToConsumerBinding'
+          - 'root\subscription'
+          - 'root/subscription'
+          - 'Register-WmiEvent'
+          - 'Set-WmiInstance'
+          - 'New-CimInstance'
+          - 'Invoke-WmiMethod'
+          - '.mof'
+      condition: selection and selection_tool and selection_wmi
+    fields:
+      - Image
+      - CommandLine
+      - User
+  answer_sources:
+  - process_creation
+- question: Did the WMI provider host, the script consumer host, or a script interpreter make outbound connections close to the alert?
+  context: >-
+    Two of the three branches this rule fires on are download cradles, which have to reach a
+    remote host to retrieve the stage they do not carry. Connections from WmiPrvSE.exe,
+    scrcons.exe, or a script interpreter within a short window of the subscription activity tie
+    the payload to a specific destination, and that destination is the address to check against
+    the decoded cradle URL and to scope for other hosts contacting it. A spread of destinations
+    across internal addresses points at WMI being used for lateral movement rather than local
+    execution. The marker branch does not require a network leg at all, and payloads delivered
+    over a named pipe leave no outbound connection, so an empty result does not rule out remote
+    delivery.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\WmiPrvSE.exe'
+          - '\scrcons.exe'
+          - '\wscript.exe'
+          - '\cscript.exe'
+          - '\powershell.exe'
+          - '\pwsh.exe'
+      condition: selection
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationPort
+  answer_sources:
+  - network_connection
+- question: Did the WMI provider host or the script consumer host write any files to disk around the alert?
+  context: >-
+    The .downloadfile branch retrieves a stage and writes it to a path the script chooses, which
+    is the one branch of this rule that leaves a file behind. Listing what WmiPrvSE.exe and
+    scrcons.exe wrote around the alert names that path and gives the artifact to collect and hash.
+    The .downloadstring branch runs the retrieved content in memory and writes nothing, so an
+    empty result narrows which branch fired rather than closing the question. Any file that does
+    appear is the pivot to its later execution, where the hash is recorded.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\WmiPrvSE.exe'
+          - '\scrcons.exe'
+          - '\wscript.exe'
+          - '\cscript.exe'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - User
+  answer_sources:
+  - file_event
+- question: Does the timing of this consumer's registration and execution align with normal work hours and maintenance windows?
+  context: >-
+    Agent deployments that register WMI subscriptions run on a schedule and land in a maintenance
+    window or during a rollout. A script-bearing consumer registered outside of both, on a host
+    with no deployment activity around it, is unaccounted for on timing alone. A consumer whose
+    filter triggers on a recurring condition will also execute on a rhythm — establish whether the
+    execution times form a regular interval, which points at an automated trigger, or cluster
+    around one operator session. Check the host's local time rather than the collection timestamp.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - organizational_knowledge
+  - asset_inventory
+- question: Was there a change ticket, maintenance window, or agent deployment that accounts for this WMI subscription?
+  context: >-
+    Persistence mechanisms are the class of change most organizations require a ticket for, and
+    WMI subscriptions in particular arrive almost exclusively through product deployments rather
+    than ad-hoc work. A corresponding ticket, or a monitoring, backup, or inventory agent rollout
+    scheduled for this window, closes the alert quickly. Absence of one on a host that is not part
+    of a rollout leaves the registration unaccounted for. The rule's own tuning note is
+    legitimate administrative scripts, so a documented script that uses a download cradle or one
+    of these markers is a valid outcome — get the script and compare it against the decoded
+    payload rather than accepting the ticket alone.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - organizational_knowledge
+  - manual_review
+- question: Does an administrator or the owning team recall registering this WMI subscription or authoring the script it runs?
+  context: >-
+    Direct confirmation from the person or team behind the activity is often the fastest path to a
+    determination. Because subscription registration and consumer execution both run as SYSTEM,
+    the account on the event rarely names anyone — ask the team that owns the host and the team
+    that owns any management agent installed on it. If someone confirms it, get what the consumer
+    is meant to do, what filter is meant to trigger it, and where the script retrieves content
+    from, then compare all three against the decoded payload.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - organizational_knowledge
+  - manual_review
+- question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    A script-bearing WMI consumer is a step, not an outcome. Aggregating process activity on the
+    host around the alert collapses agent telemetry into a few high-count rows and leaves novel
+    parent-child pairs standing out at low counts, which is what reconnaissance, credential
+    access, or a second persistence mechanism looks like next to WMI subscription activity. The
+    interval between whatever preceded the consumer and the consumer itself establishes whether
+    this was the operator's first action on the host or a late one.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+  answer_sources:
+  - process_creation
+  - file_event
+  - registry_event
+- question: Do permanent WMI event subscriptions appear across the fleet, or only on this host?
+  context: >-
+    This is the discriminator that separates a management agent from an operator. Deployment,
+    inventory, and backup products register the same subscriptions, in the same namespace, on
+    every host they manage, and they do it repeatedly over time — a handful of recurring
+    registrations across many hosts is what a product looks like. A subscription that appears on
+    one host, or on a small unrelated set of hosts inside a short window, has no fleet pattern
+    behind it. The grouping pairs each host with the CONSUMER column of its 5861 registrations,
+    so recurring consumer definitions across many hosts stand out directly. Use the recurring
+    registrations this returns as the allowlist for future alerts on
+    this rule, and remember that hosts not shipping the WMI activity channel contribute nothing
+    here regardless of what is registered on them, so a single-host result may reflect collection
+    coverage rather than a single-host subscription.
+  range: -30d
+  query: |
+    aggregation: true
+    logsource:
+      category: wmi_event
+      product: windows
+    detection:
+      selection:
+        EventID: 5861
+      condition: selection
+    fields:
+      - winlog.user_data.CONSUMER
+      - host.name
+  answer_sources:
+  - organizational_knowledge
+  - asset_inventory
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    A subscription that runs a download cradle is usually installed after access is already
+    established, so earlier detections on the same host frequently name how the operator arrived —
+    remote execution, credential access, or defense tampering. A subscription registered remotely
+    over DCOM may leave its precursor on a different host entirely, so an empty result here
+    narrows the question to how this host was reached rather than closing it.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+  answer_sources:
+  - alert

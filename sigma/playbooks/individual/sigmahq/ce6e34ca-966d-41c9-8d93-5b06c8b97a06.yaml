@@ -1,0 +1,523 @@
+name: OilRig APT Activity
+id: fa1ab8ee-994c-4234-b224-c0a723e242b9
+description: |
+  Detects four independent process_creation patterns tied to an intrusion toolset that combines
+  scheduled-task persistence, an AutoIt-based loader staged under a Taskbar directory, a service
+  binary planted in system32, and DNS TXT-record command and control. The rule fires when at
+  least one branch matches: either a command line containing both 'SC Scheduled Scan' and
+  '\microsoft\Taskbar\autoit3.exe', or an Image path containing '\Windows\Temp\DB\' and ending
+  in '.exe', or 'C:\Windows\system32\Service.exe' running with an 'i' or 'u' argument, or a
+  process whose parent ends in '\local\microsoft\Taskbar\autoit3.exe' and whose command line
+  contains both 'nslookup.exe' and '-q=TXT'. Because the branches are independent, the first
+  step is to establish which one fired — the task branch points at persistence registration, the
+  temp-directory and service branches point at payload staging and privileged execution, and the
+  AutoIt parent branch points at data being carried over DNS TXT lookups. The investigation
+  should determine whether the matched pattern is genuine toolset activity or a local software
+  artifact that coincidentally fits it, then check the host for the remaining branches, since
+  the toolset installs several of these mechanisms together.
+type: detection
+detection_id: ce6e34ca-966d-41c9-8d93-5b06c8b97a06
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-17
+questions:
+- question: Does the alerting event match one of the rule's four detection branches, and which branch fired?
+  context: >-
+    The rule fires when either the scheduled-task command line, the temp-directory Image path,
+    the system32 Service.exe execution, or the AutoIt-parented nslookup command matches — each
+    branch is independent, so record which one fired before going further, because the branch
+    decides which downstream questions carry weight. A command line carrying both
+    'SC Scheduled Scan' and the '\microsoft\Taskbar\autoit3.exe' path is the task-registration
+    branch, making task configuration and Security-channel registration records load-bearing. An
+    Image under '\Windows\Temp\DB\', or 'C:\Windows\system32\Service.exe' invoked with an 'i' or
+    'u' argument, is a staging or service-install branch, making service configuration and
+    persistence-stacking questions the decisive ones. A parent ending in
+    '\local\microsoft\Taskbar\autoit3.exe' with both 'nslookup.exe' and '-q=TXT' present is the
+    DNS branch, where the DNS and network questions resolve the alert. More than one branch can
+    match, either within a single event or across separate alerts on the same host.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+  answer_sources:
+  - alert
+  - process_creation
+- question: Is this user and host expected to register scheduled tasks, install services, or run binaries from a temporary directory?
+  context: >-
+    Legitimate administration and software installers produce some of these patterns — installers
+    stage executables in temporary directories, and management tooling registers tasks and
+    services. Knowing whether the account is an administrator, a service principal, or an ordinary
+    user, and whether the host is a workstation, a build machine, or a server, is usually the
+    fastest way to separate routine operations from the toolset behavior the rule targets.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: Is this parent expected to spawn this child, and what started the parent itself?
+  context: >-
+    The parent-child pairing is the core signal for the AutoIt branch — a copy of autoit3.exe
+    living under a user's Taskbar directory and spawning nslookup.exe is not a pairing any packaged
+    application produces. Tracing the parent's own origin shows whether the chain begins with a
+    user action, an installer, or the scheduler service, and whether the parent was itself launched
+    from a staging directory.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+  answer_sources:
+  - process_creation
+- question: What other child processes did the same parent instance spawn?
+  context: >-
+    A loader that spawns one process usually spawns several — a DNS lookup for tasking, a copy or
+    move to stage the next payload, and a task or service registration to survive reboot. Listing
+    every child of the exact parent instance shows whether this event is one step of a sequence or
+    an isolated execution.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: What scheduled task was created, and what command does it execute?
+  context: >-
+    Read the task name from /TN, the executed command from /TR, the schedule type from /SC, and the
+    run-as account from /RU. The task-registration branch of this rule keys on the task name
+    'SC Scheduled Scan' paired with a /TR pointing at autoit3.exe under a Taskbar directory, so
+    confirm both the name and the target path, and note whether /RU requests SYSTEM. The /TR value
+    is the persistence payload and drives the rest of the investigation.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: What service was created or modified on this host, and what binary does it execute?
+  context: >-
+    The service-installation record carries the service name, the image path, the start type, and
+    the account, as structured values rather than parsed command-line text. The service branch of
+    this rule keys on 'C:\Windows\system32\Service.exe' invoked with an 'i' or 'u' argument, which
+    is a self-install or self-uninstall pattern — a generically named binary dropped into system32
+    that registers itself. Compare the recorded image path against the alerting Image, and treat an
+    auto-start service running as LocalSystem as the persistence to remediate.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: system
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 7045
+      condition: selection
+    fields:
+      - ServiceName
+      - ImagePath
+      - StartType
+      - AccountName
+  answer_sources:
+  - process_creation
+- question: What registry keys and values did the alerting process modify, and are they known persistence or evasion locations?
+  context: >-
+    Service registration writes under HKLM\System\CurrentControlSet\Services, and loaders commonly
+    add a Run value or adjust a Start value in the same session. The key path and the value data
+    show what was registered to execute and when it will run. Read the signer columns for coherence
+    with the key being written rather than as a verdict — a trusted signature on a process writing
+    a service key proves nothing on its own.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+  answer_sources:
+  - process_creation
+- question: Is the command line encoded or obfuscated, and what does the decoded content do?
+  context: >-
+    On the DNS branch, the value carried in a TXT query is the payload — the subdomain or the
+    returned record commonly holds base64 or hex data that decodes to tasking or to exfiltrated
+    output, so reconstruct it rather than reading the query name at face value. On the task branch,
+    the /TR argument may wrap the real command in quoting, environment-variable substitution, or a
+    script host invocation. Decode iteratively until the content is readable, then identify the
+    operation it performs.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: Do the Windows Security records show a scheduled task or service being registered on this host around the alert, and under which account?
+  context: >-
+    Task and service registration leave structured records independent of the command line — 4698
+    for task creation, 4702 for task update, 4697 for service installation. These carry the task
+    name, the task or service binary, and the subject account, which lets the analyst confirm
+    registration even when the tooling registered it through an API rather than schtasks.exe or
+    sc.exe. If the Security channel is not collected from this host, treat an empty result as a
+    visibility gap rather than evidence nothing was registered.
+  range: -24h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID:
+          - 4698
+          - 4702
+          - 4697
+      condition: selection
+    fields:
+      - EventID
+      - TaskName
+      - ServiceName
+      - ServiceFileName
+      - SubjectUserName
+  answer_sources:
+  - manual_review
+- question: When is the task scheduled to run, and has it already executed?
+  context: >-
+    Tasks run as children of the Task Scheduler service, so scheduler-spawned processes in the hours
+    after registration show whether the payload has fired and how often. A task registered to run at
+    logon fires on the next sign-in; a recurring task may have already executed many times. Correlate
+    the registration time against the first scheduler-spawned execution to measure how long the
+    persistence has been live.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: '\svchost.exe'
+        ParentCommandLine|contains: 'Schedule'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: What outbound connections did the alerting process and the host's DNS lookup tool make around the alert?
+  context: >-
+    DNS TXT lookups issued by a command-line resolver rather than by the system resolver are the
+    transport for tasking and for staged output in this toolset. Look at the destination addresses
+    and ports the alerting process contacted, and at any resolver traffic on the host in the same
+    window — a resolver pointed at an external address instead of the configured internal server
+    indicates the query is being steered to an operator-controlled name server. Repeated small
+    lookups at a steady cadence suggest a polling channel rather than user-driven resolution.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection_proc:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_dns_tool:
+        host.name|expand: '%hostname%'
+        Image|endswith: '\nslookup.exe'
+      condition: 1 of selection_*
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Initiated
+      - Image
+  answer_sources:
+  - network_connection
+- question: Which domains were queried by the command-line resolver or the AutoIt binary, and what is their reputation and registration history?
+  context: >-
+    The queried names are the closest thing to an infrastructure indicator this activity produces.
+    Check each name against reputation sources and registration records — recent registration, a
+    long random-looking label under a short parent domain, or a name with no corporate purpose all
+    point at operator infrastructure rather than at a business service. High query volume against a
+    single parent domain with varying labels is the tunnelling pattern. Names that resolve to
+    reputable, long-established infrastructure with a clear business use are the likelier benign
+    explanation.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: dns_query
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\nslookup.exe'
+          - '\autoit3.exe'
+      condition: selection
+    fields:
+      - QueryName
+  answer_sources:
+  - dns_query
+  - external_threat_intel
+- question: Were other process-based persistence mechanisms installed on this host?
+  context: >-
+    This rule already covers task registration and a service install as separate branches, and the
+    toolset commonly stacks both plus a registry entry rather than relying on one. Surfacing every
+    persistence tool invocation on the host in a four-hour window either shows the other branches
+    that did not alert on their own or shows that the detected mechanism stands alone. Several
+    persistence installations clustered in the same window point at deliberate stacking rather than
+    at one administrative action.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Has this user previously produced any of the rule's four patterns, and does that history fit their role?
+  context: >-
+    The query mirrors the rule's own selection structure scoped to this account, so the result is
+    this user's 90-day history of these specific patterns rather than generic use of the binaries
+    involved. A count of zero is the expected answer and makes the alert a first occurrence for the
+    account. A non-zero count spread evenly over months, on the other hand, is closer to a local
+    application that happens to fit one branch — read it against the user's role and normal toolset.
+  range: -90d
+  always_include: true
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_schtasks:
+        CommandLine|contains|all:
+        - SC Scheduled Scan
+        - \microsoft\Taskbar\autoit3.exe
+      selection_temp:
+        Image|contains: \Windows\Temp\DB\
+        Image|endswith: .exe
+      selection_service:
+        Image: C:\Windows\system32\Service.exe
+        CommandLine|contains:
+        - i
+        - u
+      selection_autoit:
+        ParentImage|endswith: \local\microsoft\Taskbar\autoit3.exe
+        CommandLine|contains|all:
+        - nslookup.exe
+        - -q=TXT
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+- question: Has this parent process historically driven any of the rule's patterns here or elsewhere, or is the parent new for this activity?
+  context: >-
+    When the alert fires under a machine account or a service principal, the user name attributes
+    nothing and the launch mechanism becomes the meaningful pivot. The query mirrors the rule's
+    selection structure scoped to the alerting parent, so the result is the 90-day history of this
+    parent driving these patterns, grouped by host. A parent that already accounts for thousands of
+    prior events across many hosts is vendor or operating-system automation; a parent that appears
+    now for the first time is the deviation worth chasing.
+  range: -90d
+  always_include: true
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_schtasks:
+        CommandLine|contains|all:
+        - SC Scheduled Scan
+        - \microsoft\Taskbar\autoit3.exe
+      selection_temp:
+        Image|contains: \Windows\Temp\DB\
+        Image|endswith: .exe
+      selection_service:
+        Image: C:\Windows\system32\Service.exe
+        CommandLine|contains:
+        - i
+        - u
+      selection_autoit:
+        ParentImage|endswith: \local\microsoft\Taskbar\autoit3.exe
+        CommandLine|contains|all:
+        - nslookup.exe
+        - -q=TXT
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the account's activity on every host in the alert window shows whether the same
+    identity was active elsewhere — a loader that establishes persistence on one host is often used
+    to reach others under the same credentials. If the alert fired under a machine account or a
+    built-in service principal this view fills with routine background telemetry and the launch
+    mechanism is the better pivot.
+  range: +/-1h
+  always_include: true
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+- question: Did this same parent-driven pattern fire on other hosts in the same window, or is the activity isolated to this host?
+  context: >-
+    The query mirrors the rule's selection structure scoped to the alerting parent, fleet-wide,
+    inside the alert window. Several hosts matching at once points at scheduled or pushed automation
+    — which for these branches is either a management deployment or a multi-host operation, and the
+    parent identifies which. A single host points at a host-local trigger and keeps the scope of the
+    response narrow.
+  range: +/-1h
+  always_include: true
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_schtasks:
+        CommandLine|contains|all:
+        - SC Scheduled Scan
+        - \microsoft\Taskbar\autoit3.exe
+      selection_temp:
+        Image|contains: \Windows\Temp\DB\
+        Image|endswith: .exe
+      selection_service:
+        Image: C:\Windows\system32\Service.exe
+        CommandLine|contains:
+        - i
+        - u
+      selection_autoit:
+        ParentImage|endswith: \local\microsoft\Taskbar\autoit3.exe
+        CommandLine|contains|all:
+        - nslookup.exe
+        - -q=TXT
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Persistence is rarely the first stage on a host. Earlier detections covering delivery, script
+    execution, credential access, or defense tampering identify how the toolset arrived and what it
+    did before it installed itself, which sets both the timeline and the scope of the response.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+  answer_sources:
+  - alert

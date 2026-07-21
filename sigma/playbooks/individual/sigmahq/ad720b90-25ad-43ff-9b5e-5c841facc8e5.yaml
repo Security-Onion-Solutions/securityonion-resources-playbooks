@@ -1,0 +1,368 @@
+name: User Added to Local Administrators Group
+id: 0bbd6a33-b10e-4b87-a0fd-66d6c75c8c1d
+description: |
+  Detects a command line that adds a user to the local administrators group, either through net.exe / net1.exe
+  with "localgroup ... /add" or through PowerShell "Add-LocalGroupMember -Group", where the group name contains
+  "administrators" or "administrateur". This is a common administrative action, but it is also a frequent
+  privilege-escalation and persistence step: an operator who has gained a foothold grants a user or backdoor
+  account local administrator rights so the account survives reboots and can be reused. The investigation should
+  confirm the exact command and target account, determine whether the change succeeded in the Security event log,
+  establish who performed it and whether it was authorized, and check what the modifying user and the newly
+  privileged account did before and after.
+type: detection
+detection_id: ad720b90-25ad-43ff-9b5e-5c841facc8e5
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the command line both add a member to a group and name an administrators group?
+  context: >-
+    Confirm the alert is a true positive by reviewing the exact command line. The rule fires only when both
+    conditions hold together: the command uses "localgroup ... /add" (net.exe / net1.exe) or
+    "Add-LocalGroupMember -Group" (PowerShell), AND the group named contains "administrators" or
+    "administrateur". Read the full command to confirm both halves are present and to identify the exact account
+    being granted membership.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Is this user and host expected to manage local administrator group membership?
+  context: >-
+    Legitimate administration adds accounts to the local administrators group during provisioning, support, and
+    maintenance. Knowing whether the acting user holds an administrative role and whether this host is one they
+    normally manage is often the fastest way to separate routine operations from privilege abuse.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Which account was added to the administrators group, and was it preceded by account creation?
+  context: >-
+    Read the full command to extract the exact account name granted local administrator rights, and note whether
+    it is an existing user or one created moments earlier. A "net localgroup administrators ... /add" or
+    "Add-LocalGroupMember" against a freshly created or otherwise unfamiliar account points to backdoor account
+    setup rather than routine support. Scan nearby commands on the host for "net user ... /add" or "New-LocalUser"
+    that would indicate the account was just created.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_account:
+        CommandLine|contains:
+          - 'localgroup '
+          - 'Add-LocalGroupMember '
+          - 'net user'
+          - 'New-LocalUser'
+      condition: selection_host and selection_account
+    fields:
+      - CommandLine
+      - CurrentDirectory
+      - User
+- question: What process spawned this command and is that parent chain expected?
+  context: >-
+    The parent process reveals how the membership change was invoked. Interactive administration usually has a
+    predictable parent such as explorer.exe or a console session. Parents such as remote-access tooling, script
+    hosts, Office applications, or a scheduled task process are more consistent with hands-on-keyboard intrusion
+    or automated malware than with routine support.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Did the Security event log confirm a member was added to the administrators group?
+  context: >-
+    The detection fires on the command, but the Windows Security log is authoritative for whether the change
+    actually took effect. Event 4732 records a member added to a security-enabled local group; 4728 and 4756
+    cover global and universal groups. Insufficient privilege or policy can cause the command to fail with no
+    corresponding Security event. If Security audit events are not collected in this environment, treat the
+    absence of these events as a visibility gap rather than proof the change failed.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID:
+          - 4728
+          - 4732
+          - 4756
+      condition: selection
+    fields:
+      - EventID
+      - TargetUserName
+      - SubjectUserName
+      - MemberName
+- question: What activity occurred from the newly privileged account after the change?
+  context: >-
+    Once an account is granted local administrator rights, an operator typically uses it shortly after. Process
+    executions, logons, or network connections from that account in the hours following the change indicate it
+    was put to use rather than provisioned and left idle. Substitute the account name extracted from the command
+    when scoping this search.
+  range: +4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|contains:
+          - 'Administrator'
+          - 'guest'
+          - 'DefaultAccount'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+      - User
+- question: Did this user make other account or group modifications around this time?
+  context: >-
+    Operators frequently chain account changes: creating an account, adding it to administrators, and adjusting
+    other accounts in sequence. Several account-management commands from the same user in a tight window
+    strengthen the case for deliberate privilege manipulation over a one-off administrative edit.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      selection_cmd:
+        CommandLine|contains:
+          - 'net user'
+          - 'net localgroup'
+          - 'Add-LocalGroupMember'
+          - 'Remove-LocalGroupMember'
+          - 'New-LocalUser'
+          - 'Set-LocalUser'
+      condition: selection and selection_cmd
+    fields:
+      - host.name
+      - CommandLine
+- question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the acting user's activity across all hosts reveals lateral movement or parallel changes on multiple
+    endpoints. If the same user performed comparable activity on several hosts in the same window, the scope of
+    the compromise may extend beyond this host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_main:
+      - CommandLine|contains|all:
+        - 'localgroup '
+        - ' /add'
+      - CommandLine|contains|all:
+        - 'Add-LocalGroupMember '
+        - ' -Group '
+      selection_group:
+        CommandLine|contains:
+        - ' administrators '
+        - ' administrateur'
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What did this user do next on this host?
+  context: >-
+    Follow-on activity reveals the operator's next steps after the membership change. Look for additional
+    privilege escalation, persistence installation, credential access, data collection, or lateral movement from
+    the same user on this host.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: What other local-administrator group additions on this host followed in the next four hours, and does the parent or command structure change?
+  context: >-
+    Under a service principal, "what did this user do next" is unbounded. A focused follow-on for automation-driven
+    alerts is to track repeat membership changes on the same host: routine provisioning repeats with stable parents
+    and command structures, while a deviation in the parent process or command structure in the follow-on window is the
+    signal worth chasing.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains:
+          - 'localgroup '
+          - 'Add-LocalGroupMember '
+      condition: selection
+    fields:
+      - ParentImage
+      - CommandLine
+- question: Are there alerts for this user on other hosts?
+  context: >-
+    If the same user triggered alerts on multiple hosts, the activity may extend beyond a single endpoint. Check
+    for lateral movement or credential abuse across the environment. If the user field is not populated in alert
+    data, pivot on the user through process activity instead.
+  range: -24h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        user.name|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - rule.name
+      - event.severity_label
+- question: Did this same rule fire on other hosts in the past 24 hours, and does the cross-host pattern look like coordinated automation or an isolated detection?
+  context: >-
+    Under a service principal, "alerts for this user across hosts" is meaningless because the principal is
+    omnipresent. The triage-useful question is whether this rule fires on multiple hosts: a rule firing across
+    many hosts on the same day is likely tracking scheduled or pushed automation, while a rule firing on one host
+    alone is the deviation worth chasing.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        rule.uuid|expand: '%rule_uuid%'
+      condition: selection
+    fields:
+      - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Granting local administrator rights is rarely the first action in an intrusion. Earlier detections on the same
+    host such as defense tampering, reconnaissance, or credential access may reveal the stages that preceded this
+    change and help reconstruct the timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Were other process-based persistence mechanisms installed on this host?
+  context: >-
+    Granting administrator rights is one persistence and escalation foothold; operators commonly stack additional
+    mechanisms using different tooling. Scheduled tasks, services, registry Run keys, BITS jobs, or WMI
+    subscriptions created in the same timeframe indicate intentional stacking rather than an isolated
+    administrative edit.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- question: Was there a change ticket, maintenance window, or documented approval for this administrator addition?
+  context: >-
+    Many organizations require change tickets for privilege changes. A corresponding ticket suggests authorized
+    activity; absence of one when policy requires it suggests the change was unauthorized. This check often closes
+    a false positive or escalates a true positive quickly and is answered from change-management systems rather
+    than log data.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine

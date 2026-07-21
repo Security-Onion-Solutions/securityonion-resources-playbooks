@@ -1,0 +1,436 @@
+name: Uncommon Extension Shim Database Installation Via Sdbinst.EXE
+id: 79541d16-ded0-4f62-841c-cbe7c4f4b55a
+description: |
+  Detects sdbinst.exe installing an application-compatibility shim database whose command line does not match the
+  legitimate forms. The rule fires when sdbinst.exe (by Image or OriginalFileName) runs AND the command line is not a
+  recognized benign invocation — it does not reference a .sdb file, does not end in one of the known administrative
+  flags (-c, -f, -mm, -t, -m -bg), and is not null or empty. Shim databases are a durable persistence and
+  privilege-escalation mechanism: a custom shim installed system-wide can inject a DLL into a high-frequency target
+  process at every startup, surviving reboot and leaving no Run-key, scheduled-task, or service artifact. Installation
+  registers under HKLM AppCompatFlags (InstalledSDB / Custom) and normally writes the .sdb to %WINDIR%\AppPatch\Custom.
+  Legitimate app-compat patching uses sdbinst too, so the investigation must determine the parent process, the source
+  and extension of the database file, which target executable the shim patches, and whether any change record authorizes it.
+type: detection
+detection_id: 18ee686c-38a3-4f65-9f44-48a077141f42
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the sdbinst.exe command line match what this rule detects — a shim install whose arguments are not a recognized benign form?
+  context: Confirm the alert is a true positive before investing time. The rule fires when sdbinst.exe runs with a command
+    line that does not reference a .sdb file and does not end in one of the legitimate flags (-c, -f, -mm, -t, -m -bg). Read
+    the exact command line and the database path/extension being installed; an uncommon extension (a renamed .sdb such as
+    .tmp or .dat) or a database staged from a user-writable directory is the pattern of interest.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- question: Is this user and host expected to install application-compatibility shim databases?
+  context: sdbinst.exe is rarely used in modern environments outside legacy application support, and installing a shim requires
+    administrative rights (HKLM write). Knowing whether this user role and host function legitimately involve app-compat
+    patching is often the fastest way to separate routine legacy-app maintenance from operator-installed persistence.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Is the parent that launched sdbinst.exe expected, and what started that parent?
+  context: The parent process discriminates legitimate app-compat patching from malicious persistence. An installer, a
+    deployment agent, or a documented maintenance script is a benign parent; a command shell, a script host (wscript.exe,
+    powershell.exe, mshta.exe), or an Office application spawning sdbinst.exe points to operator or macro-driven activity.
+    Trace the parent's own origin to see whether the chain began with a user action or with downloaded/attacker tooling.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What other child processes did the same parent spawn around this time?
+  context: If the parent that launched sdbinst.exe is suspicious, it likely spawned other processes too. Sibling processes
+    reveal the full scope of activity from that parent — reconnaissance, the staging of the shim database file, or follow-on
+    execution — and multiple suspicious children from one parent indicates orchestrated activity rather than an isolated install.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: What exactly did this sdbinst.exe invocation do? Decode the full command line and identify the database file and extension.
+  context: The full command line reveals the specific install action. Identify the path to the database being installed, its
+    extension (a non-.sdb extension is the rule's trigger and a known renaming trick), and the source directory — a database
+    staged from %TEMP%, %APPDATA%, or another user-writable path rather than %WINDIR%\AppPatch is a strong signal. Note any
+    silent-install flag. The query returns all sdbinst.exe executions on this host in the window so sequential install steps
+    are visible together.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Were AppCompatFlags registry keys modified on this host around the time of the shim install?
+  context: Installing a shim database registers it system-wide under HKLM SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\InstalledSDB,
+    with per-application entries under the sibling Custom subkey naming the patched executable. Correlating these registry
+    writes with the sdbinst.exe execution confirms a real install and, through the Custom subkey, names the target executable
+    the shim was built to patch — which is what an injected DLL would load into. If no AppCompatFlags writes accompany the
+    process event, the install may have failed, been rolled back, or registry auditing may not be collected here.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains: '\AppCompatFlags\'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- question: After the shim was installed, were unexpected DLLs loaded into the executable the shim patches?
+  context: The persistence payload of a malicious shim is DLL injection — a RedirectShim or InjectDll fixup causes the patched
+    executable to load an attacker DLL every time it starts, with no further command-line activity. Identify the target
+    executable from the AppCompat Custom registration, then review the modules it loads for unsigned or unexpected DLLs,
+    especially any loaded from a user-writable directory. If image-load telemetry is not collected in this environment,
+    treat zero results as a visibility gap rather than evidence nothing was injected.
+  range: +24h
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      filter_signed:
+        Signed: 'true'
+      condition: selection and not filter_signed
+    fields:
+      - Image
+      - ImageLoaded
+      - Signed
+- question: Was there a change ticket, maintenance window, or documented approval for installing this shim database?
+  context: System-wide shim installation modifies HKLM and is a persistence-class change, so most organizations would require
+    a change record for legitimate legacy-application support. A corresponding ticket or maintenance window suggests
+    authorized patching; the absence of one when policy requires it shifts the disposition toward unauthorized persistence.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Does the timing of this shim install align with normal work hours and maintenance windows?
+  context: Legitimate app-compat patching typically happens during business hours or a scheduled maintenance window.
+    A shim install registered outside those windows — overnight, on a weekend, or on a host with no associated maintenance
+    activity — is more suspicious than the same action during a documented window and is worth correlating with the
+    surrounding host activity.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: When this host has previously fired this rule's pattern, what parents and users drove it, and does the current alert fit?
+  context: Even a rarely used installer can have a legitimate footprint. The query mirrors the rule's selection structure
+    scoped to this host, so the parent/user distribution reflects how this specific firing pattern — not generic sdbinst.exe
+    usage — has historically run here. A new parent process, an unexpected user account, or an unusual command-line structure
+    relative to that history is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - Image|endswith: \sdbinst.exe
+      - OriginalFileName: sdbinst.exe
+      filter_main_legit_ext:
+        CommandLine|contains: .sdb
+      filter_main_legit_extensions:
+      - CommandLine|endswith:
+        - ' -c'
+        - ' -f'
+        - ' -mm'
+        - ' -t'
+      - CommandLine|contains: ' -m -bg'
+      filter_main_null:
+        CommandLine: null
+      filter_main_empty:
+        CommandLine: ''
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - Image|endswith: \sdbinst.exe
+      - OriginalFileName: sdbinst.exe
+      filter_main_legit_ext:
+        CommandLine|contains: .sdb
+      filter_main_legit_extensions:
+      - CommandLine|endswith:
+        - ' -c'
+        - ' -f'
+        - ' -mm'
+        - ' -t'
+      - CommandLine|contains: ' -m -bg'
+      filter_main_null:
+        CommandLine: null
+      filter_main_empty:
+        CommandLine: ''
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - Image|endswith: \sdbinst.exe
+      - OriginalFileName: sdbinst.exe
+      filter_main_legit_ext:
+        CommandLine|contains: .sdb
+      filter_main_legit_extensions:
+      - CommandLine|endswith:
+        - ' -c'
+        - ' -f'
+        - ' -mm'
+        - ' -t'
+      - CommandLine|contains: ' -m -bg'
+      filter_main_null:
+        CommandLine: null
+      filter_main_empty:
+        CommandLine: ''
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints.
+    If the same account installed shims or ran other administrative tooling on more than one host in this window, the scope
+    of the activity is broader than a single endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - Image|endswith: \sdbinst.exe
+      - OriginalFileName: sdbinst.exe
+      filter_main_legit_ext:
+        CommandLine|contains: .sdb
+      filter_main_legit_extensions:
+      - CommandLine|endswith:
+        - ' -c'
+        - ' -f'
+        - ' -mm'
+        - ' -t'
+      - CommandLine|contains: ' -m -bg'
+      filter_main_null:
+        CommandLine: null
+      filter_main_empty:
+        CommandLine: ''
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining the surrounding host activity reveals what led up to the shim install
+    and what followed — staging of the database file, reconnaissance, privilege escalation, or additional persistence.
+    Novel parent-child pairs at low counts stand out against the high-count repetitive system noise.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — defense tampering, reconnaissance, credential access, or privilege
+    escalation — may reveal the stages that preceded the shim install. Persistence is usually established after an actor
+    already has administrative access, so a prior privilege-escalation or credential-access alert reframes this install
+    as one step in a longer sequence.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Have other hosts fired this rule's pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of this
+    firing pattern rather than generic sdbinst.exe usage. Many hosts firing the same pattern points to scripted deployment
+    or vendor automation; one host or a small unrelated set points to manual operator activity. Use the host distribution
+    to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - Image|endswith: \sdbinst.exe
+      - OriginalFileName: sdbinst.exe
+      filter_main_legit_ext:
+        CommandLine|contains: .sdb
+      filter_main_legit_extensions:
+      - CommandLine|endswith:
+        - ' -c'
+        - ' -f'
+        - ' -mm'
+        - ' -t'
+      - CommandLine|contains: ' -m -bg'
+      filter_main_null:
+        CommandLine: null
+      filter_main_empty:
+        CommandLine: ''
+      condition: selection and not 1 of filter_main_*
+    fields:
+    - host.name
+- question: Were other process-based persistence mechanisms installed on this host in the surrounding window?
+  context: Attackers rarely rely on a single persistence mechanism. After installing a shim database, an operator commonly
+    stacks backup mechanisms using different techniques — scheduled tasks, services, registry Run keys, BITS jobs, or WMI
+    subscriptions. Multiple persistence installations in the same timeframe indicate intentional stacking rather than an
+    isolated administrative action.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine

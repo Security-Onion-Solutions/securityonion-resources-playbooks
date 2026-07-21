@@ -1,0 +1,496 @@
+name: Suspicious WSMAN Provider Image Loads
+id: 87c0a3b4-919f-4aae-978a-d4712771b78c
+description: |
+  Detects a process loading a Windows Remote Management (WSMAN/WinRM) provider or automation
+  module from outside the small set of expected WinRM hosts. The rule fires on either of two
+  branches: a requesting client where a non-allowlisted process loads WsmSvc.dll, WsmAuto.dll,
+  or Microsoft.WSMan.Management.ni.dll (matched by loaded-module path or by OriginalFileName so
+  a renamed copy is still caught), OR a responding server where svchost.exe loads the WsmWmiPl.dll
+  WMI plug-in. Known WinRM hosts (pwsh.exe, powershell.exe, powershell_ise.exe, mmc.exe,
+  services.exe, sdiagnhost.exe, and a handful of servicing and management binaries) are filtered out.
+  WinRM sessions are normally driven from PowerShell; loading the WSMAN provider from an unexpected
+  or custom process is consistent with WinRM being driven directly through the WSMan.Automation COM
+  object from non-PowerShell tooling, a lateral-movement approach that avoids powershell.exe and its
+  logging. Determine which process loaded the module and whether it is a legitimate WinRM host,
+  whether the load corresponds to an inbound or outbound WinRM connection, which account and source
+  host are involved, and what command execution followed.
+type: detection
+detection_id: ad1f4bb9-8dfb-4765-adb6-2a7cfb6c0f94
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-10
+questions:
+- question: Which WSMAN provider module loaded, in which process, and did the client or the server branch fire?
+  context: >-
+    Confirm the alert is a true positive by reviewing the exact loaded module (ImageLoaded), its
+    OriginalFileName, and the loading process (Image) against the rule's criteria. Two distinct
+    branches trigger this rule: the requesting-client branch, where a process that is not one of
+    the expected WinRM hosts loads WsmSvc.dll, WsmAuto.dll, or Microsoft.WSMan.Management.ni.dll and
+    is reaching out to drive a remote WinRM session; and the responding-server branch, where
+    svchost.exe loads WsmWmiPl.dll to service an inbound WinRM/WMI request. Note which branch fired,
+    because it selects which downstream questions carry weight: the client branch points to the
+    loading process's identity and its outbound connection, while the server branch points to the
+    inbound source host and the account that authenticated. DLL loads carry the module's signing
+    status and hash directly on the load event.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|endswith|expand: '%ImageLoaded%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+      - ImageLoaded
+- question: Is this user and host expected to initiate or service WinRM sessions?
+  context: >-
+    Legitimate remote administration, monitoring, and management platforms drive WinRM routinely, so
+    knowing whether the account and host function match sanctioned WinRM usage is often the fastest
+    way to separate an administrator or automation from operator-driven lateral movement. A
+    workstation that has no reason to originate WinRM connections, or a server that has no reason to
+    accept them from the observed source, raises the weight of the alert. When the account is a
+    machine account or SYSTEM, pivot on the loading process and the source host instead.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What is the true identity of the process that loaded the WSMAN provider module?
+  context: >-
+    The loading process is the crux of this rule. Compare its Image path against the embedded
+    OriginalFileName and check its hash and signing party: a legitimate WinRM host such as
+    wsmprovhost.exe, an expected management binary, or svchost.exe on the server branch is one story;
+    a renamed, unsigned, or custom-compiled executable driving the WSMan.Automation COM object is
+    another. The example binaries abused for related remote-execution techniques (excel.exe,
+    wmiprvse.exe) are not a fixed list here; any non-allowlisted process loading the provider is the
+    signal. The hash enables a threat-intelligence lookup to determine whether the loader is a known
+    tool or a novel binary.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Hashes
+- question: What full set of modules did this process load, and are any unsigned or from non-canonical paths?
+  context: >-
+    The set of modules a process loads tells the operator's story when the process itself looks
+    ordinary. For WinRM-from-tooling, look for the .NET automation stack (Microsoft.WSMan.Management
+    and its dependencies) loaded by a process that is not a normal PowerShell host, which indicates
+    the WSMan.Automation COM object is being driven from custom code. Also flag modules loaded from
+    %TEMP%, AppData, ProgramData, or Public, unsigned modules where signed ones are expected, and
+    system DLL names resolved from non-system paths. The load events carry each module's signing
+    status and hash directly.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+      - SignatureStatus
+      - Hashes
+- question: What was the loading process's full command line, and what launched it?
+  context: >-
+    The image_load event carries no command line, so pivot by ProcessGuid to the loading process's
+    own execution record to read its full command line, working directory, and parent. On the client
+    branch this reveals whether the process was invoked with a target host and command (the remote
+    instruction being carried over WinRM) and whether it was launched from an interactive shell, a
+    script host such as wscript.exe or mshta.exe, an Office application, or another unexpected parent.
+    Encoded or obfuscated PowerShell arguments (for example -enc or -nop) are not expected here because
+    the expected PowerShell hosts are filtered out of this rule; the loader's own arguments are what
+    describe the operation.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+      - ParentImage
+      - ParentCommandLine
+- question: Has this WSMAN provider module been loaded on this host before, and by which processes?
+  context: >-
+    A first-time load of the provider module by a given process is a stronger anomaly than a
+    recurring one. If the same module has been loaded by the same binary repeatedly over the past 90
+    days, the current load is probably routine WinRM servicing or an installed management agent. If
+    this is the first occurrence, or the module has historically been loaded only by entirely
+    different processes, the current load is anomalous and worth chasing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|endswith|expand: '%ImageLoaded%'
+      condition: selection
+    fields:
+      - Image
+- question: When this host previously fired this rule's pattern, what programs and users drove it, and does the current alert fit?
+  context: >-
+    Even legitimate WinRM servicing can match this rule occasionally. The query mirrors the
+    rule's full selection structure scoped to this host, so the resulting program and user
+    distribution reflects how this specific firing pattern has historically run here rather than
+    generic module usage. A new acting program process, an unexpected account, or an unusual
+    loading process compared with that history is the deviation worth investigating.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      request_client:
+      - ImageLoaded|endswith:
+        - \WsmSvc.dll
+        - \WsmAuto.dll
+        - \Microsoft.WSMan.Management.ni.dll
+      - OriginalFileName:
+        - WsmSvc.dll
+        - WSMANAUTOMATION.DLL
+        - Microsoft.WSMan.Management.dll
+      respond_server:
+        Image|endswith: \svchost.exe
+        OriginalFileName: WsmWmiPl.dll
+      filter_general:
+        Image:
+        - C:\Program Files (x86)\PowerShell\6\pwsh.exe
+        - C:\Program Files (x86)\PowerShell\7\pwsh.exe
+        - C:\Program Files\PowerShell\6\pwsh.exe
+        - C:\Program Files\PowerShell\7\pwsh.exe
+        - C:\Windows\System32\sdiagnhost.exe
+        - C:\Windows\System32\services.exe
+        - C:\Windows\System32\WindowsPowerShell\v1.0\powershell_ise.exe
+        - C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+      filter_svchost:
+        CommandLine|contains:
+        - svchost.exe -k netsvcs -p -s BITS
+        - svchost.exe -k GraphicsPerfSvcGroup -s GraphicsPerfSvc
+        - svchost.exe -k NetworkService -p -s Wecsvc
+        - svchost.exe -k netsvcs
+      filter_mscorsvw:
+        Image|startswith:
+        - C:\Windows\Microsoft.NET\Framework64\v
+        - C:\Windows\Microsoft.NET\Framework\v
+        - C:\Windows\Microsoft.NET\FrameworkArm\v
+        - C:\Windows\Microsoft.NET\FrameworkArm64\v
+        Image|endswith: \mscorsvw.exe
+      filter_svr_2019:
+        Image:
+        - C:\Windows\System32\Configure-SMRemoting.exe
+        - C:\Windows\System32\ServerManager.exe
+      filter_nextron:
+        Image|startswith: C:\Windows\Temp\asgard2-agent\
+      filter_citrix:
+        Image|startswith: C:\Program Files\Citrix\
+      filter_upgrade:
+        Image|startswith: C:\$WINDOWS.~BT\Sources\
+      filter_mmc:
+        Image|endswith: \mmc.exe
+      svchost:
+        Image|endswith: \svchost.exe
+      commandline_null:
+        CommandLine: null
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (( request_client or respond_server ) and not 1 of filter* and not ( svchost and commandline_null )) and _pb_scope
+    fields:
+    - Image
+    - User
+- question: What remote connection accompanied this WSMAN load, and is the source or destination an expected administrative endpoint?
+  context: >-
+    WinRM carries its sessions over HTTP on TCP 5985 and HTTPS on TCP 5986, with related remote
+    invocation on RPC port 135. On the responding-server branch, an inbound connection to this host
+    on 5985 or 5986 around the load reveals which host initiated the session; on the client branch the
+    same ports show where this host reached out. Determine whether the peer is a known jump box or
+    management server, or an unexpected workstation being used as a pivot. Connections on lateral
+    ports from or to an unusual peer are the network half of the remote-execution chain.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationPort:
+          - 445
+          - 135
+          - 3389
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - SourceIp
+      - DestinationPort
+- question: Where has this account authenticated recently, and do the logons look like WinRM lateral movement?
+  context: >-
+    WinRM-driven remote execution produces a network logon (type 3) on the responding host, so
+    the account's authentication trail places this WSMAN activity in the context of where it has
+    been used. An account authenticating to many hosts in a short window, especially with
+    network logons around the time of the module load, points to lateral movement in progress
+    rather than a single administrative session. Correlate the logon source addresses with the
+    connection peer seen on the WinRM ports. If the alert fired under SYSTEM, LOCAL SERVICE,
+    NETWORK SERVICE, or a machine account (name ending in $), this query intentionally returns
+    nothing — service-principal logons are background noise, not an actor trail. For a human
+    account, zero results can also mean the Security channel is not ingested for the relevant
+    hosts; confirm 4624 visibility before reading zero as "no authentications".
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        EventID:
+        - 4624
+        - 4625
+        TargetUserName|expand: '%User%'
+      filter_svcprin_builtin:
+        TargetUserName:
+        - SYSTEM
+        - LOCAL SERVICE
+        - NETWORK SERVICE
+      filter_svcprin_machine:
+        TargetUserName|endswith: $
+      condition: (selection) and not 1 of filter_svcprin_*
+    fields:
+    - host.name
+    - IpAddress
+    - EventID
+    - LogonType
+- question: What processes ran on this host shortly after the WSMAN load, and did wsmprovhost.exe spawn any commands?
+  context: >-
+    Loading the WSMAN provider is a means to remote command execution. On the responding-server
+    branch, a WinRM request is serviced by wsmprovhost.exe, whose child processes are the commands the
+    remote operator ran; on the client branch, the loading tool itself may spawn follow-on processes.
+    Examining what executed in the window after the load reveals the operator's objective on the host
+    -- reconnaissance, credential access, tool staging, or further lateral movement.
+  range: +30m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - User
+      - Image
+- question: Is there any PowerShell script-block activity tied to this WinRM session, or is it decoupled from PowerShell?
+  context: >-
+    PowerShell script block logging (Event ID 4104) records the deobfuscated content of any PowerShell
+    that ran, including WinRM cmdlets such as Invoke-Command or New-PSSession. Because the expected
+    PowerShell hosts are filtered out of this rule, the informative outcome is often the absence of
+    matching script-block events around the load: no corresponding PowerShell activity corroborates
+    that WinRM was driven directly from the WSMan.Automation COM object by non-PowerShell tooling. If
+    script-block events are present, they reveal the actual commands. If PowerShell operational logs
+    are not ingested in this environment, treat zero results as a visibility gap rather than evidence
+    nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: What other process activity occurred on this host around the time of the alert?
+  context: >-
+    Remote-execution activity rarely occurs in isolation. Aggregating process activity in a tight
+    window around the load surfaces what led up to the WSMAN session and what ran immediately after.
+    Novel parent-child pairs stand out at low counts against high-count routine telemetry, which is
+    what points to reconnaissance, privilege escalation, or persistence installed alongside the remote
+    execution.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host -- reconnaissance, credential access, or defense tampering --
+    may reveal the stages that preceded this remote-execution activity and help reconstruct the
+    timeline. Lateral movement is usually a means to an end, so prior alerts help place this WSMAN
+    load within a larger sequence and identify how the operator reached the point of driving WinRM.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Have other hosts fired this rule's pattern in the past week, and does the distribution look like automation or targeted activity?
+  context: >-
+    The query mirrors the rule's full selection structure with no host scope, so the result is a
+    fleet-wide count of this specific firing pattern rather than generic WSMAN usage. Many hosts
+    matching the same pattern points to a management platform, monitoring agent, or vendor automation
+    that drives WinRM broadly; one host or a small unrelated set points to hands-on operator activity.
+    Use the host distribution to calibrate severity and to identify whether the same pattern is
+    spreading across the environment.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      request_client:
+      - ImageLoaded|endswith:
+        - \WsmSvc.dll
+        - \WsmAuto.dll
+        - \Microsoft.WSMan.Management.ni.dll
+      - OriginalFileName:
+        - WsmSvc.dll
+        - WSMANAUTOMATION.DLL
+        - Microsoft.WSMan.Management.dll
+      respond_server:
+        Image|endswith: \svchost.exe
+        OriginalFileName: WsmWmiPl.dll
+      filter_general:
+        Image:
+        - C:\Program Files (x86)\PowerShell\6\pwsh.exe
+        - C:\Program Files (x86)\PowerShell\7\pwsh.exe
+        - C:\Program Files\PowerShell\6\pwsh.exe
+        - C:\Program Files\PowerShell\7\pwsh.exe
+        - C:\Windows\System32\sdiagnhost.exe
+        - C:\Windows\System32\services.exe
+        - C:\Windows\System32\WindowsPowerShell\v1.0\powershell_ise.exe
+        - C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+      filter_svchost:
+        CommandLine|contains:
+        - svchost.exe -k netsvcs -p -s BITS
+        - svchost.exe -k GraphicsPerfSvcGroup -s GraphicsPerfSvc
+        - svchost.exe -k NetworkService -p -s Wecsvc
+        - svchost.exe -k netsvcs
+      filter_mscorsvw:
+        Image|startswith:
+        - C:\Windows\Microsoft.NET\Framework64\v
+        - C:\Windows\Microsoft.NET\Framework\v
+        - C:\Windows\Microsoft.NET\FrameworkArm\v
+        - C:\Windows\Microsoft.NET\FrameworkArm64\v
+        Image|endswith: \mscorsvw.exe
+      filter_svr_2019:
+        Image:
+        - C:\Windows\System32\Configure-SMRemoting.exe
+        - C:\Windows\System32\ServerManager.exe
+      filter_nextron:
+        Image|startswith: C:\Windows\Temp\asgard2-agent\
+      filter_citrix:
+        Image|startswith: C:\Program Files\Citrix\
+      filter_upgrade:
+        Image|startswith: C:\$WINDOWS.~BT\Sources\
+      filter_mmc:
+        Image|endswith: \mmc.exe
+      svchost:
+        Image|endswith: \svchost.exe
+      commandline_null:
+        CommandLine: null
+      condition: ( request_client or respond_server ) and not 1 of filter* and not ( svchost and commandline_null )
+    fields:
+    - host.name
+- question: Has this account used lateral-movement tooling to reach other hosts recently?
+  context: >-
+    Operators rarely stop at one target. If the same account has driven remote-execution or
+    remote-copy tools across several hosts in a short window, the scope of the activity is
+    larger than a single WinRM session. Finding this account launching lateral tooling on many
+    hosts, alongside the WSMAN load seen here, indicates active movement across the environment
+    rather than an isolated administrative action. If this alert fired under SYSTEM, LOCAL
+    SERVICE, NETWORK SERVICE, or a machine account (name ending in $), this query intentionally
+    returns nothing — a user pivot on a service principal matches every host's background
+    automation, not an actor; assess movement through the host- and program-scoped questions
+    instead.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      selection_lateral:
+        Image|endswith:
+        - \psexec.exe
+        - \psexec64.exe
+        - \mstsc.exe
+        - \ssh.exe
+        - \plink.exe
+        - \wmic.exe
+      filter_svcprin_builtin:
+        User:
+        - SYSTEM
+        - LOCAL SERVICE
+        - NETWORK SERVICE
+      filter_svcprin_machine:
+        User|endswith: $
+      condition: (selection and selection_lateral) and not 1 of filter_svcprin_*
+    fields:
+    - host.name
+    - Image

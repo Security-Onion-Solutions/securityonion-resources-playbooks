@@ -1,0 +1,405 @@
+name: Suspicious FileFix Execution Pattern
+id: bde24086-b6d1-45e9-87ed-9f2a2b11053b
+description: |
+  Detects a browser process (brave.exe, chrome.exe, firefox.exe, msedge.exe) spawning a child whose command line contains a '#' character AND EITHER a command-interpreter or download-utility token (cmd, powershell, pwsh, mshta, wscript, cscript, rundll32, regsvr32, certutil, bitsadmin, curl, wget, finger, %comspec%, schtasks) OR a social-engineering keyword (captcha, verify, verification, validation, human, robot, challenge, confirmation, account, identity, and similar). This pattern reflects FileFix-style social engineering: a web page silently writes an interpreter command to the clipboard, pads it so the visible portion looks like a benign file path, and instructs the victim to paste it into the File Explorer address bar, where pressing Enter executes the hidden command from a browser child process. The investigation should determine what command actually ran, whether it downloaded or staged a payload, what the parent browser was doing, and whether the same pattern reached other users or hosts.
+type: detection
+detection_id: b5b29e4e-31fa-4fdf-b058-296e7a1aa0c2
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- question: Did a browser process spawn a child whose command line contains '#' and either an interpreter/download token or a social-engineering keyword?
+  context: Confirm the alert is a true positive by reviewing the exact command line and parent against the detection criteria. The rule fires when the parent is a browser AND the command line contains '#' AND EITHER a command-interpreter or download-utility token OR a social-engineering keyword such as captcha or verify. Note which branch matched, because an interpreter/download token points at direct execution while a keyword-only match points at clipboard lure text that may still carry a hidden command after the '#'.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - CommandLine
+- question: Is this user and host expected to launch command interpreters or download utilities from a browser?
+  context: Legitimate workflows rarely have a browser directly spawn cmd.exe, powershell.exe, or download utilities. Browser extensions, automation frameworks, or developer tooling can do so on specific endpoints. Knowing whether this user role and host function routinely involve such activity is often the fastest way to separate a genuine FileFix paste from sanctioned automation.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What did the browser child actually run? Decode the command line, focusing on what follows the '#' and any encoding or download logic.
+  context: In FileFix, the clipboard text is padded with whitespace and a '#' so the visible portion looks like a harmless file path, while the real interpreter command sits before the '#' or is hidden by leading spaces. Decode any base64 or encoded blocks, identify download or web-request logic, and note any file paths the command reads from or writes to. The query scopes to browser-spawned children on this host carrying the '#' marker so multi-step pastes that span more than one invocation are visible together.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%ParentImage%'
+        CommandLine|contains: '#'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+      - Image
+- question: Is this browser expected to spawn this child, and what started the browser?
+  context: The browser-to-interpreter parent-child relationship is the core signal. Tracing the browser's own origin helps confirm it is an ordinary interactive session rather than a process masquerading under a browser name, and the parent's command line may show the profile or page context in play.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What other child processes did the same browser instance spawn?
+  context: A FileFix paste frequently launches a chain — an interpreter that then calls a download utility, an archive expander, or a second-stage binary. Examining all children of the same browser instance reveals whether this was an isolated spawn or one step in a sequence of staged tools.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: What file events did this browser generate around the time of the alert?
+  context: FileFix variants stage payloads without an explicit download by abusing the browser cache, where the page causes the browser to cache a disguised file and a pasted command later copies cache files into a working directory, carves out embedded archive bytes, and expands them. File events tied to the browser around the alert time can reveal cached payload files, copied archives, or expanded executables that the command-line view alone would miss.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%ParentImage%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Are the files referenced by the command line still on disk for analysis?
+  context: If the pasted command downloaded, copied, or expanded a file (a staged payload, a carved archive, an expanded executable), checking whether those paths still exist enables hash lookups, content review, or submission to a safe analysis environment. The file paths are derived from the command line surfaced during command decoding.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Did the browser child or its descendants make outbound network connections shortly after execution?
+  context: A FileFix one-liner commonly downloads a payload or contacts an external host immediately after the user pastes it. Outbound connections from the spawned interpreter or its children, correlated to the execution time, distinguish a benign paste from one that fetched or beaconed to a remote host. Some cache-smuggling variants make no outbound connection at all, so absence of egress does not by itself clear the alert.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      filter_system:
+        Image|endswith:
+          - \svchost.exe
+          - \services.exe
+          - \lsass.exe
+      condition: selection and not filter_system
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- question: What page or browsing activity led the browser to spawn this child?
+  context: FileFix begins with a malicious web page impersonating a legitimate service that copies a disguised command to the clipboard and instructs the user to paste it into the File Explorer address bar. Identifying the originating page — from browser history, proxy or web logs, or the parent command line — enables blocking the lure domain and finding other users who visited it.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+- question: Does this browser normally spawn this child binary on this host?
+  context: Browsers spawning command interpreters or download utilities is unusual outside of specific extensions or automation. A zero or very low historical count for this browser-to-child pairing on this host marks it as a novel spawning relationship worth chasing; a high count points to an established local workflow.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_exec_parent:
+        ParentImage|endswith:
+        - \brave.exe
+        - \chrome.exe
+        - \firefox.exe
+        - \msedge.exe
+        CommandLine|contains: '#'
+      selection_cli_lolbin:
+        CommandLine|contains:
+        - '%comspec%'
+        - bitsadmin
+        - certutil
+        - cmd
+        - cscript
+        - curl
+        - finger
+        - mshta
+        - powershell
+        - pwsh
+        - regsvr32
+        - rundll32
+        - schtasks
+        - wget
+        - wscript
+      selection_cli_captcha:
+        CommandLine|contains:
+        - account
+        - anti-bot
+        - botcheck
+        - captcha
+        - challenge
+        - confirmation
+        - fraud
+        - human
+        - identification
+        - identificator
+        - identity
+        - robot
+        - validation
+        - verification
+        - verify
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection_exec_parent and 1 of selection_cli_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_exec_parent:
+        ParentImage|endswith:
+        - \brave.exe
+        - \chrome.exe
+        - \firefox.exe
+        - \msedge.exe
+        CommandLine|contains: '#'
+      selection_cli_lolbin:
+        CommandLine|contains:
+        - '%comspec%'
+        - bitsadmin
+        - certutil
+        - cmd
+        - cscript
+        - curl
+        - finger
+        - mshta
+        - powershell
+        - pwsh
+        - regsvr32
+        - rundll32
+        - schtasks
+        - wget
+        - wscript
+      selection_cli_captcha:
+        CommandLine|contains:
+        - account
+        - anti-bot
+        - botcheck
+        - captcha
+        - challenge
+        - confirmation
+        - fraud
+        - human
+        - identification
+        - identificator
+        - identity
+        - robot
+        - validation
+        - verification
+        - verify
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection_exec_parent and 1 of selection_cli_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals whether the same person triggered similar activity on multiple endpoints, which would widen the scope of the incident. This asks what they did right now across the network, distinct from their long-term baseline.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_exec_parent:
+        ParentImage|endswith:
+        - \brave.exe
+        - \chrome.exe
+        - \firefox.exe
+        - \msedge.exe
+        CommandLine|contains: '#'
+      selection_cli_lolbin:
+        CommandLine|contains:
+        - '%comspec%'
+        - bitsadmin
+        - certutil
+        - cmd
+        - cscript
+        - curl
+        - finger
+        - mshta
+        - powershell
+        - pwsh
+        - regsvr32
+        - rundll32
+        - schtasks
+        - wget
+        - wscript
+      selection_cli_captcha:
+        CommandLine|contains:
+        - account
+        - anti-bot
+        - botcheck
+        - captcha
+        - challenge
+        - confirmation
+        - fraud
+        - human
+        - identification
+        - identificator
+        - identity
+        - robot
+        - validation
+        - verification
+        - verify
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection_exec_parent and 1 of selection_cli_*) and _pb_scope
+    fields:
+    - host.name
+- question: Did this same detection fire for other users or on other hosts?
+  context: Social-engineering campaigns rarely target a single user. If one person was lured into pasting the command, others likely received the same page. Correlating this detection across hosts reveals the breadth of the campaign and identifies additional systems that need investigation.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        rule.uuid|expand: '%rule_uuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — reconnaissance, defense tampering, or credential access — may reveal the stages that preceded this execution and help reconstruct the timeline of the intrusion.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

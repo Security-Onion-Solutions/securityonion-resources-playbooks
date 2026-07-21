@@ -1,0 +1,365 @@
+name: Potential Arbitrary DLL Load Using Winword
+id: 458b1b65-10ba-45b6-9983-85b17f77f216
+description: |
+  Detects the Microsoft Word process (winword.exe, identified by Image or
+  OriginalFileName) launched with a command line that contains both the '/l '
+  switch and a '.dll' reference. Word's '/l' flag loads a specified add-in
+  library at startup, so this command structure causes Word to load an arbitrary DLL —
+  an indirect-execution path that runs operator code under a trusted Office
+  process and can bypass controls keyed on direct loader binaries. Legitimate use
+  is rare; the investigation should decode the exact DLL and switches, identify
+  where the DLL came from and whether it is signed, and determine what Word did
+  after loading it (child processes or outbound connections).
+type: detection
+detection_id: f7375e28-5c14-432f-b8d1-1db26c832df3
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-09
+questions:
+- question: Does the command line match what this rule detects — winword.exe (by Image or OriginalFileName) invoked with both the '/l ' switch and a '.dll' reference?
+  context: Before investing investigation time, confirm the alert is a true positive. The
+    rule fires only when the process is Word and its command line contains both the '/l '
+    add-in-load switch and a '.dll' string. Review the full command line and the Image /
+    OriginalFileName to verify both conditions are present and note the exact DLL path the
+    '/l' flag points to.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to launch Word with an add-in-load switch?
+  context: Interactive users almost never start Word from the command line with the '/l'
+    switch — that pattern is typical of scripted or automated invocation. Knowing whether
+    the account routinely runs Office automation, and whether the host's function involves
+    document processing or add-in development, is often the fastest way to separate a true
+    positive from a sanctioned workflow.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What exactly did this Word invocation do? Decode the full command line, the '/l' target DLL path, and any other switches.
+  context: The full command line reveals the specific DLL Word was directed to load and any
+    additional switches. Decode the path the '/l' flag points to — note whether it sits in a
+    user-writable or temporary location, carries an unusual name, or is masquerading as a
+    legitimate add-in. The DLL path is the primary indicator to pivot on for origin and
+    reputation checks.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What process spawned this Word instance, and is that parent chain expected?
+  context: A user opening Word from Explorer or a desktop shortcut is routine; Word launched
+    by a script host, command interpreter, or another Office application with a command-line
+    add-in switch is the indirect-execution path this rule targets. The parent reveals how
+    the invocation was driven — tracing what spawned the parent shows whether a person or an
+    automated loader initiated it.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What child processes did this Word instance spawn afterward?
+  context: A loaded DLL commonly runs operator code that spawns secondary programs —
+    command interpreters, script hosts, rundll32, regsvr32, mshta, msiexec, curl, or
+    bitsadmin. Children of this kind shortly after the load indicate the DLL executed
+    follow-on activity rather than a benign add-in initialization; predictable Office helper
+    children point to routine behavior.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Did this Word process or its children open outbound network connections shortly after the load?
+  context: Indirect execution through a loaded library frequently reaches out to retrieve a
+    second stage or establish command-and-control. Outbound connections from winword.exe or
+    a child it spawned, especially to external addresses, point to active payload behavior
+    rather than a local add-in. Correlate the connection timing with the load to tie network
+    activity to this invocation.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+      filter_internal:
+        DestinationIp|cidr:
+          - '10.0.0.0/8'
+          - '172.16.0.0/12'
+          - '192.168.0.0/16'
+          - '127.0.0.0/8'
+      condition: selection and not filter_internal
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- question: Where did the loaded DLL come from — was the file recently written to this host, and from what location?
+  context: A sideloaded DLL is often dropped onto the host shortly before Word loads it.
+    Looking at file-write events for the DLL path shows whether the library was newly
+    created, where it landed (a user-writable or temporary directory is notable), and which
+    process wrote it. A long-resident, system-path DLL is less concerning than one written
+    minutes before the alert by a download or extraction tool.
+  range: -24h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith: '.dll'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - User
+- question: Does this host normally run Word with this command-line structure?
+  context: Word itself is common on most workstations, but a command-line launch carrying the
+    '/l' add-in-load switch is not. Low or zero historical counts of this binary's
+    command-line invocation indicate first-time or rare execution; a steady history points to
+    an established automation or add-in workflow worth confirming.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: When this host has previously matched this rule's pattern, what parents and users normally drive it, and does the current alert fit?
+  context: Even a trusted application can be abused. This query mirrors the rule's selection —
+    Word with both '/l ' and '.dll' — scoped to this host, so the resulting parent/user
+    distribution reflects how this specific firing pattern has historically run here.
+    Deviations such as a new parent process, an unexpected account, or an unusual command-line
+    pattern are the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \WINWORD.exe
+      - OriginalFileName: WinWord.exe
+      selection_dll:
+        CommandLine|contains|all:
+        - '/l '
+        - .dll
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Have other hosts matched this rule's pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: This query mirrors the rule's selection with no host scope, giving a fleet-wide
+    count of the pattern — Word loading a DLL via '/l' — rather than generic Word usage. Many
+    hosts firing the same pattern points to a scripted deployment or vendor add-in rollout; a
+    single host or a small unrelated set points to manual operator activity. Use the host
+    distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \WINWORD.exe
+      - OriginalFileName: WinWord.exe
+      selection_dll:
+        CommandLine|contains|all:
+        - '/l '
+        - .dll
+      condition: all of selection_*
+    fields:
+    - host.name
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \WINWORD.exe
+      - OriginalFileName: WinWord.exe
+      selection_dll:
+        CommandLine|contains|all:
+        - '/l '
+        - .dll
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \WINWORD.exe
+      - OriginalFileName: WinWord.exe
+      selection_dll:
+        CommandLine|contains|all:
+        - '/l '
+        - .dll
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the environment around this time?
+  context: Tracking the account's activity across all hosts in the surrounding window reveals
+    lateral movement or coordinated activity on multiple endpoints. If the same user triggered
+    similar activity elsewhere, the scope is larger than this one host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \WINWORD.exe
+      - OriginalFileName: WinWord.exe
+      selection_dll:
+        CommandLine|contains|all:
+        - '/l '
+        - .dll
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Surveying activity around the alert reveals what
+    led to the load and what followed — reconnaissance, persistence, or further execution.
+    Aggregating by process and parent collapses repetitive agent telemetry into high-count
+    rows while novel parent-child pairs stand out at low counts.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — defense tampering, reconnaissance, credential
+    access, or a download — may reveal the attack stages that preceded the DLL load and help
+    reconstruct the full timeline. The sequence of alerts on a host often tells the broader
+    story of what is unfolding.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

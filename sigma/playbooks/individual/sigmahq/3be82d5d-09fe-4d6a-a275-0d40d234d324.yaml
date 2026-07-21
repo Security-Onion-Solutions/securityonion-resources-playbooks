@@ -1,0 +1,365 @@
+name: InstallerFileTakeOver LPE CVE-2021-41379 File Create Event
+id: ba17bf4f-a9bf-49a4-b8e1-cc9492b4d4da
+description: |
+  Detects the file-create signature of CVE-2021-41379 (InstallerFileTakeOver) local privilege escalation: an msiexec.exe
+  process writing elevation_service.exe into the Microsoft Edge Application directory. The exploit abuses the Windows
+  Installer service to overwrite the Edge elevation service DACL and copy an attacker-controlled binary into that protected
+  location, which is then executed as SYSTEM to obtain elevated privileges. Legitimate Edge upgrades can occasionally touch
+  this path, so confirm the writing process and its parent lineage, inspect the payload's content and hash, and determine
+  whether a SYSTEM-level process executed from the location afterward.
+type: detection
+detection_id: 3be82d5d-09fe-4d6a-a275-0d40d234d324
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-03
+questions:
+- question: Did msiexec.exe create elevation_service.exe under the Microsoft Edge Application directory, exactly as this rule detects?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule fires when msiexec.exe writes
+    a file ending in \elevation_service.exe beneath C:\Program Files (x86)\Microsoft\Edge\Application — the CVE-2021-41379
+    takeover signature. Review the exact path, the operation type (created/renamed), and the responsible process against the
+    detection criteria.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - Image
+      - TargetFilename
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this host expected to have msiexec.exe write into the Microsoft Edge Application directory?
+  context: Legitimate Microsoft Edge update flows occasionally write to the Application directory, but they run from Edge
+    update services rather than an interactive or ad-hoc msiexec invocation. Knowing whether this host and account routinely
+    perform installer activity in this location is often the fastest way to separate a genuine upgrade from the exploit.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: What msiexec.exe command lines ran on this host around the alert, and what installer operation do they show?
+  context: The file write is driven by msiexec.exe. Decode the msiexec command lines on this host within a few minutes of
+    the alert — the exploit typically triggers an administrative install (/a) or a repair/patch operation against a crafted
+    package to make the installer service perform the privileged file copy. The command line reveals which package and switches
+    were used.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What is the content of the elevation_service.exe that was written — the legitimate Edge service or a substituted binary?
+  context: The exploit copies an attacker-controlled binary to the Edge elevation service location. Retrieve the file from
+    disk and inspect it — signing status, embedded strings, imports, and size — to determine whether it is the genuine
+    Microsoft-signed elevation service or a planted payload staged for SYSTEM execution.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: If the written binary later executed, what is its hash and does it have known threat-intel detections?
+  context: A file's hash is recorded when it runs, not when it is written, so file-create events carry no hash. This query
+    looks for the dropped path executing and reads its hash; submit that to reputation and internal threat-intel sources to
+    determine whether it is the signed Edge service, known malicious, or previously unseen. If the binary is present but has
+    not executed, retrieve it from its on-disk path and hash it manually.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - Image
+      - Hashes
+- question: What process launched the msiexec.exe that performed the write, and is that parent chain expected?
+  context: The parent of msiexec reveals how the installer was invoked. A genuine Edge upgrade is driven by an update service;
+    the exploit is typically launched from a low-privilege user shell, a script host, or a dropped executable. This lookup
+    retrieves the msiexec process event by its identifier so the parent process and its command line are visible.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - Image
+      - CommandLine
+- question: After the drop, did elevation_service.exe execute and spawn a SYSTEM-level process such as a command shell?
+  context: The payoff of the exploit is running the substituted binary as SYSTEM and using it to launch an elevated shell.
+    A cmd.exe or powershell.exe child of elevation_service.exe running under the SYSTEM account is the privilege-escalation
+    payload. Special-privilege logon events are not consistently collected in every environment, so confirm SYSTEM-level
+    execution from the process lineage and the User field on the spawned children.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: \elevation_service.exe
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - User
+- question: Is the written elevation_service.exe still on disk, or was it deleted or renamed after the alert?
+  context: The file's post-alert lifecycle drives next steps. A payload still on disk can be retrieved, hashed, and analyzed;
+    a file deleted or overwritten shortly after creation suggests cleanup after the SYSTEM shell was obtained and shifts the
+    focus to what executed in between.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What other files did the responsible msiexec.exe process write or delete around the alert?
+  context: The installer service performs the takeover by manipulating files beyond the single dropped binary — junctions,
+    staged packages, or DACL-altered targets. The breadth, paths, and operations of the writing process's other file activity
+    distinguish a single artifact from a wider takeover sequence and enumerate what else needs review.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What else has been written to the Microsoft Edge Application directory recently, and by which processes?
+  context: The Edge Application directory is normally written only by Edge update components. Other recent arrivals in the
+    same location — and especially writes by msiexec.exe or non-Edge processes — reveal whether this is an isolated drop or
+    a location under active manipulation, and surface any additional planted files.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains: '\Microsoft\Edge\Application\'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- always_include: true
+  question: Has the user tied to this write previously produced this exact create pattern, and does that fit their role?
+  context: The query mirrors the rule's selection scoped to this user, so the result is the user's 90-day history of this
+    specific msiexec-to-elevation_service.exe create pattern, aggregated by host. A user who has never produced it is more
+    suspicious than one who does so routinely. When the write is attributed to a service or machine account, identity does
+    not attribute intent — weigh this alongside the parent-process history.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \msiexec.exe
+        TargetFilename|startswith: C:\Program Files (x86)\Microsoft\Edge\Application
+        TargetFilename|endswith: \elevation_service.exe
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: Has this program historically driven this create pattern, or is the program new for this activity?
+  context: When the alert fires under a service principal such as SYSTEM, user identity does not attribute behavior — the
+    meaningful pivot is the launch mechanism. The query mirrors the rule's selection scoped to the alerting program,
+    so the result is the 90-day history of that program driving this specific pattern. A new or rare program for the pattern
+    is the deviation worth chasing; a program that already accounts for many prior events is more likely update automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \msiexec.exe
+        TargetFilename|startswith: C:\Program Files (x86)\Microsoft\Edge\Application
+        TargetFilename|endswith: \elevation_service.exe
+      _pb_scope:
+        Image|endswith|expand: '%Image%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Have other hosts fired this create pattern in the past week, and does the distribution look like automation or isolated activity?
+  context: The query mirrors the rule's selection with no host scope, so the result is a fleet-wide count of this specific
+    takeover pattern. Many hosts firing it in the same period would point to a scripted deployment or a broad update event;
+    a single host or a small unrelated set points to targeted exploitation. Use the host distribution to calibrate scope and
+    severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \msiexec.exe
+        TargetFilename|startswith: C:\Program Files (x86)\Microsoft\Edge\Application
+        TargetFilename|endswith: \elevation_service.exe
+      condition: selection
+    fields:
+    - host.name
+- question: Was the msiexec.exe that performed the write the genuine system binary, or a copied or renamed executable?
+  context: The exploit normally uses the legitimate msiexec.exe, but a mismatch between the running image name and its
+    embedded original file name would indicate a relocated or renamed copy staged to evade path-based controls. This lookup
+    reads the process's original file name for comparison against its on-disk path.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- question: Were any other proxy-execution LOLBins used on this host recently?
+  context: Operators who abuse one signed system binary to run or stage code often use several. If additional proxy-execution
+    LOLBins ran on this host near the alert, the msiexec takeover may be one step in a broader hands-on-keyboard sequence
+    rather than an isolated event.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\rundll32.exe'
+          - '\regsvr32.exe'
+          - '\mshta.exe'
+          - '\msbuild.exe'
+          - '\cmstp.exe'
+          - '\installutil.exe'
+          - '\forfiles.exe'
+          - '\pcalua.exe'
+          - '\presentationhost.exe'
+          - '\control.exe'
+          - '\infdefaultinstall.exe'
+          - '\msdt.exe'
+          - '\mavinject.exe'
+          - '\wmic.exe'
+          - '\xwizard.exe'
+          - '\ie4uinit.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- question: How often has this msiexec-to-elevation_service.exe create pattern fired on this host over the past 90 days?
+  context: A takeover pattern with no prior history on a host is far more suspicious than one seen repeatedly under stable
+    update automation. The query mirrors the rule's selection scoped to this host, so the count reflects this specific
+    pattern rather than generic msiexec activity. A count at or near zero indicates first-time activity; the command-line
+    detail for the writing process is retrieved through the process pivot rather than from the file event itself.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \msiexec.exe
+        TargetFilename|startswith: C:\Program Files (x86)\Microsoft\Edge\Application
+        TargetFilename|endswith: \elevation_service.exe
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - CommandLine
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Local privilege escalation is rarely the first action on a host. Earlier detections — initial access, reconnaissance,
+    or execution of the exploit's staging steps — may reveal how the attacker gained the low-privilege foothold the takeover
+    builds on and help reconstruct the timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

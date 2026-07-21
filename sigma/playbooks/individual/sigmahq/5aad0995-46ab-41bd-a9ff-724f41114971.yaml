@@ -1,0 +1,296 @@
+name: Esentutl Volume Shadow Copy Service Keys
+id: 8d92cd37-2440-40d8-be65-ebc65cfbf4c8
+description: |
+  Detects esentutl.exe writing to a registry key path containing System\CurrentControlSet\Services\VSS, excluding the VSS\Start service-configuration subkey. esentutl.exe is the built-in Extensible Storage Engine utility; when it is invoked to copy a file through the Volume Shadow Copy Service it initializes and processes the VSS diagnostic and volume keys as a side effect, so esentutl touching these keys is the fingerprint of a shadow-copy-backed file copy rather than routine database maintenance. This access pattern is commonly used to copy locked credential stores — the local SAM hive or ntds.dit — that cannot be read directly, so the alert fires when the registry write matches the VSS path AND is not the excluded Start subkey. The investigation should determine what esentutl was copying, which parent launched it, whether a copied hive file was written to disk, and which local accounts are exposed if a SAM copy succeeded.
+type: detection
+detection_id: 5aad0995-46ab-41bd-a9ff-724f41114971
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-09
+questions:
+- question: Does the registry key and writing process match what this rule detects?
+  context: Confirm the alert is a true positive before investing time. The TargetObject should be a key path under System\CurrentControlSet\Services\VSS that is not the VSS\Start service-start subkey, and the writing process (Image) should be esentutl.exe. esentutl writing these Volume Shadow Copy Service keys is the artifact of a shadow-copy file copy, which is what separates this from the VSS service itself touching the same keys during a routine backup.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - Image
+      - TargetObject
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this user and host expected to run esentutl against Volume Shadow Copy keys?
+  context: esentutl driving the Volume Shadow Copy Service is normal on database and backup servers and on hosts running Extensible Storage Engine maintenance. On a general-purpose workstation or a server with no database or backup role, esentutl processing VSS keys is uncommon and worth scrutiny. The User field is present on most endpoint registry events, but shadow-copy access typically runs with SYSTEM or administrative rights, so if User is a machine account or missing, judge context from the host's role and the writing process.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: What was esentutl copying — was the SAM, SYSTEM, or ntds.dit hive accessed or exported?
+  context: The registry write is a side effect; the esentutl command line reveals the real target. Copying a locked hive through the shadow copy service usually appears as esentutl invoked with a /vss or /y copy option and a source path such as %SystemRoot%\System32\config\SAM, %SystemRoot%\System32\config\SYSTEM, or an ntds.dit path, with a destination in %TEMP%, C:\Users\Public, or a similar staging directory. Recovering both SAM and SYSTEM (or ntds.dit plus SYSTEM) is what enables offline hash extraction, so the presence of both confirms credential-theft intent. The alert carries no command line on the registry event itself, so this query pivots to the esentutl process by ProcessGuid.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Which Volume Shadow Copy Service key was written, and does the value indicate active shadow-copy processing rather than service configuration?
+  context: The path under Services\VSS distinguishes intent. The Diag and VolSnap\Volume keys are written while the shadow copy service is actively initialized and a snapshot is processed, which is the state esentutl drives when copying a locked file; the VSS\Start subkey (excluded by the rule) is ordinary service-start configuration. Record the exact key and value data so the write can be correlated with the esentutl command and with any copied hive file created in the same window.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: What process launched esentutl, and is that parent chain expected?
+  context: The parent reveals how esentutl was invoked. A backup or database-maintenance parent (a scheduled backup service, an administrative console) fits routine shadow-copy use; an interactive shell, a script host such as wscript.exe or powershell.exe, or an Office application launching esentutl points to hands-on operator activity or a malicious script. The query returns the esentutl process event by ProcessGuid so its immediate parent and the command that started it are visible; walk further up the tree from the parent if the immediate parent is itself a generic launcher.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - CommandLine
+- question: When this host has previously fired the esentutl-plus-VSS pattern, what programs and users drove it, and does the current alert fit that profile?
+  context: Even legitimate tooling can be abused. The query mirrors the rule's selection scoped to this host, so the resulting program and user distribution reflects how this specific esentutl-writing-VSS-keys pattern has run here before, not generic esentutl or generic shadow-copy activity. A new acting program process, an unexpected account, or a first-ever occurrence is the deviation worth chasing; a recurring backup routine that has produced the same profile for weeks is more likely benign.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_event
+      product: windows
+    detection:
+      selection:
+        TargetObject|contains: System\CurrentControlSet\Services\VSS
+        Image|endswith: esentutl.exe
+      filter:
+        TargetObject|contains: System\CurrentControlSet\Services\VSS\Start
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - Image
+    - User
+- question: Have other hosts fired this esentutl-plus-VSS pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: The query mirrors the rule's selection with no host scope, giving a fleet-wide count of the esentutl-writing-VSS-keys pattern rather than generic shadow-copy usage. Many hosts firing the same pattern points to a backup product or provisioning routine that uses esentutl by design; a single host or a small unrelated set points to manual operator activity that merits closer review. Use the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_event
+      product: windows
+    detection:
+      selection:
+        TargetObject|contains: System\CurrentControlSet\Services\VSS
+        Image|endswith: esentutl.exe
+      filter:
+        TargetObject|contains: System\CurrentControlSet\Services\VSS\Start
+      condition: selection and not filter
+    fields:
+    - host.name
+- question: Which accounts may be compromised, and do any have elevated privileges?
+  context: If the SAM hive was copied, every local account on this host is exposed, including the built-in local administrator; if an ntds.dit copy was involved, domain accounts and the krbtgt account are in scope and the incident escalates. Cross-reference the host's local accounts and the account that ran esentutl against directory group memberships to determine whether privileged credentials were within reach and to scope password resets.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Were outbound remote-access connections (RDP, SMB, WinRM, SSH) initiated from this host after this event?
+  context: Credential theft from a hive copy is typically followed by lateral movement once the hashes are cracked or replayed. The query returns outbound connections from this host to remote-access ports -- 3389 (RDP), 445 (SMB), 5985/5986 (WinRM), 22 (SSH) -- in the hours after the event, with the originating process and account. Two limits apply -- offline cracking of SAM hashes can delay movement well beyond this window, so a clean result is not proof of no follow-on; and credentials replayed from another machine will not appear here, so also check logon events on suspected targets for the exposed accounts. If endpoint network telemetry is not collected from this host, treat zero rows as a visibility gap.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
+- question: What other process activity ran on this host in the minutes around this event?
+  context: A hive copy is one step in a credential-access sequence, and the surrounding process activity places it in context. Look within a tight window for the tool that staged or exfiltrated the copied hive and for related credential-access commands -- reg save, certutil against a shadow path, a script host, or an archiver packaging the dump -- and note whether they share a parent with esentutl, which would indicate a scripted operation rather than isolated administrative use.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Were other registry modifications made on this host in the same session?
+  context: Operators who dump credentials frequently make additional changes in the same window -- disabling protections, configuring persistence, or adjusting shadow-copy settings. Grouping all registry writes on the host by key path and writing process reveals whether the VSS access stood alone or landed alongside tampering and configuration changes that indicate a hands-on session or an installer-style implant.
+  range: +/-30m
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - User
+- question: Were other built-in tools used to copy or export credential hives on this host recently?
+  context: Operators who use one living-off-the-land binary to grab a hive often try several. If esentutl accessed the shadow copy service, check whether reg (reg save of SAM/SYSTEM/SECURITY), certutil (dumping hives from a shadow path), diskshadow or vssadmin (creating a shadow copy), or wbadmin (backup catalog access) were also run in the same timeframe. Multiple tools pursuing the same hive-copy objective strengthen the case for deliberate credential theft.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\reg.exe'
+          - '\certutil.exe'
+          - '\diskshadow.exe'
+          - '\vssadmin.exe'
+          - '\wbadmin.exe'
+          - '\wmic.exe'
+          - '\makecab.exe'
+          - '\expand.exe'
+          - '\extrac32.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- question: Was esentutl executed from its expected System32 path?
+  context: esentutl.exe run from outside System32 or SysWOW64 -- from a user temp directory, a staging folder, or another writable path -- may have been copied or renamed to evade path-based allowlists, which raises suspicion beyond an in-place System32 copy. Compare the Image path and the OriginalFileName field, since a renamed binary retains esentutl.exe as its original name while presenting a different on-disk path or file name.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- question: How often has this host fired the esentutl-plus-VSS pattern over the past 90 days?
+  context: A shadow-copy access pattern with no prior history on a host is more suspicious than one that recurs on a stable schedule under the same parent. The query mirrors the rule's selection scoped to this host, so the count reflects the rule's specific firing pattern rather than generic esentutl usage. A long-running backup product produces a steady cadence; a lone occurrence with no history is consistent with an operator using esentutl for the first time to copy a hive.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_event
+      product: windows
+    detection:
+      selection:
+        TargetObject|contains: System\CurrentControlSet\Services\VSS
+        Image|endswith: esentutl.exe
+      filter:
+        TargetObject|contains: System\CurrentControlSet\Services\VSS\Start
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - CommandLine
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Credential dumping usually follows earlier stages of an intrusion. Earlier detections on the same host -- privilege escalation, defense tampering, or reconnaissance -- help place the shadow-copy access in a sequence and reconstruct how the operator reached the point of copying a protected hive.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Did esentutl write a copied hive or database file to disk on this host?
+  context: Copying a locked store through the shadow copy service produces a destination file -- the actual SAM, SYSTEM, or ntds.dit copy that the operator will process offline. That file write is separate from the registry event and is the concrete artifact of a successful copy. Look for files written by esentutl in the surrounding window, especially large files or hive-named copies landing in %TEMP%, C:\Users\Public, or another staging directory; the destination path recovered from the esentutl command line tells you where to confirm. If a hive file is present, treat the credentials in it as exposed. File writes carry no hash on this event -- if the copy is later executed or moved, pivot to the execution event for the hash.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: '\esentutl.exe'
+      condition: selection
+    fields:
+      - TargetFilename
+      - ProcessGuid

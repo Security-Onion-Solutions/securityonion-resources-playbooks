@@ -1,0 +1,361 @@
+name: Suspicious Recursive Takeown
+id: 338a3d5d-0e1d-4263-8b71-2642acdb7b84
+description: |
+  Detects takeown.exe (Image ending in \takeown.exe) invoked with both the /f target flag AND the /r recursive flag,
+  which transfers ownership of a file or directory and everything beneath it to the calling account. Taking recursive
+  ownership is a defense-evasion step: it lets an account overwrite, read, or delete files whose original DACLs denied
+  access, and is frequently paired with icacls /grant to follow up with a full permission rewrite. Administrators and
+  setup scripts legitimately reclaim ownership of locked directories, so the investigation should decode the exact target
+  path, confirm the user and host are expected to modify ownership, and determine whether the recursive takeover was
+  followed by file access, permission grants, or persistence the bypass enabled.
+type: detection
+detection_id: 554601fb-9b71-4bcc-abf4-21a611be4fde
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- question: Does the command line match what this rule detects, with takeown.exe carrying both the /f target flag and the /r recursive flag?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the exact command line and process details against the rule's criteria. The rule fires only when both halves are present together, an Image ending in takeown.exe AND a command line containing both /f and /r. Confirm both the target flag and the recursive flag are in the actual event, since recursion is what turns a single-file ownership change into a directory-wide one.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Is this user and host expected to take recursive ownership of files or directories?
+  context: Legitimate administrative activity and setup scripts do reclaim ownership of locked or inherited-deny directories, but this is uncommon for standard user accounts on general-purpose endpoints. Knowing whether the user role and host function involve filesystem administration is often the fastest path to distinguishing routine maintenance from an account clearing the way to overwrite protected files.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What file or directory was the target of the recursive ownership change, and what does that path contain?
+  context: The /f argument names the target and /r extends the change to every file and subdirectory beneath it. Read the full command line to identify the exact path. Ownership taken over a system directory (such as System32 or Program Files), a security tool's install path, a log directory, or another user's profile points to an attempt to overwrite, read, or delete protected content; ownership of a path the user already controls is more likely routine cleanup. Wildcards in the target widen the impact further.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Was the recursive takeown immediately followed by a permission grant against the same path?
+  context: Taking ownership only changes who owns an object; it does not by itself grant read or write access. Operators typically chain takeown /r with icacls or cacls using /grant or /t to rewrite the DACL so the controlled account gains full control over the now-owned tree. A grant against the same path within the same window confirms the ownership change was a means to a permission rewrite rather than a one-off reclaim.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_grant:
+        Image|endswith:
+          - '\icacls.exe'
+          - '\cacls.exe'
+          - '\xcacls.exe'
+        CommandLine|contains:
+          - '/grant'
+          - '/setowner'
+          - ' /t'
+      condition: selection_host and selection_grant
+    fields:
+      - Image
+      - CommandLine
+      - User
+- question: Were security-descriptor or ACL changes made through WMI on this host around the same time?
+  context: >-
+    Permission and ownership changes can be driven through WMI security-descriptor classes
+    instead of command-line utilities, which sidesteps process-creation detection of takeown and
+    icacls. A WMI provider start (5857) near the alert window shows the WMI service loading a
+    provider to service such a call - read winlog.user_data.ProviderName,
+    winlog.user_data.HostProcess, and the message narrative to see which provider ran and judge
+    whether the same operator is modifying access rights through more than one mechanism. If WMI
+    activity logging is not collected in this environment, treat an empty result as a visibility
+    gap rather than evidence nothing occurred.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        Channel: 'Microsoft-Windows-WMI-Activity/Operational'
+        host.name|expand: '%hostname%'
+        EventID: 5857
+      condition: selection
+    fields:
+      - winlog.user_data.ProviderName
+      - winlog.user_data.HostProcess
+      - message
+- question: What process spawned takeown.exe, and is that parent chain expected?
+  context: The parent process reveals how the ownership change was invoked. Interactive administration typically descends from explorer.exe, cmd.exe, or powershell.exe started by a logged-on admin; setup and maintenance from services.exe or an installer. Parents such as mshta.exe, wscript.exe, an Office application, or an unsigned binary indicate scripted or staged execution rather than hands-on administration. Walk up the tree to see what spawned the parent.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What activity occurred on this host after ownership of the target was taken?
+  context: Recursive ownership is taken to enable an action that the original permissions would have blocked, such as overwriting a protected binary, reading a restricted file, deleting logs, or staging a payload into a system path. Examining process activity immediately after the takeown reveals what the ownership change was meant to enable. Correlate with file and network events in the same window, since the consequential action may be a file write or read rather than a new process.
+  range: +1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - User
+- question: Were other defense tampering actions performed on this host?
+  context: An account clearing access to protected files often performs several evasion steps in sequence, pairing ownership and permission changes with log clearing, shadow-copy deletion, recovery disabling, or service stops to maximize coverage. Finding additional tampering events from the same user or parent process indicates multiple controls were targeted in one operation rather than an isolated ownership reclaim.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_tamper:
+        Image|endswith:
+          - '\wevtutil.exe'
+          - '\vssadmin.exe'
+          - '\bcdedit.exe'
+          - '\wbadmin.exe'
+          - '\netsh.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\icacls.exe'
+          - '\powershell.exe'
+        CommandLine|contains:
+          - 'cl '
+          - 'clear-log'
+          - 'delete shadows'
+          - 'recoveryenabled'
+          - 'DisableRealtimeMonitoring'
+          - 'advfirewall'
+          - '/grant'
+          - 'stop'
+          - 'delete'
+      condition: selection and selection_tamper
+    fields:
+      - Image
+      - User
+- question: Has ownership and access on the targeted path been restored, or does the modified account still control it?
+  context: An ownership change may be temporary, taken for a single action and reverted, or it may persist and leave the modified account in lasting control of the tree. Checking the current owner and DACL of the targeted path reveals whether the host is still exposed. If the original owner has not been restored and broad access remains in place, ownership and permissions should be reset before further investigation.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Does this host normally run takeown.exe?
+  context: A binary that has never been seen on a host is more suspicious than one that runs regularly. Zero or very low historical counts indicate first-time or rare use of takeown, which on a host that is not routinely administered this way raises the priority of the target-path result.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: When this host has previously fired the rule's pattern, what parents and users normally drive that activity, and does the current alert fit that pattern?
+  context: Even routine maintenance can run takeown recursively. The query mirrors the rule's selection structure scoped to this host, so the resulting parent and user distribution reflects how this specific recursive-takeown firing pattern has historically run here, not generic takeown usage. A new parent process, an unexpected user account, or an unusual command structure is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \takeown.exe
+        CommandLine|contains|all:
+        - '/f '
+        - /r
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \takeown.exe
+        CommandLine|contains|all:
+        - '/f '
+        - /r
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \takeown.exe
+        CommandLine|contains|all:
+        - '/f '
+        - /r
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity across multiple endpoints. If the same user took ownership or modified permissions on more than one host in this window, the scope of the operation may be larger than a single endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \takeown.exe
+        CommandLine|contains|all:
+        - '/f '
+        - /r
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate context: what led to this event, what happened after, and whether it is part of a larger sequence. Look for reconnaissance, permission and ownership changes on other paths, persistence installation, or data staging.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Have other hosts fired the rule's pattern in the past week, and does the cross-host distribution look like consistent automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of this recursive-takeown firing pattern, not generic takeown usage. Many hosts firing the same pattern points to scripted deployment or vendor automation; one host or a small unrelated set points to manual operator activity. Use host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \takeown.exe
+        CommandLine|contains|all:
+        - '/f '
+        - /r
+      condition: selection
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: 'Alerts rarely happen in isolation. Earlier detections on the same host, reconnaissance, credential access, or other defense tampering, may reveal the stages that preceded this event and help reconstruct the timeline. Look for patterns: reconnaissance followed by permission changes, or tampering followed by execution.'
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

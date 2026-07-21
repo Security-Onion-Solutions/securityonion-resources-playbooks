@@ -1,0 +1,374 @@
+name: New Process Created Via Wmic.EXE
+id: f7a17bd3-f36b-48fa-8ace-7232acd8c114
+description: |
+  Detects wmic.exe (matched by Image or OriginalFileName) invoked with a command line that contains all of "process",
+  "call", and "create" together. This is the WMIC syntax for spawning a new process through Windows Management
+  Instrumentation, which can target the local host or a remote host via the /node switch and run under alternate
+  credentials. Both the binary selection and the command-line selection must match for the rule to fire. WMIC process
+  creation is used by administrators and software-deployment tooling, but it is also a common living-off-the-land
+  execution and lateral-movement primitive because it launches processes outside the normal parent-child chain. The
+  investigation should decode the full command, identify the process WMIC was asked to create and whether a remote node
+  was targeted, and confirm the user, host, and parent are consistent with sanctioned administration.
+type: detection
+detection_id: 526be59f-a573-4eea-b5f7-f0973207634d
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- question: Does the command line match what this rule detects, with wmic.exe running a process call create invocation?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the exact command line and process details. The rule fires only when both halves hold together, a binary identified as wmic.exe by Image or OriginalFileName AND a command line containing all of process, call, and create. Confirm both are present in the actual event and read the full command to see what process WMIC was asked to launch.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to create processes through WMIC?
+  context: Legitimate administrative and software-deployment activity can launch processes via WMIC. Knowing whether the user role and host function involve WMI-based administration or remote management is often the fastest path to distinguishing routine operations from operator activity. A workstation user account driving WMIC process creation is less expected than a management server or an administrator's session.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Decode the full WMIC command line. What process was it asked to create, and was a remote node or alternate credential specified?
+  context: The full command reveals the actual operation. Read the value passed after process call create to identify the binary and arguments WMIC was instructed to launch, and check for a /node switch (a hostname or IP targets a remote machine), /user and /password (alternate credentials), or /namespace. A local cmd.exe or powershell.exe launch differs sharply from a remote /node execution against another host, which indicates lateral movement.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|contains|all:
+          - process
+          - call
+          - create
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What process did WMIC actually spawn on this host, and what did that child do?
+  context: WMIC process creation launches the new process outside the normal interactive parent chain, so the child of wmic.exe is the payload the operator wanted to run. Review the spawned binary and its command line; benign deployment typically runs an installer or a known management script, while a shell, a download cradle, or a living-off-the-land binary points to staging or post-exploitation. Note the timing relative to the WMIC invocation.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Did this host open network connections to other hosts around the time of the alert, consistent with remote WMI execution?
+  context: WMIC with a /node switch executes against a remote host over DCOM/WMI, producing outbound connections (commonly RPC endpoint mapper on 135 and dynamic high ports) close in time to the alert. Connections to internal hosts shortly before or after the WMIC invocation suggest remote process creation or lateral movement rather than a purely local launch; review the destination addresses against the nodes named in the decoded command line. If network telemetry is not collected for this host, treat zero results as a visibility gap rather than evidence the execution was local.
+  range: +/-10m
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+      filter_loopback:
+        DestinationIp|cidr:
+          - '127.0.0.0/8'
+          - '::1/128'
+      condition: selection and not filter_loopback
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+- question: Did WMI provider activity on this host record the corresponding operation, and what consumer or query drove it?
+  context: >-
+    WMI subscription events record registrations independently of the process_creation event:
+    5860 captures temporary consumer registrations with the event query, and 5859/5861 capture
+    permanent filter-to-consumer activity, with 5861 carrying the consumer definition itself.
+    Read winlog.user_data.Query and winlog.user_data.CONSUMER alongside the message narrative to
+    see what the subscription runs, and check winlog.user_data.NamespaceName for use beyond
+    root\cimv2 - root\subscription is associated with event-based persistence. If WMI activity
+    logging is not ingested in this environment, treat zero results as a visibility gap rather
+    than absence of the operation.
+  range: +/-10m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        Channel: 'Microsoft-Windows-WMI-Activity/Operational'
+        host.name|expand: '%hostname%'
+        EventID:
+          - 5859
+          - 5860
+          - 5861
+      condition: selection
+    fields:
+      - EventID
+      - winlog.user_data.CONSUMER
+      - winlog.user_data.ESS
+      - winlog.user_data.Query
+      - winlog.user_data.NamespaceName
+      - message
+- question: What process spawned this WMIC instance, and is that parent chain expected?
+  context: The parent process reveals how WMIC was invoked. Interactive administration usually descends from explorer.exe or a shell; scripted deployment from services.exe or a management agent. Parents such as winword.exe, mshta.exe, wscript.exe, or an archive utility indicate macro-driven or staged execution rather than sanctioned administration. Walk up the tree to see what spawned the parent.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Does this host normally run wmic.exe?
+  context: A binary that has rarely or never been seen on a host is more suspicious than one that runs regularly. Zero or very low historical counts of wmic.exe indicate first-time or rare execution, which on a general-purpose endpoint raises the priority of the decode result; high counts on a management server suggest routine administration.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: When this host has previously fired the rule's pattern, what parents and users normally drive that activity, and does the current alert fit that pattern?
+  context: Even common tools can be abused. The query mirrors the rule's selection structure scoped to this host, so the resulting parent and user distribution reflects how this specific WMIC process-creation firing pattern has historically run here, not generic wmic.exe usage. A new parent process, an unexpected user account, or an unusual command structure is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \wmic.exe
+      - OriginalFileName: wmic.exe
+      selection_cli:
+        CommandLine|contains|all:
+        - process
+        - call
+        - create
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Was wmic.exe executed from its expected System32 or SysWOW64 path?
+  context: A LOLBin executed from a non-standard path, outside System32 or SysWOW64, may indicate the binary was copied or renamed to evade path-based allowlists. A wmic.exe running from a user's temp or profile directory is more suspicious than one in the system directory; compare the full Image path against the expected location and check whether OriginalFileName still reads as wmic.exe.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- question: How often has this host fired the rule's WMIC pattern over the past 90 days, and what command-line structures are typical?
+  context: A LOLBin pattern with no prior history on a host is more suspicious than one used daily under stable parents. The query mirrors the rule's selection structure scoped to this host, so the resulting count reflects the rule's specific WMIC process-creation firing pattern, not generic wmic.exe usage. The command-line projection lets the analyst compare typical invocation patterns, such as a recurring deployment command, against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \wmic.exe
+      - OriginalFileName: wmic.exe
+      selection_cli:
+        CommandLine|contains|all:
+        - process
+        - call
+        - create
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \wmic.exe
+      - OriginalFileName: wmic.exe
+      selection_cli:
+        CommandLine|contains|all:
+        - process
+        - call
+        - create
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \wmic.exe
+      - OriginalFileName: wmic.exe
+      selection_cli:
+        CommandLine|contains|all:
+        - process
+        - call
+        - create
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity across multiple endpoints. If the same user triggered similar activity on multiple hosts, the scope of the operation may be larger than a single endpoint, which is especially relevant when WMIC is being used to reach remote nodes.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \wmic.exe
+      - OriginalFileName: wmic.exe
+      selection_cli:
+        CommandLine|contains|all:
+        - process
+        - call
+        - create
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate context: what led to this event, what happened after, and whether it is part of a larger sequence. Look for reconnaissance, privilege escalation, persistence installation, or data staging surrounding the WMIC execution.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Have other hosts fired the rule's pattern in the past week, and does the cross-host distribution look like consistent automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of this WMIC process-creation firing pattern, not generic wmic.exe usage. Many hosts firing the same pattern points to scripted deployment or vendor automation; one host or a small unrelated set points to manual operator activity. Use the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \wmic.exe
+      - OriginalFileName: wmic.exe
+      selection_cli:
+        CommandLine|contains|all:
+        - process
+        - call
+        - create
+      condition: all of selection_*
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: 'Alerts rarely happen in isolation. Earlier detections on the same host, defense tampering, reconnaissance, or credential access, may reveal the stages that preceded this event and help reconstruct the timeline. Look for patterns: reconnaissance followed by WMI execution, or credential access followed by remote process creation.'
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

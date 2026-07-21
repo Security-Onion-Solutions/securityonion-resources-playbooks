@@ -1,0 +1,410 @@
+name: Potential Goofy Guineapig Backdoor Activity
+id: 51df4020-a422-4b97-aac7-e190b50c8b0b
+description: |
+  Detects a process command line containing the literal string `choice /t %d /d y /n >nul`. The `%d` is an
+  unsubstituted format specifier, so the command is a malformed delay primitive that errors out immediately
+  rather than pausing — the literal string only appears when a program emits the line without filling in the
+  timeout value. The Goofy Guineapig backdoor family writes this line into a temporary batch script that runs
+  during first-stage bootstrap, alongside deletion of the original dropped files and a relaunch of a
+  side-loaded updater binary from a ProgramData directory. Determine which process wrote and invoked the
+  script, what else ran under the same parent, whether a DLL was side-loaded from a user-writable directory,
+  whether a service was registered to relaunch the binary, and whether the host subsequently made outbound
+  connections on non-standard ports.
+type: detection
+detection_id: 477a5ed3-a374-4282-9f3b-ed94e159a108
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-16
+questions:
+- question: Does the command line contain the literal string `choice /t %d /d y /n >nul`, with the `%d` left unsubstituted?
+  context: >-
+    The rule matches one exact command-line substring, including the unsubstituted `%d` and the `>nul`
+    redirect. Confirm the alerting event carries that literal text rather than a normal `choice` invocation
+    with a real timeout value, and record the process image and its command line before continuing.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - alert
+  - process_creation
+- question: Is this user and host expected to run batch scripts that call `choice` as a delay?
+  context: >-
+    Installers, vendor maintenance scripts, and in-house automation do use `choice` to pause a batch file, so
+    the user role and host function narrow the question quickly. The distinguishing detail here is the
+    unsubstituted format specifier, which a working script would not carry.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: What was the full sequence of commands run under the same parent, and what script were they read from?
+  context: >-
+    The alerting line is one command out of a batch script, so the parent process is the shell interpreting
+    that script and its other children are the rest of the operation. Read the sibling command lines and the
+    working directory for the script path, file deletions of recently dropped executables, and a relaunch of a
+    binary from a different directory — that sequence is what the bootstrap stage of this family performs.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - Image
+      - CurrentDirectory
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: What process spawned this command and is that parent chain expected?
+  context: >-
+    The parent reveals how the script was invoked. A shell launched by an installer stub, an updater
+    executable, or a freshly written file in a user-writable directory is a different situation than a shell
+    launched by a management agent or by an interactive session.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: What child processes did the alerting process spawn afterward?
+  context: >-
+    Children of the alerting process show what the script went on to do after the delay attempt. File deletion
+    utilities, a relaunch of an executable from a ProgramData or AppData path, or a shell that removes the
+    script itself are the artifacts this bootstrap pattern leaves.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Were batch or command scripts written to disk on this host around the alert, and where do they live?
+  context: >-
+    This bootstrap stage writes a temporary batch file, runs it, and has the script delete itself as its last
+    command, so the file may be gone by the time of review while the write event remains. A script written
+    into ProgramData, AppData, or a download directory and executed within seconds ties the alerting command
+    line back to the process that dropped it.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith:
+          - '.bat'
+          - '.cmd'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - User
+  answer_sources:
+  - file_event
+  - process_creation
+- question: Did any process load a DLL from a user-writable directory on this host, and is that DLL signed?
+  context: >-
+    This family's payload is a DLL placed next to a signed updater executable and loaded by it from a
+    ProgramData directory, which is how the code runs under a legitimate signed image. An unsigned or
+    unexpectedly signed DLL loaded from ProgramData or AppData by a binary that normally loads only from
+    Program Files is the pivot from the script artifact to the running payload.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|contains:
+          - '\ProgramData\'
+          - '\AppData\Local\'
+          - '\AppData\Roaming\'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Image
+      - Signed
+      - Signature
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: Was a new Windows service registered on this host, and does its ImagePath chain through a shell or rundll32.exe?
+  context: >-
+    Persistence for this family is a service named after a common updater whose ImagePath runs cmd.exe, which
+    in turn calls rundll32.exe with url.dll FileProtocolHandler to launch the payload executable from
+    ProgramData. A service whose ImagePath is an interpreter rather than the service binary itself is the
+    artifact to look for. If the System event-log channel is not collected in this environment, treat zero
+    results as a visibility gap rather than evidence no service was created.
+  range: -24h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: system
+    detection:
+      selection:
+        EventID: 7045
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - ServiceName
+      - ImagePath
+      - ServiceType
+      - StartType
+      - AccountName
+  answer_sources:
+  - organizational_knowledge
+  - manual_review
+- question: Did this host make outbound connections on non-standard HTTPS ports after the alert?
+  context: >-
+    Once the bootstrap stage completes, this family's payload speaks HTTPS to a hard-coded host on port 4443
+    and falls back to raw TCP or UDP transports, ignoring certificate errors on the way. Outbound sessions on
+    a non-standard TLS port from an updater-named binary or from a hollowed system process link the execution
+    artifact to command-and-control activity.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationPort:
+          - 4443
+          - 8443
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - Initiated
+  answer_sources:
+  - network_connection
+- question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Aggregating process activity around the alert collapses routine agent telemetry into high-count rows and
+    leaves novel parent-child pairs standing out at low counts. Look for an installer stub, an updater
+    executable running from an unusual directory, or a shell parented by a freshly dropped binary.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+  answer_sources:
+  - process_creation
+  - file_event
+  - registry_event
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host help place this event in a sequence — a download or installer-stub
+    alert before it, side-loading or service-creation alerts after it. The alert timeline often identifies the
+    delivery stage that preceded the script.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+  answer_sources:
+  - alert
+- question: Has this host produced the rule's exact command-line pattern before, and if so under which parents and users?
+  context: >-
+    The query mirrors the rule's selection scoped to this host, so the resulting parent and user distribution
+    reflects how this specific literal string has run here historically. Because the string is a malformed
+    command that never works, any prior history is itself notable — repeated firings under the same parent
+    point to a program re-running the same broken bootstrap.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains: choice /t %d /d y /n >nul
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+  answer_sources:
+  - process_creation
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: >-
+    The query mirrors the rule's selection scoped to this user, aggregated by host, so the count is the user's
+    90-day history of this exact string rather than generic shell usage. A user who has never produced it is
+    a different situation than one whose workstation has repeated it across a software rollout.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains: choice /t %d /d y /n >nul
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+  always_include: true
+- question: Has this parent process historically driven the rule's pattern on this host or across the environment, or is the parent new for this activity?
+  context: >-
+    When the alert fires under a service principal, user identity does not attribute the behavior and the
+    launch mechanism is the meaningful pivot. The query mirrors the rule's selection scoped to the alerting
+    parent process, so the result is the 90-day history of this parent producing this exact string. A new or
+    rare parent is the deviation worth chasing; a parent that already accounts for many prior events is
+    packaged automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains: choice /t %d /d y /n >nul
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  always_include: true
+- question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the user's process activity across all hosts in the alert window shows whether the same account
+    drove similar activity elsewhere. If the alert fired under SYSTEM or another service principal, this
+    returns broad agent telemetry and the parent-anchored view is the meaningful answer instead.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+  always_include: true
+- question: Did the same parent-driven pattern fire on other hosts in the same window, or is the activity isolated to this host?
+  context: >-
+    The query mirrors the rule's selection scoped to the alerting parent process, fleet-wide, within the alert
+    window. Multiple hosts in the same window points to a pushed or scheduled deployment running the same
+    script; a single host points to a host-local trigger such as an installer a user ran.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains: choice /t %d /d y /n >nul
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  always_include: true
+- question: Have other hosts produced the rule's pattern in the past week, and does the cross-host distribution look like consistent automation or one-off activity?
+  context: >-
+    The query mirrors the rule's selection with no host scope, giving a fleet-wide count of this exact string.
+    Many hosts firing it points to a packaged installer or vendor script that ships the malformed line; one
+    host or a small unrelated set points to a locally delivered payload. Use the host distribution to
+    calibrate how far the investigation needs to extend.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains: choice /t %d /d y /n >nul
+      condition: selection
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation

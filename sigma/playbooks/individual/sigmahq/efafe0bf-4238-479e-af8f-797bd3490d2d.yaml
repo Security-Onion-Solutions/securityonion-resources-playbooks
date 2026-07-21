@@ -1,0 +1,436 @@
+name: Outbound Network Connection Initiated By Cmstp.EXE
+id: 2b5ff1d8-e19f-4509-b0e1-204bd179a6c1
+description: |
+  Detects an outbound external network connection initiated by cmstp.exe, the Connection Manager Profile Installer.
+  cmstp.exe is a signed Windows binary that installs remote-access service profiles from INF files and rarely has a
+  reason to contact internet hosts; attackers abuse it to fetch and execute remote scriptlets referenced by an
+  attacker-supplied INF and to elevate from medium to high integrity through the auto-elevated CMSTP COM interfaces,
+  all under the cover of a trusted System32 binary. The rule fires when cmstp.exe initiates a connection to a
+  destination outside the loopback, private, link-local, and unique-local ranges. Investigation should confirm the
+  external destination and its reputation, recover the command line and INF file the installer ran, look for staged
+  INF/SCT payloads, elevated children of the COM surrogate, and profile-registration registry writes, and establish
+  whether this host or the fleet has any history of the pattern.
+type: detection
+detection_id: efafe0bf-4238-479e-af8f-797bd3490d2d
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-10
+questions:
+- question: Do the destination and port match what this rule detects, and did cmstp.exe initiate the connection?
+  context: >-
+    Confirm the alert by reviewing the exact destination IP and port, the connection direction, and the initiating
+    process against the rule's criteria. The rule fires only when cmstp.exe initiates an egress connection to a
+    destination outside the loopback, private, link-local, and unique-local address ranges, so verify the destination
+    is genuinely external.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationIp|expand: '%dst_ip%'
+      condition: selection
+    fields:
+      - Image
+      - Initiated
+- question: Is this user or host expected to install Connection Manager service profiles?
+  context: >-
+    The legitimate use of cmstp.exe is installing VPN or dial-up connection profiles produced by the Connection
+    Manager Administration Kit, typically during IT-driven provisioning. On most fleets that is rare, and a profile
+    installation that reaches out to an internet host is rarer still. Knowing whether this user or host has a
+    sanctioned profile-rollout reason is often the fastest way to separate routine administration from abuse.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What command line launched cmstp.exe, and which INF file does it reference?
+  context: >-
+    Abuse invocations typically run cmstp.exe with the /s (silent) switch and an attacker-supplied INF whose sections
+    point at scrobj.dll and a local or remote scriptlet, so the INF path and any URL in the arguments reveal the
+    payload. An INF in a user-writable location such as Downloads or Temp is far more suspicious than a profile
+    package on an administrative share, and the working directory often exposes where the package was staged.
+    Events in this window also tie the execution directly to the alerting connection, which usually follows
+    within seconds.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What is the destination, and what do DNS, WHOIS, and threat intel reveal about it?
+  context: >-
+    Investigate the endpoint cmstp.exe connected to - resolution history, registration age, hosting provider, TLS
+    certificate details, and reputation. Weaponized INF packages commonly fetch their scriptlet from raw-content or
+    code-hosting services or from attacker infrastructure, so recently registered domains, self-signed certificates,
+    or known command-and-control hits point to an attacker-controlled endpoint. The hostname field is rarely populated
+    on connection events because name resolution is a separate lookup, so anchor on the IP and corroborate with the
+    host's DNS activity.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationIp|expand: '%dst_ip%'
+      condition: selection
+    fields:
+      - DestinationHostname
+      - DestinationPort
+- question: What parent process launched cmstp.exe, and is that launch chain expected?
+  context: >-
+    Legitimate profile installations are driven interactively through explorer.exe or by IT deployment tooling. A
+    parent such as an Office application, a script host like wscript.exe or powershell.exe, or a freshly dropped
+    executable suggests the INF was delivered by phishing or an earlier payload rather than a sanctioned rollout.
+    Learn the benign parents seen on this host before judging the current one.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - ParentProcessGuid
+- question: Were any INF or SCT files written on this host in the hours before the connection?
+  context: >-
+    CMSTP abuse requires an INF on disk, and the fetch-and-execute method pairs it with a scriptlet (.sct) payload.
+    A weaponized package is usually staged in a user-writable path shortly before execution, so INF or SCT writes by
+    a browser, mail client, script host, or archive tool in the preceding hours reveal the delivery step. Driver and
+    device installations also write INF files under C:\Windows\INF, so weigh the writing process and path when
+    judging each result.
+  range: -24h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith:
+          - '.inf'
+          - '.sct'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: Did the COM surrogate spawn any processes with the CMSTP elevation COM class in its command line?
+  context: >-
+    Both the INF RunPreSetupCommandSection method and the direct COM method elevate through the auto-elevated CMSTP
+    interfaces (CMSTPLUA, CLSID 3E5FC7F9-9A51-4367-9063-A120244FBEC7, and CMLUAUTIL via cmlua.dll), hosted in a
+    dllhost.exe surrogate whose command line carries the CLSID. A child such as cmd.exe spawned by that surrogate
+    runs at high integrity without a UAC prompt. Cross-process handle-access telemetry is not collected in this
+    environment, so the surrogate's elevated child - not the handle access itself - is the durable evidence of this
+    stage.
+  range: +/-24h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentCommandLine|contains: 3E5FC7F9-9A51-4367-9063-A120244FBEC7
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentCommandLine
+      - User
+- question: Were Connection Manager profile registry entries modified on this host around the alert?
+  context: >-
+    During profile installation the elevation path writes registry entries referencing cmmgr32.exe and sets the
+    ProfileInstallPath value (typically C:\ProgramData\Microsoft\Network\Connections\Cm). Legitimate profile
+    rollouts write the same keys, so the signal is these modifications appearing with no sanctioned VPN or dial-up
+    deployment, especially when the writing process is a COM surrogate rather than an administrative installer.
+  range: +/-24h
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains:
+          - 'cmmgr32.exe'
+          - 'ProfileInstallPath'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- question: What child processes did this cmstp.exe instance spawn?
+  context: >-
+    The remote-scriptlet method leaves its payload running as a child of cmstp.exe at medium integrity - script
+    hosts, command interpreters, or a dropped executable. Legitimate profile installation spawns essentially
+    nothing of interest, so any child of a network-connecting cmstp.exe deserves full command-line decoding.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Has cmstp.exe run on this host before, and under which users?
+  context: >-
+    cmstp.exe is rarely executed on modern fleets outside VPN-profile provisioning. Zero or near-zero prior
+    executions make this launch first-of-its-kind on the host and raise the likelihood the binary was invoked to
+    proxy attacker code; a steady history under an administrative or deployment account points toward routine
+    profile management.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: Does this host normally communicate with this destination?
+  context: >-
+    First-time connections to a destination are more suspicious than routine traffic to a known business endpoint,
+    such as a sanctioned VPN gateway a connection profile would legitimately reference. If prior connections exist
+    but only from browsers or updaters - never from cmstp.exe - the process-and-destination pairing is the anomaly,
+    not the destination on its own.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationIp|expand: '%dst_ip%'
+      condition: selection
+    fields:
+      - DestinationPort
+      - Image
+- question: When this host has previously fired this rule's cmstp.exe egress pattern, what programs and users normally drive it, and does the current alert fit?
+  context: >-
+    Even an uncommon tool can have a benign local pattern. The query mirrors the rule's
+    selection structure scoped to this host - the resulting program and user distribution
+    reflects how the rule's specific firing pattern (not generic cmstp.exe usage) has
+    historically run here. A new acting program process, an unexpected user account, or an
+    unusual launch context is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \cmstp.exe
+        Initiated: 'true'
+      filter_main_local_ranges:
+        DestinationIp|cidr:
+        - 127.0.0.0/8
+        - 10.0.0.0/8
+        - 172.16.0.0/12
+        - 192.168.0.0/16
+        - 169.254.0.0/16
+        - ::1/128
+        - fe80::/10
+        - fc00::/7
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - Image
+    - User
+- question: Have other hosts fired this rule's pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: >-
+    The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of the
+    rule's firing pattern rather than generic cmstp.exe usage. Many hosts firing the same pattern points to a
+    scripted profile rollout reaching an external gateway; one host or a small unrelated set points to hands-on
+    operator activity. Use the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \cmstp.exe
+        Initiated: 'true'
+      filter_main_local_ranges:
+        DestinationIp|cidr:
+        - 127.0.0.0/8
+        - 10.0.0.0/8
+        - 172.16.0.0/12
+        - 192.168.0.0/16
+        - 169.254.0.0/16
+        - ::1/128
+        - fe80::/10
+        - fc00::/7
+      condition: selection and not 1 of filter_main_*
+    fields:
+    - host.name
+- question: What other process activity occurred on this host around the time of the alert?
+  context: >-
+    Alerts rarely occur in isolation. Examining the process activity surrounding the connection reveals what led to
+    it and what followed - phishing-delivered document handlers, reconnaissance, defense tampering, or persistence
+    installation that gives the investigation broader context. Novel parent-child pairs at low counts are what to
+    scan for.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host - Office applications spawning processes, script-host execution, defense
+    tampering, or UAC-bypass alerts - may reveal the delivery stage that preceded the profile-installer abuse and
+    help reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Were any other proxy-execution LOLBins used on this host recently?
+  context: >-
+    Operators who proxy code through one signed system binary often use several. If cmstp.exe was used to run an
+    attacker INF, check whether rundll32, regsvr32, mshta, msbuild, or similar proxy-execution binaries also ran
+    unusual payloads on this host in the same period. Multiple signed binaries performing the same objective
+    strengthens the case for deliberate allowlist evasion.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\rundll32.exe'
+          - '\regsvr32.exe'
+          - '\mshta.exe'
+          - '\msbuild.exe'
+          - '\installutil.exe'
+          - '\msiexec.exe'
+          - '\forfiles.exe'
+          - '\pcalua.exe'
+          - '\presentationhost.exe'
+          - '\control.exe'
+          - '\infdefaultinstall.exe'
+          - '\msdt.exe'
+          - '\mavinject.exe'
+          - '\wmic.exe'
+          - '\xwizard.exe'
+          - '\ie4uinit.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- question: Was cmstp.exe executed from its expected path?
+  context: >-
+    cmstp.exe normally runs from System32 or SysWOW64. A copy running from a user profile, temp directory, or other
+    non-standard path may have been relocated or renamed to evade path-based allowlists. Compare the executed path
+    and the original file name to confirm the installer is the genuine system binary in its expected location.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- question: How often has this host fired this rule's cmstp.exe egress pattern over the past 90 days, and what invocations are typical?
+  context: >-
+    A cmstp.exe egress pattern with no prior history on a host is more suspicious than one seen regularly during
+    scheduled profile maintenance. The query mirrors the rule's selection structure scoped to this host, so the
+    resulting count reflects the rule's specific firing pattern rather than generic use of the binary, and the
+    projection lets typical prior invocations be compared against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \cmstp.exe
+        Initiated: 'true'
+      filter_main_local_ranges:
+        DestinationIp|cidr:
+        - 127.0.0.0/8
+        - 10.0.0.0/8
+        - 172.16.0.0/12
+        - 192.168.0.0/16
+        - 169.254.0.0/16
+        - ::1/128
+        - fe80::/10
+        - fc00::/7
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - CommandLine

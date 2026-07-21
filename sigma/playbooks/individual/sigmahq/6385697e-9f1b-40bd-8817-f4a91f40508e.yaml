@@ -1,0 +1,386 @@
+name: PowerShell Base64 Encoded Invoke Keyword
+id: b08eda8f-0aa2-47be-90bb-53fb482b3c00
+description: |
+  Fires when powershell.exe or pwsh.exe runs with an encoded-command flag (a CommandLine
+  fragment matching ' -e', covering -e/-enc/-EncodedCommand) AND the encoded payload contains
+  a base64 representation of the 'Invoke-' keyword in either UTF-8 or UTF-16LE form. All three
+  conditions (PowerShell binary, encoded-command flag, embedded Invoke- fragment) must match
+  together. The combination is a strong sign the operator base64-encoded a PowerShell command to
+  hide an Invoke-* call from casual inspection. Legitimate management tooling occasionally passes
+  encoded commands, but an encoded Invoke- payload commonly wraps a download cradle, a reflective
+  .NET assembly load, or an in-memory tool such as Invoke-Mimikatz or Invoke-BloodHound. The
+  investigation should decode the payload, identify what it executes, and determine whether the
+  user, host, and parent process make this a routine automation or an operator action.
+type: detection
+detection_id: 6385697e-9f1b-40bd-8817-f4a91f40508e
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the command line show powershell.exe or pwsh.exe with an encoded-command flag and a base64 Invoke- fragment?
+  context: Confirm the alert is a true positive by reviewing the exact command line. All three
+    criteria must be present together — the process is powershell.exe or pwsh.exe, the command line
+    carries an encoded-command flag (-e/-enc/-EncodedCommand), and the encoded blob contains a
+    base64-encoded 'Invoke-' keyword (UTF-8 or UTF-16LE). Verify the encoded string is actually a
+    valid base64 argument to the flag and not an unrelated token that happens to contain the fragment.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to run encoded PowerShell commands?
+  context: Legitimate management frameworks, software deployment tooling, and some installers pass
+    encoded PowerShell. Knowing whether this user role and host function routinely run encoded
+    commands is often the fastest way to separate sanctioned automation from operator activity.
+    A workstation user manually launching an encoded Invoke- payload is far more suspicious than a
+    build server where deployment scripts encode commands by design.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What does the base64 payload decode to, and what operation does the decoded script perform?
+  context: Base64-decode the argument to the encoded-command flag. PowerShell encodes -EncodedCommand
+    payloads as UTF-16LE, so the rule's UTF-16 fragments decode to a script body. The decoded content
+    is the operator's actual intent — common patterns are a download cradle (IEX(New-Object
+    Net.WebClient).DownloadString), a reflective .NET assembly load ([Reflection.Assembly]::Load),
+    or an in-memory tool invocation (Invoke-Mimikatz, Invoke-BloodHound, Invoke-Expression). Record
+    any URLs, IPs, file paths, or assembly names the decoded script references.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did PowerShell script block logging capture the deobfuscated script content?
+  context: Script block logging (Event ID 4104) records the fully deobfuscated script body PowerShell
+    actually executed, even when the command line was base64-encoded. This is ground truth that
+    bypasses the encoding the rule fired on — compare the 4104 content against the decoded command
+    line to confirm what ran. If PowerShell operational logs are not ingested in this environment,
+    treat zero results as a visibility gap rather than evidence nothing executed.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Did this PowerShell process load uncommon .NET or scripting assemblies after the encoded command ran?
+  context: Encoded Invoke- payloads frequently reflectively load .NET assemblies into the PowerShell
+    process rather than spawning child binaries, so the operation leaves an image_load trail instead
+    of a process_creation one. Loads of System.Management.Automation alone are normal for any
+    PowerShell host; loads of System.Reflection.Assembly together with rare, unsigned, or
+    user-path-resident DLLs point to in-memory assembly execution. If image_load events are not
+    collected in this environment, treat absence as a visibility gap.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+- question: Were PowerShell or endpoint security controls bypassed or weakened on this host before the encoded command ran?
+  context: Operators commonly disable or downgrade PowerShell defenses before running an encoded
+    payload. Look for AMSI bypass markers (AmsiUtils, amsiInitFailed), execution-policy changes
+    (-ExecutionPolicy Bypass, -ep bypass), engine downgrades (-Version 2), and Defender disabling.
+    Finding these precursors in the hour before the alert strengthens the case that the encoded
+    command was malicious rather than routine automation.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: What process spawned this PowerShell instance, and is that parent chain expected?
+  context: The parent process reveals how PowerShell was invoked. Encoded-command abuse is often
+    launched from Office applications, mshta.exe, wscript.exe, cscript.exe, or a scheduled-task host
+    rather than explorer.exe or a console session. An Office or scripting-engine parent points to a
+    document or loader chain; a services.exe or taskeng.exe parent points to scheduled or service-driven
+    execution. Walk up to the parent's own parent if the immediate parent is itself a shell.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Are any files written or referenced by the decoded command still on disk for analysis?
+  context: The decoded payload may write a staged file, a dropped script, or a downloaded artifact to
+    disk. T1027 ties obfuscated execution to encoded or compressed file output (.zip, .7z, .enc, .dll).
+    If the decoded command references a path, check whether the file still exists so it can be hashed,
+    reputation-checked, or submitted for analysis before it is cleaned up.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What child processes did this PowerShell instance spawn afterward?
+  context: Children spawned by the alerting PowerShell reveal its downstream impact. Encoded Invoke-
+    payloads commonly spawn cmd.exe, rundll32.exe, additional powershell.exe instances, certutil.exe,
+    or reconnaissance binaries for post-exploitation. Reflective in-memory execution may spawn nothing
+    at all, in which case the assembly-load evidence carries more weight than the child list.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Does this host normally run powershell.exe or pwsh.exe?
+  context: A PowerShell binary that rarely or never runs on a host is more notable than one that runs
+    constantly. PowerShell is common on managed workstations and servers, so the raw count alone is
+    weak — read it alongside the user breakdown to judge whether encoded execution by this account
+    on this host is a normal pattern or a first occurrence.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: When this host previously fired this encoded-Invoke pattern, what parents and users drove it, and does the current alert fit?
+  context: Even common tools get abused. This query mirrors the rule's full selection — PowerShell
+    binary, encoded-command flag, and base64 Invoke- fragment — scoped to this host, so the resulting
+    parent and user distribution reflects how this specific firing pattern has historically run here,
+    not generic PowerShell usage. A new parent process, an unexpected account, or a first-ever
+    occurrence of the pattern is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_cli_enc:
+        CommandLine|contains: ' -e'
+      selection_cli_invoke:
+        CommandLine|contains:
+        - SQBuAHYAbwBrAGUALQ
+        - kAbgB2AG8AawBlAC0A
+        - JAG4AdgBvAGsAZQAtA
+        - SW52b2tlL
+        - ludm9rZS
+        - JbnZva2Ut
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_cli_enc:
+        CommandLine|contains: ' -e'
+      selection_cli_invoke:
+        CommandLine|contains:
+        - SQBuAHYAbwBrAGUALQ
+        - kAbgB2AG8AawBlAC0A
+        - JAG4AdgBvAGsAZQAtA
+        - SW52b2tlL
+        - ludm9rZS
+        - JbnZva2Ut
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the environment around the time of the alert?
+  context: Tracking the user's activity across all hosts in a tight window reveals lateral movement or
+    parallel activity on multiple endpoints. If the same account triggered similar PowerShell or
+    reconnaissance activity elsewhere, the scope of the incident may be wider than one host. If the
+    alert fired under a non-attributable service principal, this pivot returns broad agent-telemetry
+    noise — read it together with the parent-and-binary mechanism view.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: What other tools ran on this host around the same time?
+  context: Encoded-payload execution rarely happens in isolation. Activity surrounding the alert may
+    reveal reconnaissance, credential access, persistence installation, or data staging that together
+    form a multi-stage operation. Novel parent-child pairs at low counts are what to scan for; high-count
+    rows are usually routine agent and OS telemetry.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+- question: Have other hosts fired this encoded-Invoke pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: This query mirrors the rule's full selection with no host scope, so the result is a
+    fleet-wide count of this specific firing pattern rather than generic PowerShell usage. Many hosts
+    firing the identical encoded-Invoke pattern points to scripted deployment or vendor automation
+    that encodes commands by design; one host or a small unrelated set points to manual operator
+    activity. Use the host spread and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_cli_enc:
+        CommandLine|contains: ' -e'
+      selection_cli_invoke:
+        CommandLine|contains:
+        - SQBuAHYAbwBrAGUALQ
+        - kAbgB2AG8AawBlAC0A
+        - JAG4AdgBvAGsAZQAtA
+        - SW52b2tlL
+        - ludm9rZS
+        - JbnZva2Ut
+      condition: all of selection_*
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering,
+    reconnaissance, or credential access — may reveal the stages that preceded this encoded execution
+    and help reconstruct the timeline. A sequence of tamper-then-execute or recon-then-execute is more
+    concerning than an isolated firing.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

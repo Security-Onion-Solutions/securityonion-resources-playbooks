@@ -1,0 +1,522 @@
+name: Shell Open Registry Keys Manipulation
+id: 9bebea04-4e5f-4b3e-a545-0a101494a7b1
+description: |
+  Fires when a value is written under a shell open command key that Windows consults to decide what to run for a
+  file class or shell verb. Three independent writes each satisfy the rule on their own: a SymbolicLinkValue under
+  Classes\ms-settings\shell\open\command whose data references \Software\Classes\{ (a CLSID redirect), a
+  DelegateExecute value under that same key regardless of its data, or a non-empty (Default) value under either
+  Classes\ms-settings\shell\open\command or Classes\exefile\shell\open\command. The ms-settings key is the registry
+  side of the auto-elevation bypass that fodhelper.exe, computerdefaults.exe and slui.exe support -- those binaries
+  read the key at launch and execute whatever the value names in a high-integrity context without a consent prompt;
+  the exefile key hijacks the handler for every .exe file open, which serves persistence as well as elevation. Neither
+  key exists by default in a user hive, so a write to one is a created condition rather than a modified setting.
+  Determine which branch fired, what command the value data names, whether an auto-elevated handler subsequently ran
+  it, and what was done with the resulting elevated process.
+type: detection
+detection_id: 152f3630-77c1-4284-bcc0-4cc68ab2f6e7
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-16
+questions:
+- question: Which of the three shell open command writes does this alert match, and what does the value data contain?
+  context: >-
+    The rule fires when any one of three independent writes matches, so establish which branch is in play before
+    going further. A SymbolicLinkValue under Classes\ms-settings\shell\open\command carrying \Software\Classes\{ in
+    its data redirects the key to an attacker-registered class. A DelegateExecute value under that same key matches
+    on the value name alone, including the empty data the technique normally writes, because the auto-elevated
+    handler only checks that the value exists before reading the command. A non-empty (Default) under
+    Classes\ms-settings\shell\open\command or Classes\exefile\shell\open\command is the value that carries the
+    command itself, and empty data is excluded because that is the reverted state. A DelegateExecute-only match
+    means the command may live in a separate write to the same key, so read the whole key rather than this one
+    value; an exefile match reaches past elevation into every .exe file open on the host. Read the writing process
+    and its signer for coherence with the key rather than as a verdict -- essentially every alerting process is
+    trusted-signed, and these keys are not owned by any vendor.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - EventType
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+  answer_sources:
+  - alert
+  - registry_event
+- question: Is this user and host expected to write shell open command keys under their own class registrations?
+  context: >-
+    These keys do not exist by default under a user hive, and normal software registers file handlers through
+    installers writing to HKLM or through per-user association APIs rather than by planting a raw command under
+    ms-settings or exefile. A developer registering a custom handler or a packaging tool testing an association is
+    the realistic benign path; anything else on a general-purpose workstation is worth carrying forward. User
+    attribution is present on most endpoint registry events, but when it is a machine account or missing, judge from
+    the writing process instead. The signer columns say who published the writing process, not whether the write was
+    intended.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: What launched the process that wrote this shell open command value?
+  context: >-
+    The writing process is named in the alert but its lineage is not. Looking that process up by its own identifier
+    returns the parent that started it, which is what separates a packaging or deployment chain from an interactive
+    shell, a script host, or an Office application spawned by a macro. Registry writes to these keys are commonly
+    performed by a script rather than reg.exe, so a powershell.exe or wscript.exe writer with an unexpected parent is
+    the pattern to look for.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+  answer_sources:
+  - process_creation
+- question: What other processes did the writing process spawn?
+  context: >-
+    A process that plants a shell open command value rarely stops there -- the technique's next step is to invoke the
+    auto-elevated handler itself, so the handler often appears as a child of the same process within seconds.
+    Listing the children shows whether the write was an isolated configuration change or one step in a chain that
+    continued into elevation and payload execution. Note this shows what the writing process started, not what
+    started alongside it, because registry events do not record the writing process's own parent.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Does the user recall installing software or registering a file handler around this time?
+  context: >-
+    These keys live in the user's own hive, so the account that owns the write is directly reachable. If the user
+    recalls installing a tool, running a build script, or configuring a custom file association, get the specific
+    tool name and compare it against the writing process. If they recall nothing, the write ran without their
+    involvement -- either automated software or an unattended process acting under their token.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - organizational_knowledge
+  - manual_review
+- question: Which shell open command key was written, and what does that key control on this host?
+  context: >-
+    The key path determines what the write buys. Classes\ms-settings\shell\open\command is read by fodhelper.exe and
+    computerdefaults.exe, which auto-elevate by manifest, so a command placed there runs at high integrity with no
+    consent prompt. Classes\exefile\shell\open\command is the handler for opening any .exe, which both slui.exe-style
+    elevation and plain persistence use -- every subsequent double-click routes through the planted command.
+    Neither key is present in a default user hive. Judge the writing process's signer for coherence with the key
+    rather than as an exoneration -- no vendor legitimately owns these paths, so a trusted Microsoft binary writing
+    them is not reassuring.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+  answer_sources:
+  - registry_event
+- question: What other values were written to the same shell open command key family on this host, and what command do they name together?
+  context: >-
+    The technique needs more than one value to work -- a DelegateExecute value to make the handler proceed, and a
+    (Default) command for it to execute -- and the rule may fire on only one of them. Pulling every write to the
+    ms-settings, exefile, Folder and mscfile shell open command keys in the same window reassembles the full
+    configuration. Read the value data as a command line: a path under Temp, AppData or ProgramData, a cmd.exe /c or
+    powershell.exe invocation, base64 in an -enc argument, or a rundll32 export call all name the payload that the
+    elevated handler would run. A CLSID in \Software\Classes\{ form means the command lives under that class
+    registration instead, and that key needs reading too. Value data is absent on registry events with binary or
+    empty data, so an empty result for one value is not proof it was never set.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains:
+          - '\ms-settings\shell\open\command'
+          - '\exefile\shell\open\command'
+          - '\Folder\shell\open\command'
+          - '\mscfile\shell\open\command'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+  answer_sources:
+  - registry_event
+  - manual_review
+- question: What other registry modifications were made on this host in the same session?
+  context: >-
+    Operators who plant one class hijack often make several changes in the same sitting -- another handler class, an
+    autorun value, a Defender policy, or an Environment variable used by a second bypass. Grouping every registry
+    modification on the host in the window by key path and writing process shows what else landed alongside the
+    triggering write. The triggering key will appear in the results; the signal is what accompanies it, and whether
+    the surrounding writes look like an installer touching many keys at once or a hands-on session touching a
+    handful of security-relevant ones.
+  range: +/-30m
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - User
+  answer_sources:
+  - registry_event
+- question: Was the executable or script named in the shell open command value written to disk by the same process or its children?
+  context: >-
+    A planted command is only effective if what it names exists at that path. Correlating file activity by the
+    writing process and its children in the same session shows whether the payload was staged locally or whether
+    the command points at a binary already present. Registry value data carries no hash, and file writes carry no
+    hash either -- if a payload path is present, hash it from a later execution of that path or retrieve it for a
+    reputation lookup.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+  answer_sources:
+  - file_event
+  - manual_review
+- question: Did an auto-elevated handler run on this host after the write, and what did it launch?
+  context: >-
+    The registry write is inert until one of the binaries that reads the key is invoked. fodhelper.exe,
+    computerdefaults.exe, slui.exe, sdclt.exe and eventvwr.exe auto-elevate by manifest and consult a shell open
+    command key at launch, so an execution of one of them shortly after the write, and any child it spawned, is the
+    evidence that the hijack took effect. A child such as cmd.exe, powershell.exe or an executable from a
+    user-writable path under one of these parents is the elevated payload. Their absence means the configuration is
+    staged but not yet triggered, which for the exefile branch will happen the next time any .exe is opened.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_launcher:
+        Image|endswith:
+          - '\fodhelper.exe'
+          - '\computerdefaults.exe'
+          - '\slui.exe'
+          - '\sdclt.exe'
+          - '\eventvwr.exe'
+      selection_child:
+        ParentImage|endswith:
+          - '\fodhelper.exe'
+          - '\computerdefaults.exe'
+          - '\slui.exe'
+          - '\sdclt.exe'
+          - '\eventvwr.exe'
+      condition: selection_host and (selection_launcher or selection_child)
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+  answer_sources:
+  - process_creation
+  - registry_event
+- question: What action was performed with elevated privileges after the shell open command write?
+  context: >-
+    Elevation is a means to an end. Processes running at High or System integrity in the window after the write show
+    what the elevated context was used for -- credential access tooling, persistence installation through schtasks,
+    sc.exe or HKLM registry writes, security-tool tampering, log clearing, or preparation for movement to other
+    hosts. Compare each against what the user would plausibly have run with an elevation prompt they never saw. If
+    integrity level is not recorded on this host's process telemetry, treat an empty result as a visibility gap and
+    judge from the handler's children instead.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        IntegrityLevel:
+          - 'High'
+          - 'System'
+          - 'S-1-16-16384'
+          - 'S-1-16-12288'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - IntegrityLevel
+  answer_sources:
+  - process_creation
+- question: Did the Security log record a privileged process start or special-privilege assignment on this host around the write?
+  context: >-
+    A successful bypass produces a process holding administrative privileges that was never granted them through a
+    consent prompt. The Security channel records process creation under 4688 with the subject account and creator
+    process, and the assignment of sensitive privileges such as SeDebugPrivilege or SeTakeOwnershipPrivilege under
+    4672. A 4672 for the same account that owns the registry write, with no interactive elevation the user recalls,
+    corroborates the bypass independently of endpoint process telemetry. If Security audit logging for these codes
+    is not enabled in this environment, treat zero results as a visibility gap rather than evidence nothing elevated.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID:
+          - 4688
+          - 4672
+      condition: selection
+    fields:
+      - EventID
+      - SubjectUserName
+      - ProcessName
+      - PrivilegeList
+  answer_sources:
+  - manual_review
+- question: Which modules did the auto-elevated handlers load on this host around the time of the registry write?
+  context: >-
+    Registry-trigger bypasses are one family among several; the same operator tooling also carries DLL-hijack methods
+    against these auto-elevating binaries, where the elevated process loads an attacker-supplied module from a
+    writable path instead of, or in addition to, reading a hijacked command. Reviewing what fodhelper.exe,
+    computerdefaults.exe, slui.exe, sdclt.exe and eventvwr.exe loaded shows whether a second method was attempted
+    alongside this one. An unsigned module, an untrusted signature status, or a module path outside System32 under
+    these parents is what distinguishes a hijack from a normal launch.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\fodhelper.exe'
+          - '\computerdefaults.exe'
+          - '\slui.exe'
+          - '\sdclt.exe'
+          - '\eventvwr.exe'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+      - SignatureStatus
+  answer_sources:
+  - process_creation
+- question: Were cross-process memory writes or execution-forcing API calls made on this host around the write?
+  context: >-
+    Some elevation chains skip the registry trigger entirely and inject into a process that already holds the token
+    they want, and an operator who plants a class hijack may run both in the same session. Behavioral API telemetry
+    records the injection side of that -- writing into another process's memory, queueing an APC into it, or
+    installing a hook to force execution -- which is the observable counterpart to the handle activity this technique
+    implies. The read side has no equivalent telemetry, so memory reads against a privileged process such as a
+    credential store will not appear here; an empty result rules out injection, not all cross-process access.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        event.dataset: endpoint.events.api
+        process.Ext.api.name:
+          - WriteProcessMemory
+          - QueueUserAPC
+          - SetWindowsHookEx
+      condition: selection
+    fields:
+      - Image
+      - process.Ext.api.name
+  answer_sources:
+  - process_creation
+- question: Was the hijack set up from a command line, and does that command name the class and value directly?
+  context: >-
+    When the write is performed by reg.exe, cmd.exe or powershell.exe, the class path and the payload command are
+    both visible in the command line, which gives the full setup in one row -- including values the registry
+    telemetry may have dropped for empty or binary data. Look for the class name, the shell open command path, the
+    DelegateExecute value name, and Environment or Folder class references that would indicate a second method being
+    staged. A method number passed to a bypass launcher also appears here. An empty result does not clear the write --
+    scripts commonly use registry APIs directly, and then the writing process itself is the only attribution.
+  range: -15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\reg.exe'
+          - '\powershell.exe'
+          - '\cmd.exe'
+        CommandLine|contains:
+          - 'ms-settings'
+          - 'mscfile'
+          - 'Classes\exefile'
+          - 'Classes\Folder'
+          - 'Environment'
+          - 'Shell\Open\command'
+          - 'DelegateExecute'
+      condition: selection
+    fields:
+      - CommandLine
+      - Image
+  answer_sources:
+  - process_creation
+- question: Were other privilege escalation or defense evasion detections raised on this host?
+  context: >-
+    Bypass methods are version-dependent, and an operator who does not know the target build often works through
+    several until one succeeds. Other detections on the same host in the surrounding hour -- a second class hijack, an
+    Environment variable bypass, a scheduled-task or COM elevation method, or defense tampering that follows a
+    successful elevation -- establish whether this write is one attempt among many rather than an isolated
+    configuration change. Read the sequence as a timeline rather than a list.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - rule.name
+      - rule.uuid
+      - event.severity_label
+  answer_sources:
+  - alert
+- question: Has this registry key been written before on this host?
+  context: >-
+    Neither the ms-settings nor the exefile shell open command key exists in a default user hive, so any history at
+    all is informative. No prior writes in ninety days means the key was created for this event. Repeated writes with
+    the same value data and the same writing process point at software that re-registers a handler on every launch,
+    which is a tuning candidate; repeated writes with changing data, or a writing process that differs from the
+    historical one, point the other way. Value data is not recorded for empty or binary writes, so rows with no
+    Details still count as modifications.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - Details
+      - Image
+  answer_sources:
+  - registry_event
+- question: Was this same registry key written on other hosts in the environment?
+  context: >-
+    The same class hijack across many hosts separates a deployed package or a policy push -- which would show
+    consistent value data and a consistent writing process -- from activity confined to this host. A handful of hosts
+    with differing value data, or with a writing process that varies, points at operator activity rather than
+    software. If the key turns out to be written broadly by a known application, that application is the tuning
+    target; if this host stands alone, the write is specific to it.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+      - Details
+  answer_sources:
+  - registry_event

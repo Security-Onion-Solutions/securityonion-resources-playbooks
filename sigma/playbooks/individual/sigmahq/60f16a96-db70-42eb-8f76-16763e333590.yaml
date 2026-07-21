@@ -1,0 +1,308 @@
+name: New Capture Session Launched Via DXCap.EXE
+id: 799223c7-ef19-4940-8691-36359aa1302c
+description: |
+  Detects dxcap.exe, a DirectX diagnostics and debugging tool shipped with Visual Studio, invoked with the -c flag.
+  The -c flag tells dxcap.exe to launch an arbitrary executable as a subprocess of itself, which lets an operator run a
+  payload under the umbrella of a Microsoft-signed, trusted binary and potentially bypass application control or
+  allow-listing. The rule fires only when both conditions match together, an Image ending in DXCap.exe or an
+  OriginalFileName of DXCap.exe AND a command line containing the -c switch. Legitimate use of dxcap.exe is limited to
+  developers profiling DirectX applications, so the investigation should decode the command line to identify the proxied
+  child binary, confirm the parent chain and user are expected, and determine whether the launched child performs benign
+  diagnostics or stages further execution.
+type: detection
+detection_id: 60f16a96-db70-42eb-8f76-16763e333590
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- question: Does the command line match what this rule detects, with dxcap.exe invoked using the -c flag to launch a subprocess?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the exact command line and process details. The rule fires only when both halves match together, the process is dxcap.exe (by Image ending in DXCap.exe or an OriginalFileName of DXCap.exe) AND the command line contains the -c switch. Confirm both are present in the actual event and note the executable path that follows -c, since that is the proxied child binary.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to run dxcap.exe and launch executables through it?
+  context: dxcap.exe is a developer-facing DirectX diagnostics tool, and launching another executable through its -c flag is uncommon outside of graphics or game development workflows. Knowing whether the user role and host function involve DirectX development is often the fastest path to distinguishing routine work from a proxy-execution attempt.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What did this dxcap.exe invocation actually launch? Decode the command line and identify the executable passed after -c.
+  context: The full command line reveals the proxied target. dxcap.exe -c takes an absolute path to an executable that it launches as a subprocess, optionally preceded by -file to redirect output to a writable location. Read the argument that follows -c to identify exactly which binary was run, where it lives on disk, and any arguments handed to it. A path under a user-writable or temporary directory, an unsigned binary, or a script host is the detail that separates legitimate DirectX profiling from payload proxying.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|contains: ' -c '
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What process spawned dxcap.exe, and is that parent chain expected?
+  context: The parent process reveals how dxcap.exe was invoked. Legitimate developer use typically descends from a Visual Studio process, a shell, or explorer.exe. Parents like mshta.exe, wscript.exe, an Office application, or an archive tool indicate macro-driven or staged execution rather than interactive diagnostics. Walk up the tree to see what spawned the parent.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What child process did dxcap.exe spawn, and is that binary signed and expected on this host?
+  context: The -c flag launches the named executable as a child of dxcap.exe, so the spawned process is the actual payload the proxy executed. Review the child Image, its command line, and where it lives on disk. A signed Microsoft binary or a known development tool points to benign use; an unsigned binary, a script host (cmd.exe, powershell.exe, cscript.exe), or a binary under a user-writable or temporary path points to proxied execution that warrants follow-on analysis of that child.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Did the binary dxcap.exe launched load any unsigned or unusual DLLs shortly after it started?
+  context: Proxy execution through a trusted binary is often paired with side-loading, where the launched child loads an attacker-supplied DLL from its working directory rather than the expected system path. Reviewing modules loaded by the child process shortly after launch surfaces unsigned DLLs, modules loaded from user-writable or temporary directories, or libraries that do not belong to the child's normal dependency set. Absence of image-load telemetry for the child should be treated as a visibility gap, not as evidence that nothing loaded.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ImageLoaded
+      - Signed
+      - Signature
+- question: Did dxcap.exe or the child process it launched make any outbound network connections?
+  context: Proxied payloads commonly retrieve externally hosted content or beacon to operator infrastructure under the cover of the trusted parent. Reviewing outbound connections initiated by dxcap.exe and its child around the alert time surfaces destinations that are not normal for a local DirectX diagnostics tool. Connections to external IP addresses, unexpected ports, or freshly registered domains shift the disposition toward retrieval or command-and-control; no connections is consistent with purely local execution. Filter known enterprise destinations before treating any single connection as notable.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+      filter_local:
+        DestinationIp|cidr:
+          - '10.0.0.0/8'
+          - '172.16.0.0/12'
+          - '192.168.0.0/16'
+          - '127.0.0.0/8'
+      condition: selection and not filter_local
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- question: Does this host normally run dxcap.exe?
+  context: dxcap.exe is a developer tool that has no place in the runtime footprint of most production hosts. A binary that has never been seen on a host is more suspicious than one that runs regularly; zero or very low historical counts indicate first-time or rare execution, which raises the priority of the proxied child identified in the command line.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: When this host has previously fired the rule's pattern, what parents and users normally drive that activity, and does the current alert fit that pattern?
+  context: Even a legitimate developer tool can be abused. The query mirrors the rule's selection structure scoped to this host, so the resulting parent and user distribution reflects how this specific dxcap.exe -c firing pattern has historically run here, not generic dxcap.exe usage. A new parent process, an unexpected user account, or an unusual command-line structure is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \DXCap.exe
+      - OriginalFileName: DXCap.exe
+      selection_cli:
+        CommandLine|contains: ' -c '
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \DXCap.exe
+      - OriginalFileName: DXCap.exe
+      selection_cli:
+        CommandLine|contains: ' -c '
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \DXCap.exe
+      - OriginalFileName: DXCap.exe
+      selection_cli:
+        CommandLine|contains: ' -c '
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity across multiple endpoints. If the same user triggered similar activity on multiple hosts, the scope of the operation may be larger than a single endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \DXCap.exe
+      - OriginalFileName: DXCap.exe
+      selection_cli:
+        CommandLine|contains: ' -c '
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection*) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate context: what led to this event, what happened after, and whether it is part of a larger sequence. Look for reconnaissance, privilege escalation, persistence installation, or data staging.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Have other hosts fired the rule's pattern in the past week, and does the cross-host distribution look like consistent automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of this dxcap.exe -c firing pattern, not generic dxcap.exe usage. Many hosts firing the same pattern points to scripted deployment or build automation; one host or a small unrelated set points to manual operator activity. Use host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \DXCap.exe
+      - OriginalFileName: DXCap.exe
+      selection_cli:
+        CommandLine|contains: ' -c '
+      condition: all of selection*
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: 'Alerts rarely happen in isolation. Earlier detections on the same host, defense tampering, reconnaissance, or credential access, may reveal the stages that preceded this event and help reconstruct the timeline. Look for patterns: tampering followed by execution, or reconnaissance followed by proxy execution.'
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

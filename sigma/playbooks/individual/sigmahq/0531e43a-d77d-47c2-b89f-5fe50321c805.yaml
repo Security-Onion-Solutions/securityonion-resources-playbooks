@@ -1,0 +1,387 @@
+name: RegAsm.EXE Initiating Network Connection To Public IP
+id: b660fcaa-7e7f-485e-ad5b-762014936891
+description: |
+  Detects regasm.exe, the .NET assembly registration tool, initiating an outbound connection to a
+  public IP address. Regasm registers .NET assemblies for COM interop and has no routine need for
+  network access; because it is Microsoft-signed, attackers use it to load a malicious .NET DLL
+  (T1218.009) that runs under a trusted binary while bypassing application allow-listing, with the
+  network connection typically being payload retrieval or command-and-control. The investigation
+  identifies the assembly that was passed to regasm, where it came from, what the registration
+  wrote, and whether the destination is attacker infrastructure.
+type: detection
+detection_id: 0531e43a-d77d-47c2-b89f-5fe50321c805
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-03
+questions:
+- question: Do the destination and initiating process match what this rule detects, regasm.exe connecting to a public IP?
+  context: |
+    Confirm the alert from the destination address, the outbound direction, and the initiating
+    process image. The rule fires only when the destination falls outside private, loopback, and
+    link-local ranges, so the destination is internet-facing by construction. Also check the
+    image path: regasm.exe legitimately lives only under the .NET Framework directories
+    (C:\Windows\Microsoft.NET\Framework or Framework64, v2.0.50727 or v4.0.30319) — a copy
+    running from anywhere else is a masquerade rather than the signed system tool.
+  range: +/-5m
+  answer_sources:
+  - alert
+  - network_connection
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationIp|expand: '%dst_ip%'
+      condition: selection
+    fields:
+      - Image
+      - Initiated
+- question: Is this host expected to run .NET assembly registration at all?
+  context: |
+    Regasm runs during software installs and on developer or build machines that register COM
+    interop assemblies; on an ordinary workstation or server it may never run. Even where regasm
+    use is routine, it performs a local registration and does not need to reach the internet — so
+    the host being a plausible regasm user explains the execution, not the connection.
+  range: +/-30d
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What process spawned regasm.exe, and is that parent chain expected?
+  context: |
+    Legitimate regasm invocations come from installers (setup.exe, msiexec.exe), build tooling,
+    or an administrator's shell. A parent that is an Office application, script host, browser, or
+    a binary running from a user-writable path points at a delivery chain rather than a software
+    install. The parent's own command line shows what it was doing when it invoked regasm.
+  range: +/-30d
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - Image
+      - CommandLine
+- question: What assembly path and flags were passed to regasm.exe?
+  context: |
+    The command line names the .NET DLL regasm loaded and executed. An assembly under %TEMP%,
+    Downloads, AppData, or a network share is the delivery tell; the /U flag matters because
+    unregistration runs the assembly's code with user privileges only, and /codebase or /regfile
+    change what the registration writes. A bare regasm.exe with a DLL argument is the
+    allow-listing bypass invocation.
+  range: +/-5m
+  answer_sources:
+  - process_creation
+  - manual_review
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What non-Microsoft modules did this regasm instance load?
+  context: |
+    The payload is the assembly loaded into the regasm process, so the module list is the
+    decisive evidence: a Microsoft-signed system tool loading an unsigned DLL, or one signed by
+    an unexpected publisher, from a user-writable path is the technique executing. Capture the
+    module's hash for a reputation lookup and compare its signer against assemblies your
+    organization is known to register.
+  range: +/-5m
+  answer_sources:
+  - image_load
+  - external_threat_intel
+  - manual_review
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+      - SignatureStatus
+      - Hashes
+- question: What registry entries did this regasm instance write?
+  context: |
+    A genuine registration writes CLSID and ProgID entries under HKCR for the assembly's COM
+    classes; those writes both confirm which assembly was processed and can leave a COM hijack
+    or persistence surface behind if the assembly was malicious. No registry writes at all fits
+    the /U unregistration invocation, where the attacker only wanted the code execution.
+  range: +/-15m
+  answer_sources:
+  - registry_event
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- question: Was the assembly written to a user-writable path shortly before regasm ran, and by what process?
+  context: |
+    The technique's chain is file drop, then regasm execution, then the network connection —
+    usually within minutes. DLL writes into user-writable staging paths in the hour before the
+    alert surface the dropper; match the written path against the assembly named in regasm's
+    command line to identify which process delivered the payload and pivot the investigation to
+    that process.
+  range: -1h
+  answer_sources:
+  - file_event
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith: '.dll'
+        TargetFilename|contains:
+          - '\Users\'
+          - '\ProgramData\'
+          - '\Windows\Temp\'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: What is the destination, and what do WHOIS, passive DNS, and threat intelligence reveal about it?
+  context: |
+    Regasm has no business destination, so the endpoint itself carries the verdict. Check the
+    IP's ownership and hosting profile, passive-DNS history, and threat-intelligence hits:
+    recently registered infrastructure, consumer VPS hosting, or known command-and-control
+    listings point to an attacker endpoint, while a corporate or content-delivery range may
+    indicate an installer phoning home. The port adds signal — raw high ports are more
+    characteristic of C2 than 443.
+  range: +/-5m
+  answer_sources:
+  - external_threat_intel
+  - manual_review
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationIp|expand: '%dst_ip%'
+      condition: selection
+    fields:
+      - DestinationPort
+      - Initiated
+- question: Does this host normally communicate with this destination?
+  context: |
+    A first-time connection to this address is a stronger signal than one the host has made
+    routinely for months. Recurring history at regular intervals suggests either an established
+    beacon (if it traces back to regasm or another unexpected process) or routine software
+    traffic (if it traces to an updater); the Image grouping shows which.
+  range: -90d
+  answer_sources:
+  - network_connection
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationIp|expand: '%dst_ip%'
+      condition: selection
+    fields:
+      - DestinationPort
+      - Image
+- question: What child processes did regasm.exe spawn afterward?
+  context: |
+    The registration function of a malicious assembly can spawn shells, script hosts, or a
+    dropped second stage. No children is also common — the payload frequently runs entirely
+    inside the regasm process — in which case the module-load and file-write views carry the
+    post-execution evidence instead.
+  range: +4h
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Does this host normally run regasm.exe?
+  context: |
+    On build servers and developer machines regasm may run daily under known users; on most other
+    hosts it never runs. Zero or near-zero history makes this execution first-time-on-host, which
+    raises the weight of every other finding; regular history under the same user suggests an
+    established workflow that now needs the network connection explained.
+  range: -90d
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: When this host has fired this regasm-to-public-IP pattern before, what programs and users drove it?
+  context: |
+    The query mirrors the rule's selection scoped to this host, so the result is the host's
+    history of regasm reaching public addresses specifically — not generic regasm use. The Image
+    column shows the regasm binary itself — a path outside the .NET Framework directories is a
+    masquerade tell — and User shows who ran it. Recurring fires under one account may reveal a
+    known product behavior worth documenting; a first-time fire, or a new user relative to that
+    history, is the deviation worth chasing. Network events carry no parent lineage — pivot to
+    regasm's process-start event if the launching parent matters.
+  range: -14d
+  answer_sources:
+  - network_connection
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        Initiated: 'true'
+        Image|endswith: \regasm.exe
+      filter_main_local_ranges:
+        DestinationIp|cidr:
+        - 127.0.0.0/8
+        - 10.0.0.0/8
+        - 172.16.0.0/12
+        - 192.168.0.0/16
+        - 169.254.0.0/16
+        - ::1/128
+        - fe80::/10
+        - fc00::/7
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - Image
+    - User
+- question: Have other hosts fired this regasm-to-public-IP pattern in the past week?
+  context: |
+    The query mirrors the rule's selection with no host scope, giving the fleet-wide count of the
+    firing pattern. A product whose installer phones home will fire consistently across the hosts
+    that run it; a single host, or a small cluster sharing the same destination, points at a
+    targeted delivery. Compare destinations across firing hosts before dismissing a multi-host
+    result as vendor behavior.
+  range: -7d
+  answer_sources:
+  - network_connection
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        Initiated: 'true'
+        Image|endswith: \regasm.exe
+      filter_main_local_ranges:
+        DestinationIp|cidr:
+        - 127.0.0.0/8
+        - 10.0.0.0/8
+        - 172.16.0.0/12
+        - 192.168.0.0/16
+        - 169.254.0.0/16
+        - ::1/128
+        - fe80::/10
+        - fc00::/7
+      condition: selection and not 1 of filter_main_*
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: |
+    Aggregated parent-child process pairs around the alert reveal the surrounding sequence — the
+    dropper or installer before the fire, staged execution after it. Novel low-count pairs stand
+    out against repetitive agent noise and help decide whether this was an isolated registration
+    or one step in a longer chain.
+  range: +/-15m
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: |
+    Earlier detections — a suspicious download, archive extraction, script-host execution, or
+    other LOLBin activity — may capture the delivery of the assembly that regasm then executed,
+    and help reconstruct the timeline from arrival to the outbound connection.
+  range: -6h
+  answer_sources:
+  - alert
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

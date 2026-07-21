@@ -1,0 +1,415 @@
+name: Scheduled Task Creation with Curl and PowerShell Execution Combo
+id: 301a7d60-4bf9-4867-8297-2380cb84e346
+description: |
+  Detects creation of a scheduled task via schtasks.exe whose command line combines all of:
+  a /create switch, a curl invocation that fetches an http(s) URL with output redirection
+  (-o), and a powershell reference. This packs an entire download-and-execute cradle into a
+  single persistent task — curl pulls a remote payload and pipes it to PowerShell, so nothing
+  needs to be written to disk as a standalone sample and the task re-runs on its schedule.
+  Legitimate automation occasionally chains curl and PowerShell, so the investigation should
+  decode the embedded task command, confirm what URL and payload are involved, determine
+  whether the task already executed and is still registered, and check whether the user, host,
+  and launch path are expected.
+type: detection
+detection_id: 1d174d38-8fda-4081-a9b6-56d9763c0cd8
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- question: Does the alert match the rule — a schtasks.exe /create command line that also contains a curl http(s) download with -o and a powershell reference?
+  context: Before investing investigation time, confirm the true positive by reviewing the full
+    command line. All three elements must be present together — the /create switch, a curl
+    invocation fetching an http or https URL with -o output redirection, and a powershell
+    reference. The download-and-execute cradle is typically embedded inside the task's /TR
+    (run) argument, so read the whole command line, not just the leading schtasks tokens.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Is this user and host expected to create scheduled tasks that download and run remote content?
+  context: Legitimate administrative automation can chain schtasks, curl, and PowerShell, but
+    it is unusual for an ordinary user or workstation. Knowing whether the account routinely
+    builds scheduled tasks and whether the host's role involves this kind of automation is
+    often the fastest way to separate a sanctioned deployment from operator activity.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What scheduled task was created, and what command does it run?
+  context: The schtasks command line carries the task name (/TN), the run command (/TR), the
+    schedule type (/SC — ONLOGON, MINUTE, DAILY, etc.), and any run-as account (/RU, where
+    SYSTEM is higher risk). Read these out of the alerting command line. Randomized, obfuscated,
+    or convention-breaking task names and a /TR that wraps a curl-to-PowerShell cradle are the
+    high-signal details — they reveal both the persistence schedule and the payload it runs.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What does the embedded curl-to-PowerShell cradle resolve to, and what does PowerShell ultimately execute?
+  context: The task's run command commonly hides its intent — environment-variable substitution
+    that assembles the URL piece by piece, base64 or backtick obfuscation, or curl piping its
+    downloaded body straight into powershell. Reconstruct the full URL, decode any encoded or
+    concatenated content, and identify what the downloaded payload tells PowerShell to do.
+    Heavily encoded or high-entropy command content is itself a signal worth noting.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What process spawned schtasks.exe, and is that parent chain expected?
+  context: The parent process reveals how the task was created. Interactive administration
+    usually traces back to explorer.exe or a console the admin opened; a task created by
+    cmd.exe, conhost.exe with --headless, an Office application, a script host, or a freshly
+    spawned shell points to scripted or operator-driven creation. Trace what spawned the parent
+    to understand how the activity was initiated.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Did PowerShell script block logging capture the deobfuscated content the cradle executed?
+  context: Script block logging records the deobfuscated script content PowerShell actually ran,
+    even when the originating command line was encoded or assembled from variables. This is
+    ground truth about what the downloaded payload did. If PowerShell operational logs are not
+    ingested in this environment, treat zero results as a visibility gap rather than evidence
+    nothing ran, and decode the cradle from the alerting command line directly.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Was the download successful? Check for file creation at the destination path.
+  context: A curl command does not guarantee the file arrived — network errors, blocked URLs, or
+    security controls may have stopped the transfer. The destination path is the curl -o
+    argument from the alerting command line. Confirming a file was created there establishes
+    whether the attack progressed past the delivery stage. If curl piped its output directly to
+    PowerShell rather than to a file, no on-disk artifact may exist.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Did curl or PowerShell make outbound connections to the download host around the alert time?
+  context: The curl http(s) fetch is the ingress-tool-transfer step — the host reaches out to a
+    remote server to pull the payload. Confirming the egress connection establishes that the
+    download actually attempted, and the destination distinguishes an internal update source
+    from an external server. Compare the destination against known-good update and content
+    domains; an external or previously unseen destination raises the concern.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\curl.exe'
+          - '\powershell.exe'
+          - '\pwsh.exe'
+        Initiated: 'true'
+      condition: selection
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationHostname
+      - DestinationPort
+- question: When is the task scheduled to run, and has it already executed?
+  context: The /SC schedule type determines when the persistence activates. Tasks set to run at
+    boot or logon fire on the next restart; recurring tasks (every few minutes, daily) may have
+    already run multiple times. Scheduled tasks execute as children of the Task Scheduler service,
+    so processes spawned by svchost.exe running the Schedule service after task creation show
+    whether the payload has fired. Correlate the execution window against the create time.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: '\svchost.exe'
+        ParentCommandLine|contains: 'Schedule'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Is the scheduled task still registered on the system?
+  context: Persistence is only effective while the task exists. Some operators delete the task
+    after it runs to reduce forensic artifacts. Confirming the task is still present — via
+    schtasks /query /tn <taskname> /v on the host or through endpoint tooling — determines
+    whether the persistence mechanism is active and requires remediation. Use the /TN task name
+    decoded from the alerting command line.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Was schtasks.exe executed from its expected System32 or SysWOW64 path?
+  context: schtasks.exe running from outside System32 or SysWOW64 may indicate the binary was
+    copied or renamed to evade path-based allowlists. Compare the Image path against the
+    expected location and check OriginalFileName — a mismatch between the on-disk name and the
+    PE original name is a renaming indicator.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- question: How often has this host fired this schtasks-curl-PowerShell pattern over the past 90 days, and what command-line structures are typical?
+  context: A pattern with no prior history on a host is more suspicious than one used regularly
+    under stable conditions. The query mirrors the rule's selection structure scoped to this
+    host, so the count reflects this specific firing pattern rather than generic schtasks usage.
+    The command-line projection lets you compare typical task-creation patterns against the
+    alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+        Image|endswith: \schtasks.exe
+        CommandLine|contains|windash: ' /create '
+      selection_curl:
+        CommandLine|contains|all:
+        - 'curl '
+        - http
+        - -o
+      selection_powershell:
+        CommandLine|contains: powershell
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+        Image|endswith: \schtasks.exe
+        CommandLine|contains|windash: ' /create '
+      selection_curl:
+        CommandLine|contains|all:
+        - 'curl '
+        - http
+        - -o
+      selection_powershell:
+        CommandLine|contains: powershell
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+        Image|endswith: \schtasks.exe
+        CommandLine|contains|windash: ' /create '
+      selection_curl:
+        CommandLine|contains|all:
+        - 'curl '
+        - http
+        - -o
+      selection_powershell:
+        CommandLine|contains: powershell
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the environment around this time?
+  context: Tracking the account's activity across all hosts in the surrounding window reveals
+    lateral movement or coordinated activity on multiple endpoints. If the same user triggered
+    similar task-creation or download activity elsewhere, the scope is larger than this one host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+        Image|endswith: \schtasks.exe
+        CommandLine|contains|windash: ' /create '
+      selection_curl:
+        CommandLine|contains|all:
+        - 'curl '
+        - http
+        - -o
+      selection_powershell:
+        CommandLine|contains: powershell
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Were any other download or transfer LOLBins used on this host recently?
+  context: Operators who use one download LOLBin often use several — if curl pulled a payload,
+    check whether certutil, bitsadmin, esentutl, or other transfer binaries were also used to
+    fetch content. Finding multiple download tools performing the same objective strengthens the
+    case for deliberate activity over isolated administration.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\certutil.exe'
+          - '\bitsadmin.exe'
+          - '\esentutl.exe'
+          - '\expand.exe'
+          - '\extrac32.exe'
+          - '\makecab.exe'
+          - '\replace.exe'
+          - '\hh.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Surveying activity around the alert reveals what led
+    to the task creation and what followed — reconnaissance, additional persistence, or further
+    download activity. Aggregating by process and parent collapses repetitive agent telemetry into
+    high-count rows while novel parent-child pairs stand out at low counts.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage

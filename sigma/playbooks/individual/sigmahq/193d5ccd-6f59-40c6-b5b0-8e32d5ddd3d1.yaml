@@ -1,0 +1,358 @@
+name: Xwizard.EXE Execution From Non-Default Location
+id: 7c1f9a2e-6b84-4d3a-9e57-2f0c8d5b1a44
+description: |
+  Detects xwizard.exe (the Extensible Wizards Host Process) executing from any directory other than System32, SysWOW64, or WinSxS. The rule fires when the process image ends in xwizard.exe OR carries the embedded OriginalFileName xwizard.exe, AND the image path is NOT under one of those three trusted system directories. xwizard.exe loads xwizards.dll from its current working directory, so copying the Microsoft-signed binary to an attacker-controlled folder alongside a malicious xwizards.dll causes the signed host to side-load attacker code (DLL search-order hijacking). Legitimate xwizard.exe only runs from the system locations the rule excludes, so a non-default path is the load-bearing anomaly. Investigation should confirm the path, identify the DLL that loaded, and trace how the binary and its companion DLL arrived on the host.
+type: detection
+detection_id: 193d5ccd-6f59-40c6-b5b0-8e32d5ddd3d1
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Is the alerting process xwizard.exe running from a directory other than System32, SysWOW64, or WinSxS?
+  context: Confirm the alert is a true positive before investing time. The rule fires when the image ends in xwizard.exe or its embedded OriginalFileName is xwizard.exe, and the image path is not under C:\Windows\System32\, C:\Windows\SysWOW64\, or C:\Windows\WinSxS\. Check the full Image path and OriginalFileName on the triggering event; a path under any of those three system directories would not have fired and indicates a tuning artifact or a Windows install on a non-default system drive.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- question: Is this user/host expected to run xwizard.exe from a non-system directory?
+  context: Legitimate xwizard.exe usage is driven by legacy hardware and wizard UI flows and runs only from system directories. A user or host running it from a user-writable or staging path is rarely expected. Knowing whether the user role and host function involve legacy installer or wizard activity is often the fastest path to separating a true positive from a rare-but-benign relocation.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Does the binary's metadata and hash confirm it is the genuine Microsoft xwizard.exe, or a substituted file?
+  context: The rule fires on either the image basename or the embedded OriginalFileName, so the file on disk may not be the genuine host process. Compare the Image path against OriginalFileName and the code-signing chain to confirm this is the Microsoft-signed Extensible Wizards Host Process rather than a renamed or trojanized binary. The hash enables a reputation lookup to distinguish a known-good system binary from a novel or known-malicious sample.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Hashes
+- question: What did xwizard.exe do? Decode the full command line, looking for RunWizard, a CLSID GUID, or the /taero /u flag pair.
+  context: The command line reveals the operation. The COM-execution abuse path invokes xwizard RunWizard followed by a CLSID GUID, optionally with the /taero /u flag pair that suppresses the "not a valid wizard" error on newer Windows builds. A GUID argument points at a CLSID whose InProcServer32 may reference an attacker DLL. The DLL search-order path needs no arguments at all — simply running the relocated binary loads xwizards.dll from the working directory. Note which pattern is present.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What DLLs did xwizard.exe load, and were any loaded from the non-default working directory rather than System32?
+  context: DLL search-order hijacking completes when xwizard.exe loads xwizards.dll from its current working directory instead of the system copy. Module-load telemetry shows which libraries the process mapped and from where. A xwizards.dll (or any companion DLL) loaded from the same non-default folder as the binary, or any non-Microsoft-signed DLL loaded into this signed process, is the artifact that confirms side-loading. If image-load telemetry is not collected in this environment, treat the absence of results as a visibility gap rather than evidence no DLL loaded.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+- question: When and how did xwizards.dll (or a companion DLL) arrive in the directory alongside the relocated binary?
+  context: A side-loaded DLL must be dropped into the binary's working directory before execution. File-event telemetry for the DLL basename reveals who wrote it, when, and from what process — a download tool, an archive extractor, a copy operation, or a dropper. Correlating the DLL write time with the binary's relocation and the alert time establishes whether this was a deliberate staging step.
+  range: -30d
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith:
+          - xwizards.dll
+          - .dll
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: Was a CLSID InProcServer32 or LocalServer32 registry value written on this host pointing a COM class at a non-System32 path?
+  context: The COM-execution abuse path requires the attacker to register a CLSID whose InProcServer32 (or LocalServer32) default value points at their DLL, so that xwizard RunWizard {GUID} instantiates attacker code. Registry-set telemetry for CLSID server keys reveals such registrations. A value written shortly before the alert, pointing outside System32, ties the registry preparation to the execution. If registry-set telemetry is not collected here, this returns no rows by construction and the CLSID GUID from the command line should be inspected directly in the registry.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains:
+          - \CLSID\
+        TargetObject|endswith:
+          - \InProcServer32\(Default)
+          - \LocalServer32\(Default)
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- question: Was a mark-of-the-web alternate data stream written to the companion DLL or the relocated binary, indicating download origin?
+  context: Files downloaded from the internet receive a Zone.Identifier alternate data stream. Defend records this as an ordinary file write with the stream name embedded in the path rather than as a dedicated stream-hash event, so matching that path pattern against xwizards.dll or xwizard.exe on this host shows whether either file was fetched from an external source rather than copied locally by a trusted process, raising the likelihood of deliberate staging. No hash or content is recorded for the stream itself. Absence does not clear the file — locally copied or extracted files carry no mark-of-the-web.
+  range: -30d
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_names:
+        TargetFilename|contains:
+          - xwizards.dll
+          - xwizard.exe
+      selection_motw:
+        TargetFilename|contains: ':Zone.Identifier'
+      condition: selection and selection_names and selection_motw
+    fields:
+      - TargetFilename
+      - Image
+- question: What process spawned this xwizard.exe instance, and is that parent chain expected?
+  context: The parent process reveals how the relocated binary was invoked. Legitimate wizard flows are launched by explorer.exe or system UI processes. A parent such as a shell, script host, Office application, or a process running from the same non-default directory points to scripted or operator-driven execution rather than an interactive wizard.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What child processes did xwizard.exe spawn afterward?
+  context: Once attacker code runs inside the signed host, it often spawns follow-on processes for its actual objective. Legitimate xwizard.exe rarely spawns children. Unexpected children such as cmd.exe, powershell.exe, rundll32.exe, or network tooling indicate the side-loaded DLL is executing post-exploitation activity.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: When this host previously fired this xwizard.exe pattern, what parents and users normally drove it, and does the current alert fit?
+  context: Even legitimate relocations recur. The query mirrors the rule's selection structure scoped to this host, so the parent/user distribution reflects how the rule's specific firing pattern has historically run here — not generic binary usage. A new parent process, an unexpected user account, or a first-ever occurrence is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - Image|endswith: \xwizard.exe
+      - OriginalFileName: xwizard.exe
+      filter_main_legit_location:
+        Image|startswith:
+        - C:\Windows\System32\
+        - C:\Windows\SysWOW64\
+        - C:\Windows\WinSxS\
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - Image|endswith: \xwizard.exe
+      - OriginalFileName: xwizard.exe
+      filter_main_legit_location:
+        Image|startswith:
+        - C:\Windows\System32\
+        - C:\Windows\SysWOW64\
+        - C:\Windows\WinSxS\
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - Image|endswith: \xwizard.exe
+      - OriginalFileName: xwizard.exe
+      filter_main_legit_location:
+        Image|startswith:
+        - C:\Windows\System32\
+        - C:\Windows\SysWOW64\
+        - C:\Windows\WinSxS\
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the same user triggered similar activity on multiple hosts, the scope of compromise may be larger than the single alerting endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - Image|endswith: \xwizard.exe
+      - OriginalFileName: xwizard.exe
+      filter_main_legit_location:
+        Image|startswith:
+        - C:\Windows\System32\
+        - C:\Windows\SysWOW64\
+        - C:\Windows\WinSxS\
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance, credential access — may reveal the attack stages that preceded this event and help reconstruct the timeline that led to the DLL side-load.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: How often has this host fired the xwizard.exe non-default-location pattern over the past 90 days, and what command-line structures are typical?
+  context: A LOLBin pattern with no prior history on a host is more suspicious than one used regularly under stable parents. The query mirrors the rule's selection structure scoped to this host, so the count reflects the rule's specific firing pattern rather than generic usage. The command-line projection lets the analyst compare typical invocation patterns against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - Image|endswith: \xwizard.exe
+      - OriginalFileName: xwizard.exe
+      filter_main_legit_location:
+        Image|startswith:
+        - C:\Windows\System32\
+        - C:\Windows\SysWOW64\
+        - C:\Windows\WinSxS\
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - CommandLine
+- question: Have other hosts fired this xwizard.exe pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of the rule's firing pattern, not generic usage of the binary. Many hosts firing the same pattern points to scripted deployment or vendor automation that happens to relocate the binary; one host or a small unrelated set points to manual operator activity worth deeper review.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - Image|endswith: \xwizard.exe
+      - OriginalFileName: xwizard.exe
+      filter_main_legit_location:
+        Image|startswith:
+        - C:\Windows\System32\
+        - C:\Windows\SysWOW64\
+        - C:\Windows\WinSxS\
+      condition: selection and not 1 of filter_main_*
+    fields:
+    - host.name

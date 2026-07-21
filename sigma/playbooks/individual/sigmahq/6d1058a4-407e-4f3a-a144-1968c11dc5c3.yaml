@@ -1,0 +1,436 @@
+name: Suspicious Sysmon as Execution Parent
+id: e69fcf06-2b07-46a3-aca5-b4ebd39d4b6c
+description: |
+  Fires when a process_creation event names sysmon.exe or sysmon64.exe as the parent image AND the child is
+  none of the binaries that installation legitimately launches — its own copy under the Windows directory, a
+  temp-directory copy of the installer, conhost.exe, WerFault.exe, WerFaultSecure.exe, or wevtutil.exe. The
+  installed binary runs as SYSTEM and does not spawn arbitrary children, so a child outside that filtered set
+  points either at a binary masquerading under the same name from a non-standard path, or at abuse of the
+  installed instance to obtain execution under its token (the pattern behind CVE-2022-41120). Determine what
+  the child binary is and where it lives, whether the parent instance is the legitimately installed one, and
+  whether privileged token use or other escalation activity followed on the host.
+type: detection
+detection_id: 6d1058a4-407e-4f3a-a144-1968c11dc5c3
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-16
+questions:
+- question: Does the alerting event show sysmon.exe or sysmon64.exe as the parent, with a child outside the
+    rule's excluded set?
+  context: >-
+    The rule requires a parent image ending in sysmon.exe or sysmon64.exe and excludes the children the
+    installed binary legitimately produces: its own copy under the Windows directory, an installer copy under
+    a user AppData\Local\Temp path, conhost.exe, WerFault.exe, WerFaultSecure.exe, and wevtutil.exe. Confirm
+    the parent image path and the child image path before investing further time — a self-update or crash
+    handler running from an unexpected path is the most common way this fires without malice.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+  answer_sources:
+  - alert
+  - process_creation
+- question: Is this host expected to produce child processes under sysmon.exe or sysmon64.exe?
+  context: The installed binary spawns children only for its own update, crash-handling, and event-log
+    utility paths, all of which the rule already excludes. A deployment change, a manual install or
+    reinstall, or an operator running the binary interactively from a staging directory can produce children
+    from a path outside the filtered set. Check change records and the host's role before treating the child
+    as unexplained.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: What is the parent instance itself — where does it run from, how was it invoked, and what started
+    it?
+  context: This retrieves the parent's own creation event. The installed service runs from the Windows
+    directory under services.exe; a parent running from a user-writable or staging path, or started by a
+    shell, an archive utility, or a scripting host, is a copy of the binary rather than the installed
+    service. The parent's own command line distinguishes an install or uninstall invocation from a
+    service start.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+  answer_sources:
+  - process_creation
+- question: What did the child process actually do? Decode its full command line and working directory.
+  context: The rule places no constraint on the child, so the child's own arguments carry the whole meaning
+    of the alert. Decode any encoded content, script paths, redirected output, or credential material, and
+    note whether the working directory is a system path or a user-writable one. A child that is a command
+    interpreter, a scripting host, or a downloader inherits a SYSTEM token from this parent.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: Has this parent binary spawned this child binary on this host before?
+  context: This counts how often this exact parent-child pairing has occurred here over 90 days. Zero or very
+    low counts mean the pairing is novel and the alerting event is not a recurring maintenance or update
+    path. A steady historical count points instead at a local deployment behavior that the rule's exclusion
+    list does not cover, which is a tuning finding rather than an intrusion.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: What other child processes did this parent binary spawn on this host after the alert?
+  context: If the parent is being driven to execute code under its token, the alerting child is often not the
+    only one. Reconnaissance, credential access, and persistence tooling launched from the same parent in the
+    hours that follow reveal the operational purpose behind the first execution. Children that fall inside
+    the rule's exclusion list do not appear in the alert stream but do appear here.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: What files did the parent process instance create or modify around the time of the alert?
+  context: Beyond spawning children, the parent may have written to disk. Privilege-escalation exploitation
+    of a SYSTEM service commonly works through file operations performed with the service's token — writes
+    into system directories, junction or hardlink targets, or a dropped payload that the alerting child then
+    executes. File activity correlated to the parent process instance shows whether the execution was
+    accompanied by a file-side effect.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+  answer_sources:
+  - file_event
+  - process_creation
+- question: Is the same parent-child pairing occurring on other hosts?
+  context: The same binary parenting the same child across several hosts points at a deployment or automation
+    path common to the environment, which reframes the finding as tuning. A single host makes a host-local
+    trigger more likely, whether that is an operator action or an attempt to obtain execution under the
+    service's token.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Does this host normally run the alerting child binary at all, under any parent?
+  context: A child that has never executed on this host before is a stronger finding than one that runs daily
+    under other parents. If the binary is routine here but has only ever been launched by a different parent,
+    the parent relationship is the deviation, not the binary itself. The user breakdown shows whether prior
+    executions were operator-driven or service-driven.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+  answer_sources:
+  - process_creation
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of this specific firing pattern, aggregated by host. A user who has never produced it is
+    more notable than one who does so regularly. Note that this parent runs as SYSTEM, so the alerting user
+    is frequently a service principal rather than a person; in that case this count attributes nothing and
+    the launch-mechanism history is the meaningful pivot.
+  range: -90d
+  always_include: true
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        ParentImage|endswith:
+        - \Sysmon.exe
+        - \Sysmon64.exe
+      filter_main_temp_sysmon:
+        Image|startswith: C:\Users\
+        Image|contains: \AppData\Local\Temp\
+        Image|endswith:
+        - \Sysmon.exe
+        - \Sysmon64.exe
+      filter_main_generic:
+        Image|contains:
+        - :\Windows\Sysmon.exe
+        - :\Windows\Sysmon64.exe
+        - :\Windows\System32\conhost.exe
+        - :\Windows\System32\WerFault.exe
+        - :\Windows\System32\WerFaultSecure.exe
+        - :\Windows\System32\wevtutil.exe
+        - :\Windows\SysWOW64\wevtutil.exe
+      filter_main_null:
+        Image: null
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior. The
+    meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, so the result is the 90-day history of this parent driving this specific pattern.
+    A parent that already accounts for a large volume of prior events on many hosts is a deployment or update
+    path the exclusion list misses; a first-ever occurrence is the deviation worth chasing.'
+  range: -90d
+  always_include: true
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        ParentImage|endswith:
+        - \Sysmon.exe
+        - \Sysmon64.exe
+      filter_main_temp_sysmon:
+        Image|startswith: C:\Users\
+        Image|contains: \AppData\Local\Temp\
+        Image|endswith:
+        - \Sysmon.exe
+        - \Sysmon64.exe
+      filter_main_generic:
+        Image|contains:
+        - :\Windows\Sysmon.exe
+        - :\Windows\Sysmon64.exe
+        - :\Windows\System32\conhost.exe
+        - :\Windows\System32\WerFault.exe
+        - :\Windows\System32\WerFaultSecure.exe
+        - :\Windows\System32\wevtutil.exe
+        - :\Windows\SysWOW64\wevtutil.exe
+      filter_main_null:
+        Image: null
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- question: What else did this user do across the environment around this time?
+  context: Tracking the alerting user's activity across all hosts in the surrounding hour shows whether the
+    execution was an isolated event or one step in a sequence that spans endpoints. If the alert fired under
+    SYSTEM or a computer account, expect this to return large volumes of routine service activity and read
+    the launch-mechanism clustering instead.
+  range: +/-1h
+  always_include: true
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+- question: Did this same parent-driven pattern fire on other hosts in the same window, or is the activity
+    isolated to this host?
+  context: 'Under a service principal, asking what else the user did returns routine service noise, because
+    every host runs SYSTEM-owned processes constantly. The meaningful question is whether the same launch
+    mechanism produced the rule''s pattern elsewhere in the alert window: several hosts at once points at
+    scheduled or pushed automation, while a single host points at a host-local trigger.'
+  range: +/-1h
+  always_include: true
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        ParentImage|endswith:
+        - \Sysmon.exe
+        - \Sysmon64.exe
+      filter_main_temp_sysmon:
+        Image|startswith: C:\Users\
+        Image|contains: \AppData\Local\Temp\
+        Image|endswith:
+        - \Sysmon.exe
+        - \Sysmon64.exe
+      filter_main_generic:
+        Image|contains:
+        - :\Windows\Sysmon.exe
+        - :\Windows\Sysmon64.exe
+        - :\Windows\System32\conhost.exe
+        - :\Windows\System32\WerFault.exe
+        - :\Windows\System32\WerFaultSecure.exe
+        - :\Windows\System32\wevtutil.exe
+        - :\Windows\SysWOW64\wevtutil.exe
+      filter_main_null:
+        Image: null
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- question: What other process activity occurred on this host around the time of the alert?
+  context: Exploitation of a privileged component is usually bracketed by other execution — a dropper or
+    archive extraction before it, and reconnaissance or persistence after. Aggregating by child and parent
+    image collapses routine repetitive activity into high-count rows so that novel parent-child pairs stand
+    out at low counts. Compare the timing of any low-count pair against the alert.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+  answer_sources:
+  - process_creation
+  - file_event
+  - registry_event
+- question: Were special privileges assigned to a new logon, or privileged services called, on this host
+    around the alert?
+  context: Exploitation for privilege escalation is followed by use of the escalated token. Event 4672
+    records the privileges granted to a new logon session and 4673 records privileged service calls; a logon
+    session gaining SeDebugPrivilege, SeImpersonatePrivilege, or SeTcbPrivilege in the alert window, tied to
+    an account that is not a normal service identity, corroborates that execution under the parent's token
+    was obtained rather than incidental. If the Security channel is not collected in this environment, treat
+    zero results as a visibility gap rather than evidence nothing happened.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID:
+          - 4672
+          - 4673
+      condition: selection
+    fields:
+      - EventID
+      - SubjectUserName
+      - SubjectLogonId
+      - PrivilegeList
+      - ProcessName
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host help place this execution in a sequence. Look for a delivery
+    or download stage, defense tampering, or driver-load activity in the preceding hours — exploitation of a
+    vulnerable component is a means to an end, and the surrounding alerts usually name it.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+  answer_sources:
+  - alert

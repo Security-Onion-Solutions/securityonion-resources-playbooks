@@ -1,0 +1,1118 @@
+name: Net WebClient Casing Anomalies
+id: 5ddc5205-0de7-4abe-b120-b4f22fcebc48
+description: |
+  Detects PowerShell (powershell.exe or pwsh.exe) launched with a command line containing
+  base64-encoded fragments of a mixed-case Net.WebClient string (e.g. nEt.WEbCliEnT). The
+  rule fires only when the process is PowerShell AND the encoded command line carries one of
+  these casing-anomaly fragments. Random casing of the Net.WebClient type name is a deliberate
+  obfuscation trick used to evade signature matches while preserving a download cradle that
+  fetches and runs remote content in memory. Investigation should decode the full command,
+  identify the source URL and what gets executed, and determine whether the parent chain, user,
+  and host context indicate a real intrusion or a tolerated red-team / tooling artifact.
+type: detection
+detection_id: c86133ad-4725-4bd0-8170-210788e0a7ba
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-09
+questions:
+- question: Is this PowerShell process launched with an encoded mixed-case Net.WebClient string?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule
+    fires only when the binary is powershell.exe or pwsh.exe AND the command line contains a
+    base64 fragment of a casing-anomaly Net.WebClient string. Review the exact command line and
+    process identity against both conditions.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to run encoded PowerShell download cradles?
+  context: Legitimate administration and software deployment can run PowerShell with encoded
+    arguments, but a randomly-cased Net.WebClient cradle is rarely a sanctioned pattern. Knowing
+    whether the user role and host function involve scripted downloads is often the fastest path
+    to separating a true positive from tolerated automation.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What does the encoded command decode to, and what URL does the Net.WebClient cradle fetch and run?
+  context: The matched fragments are UTF-16LE base64 of a mixed-case Net.WebClient reference, which
+    is the obfuscated form of a download cradle. Decode the full command line and identify the
+    source URL passed to DownloadString or DownloadFile, where any downloaded file is written, and
+    whether the result is piped into Invoke-Expression for in-memory execution. The casing anomaly
+    itself is the evasion; the decoded payload is the actual behavior.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did PowerShell script block logging capture the deobfuscated script content?
+  context: Event ID 4104 records the deobfuscated script PowerShell actually executes, even when
+    the command line is encoded or casing-obfuscated. This is ground truth for what ran, bypassing
+    the Net.WebClient casing trick entirely. If PowerShell operational logs are not ingested in
+    this environment, treat zero results as a visibility gap rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Were PowerShell security controls disabled or weakened on this host before this execution?
+  context: Encoded download cradles frequently run after the operator has cleared the way -- AMSI
+    bypass (patching amsi.dll in memory), execution-policy changes (-ExecutionPolicy Bypass or
+    -ep bypass), Defender preference changes, or a v2 downgrade that strips logging. Finding these
+    precursor events on the host strengthens the case that the encoded Net.WebClient cradle is
+    malicious rather than tolerated tooling.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: What process spawned this PowerShell instance, and is that parent chain expected?
+  context: The parent reveals how the cradle was invoked. Interactive use typically descends from
+    explorer.exe or a console; document automation tooling has predictable service or task parents.
+    Office applications, mshta.exe, wscript.exe, or a browser as the parent point toward macro or
+    drive-by delivery rather than legitimate administration.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What child processes did this PowerShell instance spawn afterward?
+  context: A download cradle's impact shows up in what it launches next. In-memory execution of a
+    fetched payload commonly spawns cmd.exe, additional powershell.exe, rundll32.exe, or
+    certutil.exe, or drops and runs a new binary. Unexpected children point to successful
+    post-download execution rather than a benign or failed fetch.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Did this PowerShell instance load .NET or web-stack assemblies consistent with a download cradle running in memory?
+  context: PowerShell hosting the .NET runtime loads CLR and System.Net assemblies when a
+    Net.WebClient cradle actually executes, and amsi.dll appears when AMSI is engaged. The presence
+    and ordering of these module loads on the alerting PowerShell host help confirm the cradle ran
+    in memory rather than failing at parse time, and absence of amsi.dll alongside a successful
+    fetch can indicate an in-memory bypass.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      selection_modules:
+        ImageLoaded|endswith:
+          - '\System.Net.dll'
+          - '\System.Net.Http.dll'
+          - '\clr.dll'
+          - '\clrjit.dll'
+          - '\mscoree.dll'
+          - '\amsi.dll'
+      condition: selection and selection_modules
+    fields:
+      - ImageLoaded
+      - Signed
+- question: Does this host normally run powershell.exe or pwsh.exe?
+  context: A PowerShell binary that has never been seen on a host is more suspicious than one that
+    runs regularly. Zero or very low historical counts indicate first-time or rare execution, which
+    raises the weight of an encoded cradle firing here.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: When this host previously fired this rule's pattern, what parents and users normally drove it, and does this alert fit?
+  context: Even common tools can be abused. The query mirrors the rule's selection structure scoped
+    to this host, so the parent/user distribution reflects how this encoded Net.WebClient pattern
+    (not generic PowerShell use) has historically run here. A new parent process, an unexpected
+    user account, or an unusual command-line structure is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_encoded:
+        CommandLine|contains:
+        - TgBlAFQALgB3AEUAQg
+        - 4AZQBUAC4AdwBFAEIA
+        - OAGUAVAAuAHcARQBCA
+        - bgBFAHQALgB3AGUAYg
+        - 4ARQB0AC4AdwBlAGIA
+        - uAEUAdAAuAHcAZQBiA
+        - TgBFAHQALgB3AGUAYg
+        - OAEUAdAAuAHcAZQBiA
+        - bgBlAFQALgB3AGUAYg
+        - 4AZQBUAC4AdwBlAGIA
+        - uAGUAVAAuAHcAZQBiA
+        - TgBlAFQALgB3AGUAYg
+        - OAGUAVAAuAHcAZQBiA
+        - bgBFAFQALgB3AGUAYg
+        - 4ARQBUAC4AdwBlAGIA
+        - uAEUAVAAuAHcAZQBiA
+        - bgBlAHQALgBXAGUAYg
+        - 4AZQB0AC4AVwBlAGIA
+        - uAGUAdAAuAFcAZQBiA
+        - bgBFAHQALgBXAGUAYg
+        - 4ARQB0AC4AVwBlAGIA
+        - uAEUAdAAuAFcAZQBiA
+        - TgBFAHQALgBXAGUAYg
+        - OAEUAdAAuAFcAZQBiA
+        - bgBlAFQALgBXAGUAYg
+        - 4AZQBUAC4AVwBlAGIA
+        - uAGUAVAAuAFcAZQBiA
+        - TgBlAFQALgBXAGUAYg
+        - OAGUAVAAuAFcAZQBiA
+        - bgBFAFQALgBXAGUAYg
+        - 4ARQBUAC4AVwBlAGIA
+        - uAEUAVAAuAFcAZQBiA
+        - bgBlAHQALgB3AEUAYg
+        - 4AZQB0AC4AdwBFAGIA
+        - uAGUAdAAuAHcARQBiA
+        - TgBlAHQALgB3AEUAYg
+        - OAGUAdAAuAHcARQBiA
+        - bgBFAHQALgB3AEUAYg
+        - 4ARQB0AC4AdwBFAGIA
+        - uAEUAdAAuAHcARQBiA
+        - TgBFAHQALgB3AEUAYg
+        - OAEUAdAAuAHcARQBiA
+        - bgBlAFQALgB3AEUAYg
+        - 4AZQBUAC4AdwBFAGIA
+        - uAGUAVAAuAHcARQBiA
+        - TgBlAFQALgB3AEUAYg
+        - OAGUAVAAuAHcARQBiA
+        - bgBFAFQALgB3AEUAYg
+        - 4ARQBUAC4AdwBFAGIA
+        - uAEUAVAAuAHcARQBiA
+        - TgBFAFQALgB3AEUAYg
+        - OAEUAVAAuAHcARQBiA
+        - bgBlAHQALgBXAEUAYg
+        - 4AZQB0AC4AVwBFAGIA
+        - uAGUAdAAuAFcARQBiA
+        - TgBlAHQALgBXAEUAYg
+        - OAGUAdAAuAFcARQBiA
+        - bgBFAHQALgBXAEUAYg
+        - 4ARQB0AC4AVwBFAGIA
+        - uAEUAdAAuAFcARQBiA
+        - TgBFAHQALgBXAEUAYg
+        - OAEUAdAAuAFcARQBiA
+        - bgBlAFQALgBXAEUAYg
+        - 4AZQBUAC4AVwBFAGIA
+        - uAGUAVAAuAFcARQBiA
+        - TgBlAFQALgBXAEUAYg
+        - OAGUAVAAuAFcARQBiA
+        - bgBFAFQALgBXAEUAYg
+        - 4ARQBUAC4AVwBFAGIA
+        - uAEUAVAAuAFcARQBiA
+        - TgBFAFQALgBXAEUAYg
+        - OAEUAVAAuAFcARQBiA
+        - bgBlAHQALgB3AGUAQg
+        - 4AZQB0AC4AdwBlAEIA
+        - uAGUAdAAuAHcAZQBCA
+        - TgBlAHQALgB3AGUAQg
+        - OAGUAdAAuAHcAZQBCA
+        - bgBFAHQALgB3AGUAQg
+        - 4ARQB0AC4AdwBlAEIA
+        - uAEUAdAAuAHcAZQBCA
+        - TgBFAHQALgB3AGUAQg
+        - OAEUAdAAuAHcAZQBCA
+        - bgBlAFQALgB3AGUAQg
+        - 4AZQBUAC4AdwBlAEIA
+        - uAGUAVAAuAHcAZQBCA
+        - TgBlAFQALgB3AGUAQg
+        - OAGUAVAAuAHcAZQBCA
+        - bgBFAFQALgB3AGUAQg
+        - 4ARQBUAC4AdwBlAEIA
+        - uAEUAVAAuAHcAZQBCA
+        - TgBFAFQALgB3AGUAQg
+        - OAEUAVAAuAHcAZQBCA
+        - bgBlAHQALgBXAGUAQg
+        - 4AZQB0AC4AVwBlAEIA
+        - uAGUAdAAuAFcAZQBCA
+        - TgBlAHQALgBXAGUAQg
+        - OAGUAdAAuAFcAZQBCA
+        - bgBFAHQALgBXAGUAQg
+        - 4ARQB0AC4AVwBlAEIA
+        - uAEUAdAAuAFcAZQBCA
+        - TgBFAHQALgBXAGUAQg
+        - OAEUAdAAuAFcAZQBCA
+        - bgBlAFQALgBXAGUAQg
+        - 4AZQBUAC4AVwBlAEIA
+        - uAGUAVAAuAFcAZQBCA
+        - TgBlAFQALgBXAGUAQg
+        - OAGUAVAAuAFcAZQBCA
+        - bgBFAFQALgBXAGUAQg
+        - 4ARQBUAC4AVwBlAEIA
+        - uAEUAVAAuAFcAZQBCA
+        - TgBFAFQALgBXAGUAQg
+        - OAEUAVAAuAFcAZQBCA
+        - bgBlAHQALgB3AEUAQg
+        - 4AZQB0AC4AdwBFAEIA
+        - uAGUAdAAuAHcARQBCA
+        - TgBlAHQALgB3AEUAQg
+        - OAGUAdAAuAHcARQBCA
+        - bgBFAHQALgB3AEUAQg
+        - 4ARQB0AC4AdwBFAEIA
+        - uAEUAdAAuAHcARQBCA
+        - TgBFAHQALgB3AEUAQg
+        - OAEUAdAAuAHcARQBCA
+        - bgBlAFQALgB3AEUAQg
+        - uAGUAVAAuAHcARQBCA
+        - bgBFAFQALgB3AEUAQg
+        - 4ARQBUAC4AdwBFAEIA
+        - uAEUAVAAuAHcARQBCA
+        - TgBFAFQALgB3AEUAQg
+        - OAEUAVAAuAHcARQBCA
+        - TgBlAHQALgBXAEUAQg
+        - 4AZQB0AC4AVwBFAEIA
+        - OAGUAdAAuAFcARQBCA
+        - bgBFAHQALgBXAEUAQg
+        - 4ARQB0AC4AVwBFAEIA
+        - uAEUAdAAuAFcARQBCA
+        - TgBFAHQALgBXAEUAQg
+        - OAEUAdAAuAFcARQBCA
+        - bgBlAFQALgBXAEUAQg
+        - 4AZQBUAC4AVwBFAEIA
+        - uAGUAVAAuAFcARQBCA
+        - TgBlAFQALgBXAEUAQg
+        - OAGUAVAAuAFcARQBCA
+        - bgBFAFQALgBXAEUAQg
+        - 4ARQBUAC4AVwBFAEIA
+        - uAEUAVAAuAFcARQBCA
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Have other hosts fired this rule's pattern in the past week, and does the spread look like automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a
+    fleet-wide count of this encoded Net.WebClient pattern (not generic PowerShell use). Many hosts
+    firing the same pattern points to scripted deployment or red-team tooling; one host or a small
+    unrelated set points to manual operator activity. Use the host distribution to calibrate
+    severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_encoded:
+        CommandLine|contains:
+        - TgBlAFQALgB3AEUAQg
+        - 4AZQBUAC4AdwBFAEIA
+        - OAGUAVAAuAHcARQBCA
+        - bgBFAHQALgB3AGUAYg
+        - 4ARQB0AC4AdwBlAGIA
+        - uAEUAdAAuAHcAZQBiA
+        - TgBFAHQALgB3AGUAYg
+        - OAEUAdAAuAHcAZQBiA
+        - bgBlAFQALgB3AGUAYg
+        - 4AZQBUAC4AdwBlAGIA
+        - uAGUAVAAuAHcAZQBiA
+        - TgBlAFQALgB3AGUAYg
+        - OAGUAVAAuAHcAZQBiA
+        - bgBFAFQALgB3AGUAYg
+        - 4ARQBUAC4AdwBlAGIA
+        - uAEUAVAAuAHcAZQBiA
+        - bgBlAHQALgBXAGUAYg
+        - 4AZQB0AC4AVwBlAGIA
+        - uAGUAdAAuAFcAZQBiA
+        - bgBFAHQALgBXAGUAYg
+        - 4ARQB0AC4AVwBlAGIA
+        - uAEUAdAAuAFcAZQBiA
+        - TgBFAHQALgBXAGUAYg
+        - OAEUAdAAuAFcAZQBiA
+        - bgBlAFQALgBXAGUAYg
+        - 4AZQBUAC4AVwBlAGIA
+        - uAGUAVAAuAFcAZQBiA
+        - TgBlAFQALgBXAGUAYg
+        - OAGUAVAAuAFcAZQBiA
+        - bgBFAFQALgBXAGUAYg
+        - 4ARQBUAC4AVwBlAGIA
+        - uAEUAVAAuAFcAZQBiA
+        - bgBlAHQALgB3AEUAYg
+        - 4AZQB0AC4AdwBFAGIA
+        - uAGUAdAAuAHcARQBiA
+        - TgBlAHQALgB3AEUAYg
+        - OAGUAdAAuAHcARQBiA
+        - bgBFAHQALgB3AEUAYg
+        - 4ARQB0AC4AdwBFAGIA
+        - uAEUAdAAuAHcARQBiA
+        - TgBFAHQALgB3AEUAYg
+        - OAEUAdAAuAHcARQBiA
+        - bgBlAFQALgB3AEUAYg
+        - 4AZQBUAC4AdwBFAGIA
+        - uAGUAVAAuAHcARQBiA
+        - TgBlAFQALgB3AEUAYg
+        - OAGUAVAAuAHcARQBiA
+        - bgBFAFQALgB3AEUAYg
+        - 4ARQBUAC4AdwBFAGIA
+        - uAEUAVAAuAHcARQBiA
+        - TgBFAFQALgB3AEUAYg
+        - OAEUAVAAuAHcARQBiA
+        - bgBlAHQALgBXAEUAYg
+        - 4AZQB0AC4AVwBFAGIA
+        - uAGUAdAAuAFcARQBiA
+        - TgBlAHQALgBXAEUAYg
+        - OAGUAdAAuAFcARQBiA
+        - bgBFAHQALgBXAEUAYg
+        - 4ARQB0AC4AVwBFAGIA
+        - uAEUAdAAuAFcARQBiA
+        - TgBFAHQALgBXAEUAYg
+        - OAEUAdAAuAFcARQBiA
+        - bgBlAFQALgBXAEUAYg
+        - 4AZQBUAC4AVwBFAGIA
+        - uAGUAVAAuAFcARQBiA
+        - TgBlAFQALgBXAEUAYg
+        - OAGUAVAAuAFcARQBiA
+        - bgBFAFQALgBXAEUAYg
+        - 4ARQBUAC4AVwBFAGIA
+        - uAEUAVAAuAFcARQBiA
+        - TgBFAFQALgBXAEUAYg
+        - OAEUAVAAuAFcARQBiA
+        - bgBlAHQALgB3AGUAQg
+        - 4AZQB0AC4AdwBlAEIA
+        - uAGUAdAAuAHcAZQBCA
+        - TgBlAHQALgB3AGUAQg
+        - OAGUAdAAuAHcAZQBCA
+        - bgBFAHQALgB3AGUAQg
+        - 4ARQB0AC4AdwBlAEIA
+        - uAEUAdAAuAHcAZQBCA
+        - TgBFAHQALgB3AGUAQg
+        - OAEUAdAAuAHcAZQBCA
+        - bgBlAFQALgB3AGUAQg
+        - 4AZQBUAC4AdwBlAEIA
+        - uAGUAVAAuAHcAZQBCA
+        - TgBlAFQALgB3AGUAQg
+        - OAGUAVAAuAHcAZQBCA
+        - bgBFAFQALgB3AGUAQg
+        - 4ARQBUAC4AdwBlAEIA
+        - uAEUAVAAuAHcAZQBCA
+        - TgBFAFQALgB3AGUAQg
+        - OAEUAVAAuAHcAZQBCA
+        - bgBlAHQALgBXAGUAQg
+        - 4AZQB0AC4AVwBlAEIA
+        - uAGUAdAAuAFcAZQBCA
+        - TgBlAHQALgBXAGUAQg
+        - OAGUAdAAuAFcAZQBCA
+        - bgBFAHQALgBXAGUAQg
+        - 4ARQB0AC4AVwBlAEIA
+        - uAEUAdAAuAFcAZQBCA
+        - TgBFAHQALgBXAGUAQg
+        - OAEUAdAAuAFcAZQBCA
+        - bgBlAFQALgBXAGUAQg
+        - 4AZQBUAC4AVwBlAEIA
+        - uAGUAVAAuAFcAZQBCA
+        - TgBlAFQALgBXAGUAQg
+        - OAGUAVAAuAFcAZQBCA
+        - bgBFAFQALgBXAGUAQg
+        - 4ARQBUAC4AVwBlAEIA
+        - uAEUAVAAuAFcAZQBCA
+        - TgBFAFQALgBXAGUAQg
+        - OAEUAVAAuAFcAZQBCA
+        - bgBlAHQALgB3AEUAQg
+        - 4AZQB0AC4AdwBFAEIA
+        - uAGUAdAAuAHcARQBCA
+        - TgBlAHQALgB3AEUAQg
+        - OAGUAdAAuAHcARQBCA
+        - bgBFAHQALgB3AEUAQg
+        - 4ARQB0AC4AdwBFAEIA
+        - uAEUAdAAuAHcARQBCA
+        - TgBFAHQALgB3AEUAQg
+        - OAEUAdAAuAHcARQBCA
+        - bgBlAFQALgB3AEUAQg
+        - uAGUAVAAuAHcARQBCA
+        - bgBFAFQALgB3AEUAQg
+        - 4ARQBUAC4AdwBFAEIA
+        - uAEUAVAAuAHcARQBCA
+        - TgBFAFQALgB3AEUAQg
+        - OAEUAVAAuAHcARQBCA
+        - TgBlAHQALgBXAEUAQg
+        - 4AZQB0AC4AVwBFAEIA
+        - OAGUAdAAuAFcARQBCA
+        - bgBFAHQALgBXAEUAQg
+        - 4ARQB0AC4AVwBFAEIA
+        - uAEUAdAAuAFcARQBCA
+        - TgBFAHQALgBXAEUAQg
+        - OAEUAdAAuAFcARQBCA
+        - bgBlAFQALgBXAEUAQg
+        - 4AZQBUAC4AVwBFAEIA
+        - uAGUAVAAuAFcARQBCA
+        - TgBlAFQALgBXAEUAQg
+        - OAGUAVAAuAFcARQBCA
+        - bgBFAFQALgBXAEUAQg
+        - 4ARQBUAC4AVwBFAEIA
+        - uAEUAVAAuAFcARQBCA
+      condition: all of selection_*
+    fields:
+    - host.name
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_encoded:
+        CommandLine|contains:
+        - TgBlAFQALgB3AEUAQg
+        - 4AZQBUAC4AdwBFAEIA
+        - OAGUAVAAuAHcARQBCA
+        - bgBFAHQALgB3AGUAYg
+        - 4ARQB0AC4AdwBlAGIA
+        - uAEUAdAAuAHcAZQBiA
+        - TgBFAHQALgB3AGUAYg
+        - OAEUAdAAuAHcAZQBiA
+        - bgBlAFQALgB3AGUAYg
+        - 4AZQBUAC4AdwBlAGIA
+        - uAGUAVAAuAHcAZQBiA
+        - TgBlAFQALgB3AGUAYg
+        - OAGUAVAAuAHcAZQBiA
+        - bgBFAFQALgB3AGUAYg
+        - 4ARQBUAC4AdwBlAGIA
+        - uAEUAVAAuAHcAZQBiA
+        - bgBlAHQALgBXAGUAYg
+        - 4AZQB0AC4AVwBlAGIA
+        - uAGUAdAAuAFcAZQBiA
+        - bgBFAHQALgBXAGUAYg
+        - 4ARQB0AC4AVwBlAGIA
+        - uAEUAdAAuAFcAZQBiA
+        - TgBFAHQALgBXAGUAYg
+        - OAEUAdAAuAFcAZQBiA
+        - bgBlAFQALgBXAGUAYg
+        - 4AZQBUAC4AVwBlAGIA
+        - uAGUAVAAuAFcAZQBiA
+        - TgBlAFQALgBXAGUAYg
+        - OAGUAVAAuAFcAZQBiA
+        - bgBFAFQALgBXAGUAYg
+        - 4ARQBUAC4AVwBlAGIA
+        - uAEUAVAAuAFcAZQBiA
+        - bgBlAHQALgB3AEUAYg
+        - 4AZQB0AC4AdwBFAGIA
+        - uAGUAdAAuAHcARQBiA
+        - TgBlAHQALgB3AEUAYg
+        - OAGUAdAAuAHcARQBiA
+        - bgBFAHQALgB3AEUAYg
+        - 4ARQB0AC4AdwBFAGIA
+        - uAEUAdAAuAHcARQBiA
+        - TgBFAHQALgB3AEUAYg
+        - OAEUAdAAuAHcARQBiA
+        - bgBlAFQALgB3AEUAYg
+        - 4AZQBUAC4AdwBFAGIA
+        - uAGUAVAAuAHcARQBiA
+        - TgBlAFQALgB3AEUAYg
+        - OAGUAVAAuAHcARQBiA
+        - bgBFAFQALgB3AEUAYg
+        - 4ARQBUAC4AdwBFAGIA
+        - uAEUAVAAuAHcARQBiA
+        - TgBFAFQALgB3AEUAYg
+        - OAEUAVAAuAHcARQBiA
+        - bgBlAHQALgBXAEUAYg
+        - 4AZQB0AC4AVwBFAGIA
+        - uAGUAdAAuAFcARQBiA
+        - TgBlAHQALgBXAEUAYg
+        - OAGUAdAAuAFcARQBiA
+        - bgBFAHQALgBXAEUAYg
+        - 4ARQB0AC4AVwBFAGIA
+        - uAEUAdAAuAFcARQBiA
+        - TgBFAHQALgBXAEUAYg
+        - OAEUAdAAuAFcARQBiA
+        - bgBlAFQALgBXAEUAYg
+        - 4AZQBUAC4AVwBFAGIA
+        - uAGUAVAAuAFcARQBiA
+        - TgBlAFQALgBXAEUAYg
+        - OAGUAVAAuAFcARQBiA
+        - bgBFAFQALgBXAEUAYg
+        - 4ARQBUAC4AVwBFAGIA
+        - uAEUAVAAuAFcARQBiA
+        - TgBFAFQALgBXAEUAYg
+        - OAEUAVAAuAFcARQBiA
+        - bgBlAHQALgB3AGUAQg
+        - 4AZQB0AC4AdwBlAEIA
+        - uAGUAdAAuAHcAZQBCA
+        - TgBlAHQALgB3AGUAQg
+        - OAGUAdAAuAHcAZQBCA
+        - bgBFAHQALgB3AGUAQg
+        - 4ARQB0AC4AdwBlAEIA
+        - uAEUAdAAuAHcAZQBCA
+        - TgBFAHQALgB3AGUAQg
+        - OAEUAdAAuAHcAZQBCA
+        - bgBlAFQALgB3AGUAQg
+        - 4AZQBUAC4AdwBlAEIA
+        - uAGUAVAAuAHcAZQBCA
+        - TgBlAFQALgB3AGUAQg
+        - OAGUAVAAuAHcAZQBCA
+        - bgBFAFQALgB3AGUAQg
+        - 4ARQBUAC4AdwBlAEIA
+        - uAEUAVAAuAHcAZQBCA
+        - TgBFAFQALgB3AGUAQg
+        - OAEUAVAAuAHcAZQBCA
+        - bgBlAHQALgBXAGUAQg
+        - 4AZQB0AC4AVwBlAEIA
+        - uAGUAdAAuAFcAZQBCA
+        - TgBlAHQALgBXAGUAQg
+        - OAGUAdAAuAFcAZQBCA
+        - bgBFAHQALgBXAGUAQg
+        - 4ARQB0AC4AVwBlAEIA
+        - uAEUAdAAuAFcAZQBCA
+        - TgBFAHQALgBXAGUAQg
+        - OAEUAdAAuAFcAZQBCA
+        - bgBlAFQALgBXAGUAQg
+        - 4AZQBUAC4AVwBlAEIA
+        - uAGUAVAAuAFcAZQBCA
+        - TgBlAFQALgBXAGUAQg
+        - OAGUAVAAuAFcAZQBCA
+        - bgBFAFQALgBXAGUAQg
+        - 4ARQBUAC4AVwBlAEIA
+        - uAEUAVAAuAFcAZQBCA
+        - TgBFAFQALgBXAGUAQg
+        - OAEUAVAAuAFcAZQBCA
+        - bgBlAHQALgB3AEUAQg
+        - 4AZQB0AC4AdwBFAEIA
+        - uAGUAdAAuAHcARQBCA
+        - TgBlAHQALgB3AEUAQg
+        - OAGUAdAAuAHcARQBCA
+        - bgBFAHQALgB3AEUAQg
+        - 4ARQB0AC4AdwBFAEIA
+        - uAEUAdAAuAHcARQBCA
+        - TgBFAHQALgB3AEUAQg
+        - OAEUAdAAuAHcARQBCA
+        - bgBlAFQALgB3AEUAQg
+        - uAGUAVAAuAHcARQBCA
+        - bgBFAFQALgB3AEUAQg
+        - 4ARQBUAC4AdwBFAEIA
+        - uAEUAVAAuAHcARQBCA
+        - TgBFAFQALgB3AEUAQg
+        - OAEUAVAAuAHcARQBCA
+        - TgBlAHQALgBXAEUAQg
+        - 4AZQB0AC4AVwBFAEIA
+        - OAGUAdAAuAFcARQBCA
+        - bgBFAHQALgBXAEUAQg
+        - 4ARQB0AC4AVwBFAEIA
+        - uAEUAdAAuAFcARQBCA
+        - TgBFAHQALgBXAEUAQg
+        - OAEUAdAAuAFcARQBCA
+        - bgBlAFQALgBXAEUAQg
+        - 4AZQBUAC4AVwBFAEIA
+        - uAGUAVAAuAFcARQBCA
+        - TgBlAFQALgBXAEUAQg
+        - OAGUAVAAuAFcARQBCA
+        - bgBFAFQALgBXAEUAQg
+        - 4ARQBUAC4AVwBFAEIA
+        - uAEUAVAAuAFcARQBCA
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_encoded:
+        CommandLine|contains:
+        - TgBlAFQALgB3AEUAQg
+        - 4AZQBUAC4AdwBFAEIA
+        - OAGUAVAAuAHcARQBCA
+        - bgBFAHQALgB3AGUAYg
+        - 4ARQB0AC4AdwBlAGIA
+        - uAEUAdAAuAHcAZQBiA
+        - TgBFAHQALgB3AGUAYg
+        - OAEUAdAAuAHcAZQBiA
+        - bgBlAFQALgB3AGUAYg
+        - 4AZQBUAC4AdwBlAGIA
+        - uAGUAVAAuAHcAZQBiA
+        - TgBlAFQALgB3AGUAYg
+        - OAGUAVAAuAHcAZQBiA
+        - bgBFAFQALgB3AGUAYg
+        - 4ARQBUAC4AdwBlAGIA
+        - uAEUAVAAuAHcAZQBiA
+        - bgBlAHQALgBXAGUAYg
+        - 4AZQB0AC4AVwBlAGIA
+        - uAGUAdAAuAFcAZQBiA
+        - bgBFAHQALgBXAGUAYg
+        - 4ARQB0AC4AVwBlAGIA
+        - uAEUAdAAuAFcAZQBiA
+        - TgBFAHQALgBXAGUAYg
+        - OAEUAdAAuAFcAZQBiA
+        - bgBlAFQALgBXAGUAYg
+        - 4AZQBUAC4AVwBlAGIA
+        - uAGUAVAAuAFcAZQBiA
+        - TgBlAFQALgBXAGUAYg
+        - OAGUAVAAuAFcAZQBiA
+        - bgBFAFQALgBXAGUAYg
+        - 4ARQBUAC4AVwBlAGIA
+        - uAEUAVAAuAFcAZQBiA
+        - bgBlAHQALgB3AEUAYg
+        - 4AZQB0AC4AdwBFAGIA
+        - uAGUAdAAuAHcARQBiA
+        - TgBlAHQALgB3AEUAYg
+        - OAGUAdAAuAHcARQBiA
+        - bgBFAHQALgB3AEUAYg
+        - 4ARQB0AC4AdwBFAGIA
+        - uAEUAdAAuAHcARQBiA
+        - TgBFAHQALgB3AEUAYg
+        - OAEUAdAAuAHcARQBiA
+        - bgBlAFQALgB3AEUAYg
+        - 4AZQBUAC4AdwBFAGIA
+        - uAGUAVAAuAHcARQBiA
+        - TgBlAFQALgB3AEUAYg
+        - OAGUAVAAuAHcARQBiA
+        - bgBFAFQALgB3AEUAYg
+        - 4ARQBUAC4AdwBFAGIA
+        - uAEUAVAAuAHcARQBiA
+        - TgBFAFQALgB3AEUAYg
+        - OAEUAVAAuAHcARQBiA
+        - bgBlAHQALgBXAEUAYg
+        - 4AZQB0AC4AVwBFAGIA
+        - uAGUAdAAuAFcARQBiA
+        - TgBlAHQALgBXAEUAYg
+        - OAGUAdAAuAFcARQBiA
+        - bgBFAHQALgBXAEUAYg
+        - 4ARQB0AC4AVwBFAGIA
+        - uAEUAdAAuAFcARQBiA
+        - TgBFAHQALgBXAEUAYg
+        - OAEUAdAAuAFcARQBiA
+        - bgBlAFQALgBXAEUAYg
+        - 4AZQBUAC4AVwBFAGIA
+        - uAGUAVAAuAFcARQBiA
+        - TgBlAFQALgBXAEUAYg
+        - OAGUAVAAuAFcARQBiA
+        - bgBFAFQALgBXAEUAYg
+        - 4ARQBUAC4AVwBFAGIA
+        - uAEUAVAAuAFcARQBiA
+        - TgBFAFQALgBXAEUAYg
+        - OAEUAVAAuAFcARQBiA
+        - bgBlAHQALgB3AGUAQg
+        - 4AZQB0AC4AdwBlAEIA
+        - uAGUAdAAuAHcAZQBCA
+        - TgBlAHQALgB3AGUAQg
+        - OAGUAdAAuAHcAZQBCA
+        - bgBFAHQALgB3AGUAQg
+        - 4ARQB0AC4AdwBlAEIA
+        - uAEUAdAAuAHcAZQBCA
+        - TgBFAHQALgB3AGUAQg
+        - OAEUAdAAuAHcAZQBCA
+        - bgBlAFQALgB3AGUAQg
+        - 4AZQBUAC4AdwBlAEIA
+        - uAGUAVAAuAHcAZQBCA
+        - TgBlAFQALgB3AGUAQg
+        - OAGUAVAAuAHcAZQBCA
+        - bgBFAFQALgB3AGUAQg
+        - 4ARQBUAC4AdwBlAEIA
+        - uAEUAVAAuAHcAZQBCA
+        - TgBFAFQALgB3AGUAQg
+        - OAEUAVAAuAHcAZQBCA
+        - bgBlAHQALgBXAGUAQg
+        - 4AZQB0AC4AVwBlAEIA
+        - uAGUAdAAuAFcAZQBCA
+        - TgBlAHQALgBXAGUAQg
+        - OAGUAdAAuAFcAZQBCA
+        - bgBFAHQALgBXAGUAQg
+        - 4ARQB0AC4AVwBlAEIA
+        - uAEUAdAAuAFcAZQBCA
+        - TgBFAHQALgBXAGUAQg
+        - OAEUAdAAuAFcAZQBCA
+        - bgBlAFQALgBXAGUAQg
+        - 4AZQBUAC4AVwBlAEIA
+        - uAGUAVAAuAFcAZQBCA
+        - TgBlAFQALgBXAGUAQg
+        - OAGUAVAAuAFcAZQBCA
+        - bgBFAFQALgBXAGUAQg
+        - 4ARQBUAC4AVwBlAEIA
+        - uAEUAVAAuAFcAZQBCA
+        - TgBFAFQALgBXAGUAQg
+        - OAEUAVAAuAFcAZQBCA
+        - bgBlAHQALgB3AEUAQg
+        - 4AZQB0AC4AdwBFAEIA
+        - uAGUAdAAuAHcARQBCA
+        - TgBlAHQALgB3AEUAQg
+        - OAGUAdAAuAHcARQBCA
+        - bgBFAHQALgB3AEUAQg
+        - 4ARQB0AC4AdwBFAEIA
+        - uAEUAdAAuAHcARQBCA
+        - TgBFAHQALgB3AEUAQg
+        - OAEUAdAAuAHcARQBCA
+        - bgBlAFQALgB3AEUAQg
+        - uAGUAVAAuAHcARQBCA
+        - bgBFAFQALgB3AEUAQg
+        - 4ARQBUAC4AdwBFAEIA
+        - uAEUAVAAuAHcARQBCA
+        - TgBFAFQALgB3AEUAQg
+        - OAEUAVAAuAHcARQBCA
+        - TgBlAHQALgBXAEUAQg
+        - 4AZQB0AC4AVwBFAEIA
+        - OAGUAdAAuAFcARQBCA
+        - bgBFAHQALgBXAEUAQg
+        - 4ARQB0AC4AVwBFAEIA
+        - uAEUAdAAuAFcARQBCA
+        - TgBFAHQALgBXAEUAQg
+        - OAEUAdAAuAFcARQBCA
+        - bgBlAFQALgBXAEUAQg
+        - 4AZQBUAC4AVwBFAEIA
+        - uAGUAVAAuAFcARQBCA
+        - TgBlAFQALgBXAEUAQg
+        - OAGUAVAAuAFcARQBCA
+        - bgBFAFQALgBXAEUAQg
+        - 4ARQBUAC4AVwBFAEIA
+        - uAEUAVAAuAFcARQBCA
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity on
+    multiple endpoints. If the same user triggered similar activity elsewhere in the same window,
+    the scope of the operation may be larger than a single host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_encoded:
+        CommandLine|contains:
+        - TgBlAFQALgB3AEUAQg
+        - 4AZQBUAC4AdwBFAEIA
+        - OAGUAVAAuAHcARQBCA
+        - bgBFAHQALgB3AGUAYg
+        - 4ARQB0AC4AdwBlAGIA
+        - uAEUAdAAuAHcAZQBiA
+        - TgBFAHQALgB3AGUAYg
+        - OAEUAdAAuAHcAZQBiA
+        - bgBlAFQALgB3AGUAYg
+        - 4AZQBUAC4AdwBlAGIA
+        - uAGUAVAAuAHcAZQBiA
+        - TgBlAFQALgB3AGUAYg
+        - OAGUAVAAuAHcAZQBiA
+        - bgBFAFQALgB3AGUAYg
+        - 4ARQBUAC4AdwBlAGIA
+        - uAEUAVAAuAHcAZQBiA
+        - bgBlAHQALgBXAGUAYg
+        - 4AZQB0AC4AVwBlAGIA
+        - uAGUAdAAuAFcAZQBiA
+        - bgBFAHQALgBXAGUAYg
+        - 4ARQB0AC4AVwBlAGIA
+        - uAEUAdAAuAFcAZQBiA
+        - TgBFAHQALgBXAGUAYg
+        - OAEUAdAAuAFcAZQBiA
+        - bgBlAFQALgBXAGUAYg
+        - 4AZQBUAC4AVwBlAGIA
+        - uAGUAVAAuAFcAZQBiA
+        - TgBlAFQALgBXAGUAYg
+        - OAGUAVAAuAFcAZQBiA
+        - bgBFAFQALgBXAGUAYg
+        - 4ARQBUAC4AVwBlAGIA
+        - uAEUAVAAuAFcAZQBiA
+        - bgBlAHQALgB3AEUAYg
+        - 4AZQB0AC4AdwBFAGIA
+        - uAGUAdAAuAHcARQBiA
+        - TgBlAHQALgB3AEUAYg
+        - OAGUAdAAuAHcARQBiA
+        - bgBFAHQALgB3AEUAYg
+        - 4ARQB0AC4AdwBFAGIA
+        - uAEUAdAAuAHcARQBiA
+        - TgBFAHQALgB3AEUAYg
+        - OAEUAdAAuAHcARQBiA
+        - bgBlAFQALgB3AEUAYg
+        - 4AZQBUAC4AdwBFAGIA
+        - uAGUAVAAuAHcARQBiA
+        - TgBlAFQALgB3AEUAYg
+        - OAGUAVAAuAHcARQBiA
+        - bgBFAFQALgB3AEUAYg
+        - 4ARQBUAC4AdwBFAGIA
+        - uAEUAVAAuAHcARQBiA
+        - TgBFAFQALgB3AEUAYg
+        - OAEUAVAAuAHcARQBiA
+        - bgBlAHQALgBXAEUAYg
+        - 4AZQB0AC4AVwBFAGIA
+        - uAGUAdAAuAFcARQBiA
+        - TgBlAHQALgBXAEUAYg
+        - OAGUAdAAuAFcARQBiA
+        - bgBFAHQALgBXAEUAYg
+        - 4ARQB0AC4AVwBFAGIA
+        - uAEUAdAAuAFcARQBiA
+        - TgBFAHQALgBXAEUAYg
+        - OAEUAdAAuAFcARQBiA
+        - bgBlAFQALgBXAEUAYg
+        - 4AZQBUAC4AVwBFAGIA
+        - uAGUAVAAuAFcARQBiA
+        - TgBlAFQALgBXAEUAYg
+        - OAGUAVAAuAFcARQBiA
+        - bgBFAFQALgBXAEUAYg
+        - 4ARQBUAC4AVwBFAGIA
+        - uAEUAVAAuAFcARQBiA
+        - TgBFAFQALgBXAEUAYg
+        - OAEUAVAAuAFcARQBiA
+        - bgBlAHQALgB3AGUAQg
+        - 4AZQB0AC4AdwBlAEIA
+        - uAGUAdAAuAHcAZQBCA
+        - TgBlAHQALgB3AGUAQg
+        - OAGUAdAAuAHcAZQBCA
+        - bgBFAHQALgB3AGUAQg
+        - 4ARQB0AC4AdwBlAEIA
+        - uAEUAdAAuAHcAZQBCA
+        - TgBFAHQALgB3AGUAQg
+        - OAEUAdAAuAHcAZQBCA
+        - bgBlAFQALgB3AGUAQg
+        - 4AZQBUAC4AdwBlAEIA
+        - uAGUAVAAuAHcAZQBCA
+        - TgBlAFQALgB3AGUAQg
+        - OAGUAVAAuAHcAZQBCA
+        - bgBFAFQALgB3AGUAQg
+        - 4ARQBUAC4AdwBlAEIA
+        - uAEUAVAAuAHcAZQBCA
+        - TgBFAFQALgB3AGUAQg
+        - OAEUAVAAuAHcAZQBCA
+        - bgBlAHQALgBXAGUAQg
+        - 4AZQB0AC4AVwBlAEIA
+        - uAGUAdAAuAFcAZQBCA
+        - TgBlAHQALgBXAGUAQg
+        - OAGUAdAAuAFcAZQBCA
+        - bgBFAHQALgBXAGUAQg
+        - 4ARQB0AC4AVwBlAEIA
+        - uAEUAdAAuAFcAZQBCA
+        - TgBFAHQALgBXAGUAQg
+        - OAEUAdAAuAFcAZQBCA
+        - bgBlAFQALgBXAGUAQg
+        - 4AZQBUAC4AVwBlAEIA
+        - uAGUAVAAuAFcAZQBCA
+        - TgBlAFQALgBXAGUAQg
+        - OAGUAVAAuAFcAZQBCA
+        - bgBFAFQALgBXAGUAQg
+        - 4ARQBUAC4AVwBlAEIA
+        - uAEUAVAAuAFcAZQBCA
+        - TgBFAFQALgBXAGUAQg
+        - OAEUAVAAuAFcAZQBCA
+        - bgBlAHQALgB3AEUAQg
+        - 4AZQB0AC4AdwBFAEIA
+        - uAGUAdAAuAHcARQBCA
+        - TgBlAHQALgB3AEUAQg
+        - OAGUAdAAuAHcARQBCA
+        - bgBFAHQALgB3AEUAQg
+        - 4ARQB0AC4AdwBFAEIA
+        - uAEUAdAAuAHcARQBCA
+        - TgBFAHQALgB3AEUAQg
+        - OAEUAdAAuAHcARQBCA
+        - bgBlAFQALgB3AEUAQg
+        - uAGUAVAAuAHcARQBCA
+        - bgBFAFQALgB3AEUAQg
+        - 4ARQBUAC4AdwBFAEIA
+        - uAEUAVAAuAHcARQBCA
+        - TgBFAFQALgB3AEUAQg
+        - OAEUAVAAuAHcARQBCA
+        - TgBlAHQALgBXAEUAQg
+        - 4AZQB0AC4AVwBFAEIA
+        - OAGUAdAAuAFcARQBCA
+        - bgBFAHQALgBXAEUAQg
+        - 4ARQB0AC4AVwBFAEIA
+        - uAEUAdAAuAFcARQBCA
+        - TgBFAHQALgBXAEUAQg
+        - OAEUAdAAuAFcARQBCA
+        - bgBlAFQALgBXAEUAQg
+        - 4AZQBUAC4AVwBFAEIA
+        - uAGUAVAAuAFcARQBCA
+        - TgBlAFQALgBXAEUAQg
+        - OAGUAVAAuAFcARQBCA
+        - bgBFAFQALgBXAEUAQg
+        - 4ARQBUAC4AVwBFAEIA
+        - uAEUAVAAuAFcARQBCA
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining activity around the alert reveals the
+    immediate context -- what led to this event, what happened after, and whether it is part of a
+    larger sequence. Look for reconnaissance, privilege escalation, or persistence around the
+    encoded PowerShell execution.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host -- defense
+    tampering, reconnaissance, credential access -- may reveal the stages that preceded this event
+    and help reconstruct the full timeline leading to the encoded PowerShell execution.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

@@ -1,0 +1,457 @@
+name: Invoke-Obfuscation VAR+ Launcher - PowerShell
+id: 47aa2280-cd45-4cc3-b42c-5f6b3a3c4284
+description: |
+  Detects PowerShell script-block content (Event ID 4104) matching the launcher structure produced
+  by the Invoke-Obfuscation framework's VAR+ technique: a cmd.exe invocation (/c or /r) that stores
+  an obfuscated command in a short set environment variable whose value carries indexed placeholders
+  such as {0}, reassembled at runtime by PowerShell's -f format operator. Legitimate automation
+  rarely builds commands this way, so a match usually reflects deliberately disguised PowerShell
+  execution, but the hidden payload itself is arbitrary. Investigation should reconstruct the
+  format-operator expression to recover the concealed command, identify the process chain that
+  launched it, and determine what the decoded payload did on the host and network.
+type: detection
+detection_id: 0adfbc14-0ed1-11eb-adc1-0242ac120002
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-17
+questions:
+- question: Does the script block contain the cmd.exe set-variable launcher structure this rule detects?
+  context: The rule matches script-block text where cmd.exe is invoked with /c or /r followed by a quoted
+    set command defining a short (3-6 letter) variable, indexed placeholders such as {0}, and PowerShell's
+    -f format operator that reorders the string fragments at runtime. Long scripts are split across multiple
+    4104 events, so retrieve every chunk of the alerting block and judge the match on the complete script
+    rather than the alerting fragment.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - ScriptBlockText
+  answer_sources:
+  - alert
+  - ps_script
+- question: Is this user or host expected to run PowerShell that assembles its commands from environment
+    variables at runtime?
+  context: Administrative scripts occasionally use the format operator, but staging a command inside a
+    cmd set variable and rebuilding it at execution is characteristic of obfuscation tooling rather than
+    routine automation. The alerting event records the host, user, and on-disk script path when one exists.
+    A SYSTEM user usually means deployment tooling or a vendor agent, so weigh the host's role and the
+    script path before treating the account as the actor.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - host.name
+      - user.name
+      - Path
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: Is the script that produced this block still on disk for preservation and analysis?
+  context: A file-based script block records its on-disk path, and the file-activity history for that
+    path shows which process and account wrote the script and whether it was later deleted or renamed.
+    Preserve any recovered file for hashing and full content review. Obfuscated launchers frequently run
+    from an interactive command line with no backing file, so an event with no recorded path and an empty
+    result here points to in-memory execution, which for deliberately disguised content is itself worth
+    noting rather than a dead end.
+  range: +/-24h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+  answer_sources:
+  - file_event
+  - manual_review
+- question: What command does the -f format expression reassemble, and what does the reconstructed payload
+    do?
+  context: 'Script-block events record what PowerShell compiled, so -EncodedCommand wrappers are already
+    unwrapped, but the VAR+ technique''s obfuscation is string-level and survives into the logged text:
+    the payload sits in the set variable as out-of-order fragments that the -f operator reorders using
+    {0}-style indexes. Substitute each indexed fragment manually, or evaluate the format expression in
+    an isolated analysis session, to recover the concealed command. In the result look for download cradles
+    (IEX, Net.WebClient, Invoke-WebRequest), in-memory .NET assembly loading, AMSI or logging tampering,
+    and credential access, since these determine everything downstream.'
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - powershell.sequence
+      - powershell.total
+      - ScriptBlockText
+  answer_sources:
+  - ps_script
+  - manual_review
+- question: Which processes launched PowerShell hosts on this host around the alert, and is the launch
+    chain consistent with the cmd.exe launcher?
+  context: Script-block events carry no process identity, so the launching chain is joined by host and
+    time. The VAR+ launcher starts powershell.exe from cmd.exe, so expect a cmd.exe parent whose own command
+    line carries the quoted set-variable string. Parents such as Office applications (WinWord, Excel),
+    mshta, wscript, or browser processes point at the delivery vector instead. On the PowerShell command
+    lines themselves, switches like -enc, -nop, or -w hidden corroborate scripted or hands-on abuse rather
+    than administration.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+          - '\powershell_ise.exe'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - CommandLine
+      - User
+  answer_sources:
+  - process_creation
+- question: Were PowerShell security controls bypassed or weakened on this host before this execution?
+  context: 'Obfuscated launchers are frequently paired with control tampering in the preceding hour: AMSI
+    bypass (AmsiUtils, amsiInitFailed memory patching), execution-policy overrides (-ExecutionPolicy Bypass,
+    -ep bypass), real-time protection changes (Set-MpPreference, DisableRealtimeMonitoring), and version-2
+    downgrades (-Version 2, -v 2) that remove script-block logging entirely. Finding one of these both
+    strengthens the case for deliberate evasion and warns that 4104 visibility after that point may be
+    degraded.'
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Is full script block logging enabled on this host, or is only suspicious-content logging active?
+  context: PowerShell logs script blocks at verbose level when the Script Block Logging policy is enabled,
+    and only automatically flagged suspicious content at warning level when it is not. Verbose events
+    in this distribution mean the channel captures everything this host ran; exclusively warning-level
+    events mean this alert is a fragment of the host's PowerShell activity and surrounding benign-looking
+    blocks may simply not have been logged. That result calibrates how much weight an empty answer on
+    the other script-history questions can carry.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - log.level
+  answer_sources:
+  - ps_script
+- question: Did the PowerShell session spawn follow-on processes after this block was logged?
+  context: A script-block event records content, not outcome. Child processes of PowerShell hosts under
+    the alerting user in the following half hour are the closest process-side view of what the reconstructed
+    payload actually did, so look for network utilities, discovery commands, and second-stage binaries.
+    When the alert fired under SYSTEM or another service account the user anchor is broad; weigh the results
+    against the host-activity and fleet-pattern questions. If script-block logging on this host is warning-level
+    only, process telemetry is the more complete record of what followed.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        User|expand: '%User%'
+        ParentImage|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+          - '\powershell_ise.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+  answer_sources:
+  - process_creation
+- question: Were compressed, encoded, or encrypted files created on this host around the alert?
+  context: 'Obfuscated execution often correlates with encoded artifacts on disk: payloads staged as archives
+    or encoded blobs before decoding, or data packaged ahead of exfiltration. This lists creation of common
+    encoded and compressed formats (.zip, .7z, .enc) in the alert window. Judge hits by the writing process
+    and location, since compression is also routine; content or entropy review of the file distinguishes
+    an obfuscated payload from a legitimate archive.'
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith:
+          - '.zip'
+          - '.7z'
+          - '.enc'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - User
+  answer_sources:
+  - file_event
+- question: What other PowerShell script activity occurred on this host around the alert?
+  context: 'Attacker PowerShell rarely runs as a single block: reconnaissance, staging, and follow-on
+    tooling produce a cluster of 4104 events in a short window, and surrounding blocks from the same user
+    session often contain the plaintext the obfuscated launcher lacks. The log.level column shows whether
+    this host records all blocks (verbose present) or only automatically flagged content (warning only),
+    which sets how complete this picture is.'
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - user.name
+      - log.level
+      - Path
+      - ScriptBlockText
+  answer_sources:
+  - ps_script
+- question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Aggregating process activity in the alert window collapses
+    routine agent telemetry into high-count rows and leaves novel parent-child pairs standing out at low
+    counts. Look for the cmd.exe to powershell.exe pairing the launcher produces, plus the reconnaissance,
+    privilege escalation, or persistence activity that commonly brackets an obfuscated execution.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+  answer_sources:
+  - process_creation
+  - file_event
+  - registry_event
+- question: Did other detections fire on this host in the hours before this alert?
+  context: An obfuscated launcher is rarely the first stage. Earlier detections on the same host, such
+    as defense tampering, reconnaissance, initial-delivery, or credential-access alerts, reveal the attack
+    stages that preceded this event and help reconstruct the timeline that led to the disguised execution.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+  answer_sources:
+  - alert
+- always_include: true
+  question: What else did this user do across the network around this time?
+  context: Tracking the account across all hosts in the alert window shows whether the activity is confined
+    to this endpoint or the same account is active elsewhere, which is how lateral movement first becomes
+    visible. If the alert fired under SYSTEM, a machine account, or another service principal, this returns
+    routine agent telemetry and the fleet-pattern clustering question carries the meaningful answer instead.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+- always_include: true
+  question: Did this same launcher pattern fire on other hosts in the same window?
+  context: Under a service principal, user identity does not attribute behavior, and script-block events
+    carry no process identity to pivot on, so the meaningful pivot is the pattern itself. This mirrors
+    the rule's selection fleet-wide in the alert window, aggregated by host. Multiple hosts in the same
+    window points to scheduled or pushed automation; a single host points to a host-local trigger. Only
+    hosts shipping the PowerShell channel can appear, so absence elsewhere is weak evidence on a default-logging
+    fleet.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: ps_script
+      definition: 'Requirements: Script Block Logging must be enabled'
+    detection:
+      selection_4104:
+        ScriptBlockText|re: cmd.{0,5}(?:/c|/r)(?:\s|)"set\s[a-zA-Z]{3,6}.*(?:\{\d\}){1,}\\"\s+?-f(?:.*\)){1,}.*"
+      condition: selection_4104
+    fields:
+      - host.name
+  answer_sources:
+  - ps_script
+- question: Has this exact script block content run on this host before?
+  context: The script block hash matches byte-identical content only, so a history of prior runs points
+    to deployment tooling, vendor agents, or admin automation that has always looked this way, while zero
+    history means this content is new to the host. A trivially modified script produces a different hash,
+    and on hosts without full Script Block Logging the history contains only automatically flagged blocks,
+    so treat an empty result as "this exact content was not recorded before" rather than proof of first
+    execution.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_hash|expand: '%script_block_hash%'
+      condition: selection
+    fields:
+      - user.name
+      - Path
+  answer_sources:
+  - ps_script
+- always_include: true
+  question: Has this user produced this launcher pattern before, and does that history fit their role?
+  context: The query mirrors the rule's selection scoped to this user, giving a 90-day history of the
+    specific set-variable launcher pattern rather than generic PowerShell use, aggregated by host. An
+    account that has never produced it before deserves more attention than one that produces it regularly,
+    since regular production usually means the user operates tooling that emits this structure. Weigh
+    the count against the account's role and normal toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: ps_script
+      definition: 'Requirements: Script Block Logging must be enabled'
+    detection:
+      selection_4104:
+        ScriptBlockText|re: cmd.{0,5}(?:/c|/r)(?:\s|)"set\s[a-zA-Z]{3,6}.*(?:\{\d\}){1,}\\"\s+?-f(?:.*\)){1,}.*"
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection_4104) and _pb_scope
+    fields:
+      - host.name
+  answer_sources:
+  - ps_script
+  - organizational_knowledge
+- always_include: true
+  question: Which hosts have historically produced this launcher pattern, and is the alerting host among
+    them?
+  context: When the alert fires under a service principal, user identity does not attribute behavior,
+    and the PowerShell channel offers no process identity to pivot on, so the meaningful baseline is the
+    pattern itself fleet-wide over 90 days, aggregated by host. A pattern that routinely appears on many
+    hosts is deployment tooling or vendor automation; one that has never appeared before, or only on this
+    host, is the deviation worth chasing. Only hosts shipping the channel can appear in this history.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: ps_script
+      definition: 'Requirements: Script Block Logging must be enabled'
+    detection:
+      selection_4104:
+        ScriptBlockText|re: cmd.{0,5}(?:/c|/r)(?:\s|)"set\s[a-zA-Z]{3,6}.*(?:\{\d\}){1,}\\"\s+?-f(?:.*\)){1,}.*"
+      condition: selection_4104
+    fields:
+      - host.name
+  answer_sources:
+  - ps_script
+- question: Did the same script block content run on other hosts in the environment?
+  context: Identical script content across many hosts points to deployment tooling, GPO logon scripts,
+    or vendor agents, while the same block on a small handful of unrelated hosts is how lateral movement
+    and manual operator activity look. The distribution is often the fastest benign-versus-malicious discriminator
+    for PowerShell alerts. Only hosts with the PowerShell channel shipping, and with full Script Block
+    Logging for non-flagged content, can appear here, so absence on other hosts is weak evidence on a
+    default-logging fleet.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        powershell.file.script_block_hash|expand: '%script_block_hash%'
+      condition: selection
+    fields:
+      - host.name
+      - user.name
+      - Path
+  answer_sources:
+  - ps_script

@@ -1,0 +1,480 @@
+name: Troubleshooting Pack Cmdlet Execution
+id: 61f8edce-2aa5-49cc-8cdd-543e4a26f06e
+description: |
+  Detects PowerShell script blocks that invoke the TroubleshootingPack cmdlets against the built-in
+  Program Compatibility Wizard diagnostic pack (C:\Windows\Diagnostics\System\PCW) unattended with a
+  supplied answer file — a PowerShell-native equivalent of msdt.exe abuse (the CVE-2022-30190 class
+  of T1202 Indirect Command Execution) that runs the pack without ever spawning msdt.exe. The answer
+  file holds the responses the pack would normally collect interactively and can direct it to launch
+  an arbitrary executable or MSI under the cover of a signed Windows diagnostic component. Legitimate
+  troubleshooting can produce the same invocation, so the investigation should recover the full
+  script and the answer file, determine what the pack was directed to run, and check for follow-on
+  process and network activity from the session.
+type: detection
+detection_id: 03409c93-a7c7-49ba-9a4c-a00badf2a153
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-17
+questions:
+- question: Does the full script block invoke the PCW troubleshooting pack unattended with an answer file?
+  context: >-
+    The rule requires all four strings in one script block: Invoke-TroubleshootingPack, the built-in
+    pack path C:\Windows\Diagnostics\System\PCW, -AnswerFile, and -Unattended. Long scripts are split
+    across multiple 4104 events — this retrieves every chunk of the alerting block
+    (powershell.sequence/powershell.total order) so the match is judged on the complete script, not
+    the alerting fragment.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - ScriptBlockText
+  answer_sources:
+  - alert
+  - ps_script
+- question: Is this user or host expected to run Windows troubleshooting packs from PowerShell?
+  context: >-
+    Invoking the Program Compatibility Wizard pack unattended is a legitimate action for helpdesk
+    staff, IT support automation, and some vendor tooling. Weigh the account's role and the host's
+    function: an interactive standard user on a workstation producing this invocation deserves more
+    scrutiny than a management host running support automation. A SYSTEM or service account usually
+    points at deployment tooling — judge by the host role and the script's on-disk path shown here.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - host.name
+      - user.name
+      - Path
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: Is the script that produced this block still on disk for collection?
+  context: >-
+    A file-based script block records its on-disk path, and retrieving the file enables hashing,
+    sandbox detonation, and review beyond what the 4104 events captured. Also preserve the answer
+    file the script names and any executable or MSI it directs the pack at — those are the payload
+    half of this technique. If the block has no recorded path it ran in memory; for content like
+    this, fileless execution is itself worth noting as an evasion choice.
+  range: +/-24h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+  answer_sources:
+  - file_event
+  - manual_review
+- question: What does the complete script do, and is any of it obfuscated?
+  context: >-
+    Script-block events record what PowerShell actually compiled, so -EncodedCommand wrappers are
+    already unwrapped; only string-level obfuscation (concatenation, format operators, backticks)
+    still needs manual decoding. Read the reassembled block for how the pack path and answer-file
+    path are built, where the answer file came from, and any surrounding staging such as download
+    cradles or file writes — the answer-file path recovered here is the input to the answer-file
+    content and preservation questions.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - powershell.sequence
+      - powershell.total
+      - ScriptBlockText
+  answer_sources:
+  - ps_script
+  - manual_review
+- question: What does the answer file passed to -AnswerFile contain, and what process staged it?
+  context: >-
+    The PCW pack is a signed, built-in diagnostic component; the attacker-controlled input is the
+    answer XML, whose stored responses can direct the pack to launch an arbitrary executable or
+    install an MSI (interaction values such as IT_LaunchMethod and IT_BrowseForFile, including
+    path-traversal payloads). Take the exact path from the script text, retrieve the file, and
+    review what it configures the pack to run. The query surveys XML files written on this host
+    around the alert to locate the answer file and the process that wrote it.
+  range: +/-30m
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith: '.xml'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+  answer_sources:
+  - file_event
+  - manual_review
+  - safe_environment
+- question: What processes did PowerShell or the diagnostics host spawn after the script block was logged?
+  context: >-
+    Indirect execution through a troubleshooting pack exists to make something else run — a
+    malicious answer file typically results in msiexec.exe, cmd.exe, or an arbitrary executable
+    launching from the PowerShell session or the scripted-diagnostics host. Script-block events
+    carry no process identity, so this pivots by host, user, and time; correlate children within
+    roughly 10-30 minutes of the block, paying particular attention to cmd.exe, rundll32.exe,
+    regsvr32.exe, mshta.exe, msiexec.exe, curl.exe, and bitsadmin.exe. A SYSTEM-owned alert makes
+    the user anchor broad — read results with that in mind.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        User|expand: '%User%'
+        ParentImage|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+          - '\powershell_ise.exe'
+          - '\sdiagnhost.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+  answer_sources:
+  - process_creation
+- question: Did the processes involved in the pack execution open outbound network connections?
+  context: >-
+    Answer-file abuse can point the pack at an MSI that msiexec.exe retrieves from a remote URL, and
+    launched payloads commonly pull a second stage. This lists egress from the PowerShell hosts, the
+    scripted-diagnostics host, and the installer processes around the alert; compare destinations
+    against the egress ranges your admin automation is known to use before treating a connection as
+    payload retrieval or command-and-control.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+          - '\sdiagnhost.exe'
+          - '\msdt.exe'
+          - '\msiexec.exe'
+      condition: selection
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationPort
+  answer_sources:
+  - network_connection
+- question: Were PowerShell security controls bypassed or weakened before this execution?
+  context: >-
+    Attackers often disable or bypass PowerShell security controls before running their payload:
+    AMSI bypass (patching amsi.dll in memory), execution policy changes (Set-ExecutionPolicy or the
+    -ep bypass flag), constrained language mode escape, and downgrade to PowerShell v2, which lacks
+    script block logging. Finding these precursor commands on the host strengthens the case that the
+    pack invocation was staged rather than routine troubleshooting.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Is full script block logging enabled on this host, or is only suspicious-content logging active?
+  context: >-
+    PowerShell logs script blocks at verbose level when the Script Block Logging policy is enabled,
+    and only Microsoft's automatically-flagged suspicious blocks (at warning level) when it is not.
+    On a warning-only host this alert is a fragment of the host's PowerShell activity, not all of it
+    — surrounding benign-looking blocks may simply not have been logged. The level distribution
+    tells you how complete your view is and how much weight an empty result on the other
+    script-block questions can carry.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - log.level
+  answer_sources:
+  - ps_script
+- question: What other PowerShell script activity occurred on this host around the alert?
+  context: >-
+    Attacker PowerShell rarely runs as a single block — recon commands, staging, and follow-on
+    tooling produce a cluster of script blocks in a short window. Surrounding blocks from the same
+    session show the sequence of actions and often contain plaintext the alerting fragment lacks. On
+    a host with default logging only auto-flagged suspicious blocks appear here, so a quiet window
+    is not evidence of an idle session.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - user.name
+      - log.level
+      - Path
+      - ScriptBlockText
+  answer_sources:
+  - ps_script
+- question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Alerts rarely occur in isolation. Examining process activity around the alert reveals the
+    immediate context: what led to this event, what happened after, and whether it is part of a
+    larger sequence. Repetitive agent noise collapses into high-count rows, while novel parent-child
+    pairs stand out at low counts — look for reconnaissance, privilege escalation, or persistence
+    mechanisms.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+  answer_sources:
+  - process_creation
+- question: What else did this user do across the network around this time?
+  always_include: true
+  context: >-
+    Tracking the user's activity across all hosts shows whether the same account touched multiple
+    endpoints around the alert — the pattern lateral movement produces. If the account is SYSTEM or
+    another service principal, this view fills with agent telemetry; in that case the fleet-wide
+    script-pattern clustering question carries the meaningful answer.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+- question: Did the same script pattern fire on other hosts in the same window?
+  always_include: true
+  context: >-
+    Under a service principal, user-pivot clustering returns agent-telemetry noise, and script-block
+    events carry no process identity to pivot on — the meaningful pivot is the pattern itself. The
+    query mirrors the rule's selection fleet-wide in the alert window, aggregated by host. Several
+    hosts in the same window points to pushed or scheduled automation; a single host points to a
+    host-local trigger. Only hosts shipping the PowerShell operational channel can appear, so
+    absence elsewhere is weak evidence.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: ps_script
+      definition: 'Requirements: Script Block Logging must be enabled'
+    detection:
+      selection:
+        ScriptBlockText|contains|all:
+        - Invoke-TroubleshootingPack
+        - C:\Windows\Diagnostics\System\PCW
+        - -AnswerFile
+        - -Unattended
+      condition: selection
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- question: Has this exact script block run on this host before?
+  context: >-
+    A script that has run routinely for months (deployment tooling, vendor agents, admin
+    automation) reads differently from one appearing for the first time. The script block hash
+    matches byte-identical content only — zero history means this exact content is new to the host,
+    though a trivially edited variant would not match. On default-logging hosts the history contains
+    only auto-flagged blocks, so interpret an empty result with that limit in mind.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_hash|expand: '%script_block_hash%'
+      condition: selection
+    fields:
+      - user.name
+      - Path
+  answer_sources:
+  - ps_script
+- question: Has this user previously produced this rule's pattern, and does that history fit their role?
+  always_include: true
+  context: >-
+    The query mirrors the rule's selection scoped to this user — a 90-day history of this specific
+    unattended pack invocation (not generic PowerShell use), aggregated by host. A helpdesk or
+    support engineer who runs troubleshooting packs regularly reads differently from an account
+    producing this pattern for the first time; weigh the count against the user's role and typical
+    toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: ps_script
+      definition: 'Requirements: Script Block Logging must be enabled'
+    detection:
+      selection:
+        ScriptBlockText|contains|all:
+        - Invoke-TroubleshootingPack
+        - C:\Windows\Diagnostics\System\PCW
+        - -AnswerFile
+        - -Unattended
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+- question: Which hosts have historically produced this script pattern, and is the alerting host among them?
+  always_include: true
+  context: >-
+    When the alert fires under a service principal, user identity does not attribute behavior, and
+    script-block events carry no process identity to pivot on. The query mirrors the rule's
+    selection fleet-wide over 90 days, aggregated by host. A pattern that routinely appears across
+    many hosts is support or deployment automation; one that has never appeared before, or appears
+    only on this host, is the deviation worth chasing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: ps_script
+      definition: 'Requirements: Script Block Logging must be enabled'
+    detection:
+      selection:
+        ScriptBlockText|contains|all:
+        - Invoke-TroubleshootingPack
+        - C:\Windows\Diagnostics\System\PCW
+        - -AnswerFile
+        - -Unattended
+      condition: selection
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- question: Did the same script block run on other hosts in the environment?
+  context: >-
+    Identical script content across many hosts points to deployment tooling, logon scripts, or
+    vendor agents; the same block on a small handful of unrelated hosts is how lateral movement and
+    hands-on activity look. Only hosts shipping the PowerShell operational channel — and, for
+    content Microsoft does not auto-flag, with full Script Block Logging enabled — can appear here,
+    so absence on other hosts is weak evidence on a default-logging fleet.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        powershell.file.script_block_hash|expand: '%script_block_hash%'
+      condition: selection
+    fields:
+      - host.name
+      - user.name
+      - Path
+  answer_sources:
+  - ps_script
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering,
+    reconnaissance, credential access — may reveal the stages that preceded this event and help
+    reconstruct the timeline. Delivery-side detections (script or document execution, download
+    cradles) shortly before this alert are especially relevant to how the pack invocation arrived.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+  answer_sources:
+  - alert

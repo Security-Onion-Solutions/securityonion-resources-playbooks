@@ -1,0 +1,480 @@
+name: Suspicious Spool Service Child Process
+id: 2dbd0aab-e521-4abd-8749-9bc9ab4a97e5
+description: |
+  Detects the print spooler service (spoolsv.exe), running at System integrity, spawning a child process that is
+  either one of a list of named living-off-the-land binaries (such as whoami.exe, nltest.exe, certutil.exe,
+  schtasks.exe, sc.exe, reg.exe, wevtutil.exe) OR a known LOLBin (net.exe, cmd.exe, netsh.exe, powershell.exe)
+  invoked with a suspicious argument OR rundll32.exe. spoolsv.exe runs as SYSTEM and should normally only spawn
+  printer drivers and helper processes; a command interpreter, reconnaissance tool, or persistence utility spawned
+  by it points to exploitation of the spooler service for code execution and privilege escalation. Determine which
+  branch fired, decode the child's command line, trace what started the spooler, and check whether the activity is
+  isolated to this host or part of a broader pattern.
+type: detection
+detection_id: dcdbc940-0bff-46b2-95f3-2d73f848e33b
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-09
+questions:
+- question: Did spoolsv.exe at System integrity spawn one of the flagged child binaries or commands?
+  context: >-
+    Confirm the alert is real before investing time. The rule fires when the parent is spoolsv.exe at System
+    integrity AND at least one of these branches matches: the child is one of the named living-off-the-land
+    binaries (gpupdate, whoami, nltest, taskkill, wmic, taskmgr, sc, findstr, curl, wget, certutil, bitsadmin,
+    accesschk, wevtutil, bcdedit, fsutil, cipher, schtasks, write, wuauclt, systeminfo, reg, query); OR the child
+    is net.exe/net1.exe with "start" in its command line; OR cmd.exe with ".spl", "route add", or "program files";
+    OR netsh.exe with "add portopening" or "rule name"; OR powershell.exe/pwsh.exe with ".spl"; OR rundll32.exe.
+    Note which branch fired - it determines which downstream questions carry the most weight.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - OriginalFileName
+      - CommandLine
+      - IntegrityLevel
+- question: What started spoolsv.exe, and is this spooler instance a normal print spooler service process?
+  context: >-
+    The print spooler normally runs as a long-lived service started by services.exe at boot. An attacker exploiting
+    the spooler for code execution drives the running spoolsv.exe to spawn the child, so the spooler itself is
+    usually the legitimate service. Trace the spooler's own origin to confirm it is the genuine service process and
+    not a renamed or relocated binary, and note its start time relative to the child for the exploitation timeline.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: Is this host expected to run command interpreters or administrative tools out of the print spooler service?
+  context: >-
+    The print spooler service legitimately spawns printer-driver host processes and a small set of helpers; it does
+    not spawn command interpreters, reconnaissance binaries, or persistence utilities under normal operation. Knowing
+    the host's role (print server vs. workstation) and whether any deployment or printer-management automation could
+    produce this child quickly separates a true positive from a benign edge case.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What did the spawned child process do? Decode its full command line.
+  context: >-
+    The child's command line is the operational payload of the exploitation. Decode every flag, path, encoded blob,
+    and URL. The child set spans reconnaissance (whoami, nltest, systeminfo), defense and recovery tampering
+    (wevtutil, bcdedit, cipher, fsutil), persistence (schtasks, sc, reg), download tools (curl, wget, certutil,
+    bitsadmin), and command interpreters (cmd, powershell, rundll32). Identify which operation ran as SYSTEM and what
+    it touched - that determines the investigation priority and remediation steps.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What other child processes did this same spoolsv.exe instance spawn?
+  context: >-
+    Exploitation of the spooler for code execution rarely produces a single child. A SYSTEM-level foothold is
+    typically used to run several tools in sequence - reconnaissance, then defense tampering, then persistence.
+    Listing every child of the exact spooler instance reveals the full scope of activity launched through this
+    execution chain and shows whether multiple suspicious branches of the rule fired together.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: What file and network activity did the spooler service generate around the time of the alert?
+  context: >-
+    Beyond spawning a child, an exploited spooler may write files to user-writable or system paths and open outbound
+    connections. File writes to printer driver directories or temporary paths can reveal a dropped payload or
+    malicious driver; outbound connections shortly after the child execution point to command-and-control or a
+    second-stage download. Review activity attributed to the spooler in a tight window around the alert.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Were files written to printer driver directories, user-writable, or temporary paths around the alert?
+  context: >-
+    Spooler exploitation commonly stages a malicious DLL or driver, or drops a second-stage payload, into
+    writable locations - the print spooler driver directories, %TEMP%, %APPDATA%, C:\Users\Public, or
+    C:\Windows\Temp. A file write into one of these paths in the same window as the child process points to the
+    artifact the exploitation delivered. Examine the writing process and file path to identify the payload.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_paths:
+        TargetFilename|contains:
+          - '\spool\drivers\'
+          - '\spool\PRINTERS\'
+          - '\Windows\Temp\'
+          - '\Users\Public\'
+          - '\AppData\Local\Temp\'
+      condition: selection and selection_paths
+    fields:
+      - TargetFilename
+      - Image
+- question: Did this host open outbound network connections shortly after the child process ran?
+  context: >-
+    Client-execution and privilege-escalation chains frequently establish outbound command-and-control or pull a
+    second stage shortly after the initial code runs. Correlating egress from this host in a short window after the
+    child execution, excluding routine system processes, surfaces connections that may represent the next stage.
+    Pivot on the destination address and the initiating process to assess whether the connection is expected.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+      filter_known:
+        Image|endswith:
+          - '\svchost.exe'
+          - '\System'
+      condition: selection and not filter_known
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationPort
+- question: Has this child binary run on this host before, or is this a first-time execution?
+  context: >-
+    A binary that has never executed on this host is more suspicious than one that runs routinely. Zero or very low
+    historical counts for this child indicate first-time or rare execution, which strengthens the case that the
+    spooler was driven to run it rather than reflecting an established maintenance pattern.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      spoolsv:
+        ParentImage|endswith: \spoolsv.exe
+        IntegrityLevel:
+        - System
+        - S-1-16-16384
+      suspicious_unrestricted:
+        Image|endswith:
+        - \gpupdate.exe
+        - \whoami.exe
+        - \nltest.exe
+        - \taskkill.exe
+        - \wmic.exe
+        - \taskmgr.exe
+        - \sc.exe
+        - \findstr.exe
+        - \curl.exe
+        - \wget.exe
+        - \certutil.exe
+        - \bitsadmin.exe
+        - \accesschk.exe
+        - \wevtutil.exe
+        - \bcdedit.exe
+        - \fsutil.exe
+        - \cipher.exe
+        - \schtasks.exe
+        - \write.exe
+        - \wuauclt.exe
+        - \systeminfo.exe
+        - \reg.exe
+        - \query.exe
+      suspicious_net:
+        Image|endswith:
+        - \net.exe
+        - \net1.exe
+      suspicious_net_filter:
+        CommandLine|contains: start
+      suspicious_cmd:
+        Image|endswith: \cmd.exe
+      suspicious_cmd_filter:
+        CommandLine|contains:
+        - .spl
+        - route add
+        - program files
+      suspicious_netsh:
+        Image|endswith: \netsh.exe
+      suspicious_netsh_filter:
+        CommandLine|contains:
+        - add portopening
+        - rule name
+      suspicious_powershell:
+        Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+      suspicious_powershell_filter:
+        CommandLine|contains: .spl
+      suspicious_rundll32_img:
+      - Image|endswith: \rundll32.exe
+      - OriginalFileName: RUNDLL32.EXE
+      suspicious_rundll32_cli:
+        CommandLine|endswith: rundll32.exe
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (spoolsv and ( suspicious_unrestricted or (suspicious_net and not suspicious_net_filter) or (suspicious_cmd and not suspicious_cmd_filter) or (suspicious_netsh and not suspicious_netsh_filter) or (suspicious_powershell and not suspicious_powershell_filter) or all of suspicious_rundll32_* )) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      spoolsv:
+        ParentImage|endswith: \spoolsv.exe
+        IntegrityLevel:
+        - System
+        - S-1-16-16384
+      suspicious_unrestricted:
+        Image|endswith:
+        - \gpupdate.exe
+        - \whoami.exe
+        - \nltest.exe
+        - \taskkill.exe
+        - \wmic.exe
+        - \taskmgr.exe
+        - \sc.exe
+        - \findstr.exe
+        - \curl.exe
+        - \wget.exe
+        - \certutil.exe
+        - \bitsadmin.exe
+        - \accesschk.exe
+        - \wevtutil.exe
+        - \bcdedit.exe
+        - \fsutil.exe
+        - \cipher.exe
+        - \schtasks.exe
+        - \write.exe
+        - \wuauclt.exe
+        - \systeminfo.exe
+        - \reg.exe
+        - \query.exe
+      suspicious_net:
+        Image|endswith:
+        - \net.exe
+        - \net1.exe
+      suspicious_net_filter:
+        CommandLine|contains: start
+      suspicious_cmd:
+        Image|endswith: \cmd.exe
+      suspicious_cmd_filter:
+        CommandLine|contains:
+        - .spl
+        - route add
+        - program files
+      suspicious_netsh:
+        Image|endswith: \netsh.exe
+      suspicious_netsh_filter:
+        CommandLine|contains:
+        - add portopening
+        - rule name
+      suspicious_powershell:
+        Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+      suspicious_powershell_filter:
+        CommandLine|contains: .spl
+      suspicious_rundll32_img:
+      - Image|endswith: \rundll32.exe
+      - OriginalFileName: RUNDLL32.EXE
+      suspicious_rundll32_cli:
+        CommandLine|endswith: rundll32.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (spoolsv and ( suspicious_unrestricted or (suspicious_net and not suspicious_net_filter) or (suspicious_cmd and not suspicious_cmd_filter) or (suspicious_netsh and not suspicious_netsh_filter) or (suspicious_powershell and not suspicious_powershell_filter) or all of suspicious_rundll32_* )) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Alerts rarely occur in isolation. Examining the broader process activity around the alert reveals what led to
+    this event and what followed - reconnaissance, privilege escalation, or persistence stages that bracket the
+    spooler child. Aggregating by parent and child binary collapses routine agent telemetry while novel pairs stand
+    out at low counts.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host - reconnaissance, defense tampering, or credential access - may reveal the
+    attack stages that preceded the spooler exploitation and help reconstruct the timeline. A privilege-escalation
+    event late in a sequence of prior alerts tells a different story than an isolated firing.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Did multiple reconnaissance commands run on this host around the same time?
+  context: >-
+    A single discovery command may be benign troubleshooting, but several reconnaissance binaries in rapid
+    succession - whoami, nltest, systeminfo, net - is a signature of post-compromise enumeration. Because the rule's
+    child set already includes many of these, a SYSTEM-level foothold through the spooler is a natural launch point
+    for an enumeration burst. Three or more distinct recon binaries within the window typically indicates automated
+    reconnaissance.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_recon:
+        Image|endswith:
+          - '\whoami.exe'
+          - '\systeminfo.exe'
+          - '\ipconfig.exe'
+          - '\net.exe'
+          - '\net1.exe'
+          - '\nltest.exe'
+          - '\dsquery.exe'
+          - '\nbtstat.exe'
+          - '\arp.exe'
+          - '\netstat.exe'
+          - '\tasklist.exe'
+          - '\qprocess.exe'
+          - '\query.exe'
+          - '\quser.exe'
+          - '\hostname.exe'
+          - '\nslookup.exe'
+          - '\adfind.exe'
+          - '\csvde.exe'
+          - '\ldifde.exe'
+          - '\dnscmd.exe'
+          - '\cmdkey.exe'
+          - '\setspn.exe'
+      condition: selection and selection_recon
+    fields:
+      - Image
+      - User
+- question: Were process-based persistence mechanisms installed on this host around the alert?
+  context: >-
+    A SYSTEM-level foothold obtained through the spooler is commonly used to establish persistence. Several of the
+    rule's flagged child binaries (schtasks, sc, reg, bitsadmin, wmic) are persistence tools; this sweep surfaces
+    all such executions on the host in a wide window so the analyst can see whether persistence was installed before
+    or after the detected activity. Clustered persistence-tool use points to intentional stacking rather than
+    isolated administration.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine

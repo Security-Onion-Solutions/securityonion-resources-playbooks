@@ -1,0 +1,304 @@
+name: Suspicious Diantz Alternate Data Stream Execution
+id: 1ac0eb88-2186-445a-94aa-7b74a15af12b
+description: |
+  Detects diantz.exe invoked with a command line that names a .cab destination written into an Alternate Data Stream
+  (ADS), identified by a colon in the target path that is not followed by a backslash. Diantz is a built-in cabinet
+  packager; the ADS form lets an actor compress a file into a stream hidden on another file, where it does not show in
+  normal directory listings. The rule fires when the command line contains diantz.exe and .cab and the ADS colon syntax
+  together. Legitimate use of this exact form is rare, so the investigation should decode the source and stream targets,
+  confirm whether the stream artifact exists on disk, and determine whether the parent and user are expected to package
+  data into hidden streams.
+type: detection
+detection_id: 6b369ced-4b1d-48f1-b427-fdc0de0790bd
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- question: Does the command line match what this rule detects, with diantz.exe packaging into a .cab target written to an Alternate Data Stream?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the exact command line. The rule fires only when the command line contains diantz.exe AND .cab AND a colon in the target path that is not followed by a backslash, which is the ADS write syntax (for example, target.exe:hidden.cab). Confirm all three are present in the actual event and read off the source file and the host file whose stream receives the cab.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Is this user and host expected to package files into cabinet archives or write data into Alternate Data Streams?
+  context: Routine archiving rarely uses diantz, and writing a cabinet into an Alternate Data Stream is almost never part of normal workflows. Knowing whether the user role and host function involve any legitimate ADS or cabinet packaging is often the fastest path to distinguishing administrative activity from data hiding or staging.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Decode the diantz command line. What is the source file, and which host file receives the cab in its Alternate Data Stream?
+  context: The full command line reveals the operation. Diantz in ADS form takes a source file as the first argument and a destination of the form hostfile:stream.cab, so the colon separates the carrier file from the stream name. Read off both paths to learn what is being compressed and where the hidden cab lands. Legitimate ADS usage exists for system and AV tooling, so check whether the carrier path looks like a normal data location or a temp or user-writable directory used for staging.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+          - diantz.exe
+          - .cab
+        CommandLine|re: ':[^\\]'
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Was a stream-bearing file write recorded for the carrier file around the time of this alert?
+  context: The defining artifact of this technique is a named Alternate Data Stream attached to a carrier file. Elastic Defend records that write as an ordinary file-creation event, with the stream name embedded in the target path (host-file:stream-name) — there is no separate stream-hash field on this telemetry, so a matching write, not a hash, is what confirms the cab actually landed in an ADS rather than the command merely being attempted. A matching write near the alert ties the process execution to the on-disk hidden stream; absence may mean the write failed or the path is outside collection.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_ads:
+        TargetFilename|re: ':[^\\]'
+      condition: selection and selection_ads
+    fields:
+      - TargetFilename
+      - Image
+- question: Do the source file or the carrier file named on the command line still exist on disk for analysis?
+  context: The command line names a source file being compressed and a carrier file receiving the hidden cab stream. Checking whether those paths still exist enables deeper analysis, hash lookups, or content review of what was packaged. The carrier file may look benign in a directory listing because the cab lives in its stream rather than its main data; the stream content is what to recover. File paths here are derived from the diantz command line itself.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What process spawned diantz.exe, and is that parent chain expected?
+  context: The parent process reveals how diantz was invoked. Interactive packaging usually descends from explorer.exe or a shell launched by a user; service automation from services.exe. Parents like powershell.exe, cmd.exe, wscript.exe, mshta.exe, or an Office application point to scripted or macro-driven execution rather than a deliberate administrator action, which raises the priority of the ADS write. Walk up the tree to see what spawned the parent.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What child processes did diantz.exe spawn afterward on this host?
+  context: The processes spawned after the packaging step reveal the actual impact. A benign archiving action usually spawns nothing further; staging for exfiltration or follow-on execution may be accompanied by a shell, a transfer utility, or a binary that reads back the hidden stream. Review any children and their command lines.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: '\diantz.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Does this host normally run diantz.exe to package cabinets into Alternate Data Streams?
+  context: A command pattern that has never been seen on a host is more suspicious than one that runs regularly. Zero or very low historical counts for diantz writing a cab into an ADS indicate first-time or rare execution, which on a general-purpose endpoint raises the priority of the decode result. Legitimate ADS usage by system or AV tooling, if any exists here, would show as a recurring baseline.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains|all:
+          - diantz.exe
+          - .cab
+        CommandLine|re: ':[^\\]'
+      condition: selection
+    fields:
+      - User
+- question: When this host has previously fired the rule's pattern, what parents and users normally drive that activity, and does the current alert fit that pattern?
+  context: Even built-in utilities can be abused. The query mirrors the rule's selection structure scoped to this host, so the resulting parent and user distribution reflects how this specific diantz ADS firing pattern has historically run here, not generic diantz usage. A new parent process, an unexpected user account, or an unusual command structure is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - diantz.exe
+        - .cab
+        CommandLine|re: :[^\\]
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - diantz.exe
+        - .cab
+        CommandLine|re: :[^\\]
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - diantz.exe
+        - .cab
+        CommandLine|re: :[^\\]
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity across multiple endpoints. If the same user staged or hid data on multiple hosts, the scope of the operation may be larger than a single endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - diantz.exe
+        - .cab
+        CommandLine|re: :[^\\]
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation, and this technique gains meaning from what surrounds it: the timing between the ADS write and the process that reads or transfers the stream is what separates idle packaging from active staging. Examining activity in the minutes around the alert reveals what led to this event and what happened after. Look for reconnaissance, collection, archiving, or transfer utilities that would place the hidden cab in a data-staging sequence.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Have other hosts fired the rule's pattern in the past week, and does the cross-host distribution look like consistent automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of this diantz ADS firing pattern, not generic diantz usage. Many hosts firing the same pattern points to scripted deployment or vendor automation; one host or a small unrelated set points to manual operator activity. Use the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - diantz.exe
+        - .cab
+        CommandLine|re: :[^\\]
+      condition: selection
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: 'Alerts rarely happen in isolation. Earlier detections on the same host, reconnaissance, credential access, or collection activity, may reveal the stages that preceded this event and help reconstruct the timeline. Look for patterns: collection followed by hiding data in a stream, or hiding followed by a transfer attempt.'
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

@@ -1,0 +1,413 @@
+name: PPL Tampering Via WerFaultSecure
+id: f2ccb549-ce03-4c76-9e3f-daae79152b6f
+description: |
+  Fires when WerFaultSecure.exe (by Image name or OriginalFileName) runs with a command line containing all of the secure-dump
+  switches /h, /pid, /tid, /encfile, /cancel, /type and the dump-type value 268310. WerFaultSecure always runs at the highest
+  Protected Process Light level (WinTCB), so it can be abused to read the memory of other PPL-protected processes such as LSASS,
+  or to suspend AV/EDR processes into an indefinite frozen state. Legitimate secure crash-dump handling rarely uses this exact
+  switch combination, so the investigation should confirm the alerting command line, identify which protected process was the
+  target (LSASS for credential theft or an AV/EDR agent for protection tampering), and check whether a dump file was written
+  or whether the target process was suspended.
+type: detection
+detection_id: 1f0b4cac-9c81-41f4-95d0-8475ff46b3e2
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the command line match the WerFaultSecure secure-dump switch pattern this rule detects?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule requires WerFaultSecure.exe (by
+    image name or original file name) running with all of the switches /h, /pid, /tid, /encfile, /cancel, /type and the dump-type
+    value 268310. Read the full command line and note the value following /pid — that PID identifies the targeted process.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to run WerFaultSecure with manual secure-dump arguments?
+  context: Secure crash-dump collection is normally driven by the Windows Error Reporting service, not by a user or operator
+    typing these switches by hand. A workstation or server with no debugging role producing this command line is a stronger
+    signal than a developer or crash-analysis host where occasional manual dump handling could be expected.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Which process did WerFaultSecure target, and was it LSASS or another protected process?
+  context: The /pid value in the command line identifies the targeted process. Resolve that PID to a process name for the alert
+    window. If it resolves to lsass.exe the intent is credential memory theft; if it resolves to an AV/EDR agent process the
+    intent is protection tampering. The dump-type value and /encfile switch indicate whether an encrypted secure dump of that
+    process memory was requested.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did WerFaultSecure target an AV or EDR process rather than LSASS, and which security agent was it?
+  context: The same secure-dump path can suspend AV/EDR processes into an indefinite frozen state instead of dumping credentials.
+    Resolve the /pid value against running AV/EDR agent processes for the alert window. If the targeted process is a protection
+    agent, the host may have lost real-time monitoring while that process was suspended, which changes the investigation priority.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did the WerFaultSecure process itself write any file to disk, and where did the secure dump land?
+  context: The handle WerFaultSecure opens against the target process is not recorded — the endpoint agent has no cross-process
+    handle telemetry, so the granted-access mask cannot be read directly. The reachable evidence that the read-for-dump
+    primitive actually ran is the output file. This lists every file written by the alerting process and its direct children.
+    An encrypted secure dump written under a user-writable path (the /encfile switch names it) means protected process memory
+    was captured; no write at all is consistent with the suspend-for-freeze variant, where the target is frozen and nothing
+    is dumped.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Was a memory dump file written to disk on this host in the minutes around the alert?
+  context: The secure-dump path writes an encrypted crash dump of the target process; tooling around this technique commonly
+    rewrites the dump header to disguise it as another file type before extracting credentials offline. Look for files created
+    under operator-writable locations such as the user profile, %TEMP%, or C:\Windows\Temp, especially with a .dmp extension
+    or an unexpected extension on a file of dump-like size.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_dump_paths:
+        TargetFilename|contains:
+          - '\Temp\'
+          - '\AppData\'
+          - '\Users\Public\'
+          - '\Windows\Temp\'
+      condition: selection and selection_dump_paths
+    fields:
+      - TargetFilename
+      - Image
+- question: What process spawned WerFaultSecure, and is that parent expected to launch it?
+  context: WerFaultSecure is normally launched by the Windows Error Reporting service chain. A parent such as an operator tool,
+    a script host, or an unsigned helper points to deliberate abuse. The parent command line frequently embeds the loader name
+    and the target PID, which identifies the tool driving the secure-dump or freeze operation.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Is the targeted AV or EDR process running normally now, or is it still suspended or stopped?
+  context: The freeze variant leaves the target AV/EDR process suspended until something resumes it, so the host can remain
+    unprotected after the alert. Check the current state of the targeted protection agent through the management console or
+    direct host inspection. A still-suspended or stopped protection process should be restored before the investigation continues.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What activity occurred on this host after WerFaultSecure ran?
+  context: A protected process is suspended or dumped to enable a follow-on action that would otherwise be blocked or logged.
+    Examine process activity in the window after the alert for credential reuse, lateral-movement tooling, or further tampering.
+    If an AV/EDR agent was frozen, telemetry during that window may be incomplete, so treat gaps as part of the finding.
+  range: +1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - User
+- question: Were outbound remote-access connections (RDP, SMB, WinRM, SSH) initiated from this host after
+    this event?
+  context: Credential theft is typically followed by lateral movement. The query returns outbound connections
+    from this host to remote-access ports -- 3389 (RDP), 445 (SMB/PsExec), 5985/5986 (WinRM), 22 (SSH)
+    -- in the hours after the event; the originating Image and User show what drove each connection. Two
+    limits to keep in mind -- credentials exfiltrated and replayed from another machine will not appear
+    here (check security 4624 logons on suspected targets for this account and any accounts with sessions
+    on this host), and the query requires Sysmon network telemetry (EID 3); if that is not collected from
+    this host, treat zero rows as a visibility gap, not as evidence no movement occurred.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
+- question: Which accounts may be exposed if LSASS memory was captured, and do any have elevated privileges?
+  context: If LSASS memory was dumped, every account with cached credentials or an active session on this host is potentially
+    exposed. Cross-reference the logged-on and recently authenticated accounts against directory group memberships. Domain
+    administrator, service, or other privileged accounts present on the host require escalation and credential rotation.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: When this host previously fired the WerFaultSecure secure-dump pattern, what parents and users drove it, and does
+    this alert fit?
+  context: Even a system binary can be abused. The query mirrors the rule's selection scoped to this host, so the parent and
+    user distribution reflects how this specific secure-dump pattern has run here before. A new parent, an unexpected user
+    account, or a first-ever occurrence is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_image:
+      - Image|endswith: \WerFaultSecure.exe
+      - OriginalFileName: WerFaultSecure.exe
+      selection_args:
+        CommandLine|contains|all:
+        - ' /h '
+        - ' /pid '
+        - ' /tid '
+        - ' /encfile '
+        - ' /cancel '
+        - ' /type '
+        - ' 268310'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_image:
+      - Image|endswith: \WerFaultSecure.exe
+      - OriginalFileName: WerFaultSecure.exe
+      selection_args:
+        CommandLine|contains|all:
+        - ' /h '
+        - ' /pid '
+        - ' /tid '
+        - ' /encfile '
+        - ' /cancel '
+        - ' /type '
+        - ' 268310'
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_image:
+      - Image|endswith: \WerFaultSecure.exe
+      - OriginalFileName: WerFaultSecure.exe
+      selection_args:
+        CommandLine|contains|all:
+        - ' /h '
+        - ' /pid '
+        - ' /tid '
+        - ' /encfile '
+        - ' /cancel '
+        - ' /type '
+        - ' 268310'
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the environment around this time?
+  context: Tracking the user's activity across all hosts reveals whether the secure-dump attempt is isolated or part of broader
+    hands-on-keyboard activity. The same user driving similar tooling on multiple hosts widens the likely scope of compromise.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_image:
+      - Image|endswith: \WerFaultSecure.exe
+      - OriginalFileName: WerFaultSecure.exe
+      selection_args:
+        CommandLine|contains|all:
+        - ' /h '
+        - ' /pid '
+        - ' /tid '
+        - ' /encfile '
+        - ' /cancel '
+        - ' /type '
+        - ' 268310'
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Have other hosts fired this WerFaultSecure secure-dump pattern in the past week, and does the distribution look like
+    automation or one-off activity?
+  context: The query mirrors the rule's selection with no host scope, giving a fleet-wide count of this specific secure-dump
+    pattern rather than generic WerFaultSecure usage. Many hosts firing the same pattern points to scripted deployment; one
+    host or a small unrelated set points to manual operator activity. Use the distribution to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_image:
+      - Image|endswith: \WerFaultSecure.exe
+      - OriginalFileName: WerFaultSecure.exe
+      selection_args:
+        CommandLine|contains|all:
+        - ' /h '
+        - ' /pid '
+        - ' /tid '
+        - ' /encfile '
+        - ' /cancel '
+        - ' /type '
+        - ' 268310'
+      condition: all of selection_*
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: A defense-evasion or credential-access action rarely happens in isolation. Earlier detections on the same host —
+    reconnaissance, prior tampering, or tool staging — may reveal the stages that preceded this event and help reconstruct
+    the timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

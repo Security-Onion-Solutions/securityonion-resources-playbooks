@@ -1,0 +1,323 @@
+name: Potential Binary Proxy Execution Via Cdb.EXE
+id: 287342f8-9f13-4083-b8e1-76e163559c96
+description: |
+  Detects cdb.exe (the command-line WinDbg debugger from the Windows Debugging Tools) launched with the
+  -c or -cf flags, which feed it a debugger-command script and let it run arbitrary commands or inject
+  shellcode under a trusted Microsoft-signed binary. The rule fires when the image ends in cdb.exe OR its
+  OriginalFileName is CDB.Exe, AND the command line contains ' -c ' or ' -cf '. cdb.exe is legitimately
+  used on developer and build workstations, so the investigation centers on whether this host/user is a
+  developer context and whether the -c/-cf script and any child processes, file writes, or outbound
+  connections look like debugging or like proxied payload execution.
+type: detection
+detection_id: b5c7395f-e501-4a08-94d4-57fe7a9da9d2
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the command line match what this rule detects — cdb.exe (or a binary with OriginalFileName CDB.Exe) run with a -c or -cf flag?
+  context: Before investing investigation time, confirm the alert is a true positive. Review the exact command line and confirm the image is cdb.exe or carries OriginalFileName CDB.Exe and that a ' -c ' (debug-script command runner) or ' -cf ' (script file) flag is present. Both selection groups must match for the rule to fire.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to run a command-line debugger?
+  context: cdb.exe is not present in a default Windows install — it ships with the Windows SDK / Debugging Tools and is normally seen only on developer and build workstations. A debugger invocation on a general-purpose endpoint or under a non-developer account is the fastest signal worth chasing; confirm whether this host's function and this user's role involve native debugging.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Is this cdb.exe the genuine Microsoft-signed debugger, or a renamed or relocated copy?
+  context: The rule matches on image name OR OriginalFileName, so a renamed binary can fire it. Confirm the on-disk path and signature - the legitimate debugger installs under the Windows Kits Debuggers directory and is Microsoft-signed. A copy running from a user-writable path, or an unsigned binary with OriginalFileName CDB.Exe, points to a relocated or renamed tool used to blend proxied execution into a trusted name.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: What exactly did cdb.exe do? Decode the -c / -cf arguments and the script they reference.
+  context: The -cf flag points cdb at a debugger-command script file (often a .wds or .txt), and -c feeds an inline command string. Decode the full argument list and, where possible, read the referenced script. Debugger commands such as .dvalloc (allocate RWX memory), repeated eb byte-writes, r @$ip= (redirect the instruction pointer), and -o launching a host process (e.g., notepad.exe) indicate shellcode injection rather than legitimate debugging. .shell or arbitrary command strings indicate proxied command execution.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What process spawned cdb.exe and is that parent chain expected?
+  context: A trusted developer utility run in a non-developer context is the core abuse pattern. Legitimate debugging is typically launched interactively (explorer.exe, a terminal, or an IDE). cdb.exe spawned by mshta.exe, wscript.exe, an Office application, a script host, or a remote-execution service points to proxied execution rather than hands-on debugging. Walk up from the immediate parent to see what launched it.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What child processes did cdb.exe spawn afterward, and how soon?
+  context: The processes spawned by a debugger reveal its actual impact. cdb running a debug script can launch a host process for shellcode injection (-o notepad.exe is a common cover) or spawn cmd.exe / powershell.exe / rundll32.exe / regsvr32.exe via .shell. The correlation window between cdb execution and any child execution or payload activity (typically 0-30 minutes) helps separate a one-off debugging session from a proxied-execution chain. Unexpected children are the deviation worth chasing.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Did cdb.exe or the process it launched make outbound network connections shortly after execution?
+  context: Proxy execution via a signed debugger often precedes immediate outbound activity - the injected shellcode or spawned child beacons to a remote host or retrieves a follow-on payload. Connections to rare or newly seen destinations shortly after the cdb invocation, especially from a host that does not normally egress from debugging tools, shift the disposition toward malicious proxied execution. If network telemetry is not collected for this host, treat zero results as a visibility gap rather than evidence nothing connected.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- question: Does this host normally run cdb.exe?
+  context: A debugger that has never run on this host is far more suspicious than one that runs regularly as part of a developer workflow. Zero or very low historical counts over the baseline window indicate first-time or rare execution and weigh toward investigation; steady recurring use on a known build or developer host weighs toward routine.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: When this host has previously fired this rule's pattern, what parents and users normally drive it, and does the current alert fit?
+  context: Even a legitimately installed debugger can be abused. The query mirrors the rule's selection (cdb.exe / CDB.Exe with -c or -cf) scoped to this host, so the resulting parent and user distribution reflects how this specific firing pattern has run here historically - not generic debugger usage. A new parent process, an unexpected user account, or an unusual command-line structure against that baseline is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \cdb.exe
+      - OriginalFileName: CDB.Exe
+      selection_cli:
+        CommandLine|contains:
+        - ' -c '
+        - ' -cf '
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: What other tools ran on this host around the same time as the cdb.exe execution?
+  context: Proxied execution rarely happens in isolation. Activity surrounding the debugger invocation may reveal reconnaissance, credential access, privilege escalation, persistence installation, or data staging that provides broader context. Look for other living-off-the-land binaries or script hosts executing in the same short window.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \cdb.exe
+      - OriginalFileName: CDB.Exe
+      selection_cli:
+        CommandLine|contains:
+        - ' -c '
+        - ' -cf '
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \cdb.exe
+      - OriginalFileName: CDB.Exe
+      selection_cli:
+        CommandLine|contains:
+        - ' -c '
+        - ' -cf '
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the same user triggered similar debugger or proxied-execution activity on multiple hosts, the scope of compromise may be larger than this single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \cdb.exe
+      - OriginalFileName: CDB.Exe
+      selection_cli:
+        CommandLine|contains:
+        - ' -c '
+        - ' -cf '
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection*) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate context: what led to this event, what happened after, and whether it is part of a larger sequence. Look for reconnaissance, privilege escalation, or persistence mechanisms surrounding the cdb.exe execution.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host - defense tampering, reconnaissance, credential access - may reveal the attack stages that preceded this event and help reconstruct the timeline. A debugger proxying execution late in a chain reads very differently from a one-off debugging session with no prior alerts.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Have other hosts fired this rule's pattern in the past week, and does the cross-host distribution look like consistent automation or one-off activity?
+  context: The query mirrors the rule's selection (cdb.exe / CDB.Exe with -c or -cf) with no host scope, so the result is a fleet-wide count of this firing pattern - not generic debugger usage. Many hosts firing the same pattern points to scripted deployment or a developer/build fleet; one host or a small unrelated set points to manual operator activity. Use the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \cdb.exe
+      - OriginalFileName: CDB.Exe
+      selection_cli:
+        CommandLine|contains:
+        - ' -c '
+        - ' -cf '
+      condition: all of selection*
+    fields:
+    - host.name

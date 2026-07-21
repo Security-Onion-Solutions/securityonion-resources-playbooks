@@ -1,0 +1,340 @@
+name: Suspicious Files in Default GPO Folder
+id: 523ff949-8dfd-40c9-89d6-5425801856e2
+description: |
+  Detects the creation of a .dll or .exe file inside the Default Domain Policy storage folder (the SYSVOL ...\Policies\{31B2F340-016D-11D2-945F-00C04FB984F9}\ path). That folder normally holds policy templates, registry.pol, and scripts, not standalone executables or libraries; a compiled binary written there is anomalous because the location is trusted by domain controllers and replicates to every controller through SYSVOL, and from there can reach domain-joined hosts through policy processing. The investigation should identify the file and the process that wrote it, determine whether the binary is a genuine policy artifact or a payload, confirm whether it executed or loaded, and establish how far it has spread across hosts.
+type: detection
+detection_id: 5f87308a-0a5b-4623-ae15-d8fa1809bc60
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-09
+questions:
+- question: Do the file path and creating process match what this rule detects?
+  context: >-
+    Before investing investigation time, confirm the alert is a true positive: the file path contains the Default Domain Policy folder segment \Policies\{31B2F340-016D-11D2-945F-00C04FB984F9}\ and the filename ends in .dll or .exe, and review the responsible process and operation type. That folder normally stores policy templates and scripts, so a standalone executable or library there is the pattern the rule targets.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this user and host expected to write executables into the Default Domain Policy folder?
+  context: >-
+    Legitimate policy changes are made through Group Policy management tooling on domain controllers, which writes policy templates rather than standalone .dll or .exe files. Knowing whether the account and host role fit that activity is often the fastest way to separate a true positive from routine administration. User attribution is present on roughly 94% of endpoint file events; when it is a machine account (HOST$) or SYSTEM, judge by the writing process and host role instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: What does the dropped file contain, and is it a legitimate policy artifact or an executable payload?
+  context: >-
+    Read the file's actual content. A genuine Group Policy artifact is a template or configuration file, not a compiled binary; for a library or executable, check the imports, embedded strings, packer signatures, and signing status. Retrieving and examining the file distinguishes a mislabeled but benign item from a staged payload. Content retrieval is a manual step from the endpoint or the file share.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: If the dropped library was loaded, what is its hash and signing status, and is it known to threat intelligence?
+  context: >-
+    A library records its hash and code-signing details on the load event. Read the hash and signer where the file loaded and submit the hash for a reputation check to establish whether it is known-good, known-malicious, or previously unseen; an unsigned or mismatched-signer library loading from a policy folder is the core concern. Executable payloads that run as a process instead are covered by the post-drop execution question. If the file is present but never loaded, retrieve it from disk and hash it manually.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Hashes
+      - Signature
+      - SignatureStatus
+- question: What process wrote this file into the policy folder, and what was its full command line?
+  context: >-
+    The writing process and its arguments reveal how the file was placed. A copy utility invoked with the Default Domain Policy path as an argument, or a normally quiet system process writing there, points to deliberate staging. Decode the full command line for the destination path, the source location, and any chained operations across multiple invocations of the same binary in the surrounding window.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What is the true identity of the process that wrote this file, based on its metadata and hash?
+  context: >-
+    The writing process's on-disk name can differ from its embedded PE metadata. Compare the Image path against OriginalFileName and check the signing status and hash: a process with a legitimate system name but mismatched metadata, or an unsigned binary writing into a replicated policy folder, points to an injected or renamed writer rather than a management tool. Submit the hash for a reputation lookup.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Hashes
+- question: What process spawned the writer, and is that parent chain expected?
+  context: >-
+    The parent of the writing process shows how the write was initiated. A copy or system process launched by a script host, an Office application, or an unexpected service is inconsistent with routine policy management. Trace the parent to determine whether the chain reflects an administrator action or an automated intrusion step.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - Image
+      - CommandLine
+- question: Was the dropped executable run as a process after it was created?
+  context: >-
+    A file staged in the policy folder may be executed on the same host or, once replicated, elsewhere. Look for a process whose Image matches the dropped path in the hours after creation; a match confirms the payload progressed from staging to execution. Library payloads that load rather than run are covered by the load-and-hash question.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Is the file still on disk, or was it deleted or renamed after the alert?
+  context: >-
+    The file's post-alert lifecycle drives next steps. A payload still present can be retrieved, hashed, and analyzed; a file removed shortly after creation suggests staging that has served its purpose or anti-forensic cleanup, and shifts focus to what executed or replicated in between.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What other files did the responsible process write or delete around the alert?
+  context: >-
+    A process that drops one file into the policy folder often stages several — additional libraries, scripts, or copies scattered to other paths. The breadth and locations of the writing process's other file activity distinguish a single artifact from a larger staging operation and enumerate what else needs review.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What else has been written to the Default Domain Policy folder recently, and by which processes?
+  context: >-
+    Location drives suspicion here. The Default Domain Policy folder is written by a small set of policy-management processes and it replicates to other domain controllers. Other recent arrivals in the same folder — especially executables or libraries — reveal whether this is an isolated drop or a location under active misuse, and which processes are responsible.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains: '\Policies\{31B2F340-016D-11D2-945F-00C04FB984F9}\'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: Is the same file present on other hosts or domain controllers?
+  context: >-
+    The Default Domain Policy folder replicates across domain controllers, so a file staged there can propagate automatically to every controller and, through policy processing, reach domain-joined hosts. Finding the same filename on multiple systems indicates replication or deliberate distribution; a single-host presence points to a more contained event. Compare where and when the file appeared to reconstruct the distribution timeline.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        TargetFilename|endswith|expand: '%file_basename%'
+      condition: selection
+    fields:
+      - host.name
+      - TargetFilename
+      - Image
+- always_include: true
+  question: Has this user produced this pattern before, and does that history fit their role?
+  context: >-
+    This counts the user's 90-day history of writing a .dll or .exe into the Default Domain Policy folder, aggregated by host — the rule's specific firing pattern, not generic file activity. A user who has never produced this pattern is more notable than one who does so as part of a known workflow; weigh the count against the account's role. When the alert fires under a machine or service account, the parent-process history is the meaningful pivot.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        TargetFilename|contains: \Policies\{31B2F340-016D-11D2-945F-00C04FB984F9}\
+        TargetFilename|endswith:
+        - .dll
+        - .exe
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: Has this program driven this pattern before on this host or across the environment, or is the program new for this activity?
+  context: >-
+    When the alert fires under a service or machine account, user identity does not attribute the behavior; the launch mechanism does. This counts the 90-day history of this program driving the same policy-folder write pattern, aggregated by host. A new or rare program for this pattern is the deviation worth chasing; a program that already accounts for many prior events is more likely management automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        TargetFilename|contains: \Policies\{31B2F340-016D-11D2-945F-00C04FB984F9}\
+        TargetFilename|endswith:
+        - .dll
+        - .exe
+      _pb_scope:
+        Image|endswith|expand: '%Image%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: What else did this user do across the environment around this time?
+  context: >-
+    Tracking the account's activity across hosts in a tight window around the alert reveals whether the file drop is isolated or part of wider interactive or automated activity. The same account writing or executing across several systems widens the likely scope of the event.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- always_include: true
+  question: Did the same program-driven pattern fire on other hosts in the same window?
+  context: >-
+    Under a service or machine account, cross-host user activity is dominated by routine agent telemetry. The meaningful question is whether the same launch mechanism produced this policy-folder write elsewhere in the alert window: several hosts point to pushed or scheduled automation, while a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        TargetFilename|contains: \Policies\{31B2F340-016D-11D2-945F-00C04FB984F9}\
+        TargetFilename|endswith:
+        - .dll
+        - .exe
+      _pb_scope:
+        Image|endswith|expand: '%Image%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What other process activity occurred on this host around the time of the alert?
+  context: >-
+    The write rarely lands in isolation. Aggregating process activity around the alert surfaces what preceded it and what followed — a download or dropper, reconnaissance, privilege escalation, or additional staging. Novel parent-child pairs stand out at low counts against the routine agent and system telemetry that dominates the host.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host — defense tampering, reconnaissance, credential access, or a suspicious download — may reveal the stages that preceded this file drop and help reconstruct the timeline. A policy-folder write following earlier execution or tampering alerts reads differently from one with no prior activity.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

@@ -1,0 +1,514 @@
+name: Potential APT FIN7 Reconnaissance/POWERTRASH Related Activity
+id: 815ae792-c259-42c3-8f1b-3eacc9aa9480
+description: |
+  Detects a command line that invokes PowerShell to run a script file with the execution policy
+  bypassed and profile, banner, and interactive prompting suppressed. The rule fires on either of
+  two flag-and-path combinations that must each match together: the flags `-noni -nop -exe bypass
+  -f \\` alongside an `ADMIN$` path, or the flags `-ex bypass -noprof -nolog -nonint -f` alongside
+  a `C:\Windows\Temp\` path. Both describe a script staged where an operator can write — a remote
+  admin share or the local system temp directory — and then executed with no console attached;
+  scripts run this way are frequently obfuscated loaders that reflectively load an embedded payload
+  into memory, leaving little on disk beyond the script itself. Determine which branch fired,
+  retrieve and read the script, establish what process launched PowerShell, and check whether the
+  same pattern has run on other hosts or under other accounts.
+type: detection
+detection_id: 911389c7-5ae3-43ea-bab3-a947ebdeb85e
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-17
+questions:
+- question: Does the command line match either of the rule's two branches, and which one fired?
+  context: >-
+    Confirm the alert before investing analysis time. The rule fires when a command line carries
+    either the flags `-noni -nop -exe bypass -f \\` together with `ADMIN$`, meaning a script is
+    being run from a remote admin share, or the flags `-ex bypass -noprof -nolog -nonint -f`
+    together with `C:\Windows\Temp\`, meaning a script is being run from the system temp
+    directory. Each branch requires both of its parts in the same command line. Note which one
+    fired: the admin-share branch makes the remote host named in the UNC path and how the file got
+    there the load-bearing follow-up, while the temp branch makes the locally staged script and
+    the process that dropped it the focus.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - alert
+  - process_creation
+- question: Is this PowerShell execution part of an authorized penetration test or red team engagement?
+  context: >-
+    Running a script non-interactively from an admin share or the system temp directory is a
+    routine operator technique in authorized assessments, and it is also how some deployment
+    tooling behaves. Check whether an engagement is active against this host or network segment
+    before going further. A scoped engagement whose timing and target match resolves the alert
+    without further analysis; no engagement on record means the invocation needs to be attributed
+    to a person or a piece of software.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - organizational_knowledge
+- question: Is this user and host expected to run PowerShell scripts from an admin share or the system temp directory?
+  context: >-
+    Management and deployment tooling does stage scripts in the system temp directory and does
+    push them over admin shares, so the account and the host role decide how unusual this is. A
+    service account on a build, management, or backup server is a different answer from a
+    workstation user account or from an account that has no administrative function at all. An
+    account that cannot normally write to an admin share on a remote host but appears here is the
+    stronger finding.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: What script file and arguments were passed to -File, and does the script name look like known tooling?
+  context: >-
+    The `-f` / `-File` argument names the script that actually did the work; everything before it
+    only suppresses the profile, the execution policy, the banner, and interactive prompts.
+    Record the full script path and any arguments after it, then judge the name against what runs
+    here normally. Deployment tooling uses stable, descriptive names in predictable directories.
+    Staged loaders commonly use random or pseudo-random strings, names that imitate a legitimate
+    product updater, or names that encode a build or architecture suffix, and they sit in a
+    directory that any administrative process can write to.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: Did this flag pattern run more than once on this host in the alert window, and what script did each invocation target?
+  context: >-
+    A single alert shows one invocation, but staging and execution are often several sequential
+    PowerShell calls that share one flag set and differ only in the script path or the target
+    host. This query returns command lines on this host in the alert window that carry either of
+    the rule's two flag runs, so a sequence is distinguishable from a one-off. Decode each result:
+    note the script path, whether it sits on a UNC admin share or in the local temp directory, and
+    anything passed after it. Scoping on the flag runs rather than on powershell.exe keeps the
+    result readable — the binary itself runs constantly on most hosts.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_flags:
+        CommandLine|contains:
+          - '-noni -nop -exe bypass -f '
+          - '-ex bypass -noprof -nolog -nonint -f '
+      condition: selection_host and selection_flags
+    fields:
+      - CommandLine
+      - CurrentDirectory
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: What does the executed script actually contain?
+  context: >-
+    The command line names the script path; the script itself is where the behaviour lives.
+    Retrieve it and read it. This query lists recent writes of scripts and executables into
+    `C:\Windows\Temp` on this host, which locates a locally staged file and matches it to the path
+    in the command line and to the process that dropped it. For the admin-share branch, the script
+    was written into `C:\Windows` on the host named in the UNC path, so repeat the lookup there.
+    Read the file for reflective assembly loading, large base64 or compressed string blobs, simple
+    XOR-style decoding loops, and embedded PE bytes — a loader of this kind decodes its payload in
+    memory and may write nothing else to disk.
+  range: -24h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_path:
+        TargetFilename|contains: '\Windows\Temp\'
+      selection_ext:
+        TargetFilename|endswith:
+          - '.ps1'
+          - '.bat'
+          - '.vbs'
+          - '.js'
+          - '.exe'
+          - '.dll'
+      condition: all of selection_*
+    fields:
+      - TargetFilename
+      - Image
+  answer_sources:
+  - file_event
+  - manual_review
+  - safe_environment
+  - external_threat_intel
+- question: Is the script the command referenced still on disk for analysis?
+  context: >-
+    The rule matches on a path, so there is a file to go and get. If it is still present it can be
+    hashed, submitted for analysis, or read directly; if it has been removed, the file activity of
+    the alerting process and its direct children is what remains of it. This query shows file
+    operations tied to that process lineage, which also surfaces anything the script wrote or
+    deleted while it ran — including its own cleanup.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+  answer_sources:
+  - file_event
+  - manual_review
+- question: What files did this binary write on the host in the hour after the alert?
+  context: >-
+    Even when a loader keeps its payload in memory, the surrounding operation usually touches
+    disk: further scripts staged for other hosts, output files from enumeration commands, or a
+    legitimate signed executable dropped next to a library it will side-load. This query lists
+    file operations by this binary on the host in the hour after the alert. Files appearing
+    together as a cluster in one directory — particularly a freshly created folder under a user
+    profile or in the system temp directory — should be collected as a set rather than assessed
+    one at a time.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+  answer_sources:
+  - file_event
+  - process_creation
+  - manual_review
+- question: What process spawned this PowerShell instance, and is that parent expected to launch scripts?
+  context: >-
+    The rule constrains only the command line, so the parent is the strongest discriminator
+    available. A management or deployment agent, a scheduled-task host, or an interactive shell
+    run by an administrator are ordinary launchers. A database engine, a web-facing service
+    worker, or a service-control process on a host that was just administered remotely point at
+    execution reached through an exposed service rather than through a console. This lookup
+    returns the parent's own record, including the command line it was started with, which is
+    usually enough to tell the two apart.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: What child processes did this PowerShell instance spawn?
+  context: >-
+    The children show what the script did once it was running. Built-in enumeration utilities such
+    as netstat, tasklist, ipconfig, net, whoami, and systeminfo run constantly in legitimate IT
+    automation, so none of them means anything on its own. The discriminator is the burst: several
+    of them in quick succession from this one parent, in an order that reads like someone
+    orienting on an unfamiliar host. Also watch for wmic, net use, sc.exe, or a further PowerShell
+    process, which move the activity from enumeration toward credential use and remote execution.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: When this host previously produced the rule's pattern, what parents and users drove it, and does this alert fit?
+  context: >-
+    The query mirrors the rule's selection structure scoped to this host, so the parent and user
+    distribution describes how this specific firing pattern — not generic PowerShell usage — has
+    run here over the past two weeks. A recurring parent paired with a stable service account is
+    deployment tooling whose flags happen to match the rule. An empty result, or a parent and
+    account that have never driven this pattern before, is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_1:
+        CommandLine|contains|all:
+        - -noni -nop -exe bypass -f \\\\
+        - ADMIN$
+      selection_2:
+        CommandLine|contains|all:
+        - -ex bypass -noprof -nolog -nonint -f
+        - C:\Windows\Temp\
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+  answer_sources:
+  - process_creation
+- question: Has this account produced the rule's pattern before, and does that history fit its role?
+  context: >-
+    The query mirrors the rule's selection structure scoped to this account, so the result is the
+    account's 90-day history of this specific pattern rather than its generic PowerShell usage,
+    aggregated by host. An account that produces it routinely across a consistent set of hosts is
+    running tooling; an account that has never produced it, or that produces it on hosts outside
+    its normal footprint, is the case to work. Weigh the count against what the account is for. If
+    the alert fired under SYSTEM or a machine account, this pivot attributes nothing by itself and
+    the launch-mechanism view is the meaningful one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_1:
+        CommandLine|contains|all:
+        - -noni -nop -exe bypass -f \\\\
+        - ADMIN$
+      selection_2:
+        CommandLine|contains|all:
+        - -ex bypass -noprof -nolog -nonint -f
+        - C:\Windows\Temp\
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+  always_include: true
+- question: Has this parent process driven the rule's pattern before, or is the launch mechanism new for this activity?
+  context: >-
+    When an alert fires under a service principal, the account name attributes nothing and the
+    launch mechanism becomes the meaningful pivot. The query mirrors the rule's selection
+    structure scoped to the alerting parent process, so the result is the 90-day history of that
+    parent driving this specific pattern, aggregated by host. A parent already responsible for a
+    large volume of prior events, concentrated on the same hosts, is vendor or operating-system
+    automation. A parent that is new to this pattern, or that drives it on only one host, is the
+    deviation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_1:
+        CommandLine|contains|all:
+        - -noni -nop -exe bypass -f \\\\
+        - ADMIN$
+      selection_2:
+        CommandLine|contains|all:
+        - -ex bypass -noprof -nolog -nonint -f
+        - C:\Windows\Temp\
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  always_include: true
+- question: What else did this account do across the environment in the hour around the alert?
+  context: >-
+    Following the account across every host, rather than only this one, shows whether the activity
+    is confined here. Because both of the rule's branches describe running a script from a
+    directory reachable by an administrator, the result to look for is the same account appearing
+    on hosts it has no reason to touch, or enumeration and remote-execution binaries running under
+    it on several machines within the same window. If the alert fired under SYSTEM or a machine
+    account, this query returns routine agent telemetry from every host and should be read
+    alongside the parent-scoped fleet view rather than on its own.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+  always_include: true
+- question: Did the same parent-driven pattern fire on other hosts in this window, or is it isolated to this host?
+  context: >-
+    Under a service principal, asking what else the account did returns agent telemetry from every
+    host in the environment. The useful question is whether the same launch mechanism produced the
+    same pattern elsewhere, so the query mirrors the rule's selection structure scoped to the
+    alerting parent process, fleet-wide, within the alert window. Several hosts at once points to
+    scheduled or pushed automation. A single host points to a host-local trigger, which for this
+    pattern is more consistent with someone working from that machine.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_1:
+        CommandLine|contains|all:
+        - -noni -nop -exe bypass -f \\\\
+        - ADMIN$
+      selection_2:
+        CommandLine|contains|all:
+        - -ex bypass -noprof -nolog -nonint -f
+        - C:\Windows\Temp\
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  always_include: true
+- question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Aggregating every process on the host by binary and parent collapses repetitive agent
+    telemetry into single high-count rows and leaves novel parent-child pairs standing out at low
+    counts, which is what to scan for. Enumeration utilities appearing here are unremarkable in
+    isolation because they are part of routine IT automation; read the parent column instead. A
+    cluster of them under one unexpected parent, alongside archive or file-transfer tooling,
+    describes someone working the host rather than a management agent doing its rounds.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+  answer_sources:
+  - process_creation
+  - file_event
+  - registry_event
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    A script staged in a writable directory and executed with no console attached is rarely the
+    first step of an operation. Earlier detections on this host may show how the code arrived —
+    exploitation of an exposed service, a remote service creation, a write to an admin share — and
+    reconstruct the order of events. Read the sequence rather than the individual alerts; if
+    nothing preceded this, the arrival path is still unexplained and worth pursuing from the
+    parent process instead.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+  answer_sources:
+  - alert
+- question: Have other hosts produced the rule's pattern in the past week, and how is it distributed across them?
+  context: >-
+    The query mirrors the rule's selection structure with no host scope, so the result is a
+    fleet-wide count of this specific firing pattern rather than the generic footprint of
+    PowerShell. Many hosts producing it steadily over the week points to scripted deployment or
+    vendor automation whose flags match the rule. A small, unrelated set of hosts appearing inside
+    a short window points the other way, and since one branch of the rule describes running a
+    script from a remote admin share, a tight cluster of hosts is also what tool transfer to
+    several targets looks like from this angle.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_1:
+        CommandLine|contains|all:
+        - -noni -nop -exe bypass -f \\\\
+        - ADMIN$
+      selection_2:
+        CommandLine|contains|all:
+        - -ex bypass -noprof -nolog -nonint -f
+        - C:\Windows\Temp\
+      condition: 1 of selection_*
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation

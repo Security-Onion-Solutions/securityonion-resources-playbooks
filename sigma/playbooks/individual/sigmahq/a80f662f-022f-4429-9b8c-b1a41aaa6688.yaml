@@ -1,0 +1,410 @@
+name: Internet Explorer Autorun Keys Modification
+id: fbde5b05-f4fb-4304-adf3-9d4dd3826bb7
+description: |
+  Detects modification of an Internet Explorer autostart extensibility point (ASEP) in the registry.
+  The rule fires when a value is written whose TargetObject sits under an Internet Explorer software
+  path (either the native \Software\Microsoft\Internet Explorer or the 32-bit \Software\Wow6432Node
+  variant) AND under a \Toolbar, \Extensions, or \Explorer Bars subkey, while excluding a set of
+  known-benign values (empty Details and a handful of default extension CLSIDs and toolbar layout
+  values). These keys register browser helper objects, toolbars, and explorer-bar components that load
+  automatically when the browser or shell starts, so they are a durable persistence and privilege
+  path. Legitimate software configures them mostly during installation; investigate what value or
+  component was registered, which process wrote it and what launched that process, whether the
+  referenced component was dropped on disk and later loaded, and whether the change was reverted.
+type: detection
+detection_id: a80f662f-022f-4429-9b8c-b1a41aaa6688
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-10
+questions:
+- question: Does the alerting write target an Internet Explorer Toolbar, Extensions, or Explorer Bars autorun key with a non-benign value?
+  context: >-
+    Before investing investigation time, confirm the alert is a true positive. The rule fires only when
+    the TargetObject sits under an Internet Explorer software path (native \Software\Microsoft\Internet
+    Explorer or the 32-bit \Software\Wow6432Node\Microsoft\Internet Explorer) AND under a \Toolbar,
+    \Extensions, or \Explorer Bars subkey, AND the value is not one of the known-benign exclusions
+    (empty Details, the default extension CLSIDs, or the standard toolbar layout values). Review the exact
+    TargetObject and Details on the triggering event to confirm all three conditions hold and that this is
+    a real component registration rather than a routine default.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this user and host expected to register Internet Explorer browser extensions or toolbars?
+  context: >-
+    Browser-extension and toolbar registration under these keys usually happens during software
+    installation, so a user account or host that has no reason to install browser add-ons is a more
+    suspicious writer than a workstation mid-install. Knowing whether the writing account and host
+    function match a sanctioned install or configuration change is often the fastest way to separate a
+    legitimate deployment from a persistence attempt. User attribution is present on roughly 94% of
+    endpoint registry events; when it is a machine account or SYSTEM, pivot on the writing process instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Which Internet Explorer autorun key and value were modified, and why is this a persistence location?
+  context: >-
+    The specific subkey reveals intent. \Toolbar and \Extensions register browser helper objects and
+    toolbar bands that load into the browser at launch; \Explorer Bars register components that load into
+    Explorer. All three are autostart extensibility points that run code automatically without any further
+    user action, which is what makes them a persistence and privilege-escalation path. Confirming the exact
+    key path and the writing process establishes which extensibility point was targeted and which set of
+    startup keys should be watched more closely in this environment, and sets up decoding the registered
+    value.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: What value was written to this key, and does it reference a CLSID, DLL path, or script?
+  context: >-
+    The Details field holds what the extensibility point will load. For \Extensions and \Toolbar entries it
+    is commonly a CLSID that in turn points at a DLL registered under the class store, so the registered
+    component may be a DLL path or a class identifier rather than an executable path. Decode it: a reference
+    to a DLL or binary in a user-writable location (Temp, AppData, ProgramData) or an unfamiliar CLSID is
+    the payload the browser would load. Details is present on roughly 79% of registry modifications and
+    should be populated for this string value; if it is empty the rule's benign-empty filter would normally
+    have excluded it, so a populated non-default value here is the signal.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- question: What process wrote this registry value, and what launched that process?
+  context: >-
+    The registry event carries no command line, so pivot by ProcessGuid to the writing process to read its
+    Image, full command, and parent. A reg.exe, powershell.exe, rundll32.exe, or regsvr32.exe write, or a
+    write launched from an Office application, a script host such as wscript.exe or mshta.exe, or an
+    unsigned binary points to the registration being staged programmatically rather than by a legitimate
+    installer. The parent chain distinguishes an installer configuring its own add-on from a scripted
+    persistence write, and identifies whether the parent lineage is one this host normally produces.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: Did the writing process or its children drop a DLL or executable on disk that this registration points to?
+  context: >-
+    The extensibility point is only effective if the component it registers exists on disk. If the value
+    references a DLL or binary path, or if the registration is a CLSID whose class store entry points at a
+    dropped module, confirming that the writing process or one of its children created that file establishes
+    whether the persistence is live and what it would load. The file-write event carries no hash; if the
+    module is present, hash it from a later load or execution for a reputation lookup. Correlating file
+    activity by the registry-writing process and its children catches payloads that landed in the same
+    session as the registration.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: After this registration, did Internet Explorer load a non-Microsoft or unfamiliar module?
+  context: >-
+    An Internet Explorer autorun component takes effect at the next browser launch, when iexplore.exe loads
+    the registered browser helper object, toolbar, or explorer bar as a module. Listing the modules loaded
+    by iexplore.exe on this host after the write, with their signature state, reveals whether the registered
+    component actually loaded and whether it is unsigned or signed by an unexpected party. The browser may
+    not be launched within this window; zero results mean the persistence has not yet fired rather than that
+    it is inert, so treat the registration as primed until the value is removed.
+  range: +24h
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: '\iexplore.exe'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+      - SignatureStatus
+- question: After this write, was the value changed again or restored to a default?
+  context: >-
+    Registry key or value deletions are not observable in this telemetry, so durability is judged from the
+    key's re-modification history rather than from a delete event. A later write that reverts the value to a
+    default or empty state can indicate the registration was cleaned up after the component loaded, while the
+    value persisting leaves the extensibility point primed to load its component on every browser or shell
+    start. Compare the Details values written to this key over the following window to see whether it was
+    reverted, overwritten, or left in place.
+  range: +24h
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - Details
+      - Image
+- question: Has this Internet Explorer autorun key been modified before on this host?
+  context: >-
+    These extensibility points normally change only when browser add-on software is installed or updated, so
+    a history with no prior writes makes this a first-time change and raises its weight. A history of periodic
+    writes to the same value points instead to a management process or a repeatedly installed add-on. Compare
+    the historical Details values to see whether the same component was registered before or whether this
+    registration is new to the host.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - Details
+      - Image
+- question: Was this same autorun key modified on other hosts in the environment?
+  context: >-
+    The same registration across many hosts suggests a broad software deployment or a group policy push; the
+    same registration confined to one host suggests a targeted persistence write. Compare the Details values
+    across hosts to see whether they all register the same component and whether the writing process is
+    consistent, which separates a managed rollout from repeated hands-on use of the same technique across the
+    environment.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+      - Details
+- question: What other registry modifications were made on this host in the same window?
+  context: >-
+    An actor who registers one persistence component often makes other configuration changes in the same
+    session - additional autostart keys such as Run or RunOnce entries, other browser or shell extension
+    registrations, or security-policy edits. Clustering the registry writes on this host in a short window
+    around the alert reveals the full scope of changes and which process made them. The triggering key appears
+    in the results; the signal is what else was modified and by which process, including any adjacent Run-key
+    persistence written alongside the browser extension.
+  range: +/-30m
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - User
+- question: What other process activity occurred on this host around the time of the alert?
+  context: >-
+    Autorun registration rarely happens in isolation. Aggregating process activity in a tight window around
+    the alert surfaces what led up to the registration and what ran immediately after it. Novel parent-child
+    pairs stand out at low counts against high-count routine telemetry, which is what points to the tool that
+    staged the registration and any follow-on execution such as the component being loaded or a dropper
+    running.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host - reconnaissance, execution of scripting tools, or defense tampering -
+    may reveal the stages that preceded this change and help reconstruct the timeline. Autostart persistence is
+    typically established after initial access and alongside other footholds, so prior alerts help place this
+    registration within a larger sequence rather than treating it as an isolated event.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Were other process-based persistence mechanisms installed on this host in the same window?
+  context: >-
+    Attackers rarely rely on a single persistence mechanism. After registering a browser autostart component,
+    they commonly install backup footholds using different techniques - scheduled tasks, services, registry Run
+    keys, BITS jobs, or WMI subscriptions created by schtasks.exe, sc.exe, reg.exe, bitsadmin.exe, or wmic.exe
+    near the registration. Multiple persistence installations in the same timeframe indicate intentional
+    stacking rather than a routine software install.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- question: Were files dropped to Startup or scheduled-task locations on this host in the same window?
+  context: >-
+    File-based persistence bypasses command-line detection entirely - dropping an executable or script into a
+    Startup folder or a path referenced by a registry Run key achieves persistence without invoking schtasks,
+    sc, or reg. File writes to these locations near the browser-extension registration indicate the same actor
+    established a parallel persistence mechanism on disk alongside the autorun key.
+    Run-key persistence itself is a registry write, not a file drop, so it does not appear in file telemetry; this query covers Startup folders and scheduled-task definition files, and Run-key writes surface in registry questions instead.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist_paths:
+        TargetFilename|contains:
+          - '\Start Menu\Programs\Startup\'
+          - '\Windows\System32\Tasks\'
+          - '\Windows\Tasks\'
+      condition: selection and selection_persist_paths
+    fields:
+      - TargetFilename
+      - Image
+- question: Does the user or an administrator recall installing or configuring this browser add-on?
+  context: >-
+    Registration of a browser helper object, toolbar, or explorer bar has a plausible legitimate cause -
+    installing or updating add-on software - so direct confirmation from the account owner is a fast way to
+    resolve the alert. If a user or administrator installed the add-on or ran a tool that configured it, that
+    closes the alert; if no one recalls the action, the account may be compromised or the change was made by
+    automated tooling, and the investigation should continue into the writing process and any dropped or loaded
+    component.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Was there a change ticket, software deployment, or documented approval for this registration?
+  context: >-
+    Many organizations require a change record for software installs and configuration changes, and browser
+    add-ons are frequently deployed through managed packaging. A corresponding ticket or deployment record
+    suggests authorized activity; its absence when policy requires one suggests the registration was made
+    outside sanctioned channels. This check can quickly close a false positive from a managed install or
+    escalate a write that no process accounts for.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine

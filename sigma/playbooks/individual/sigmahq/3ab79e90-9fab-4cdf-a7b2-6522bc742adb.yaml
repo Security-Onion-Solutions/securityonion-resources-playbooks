@@ -1,0 +1,353 @@
+name: HackTool - RemoteKrbRelay SMB Relay Secrets Dump Module Indicators
+id: 8bac575b-07fd-408f-875c-fb589a8bc6b5
+description: |
+  Detects creation of the files sam.tmp, sec.tmp, or sys.tmp in C:\Windows\Temp — the SAM, SECURITY, and SYSTEM
+  registry hive dumps written by the secrets-dump module of the RemoteKrbRelay SMB relay tool. Producing these
+  hives on a host means the local account password hashes and LSA secrets (including cached domain credentials and
+  service-account passwords) have been captured, typically after an authentication-coercion and SMB-relay chain.
+  This is a high-confidence credential-theft indicator; the investigation confirms the artifacts, identifies the
+  relaying source and the process that wrote them, and scopes which credentials must now be treated as compromised.
+type: detection
+detection_id: 3ab79e90-9fab-4cdf-a7b2-6522bc742adb
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-03
+questions:
+- question: Was sam.tmp, sec.tmp, or sys.tmp created in C:\Windows\Temp, and which process wrote it?
+  context: >-
+    Confirm the alert by reviewing the exact file path and the responsible process. The rule fires on creation of
+    the SAM, SECURITY, or SYSTEM hive dumps in C:\Windows\Temp. The writing process is the anchor for the rest of
+    the investigation — a remote-registry or SMB service writing these files points to a relay-driven dump.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is any process on this host expected to export registry hives into C:\Windows\Temp?
+  context: >-
+    Backup, imaging, and certain migration tools occasionally export registry hives, but writing SAM, SECURITY, and
+    SYSTEM into C:\Windows\Temp under these specific names is not normal administration. Knowing whether any
+    sanctioned process or maintenance activity could explain it is the fastest way to separate a rare-but-benign
+    export from a credential dump.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Which registry hives were dumped, and what secrets do they expose?
+  context: >-
+    Confirm the files are raw registry hive exports and identify which ones landed. SAM yields every local account
+    password hash; SECURITY yields LSA secrets — cached domain credentials, service-account passwords, and machine
+    secrets; SYSTEM provides the boot key needed to decrypt them. Together they represent a full local-secrets
+    compromise for this host and any accounts whose secrets it stored. Retrieve the files from the endpoint for
+    confirmation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: Is this activity part of an authorized penetration test or red-team engagement?
+  context: >-
+    Offensive-security teams use relay and secrets-dump tooling during authorized assessments. Before deeper
+    analysis, check whether a pentest or red-team exercise is active on this host or segment with matching timing.
+    An authorized engagement resolves the alert; its absence on a high-confidence credential-dump indicator makes
+    this an active incident.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What process wrote the hive dumps, and what is its parent chain?
+  context: >-
+    A relay-driven dump typically writes through a remote-registry or SMB service running as SYSTEM rather than an
+    interactive process. Tracing the writing process and what spawned it distinguishes a locally launched tool from
+    a remotely driven service — and a service parent with no local operator is the signature of an SMB relay
+    reaching in over the network.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - Image
+      - CommandLine
+- question: What inbound SMB connections reached this host around the dump, and from what source address?
+  context: >-
+    A relayed secrets dump is driven over SMB from the relaying host. An inbound connection on port 445 near the
+    time the hives were written identifies the source that authenticated to this host — the pivot point of the
+    relay. Compare that address against known admin systems; an unexpected source is the origin of the attack. If
+    the alert came from network-level telemetry with no process fields, this connection record is the primary lead.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationPort: 445
+      condition: selection
+    fields:
+      - SourceIp
+      - DestinationPort
+- question: Are the hive dumps still on disk, or were they read, moved, or deleted after creation?
+  context: >-
+    The dumps' post-creation lifecycle drives urgency. Files still present can be retrieved to confirm scope; files
+    read or copied shortly after creation indicate the secrets were exfiltrated; deletion right after creation is
+    the tool's cleanup signature and shifts focus to recovering what was taken. This correlates file activity by
+    the writing process and its children.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What other files did the responsible process write or delete around the alert?
+  context: >-
+    A secrets-dump run often stages more than the three hives — additional loot, tool binaries, or output files. The
+    breadth, paths, and extensions of the writing process's other file activity enumerate the full set of artifacts
+    produced and reveal whether the operation extended beyond the hive export.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What else has been written to C:\Windows\Temp recently, and by which processes?
+  context: >-
+    C:\Windows\Temp is a common staging location for dumped credentials and tooling. Other recent arrivals there —
+    especially from the same process or other unfamiliar writers — reveal whether this host is under active use as a
+    loot-staging point and enumerate additional artifacts that belong to the same activity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains: '\Windows\Temp\'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: What other files did the responsible process create on the host?
+  context: >-
+    Even after the original process exits, the files it created map the scope of the operation. Beyond the three
+    hive dumps, the writing process may have produced logs, additional exports, or staged binaries that confirm the
+    tooling used and reveal what else to collect for the investigation.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Did lateral-movement or credential-use tooling run from this host after the dump?
+  context: >-
+    Captured hashes and secrets are used quickly. Execution of remote-execution or credential-replay tools from
+    this host in the hours after the dump indicates the stolen credentials are already being used to move onward,
+    which widens the incident scope and changes the containment priority.
+  range: +4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_lateral:
+        Image|endswith:
+          - '\psexec.exe'
+          - '\psexec64.exe'
+          - '\wmic.exe'
+          - '\smbexec.py'
+          - '\reg.exe'
+          - '\mstsc.exe'
+          - '\ssh.exe'
+      condition: selection and selection_lateral
+    fields:
+      - Image
+      - CommandLine
+- question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Alerts rarely occur in isolation. Examining activity around the dump reveals what led to it — an
+    authentication-coercion attempt, a relay setup, or a service starting — and what followed. Novel parent-child
+    process pairs at low counts are what to scan for against the routine host baseline.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    A relayed secrets dump is the payoff of an earlier chain — authentication coercion, NTLM relay setup, or remote
+    service manipulation. Earlier detections on this host may reveal how the relay reached it and reconstruct the
+    coercion-to-dump timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- always_include: true
+  question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: >-
+    The query mirrors the rule's selection scoped to this user — the user's 90-day history of producing these hive
+    dumps, aggregated by host. Because these artifacts have no legitimate routine use, any prior history is itself
+    worth examining; a first-ever occurrence under this account confirms the anomaly.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        TargetFilename|endswith:
+        - :\windows\temp\sam.tmp
+        - :\windows\temp\sec.tmp
+        - :\windows\temp\sys.tmp
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: Has the alerting program historically driven this pattern on this host or across the environment, or is it new?
+  context: >-
+    When the dump is written under a service principal such as SYSTEM, user identity does not attribute the
+    behavior; the meaningful pivot is the launch mechanism. The query mirrors the rule's selection scoped to the
+    alerting program, giving its 90-day history of producing these hives. A service that has never done this
+    before, now writing credential dumps, is the deviation that confirms the relay.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        TargetFilename|endswith:
+        - :\windows\temp\sam.tmp
+        - :\windows\temp\sec.tmp
+        - :\windows\temp\sys.tmp
+      _pb_scope:
+        Image|endswith|expand: '%Image%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Which credentials must be treated as compromised and rotated after this dump?
+  context: >-
+    Scope the exposure so remediation is complete. The SAM hive exposes every local account on this host — including
+    the local administrator, whose reused password enables lateral movement; the SECURITY hive exposes LSA secrets,
+    cached domain logons for users who signed in here, service-account passwords, and the machine account. Every one
+    of these should be rotated. Use organizational records of who logs into and what services run on this host to
+    build the reset list.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine

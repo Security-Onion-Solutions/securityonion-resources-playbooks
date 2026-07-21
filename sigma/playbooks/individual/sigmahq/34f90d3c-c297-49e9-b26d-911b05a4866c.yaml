@@ -1,0 +1,468 @@
+name: Powershell Keylogging
+id: 97f4fb4f-dfad-4aa3-83bb-57794d2866be
+description: |
+  Fires when PowerShell script-block content (EID 4104) contains EITHER the Get-Keystrokes function name OR
+  both of the user32.dll API resolutions that function performs — "Get-ProcAddress user32.dll GetAsyncKeyState"
+  together with "Get-ProcAddress user32.dll GetForegroundWindow". Get-Keystrokes is a PowerSploit keylogging
+  function (T1056.001) that resolves keyboard-polling APIs through reflection, captures each typed key with the
+  foreground window title so credentials can be attributed to the application, and appends them to a CSV log
+  file, defaulting to key.log under the user's Temp directory. Legitimate occurrences are largely limited to
+  authorized security testing or the rare accessibility or monitoring tool. The investigation should read the
+  complete script to recover the log path and capture duration, identify the PowerShell process hosting the
+  capture and what launched it, locate the keystroke log file, and establish which accounts typed credentials
+  on the host while capture was possible. Script-block capture is policy-gated per host — default installs log
+  only content matching Microsoft's suspicious-strings checks — so absence of surrounding 4104 evidence is not
+  absence of activity.
+type: detection
+detection_id: 34f90d3c-c297-49e9-b26d-911b05a4866c
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-17
+questions:
+- question: Does the script block contain the Get-Keystrokes function or both user32.dll keystroke-API resolutions?
+  context: >-
+    Confirm the alert is a true positive by reading the complete script. The rule fires when the block contains
+    EITHER the string "Get-Keystrokes" OR both "Get-ProcAddress user32.dll GetAsyncKeyState" and "Get-ProcAddress
+    user32.dll GetForegroundWindow" together. Note which branch matched — the function-name branch keys on the
+    PowerSploit name, which a renamed copy would evade, while the API-resolution branch keys on what the code
+    actually does, so an API-branch match on a script that is not named Get-Keystrokes suggests a modified or
+    rebranded variant. Long scripts are split across multiple 4104 events, so this retrieves every chunk of the
+    alerting block and the match is judged on the whole script, not the alerting fragment.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - ScriptBlockText
+- question: Is this user and host expected to run keystroke-capture or input-monitoring PowerShell?
+  context: >-
+    Keystroke capture has a very short list of legitimate explanations — an authorized penetration test or red-team
+    exercise, or sanctioned monitoring software, none of which typically arrive as a PowerSploit function in a
+    script block. The query shows the alerting block's host, user, and on-disk script path (blank for interactive
+    or in-memory execution). A SYSTEM user usually means deployment or management tooling ran the script; judge
+    that against the host's role and whether any assessment activity is scheduled for it.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - host.name
+      - user.name
+      - Path
+- question: What does the full script do, and what log path and capture duration were configured?
+  context: >-
+    Script-block content is logged after decoding, so any -EncodedCommand wrapper is already unwrapped; only
+    string-level obfuscation inside the script (concatenation, format operators, backticks) still needs manual
+    work. Read the complete reassembled script for the capture parameters — -LogPath (the keystroke file,
+    defaulting to key.log in the user's Temp directory), -Timeout (capture duration in minutes; indefinite when
+    absent), and -PassThru — and for the reflection mechanics the rule keys on: Get-ProcAddress resolving
+    user32.dll functions, dynamic delegate assembly (DefineDynamicAssembly), and loading System.Windows.Forms.
+    Also note any surrounding logic that downloads the function, schedules it, or forwards the log, since
+    Get-Keystrokes itself only writes locally.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - powershell.sequence
+      - powershell.total
+      - ScriptBlockText
+- question: Does the keylogger script exist on disk, and what created it?
+  context: >-
+    When the script block ran from a file, its path is recorded on the 4104 event. A script in a user-writable or
+    staging location (Temp, AppData, ProgramData, Downloads) implies a delivery step that wrote it — find the
+    file-creation event to identify the process and account that staged it. Interactive or in-memory execution
+    logs no path at all, which for a keylogging function is itself notable: PowerSploit modules are routinely
+    delivered as download cradles precisely to avoid touching disk, so a missing path points at the in-memory
+    delivery angle rather than closing the file question.
+  range: +/-24h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - EventType
+      - TargetFilename
+      - Image
+      - User
+- question: Which PowerShell host process ran this script, and what launched it?
+  context: >-
+    Script-block events carry no process identity, so this pivots by host and user over the preceding day to list
+    PowerShell host launches with their parents and command lines. A keylogger needs a long-lived process to keep
+    polling, so look for a launch that plausibly hosts a background job or runspace near the alert time. The
+    parent is the delivery vector: explorer.exe or a terminal points to an interactive session, an Office
+    application or browser points to a phishing chain, and a service or scheduled-task parent points to
+    established automation — or persistence.
+  range: -24h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        User|expand: '%User%'
+        Image|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+          - '\powershell_ise.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: Did any process install a keyboard hook via SetWindowsHookEx on this host around the alert?
+  context: >-
+    Behavioral API telemetry records hook installation (SetWindowsHookEx) and injection-style calls
+    (WriteProcessMemory, QueueUserAPC), the mechanism hook-based keyloggers and detection strategies that scope
+    to sensitive GUI processes such as winlogon.exe or osk.exe key on. Get-Keystrokes itself uses GetAsyncKeyState
+    polling, which places no hook and makes no cross-process write — polling-style capture produces no events on
+    this channel, so an empty result does not clear the host. A hit here instead reveals a second, hook-based
+    capture component or an injection step accompanying the script.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        event.dataset: endpoint.events.api
+        process.Ext.api.name:
+          - SetWindowsHookEx
+          - WriteProcessMemory
+          - QueueUserAPC
+      condition: selection
+    fields:
+      - Image
+      - process.Ext.api.name
+- question: What files did PowerShell hosts write on this host, and is a keystroke log among them?
+  context: >-
+    Get-Keystrokes appends captured keys to a CSV log — columns "TypedKey","WindowTitle","Time" — at the -LogPath
+    argument, defaulting to key.log in the user's Temp directory. The query lists files written by PowerShell
+    processes for this user around the alert; a growing log in Temp, AppData, or another staging directory is the
+    capture output and shows what data was collected. The 4104 event carries no process link, so this anchor is
+    the PowerShell host binary rather than the exact process — read the actual output path from the script
+    content if -LogPath was overridden.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        User|expand: '%User%'
+        Image|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+          - '\powershell_ise.exe'
+      condition: selection
+    fields:
+    - TargetFilename
+    - EventType
+- question: Were autorun registry values created or modified on this host around the alert?
+  context: >-
+    A keylogger only pays off if it keeps running, and capture that must survive logoff or reboot needs an
+    autostart — detection strategies for this technique pair the capture activity with registry changes for that
+    reason. Review Run and RunOnce value writes on this host around the alert for entries whose data references
+    powershell, a script path, or an encoded command. Value-deletion is not observable in this telemetry, so judge
+    cleanup by the value's modification history and whether its payload executed rather than by looking for a
+    removal event.
+  range: +/-24h
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains:
+          - '\Software\Microsoft\Windows\CurrentVersion\Run'
+          - '\Software\Microsoft\Windows\CurrentVersion\RunOnce'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- question: Were PowerShell security controls bypassed or weakened before this execution?
+  context: >-
+    Operators commonly weaken controls before importing offensive modules — AMSI tampering (AmsiUtils,
+    amsiInitFailed), execution-policy bypass flags, Defender preference changes, or a downgrade to PowerShell v2
+    to avoid script-block logging entirely. PowerSploit functions are widely fingerprinted, so a bypass in the
+    preceding hour is the expected companion to running one successfully and makes the routine-administration
+    explanation harder to sustain.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: Which accounts may have typed credentials on this host, and do any have elevated privileges?
+  context: >-
+    A keylogger exposes whatever was typed while it ran — application logins, web passwords, and anything entered
+    into an elevation prompt — and the window-title column attributes each capture to a program. The exposure set
+    is every account that typed a secret on this host during the capture window, not just the account that ran
+    the script: check interactive and remote sessions on the host for that period and cross-reference each
+    account's privileges in the directory. An administrator or service credential typed during capture changes
+    the response from a single-host cleanup to a credential-rotation exercise.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        User|expand: '%User%'
+        Image|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+          - '\powershell_ise.exe'
+      condition: selection
+    fields:
+    - CommandLine
+- question: Were outbound remote-access connections (RDP, SMB, WinRM, SSH) initiated from this host after this event?
+  context: >-
+    Captured credentials are typically replayed, and the first replay is often from the capture host itself. The
+    query returns outbound connections from this host to remote-access ports — 3389 (RDP), 445 (SMB/PsExec),
+    5985/5986 (WinRM), 22 (SSH) — in the hours after the event; the originating Image and User show what drove
+    each connection. Two limits to keep in mind: a keystroke log exfiltrated and replayed from another machine
+    will not appear here (check logons on suspected targets for accounts that typed on this host), and the query
+    depends on network-connection telemetry being collected from this host — where it is not, treat zero rows as
+    a visibility gap, not as evidence no movement occurred.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
+- question: What other PowerShell script activity occurred on this host around the alert?
+  context: >-
+    A keylogger rarely arrives alone — the download cradle that fetched it, reconnaissance commands, and
+    follow-on tooling produce a cluster of script blocks in a short window, and surrounding blocks from the same
+    session often contain the delivery and exfiltration logic the alerting fragment lacks. The log.level column
+    shows whether the host logs all blocks (verbose) or only automatically flagged content (warning) — on a
+    warning-only host this view is partial by design, and absence of surrounding blocks is not evidence nothing
+    else ran.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - user.name
+      - log.level
+      - Path
+      - ScriptBlockText
+- question: Is full script block logging enabled on this host, or is only suspicious-content logging active?
+  context: >-
+    PowerShell logs every script block at verbose level only when the Script Block Logging policy is enabled; by
+    default it logs only content matching Microsoft's built-in suspicious-strings checks, at warning level. This
+    alert fires on content those checks flag, so it appears either way — but on a warning-only host the
+    surrounding session activity is largely invisible, and an empty result on any script-channel question says
+    little. Use the level distribution here to calibrate how complete every other 4104-based result in this
+    investigation is.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - log.level
+- always_include: true
+  question: Has this user produced this keylogging pattern before, and does that history fit their role?
+  context: >-
+    The query mirrors the rule's own selection scoped to this user — a 90-day history of this specific
+    keystroke-capture pattern aggregated by host, not generic PowerShell use. A penetration tester or red-team
+    operator may have produced it before on assessment hosts; almost any other account producing it for the first
+    time has no routine explanation. History covers only hosts logging the PowerShell channel, so zero history is
+    weaker evidence on a default-logging fleet, though this rule's strings are within the auto-flagged subset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: ps_script
+      definition: 'Requirements: Script Block Logging must be enabled'
+    detection:
+      selection_basic:
+        ScriptBlockText|contains: Get-Keystrokes
+      selection_high:
+        ScriptBlockText|contains|all:
+        - Get-ProcAddress user32.dll GetAsyncKeyState
+        - Get-ProcAddress user32.dll GetForegroundWindow
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: Which hosts have produced this keylogging pattern in the last 90 days, and is the alerting host among them?
+  context: >-
+    When the alert fires under a service principal, user identity does not attribute the behavior, and
+    script-block events carry no process identity to pivot on — the pattern itself is the pivot. This mirrors the
+    rule's selection fleet-wide over 90 days, aggregated by host. Keystroke capture has no deployment-tooling
+    explanation, so any recurring appearance points at either an ongoing authorized-testing program or a
+    longer-running problem; a first-ever appearance on this host alone is the single-foothold case. Only hosts
+    shipping the PowerShell channel can appear, so absence elsewhere is weak evidence.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: ps_script
+      definition: 'Requirements: Script Block Logging must be enabled'
+    detection:
+      selection_basic:
+        ScriptBlockText|contains: Get-Keystrokes
+      selection_high:
+        ScriptBlockText|contains|all:
+        - Get-ProcAddress user32.dll GetAsyncKeyState
+        - Get-ProcAddress user32.dll GetForegroundWindow
+      condition: 1 of selection_*
+    fields:
+    - host.name
+- always_include: true
+  question: What else did this user do across the network around this time?
+  context: >-
+    Keylogging is a credential-harvesting step, and the same account active on several hosts in the alert window
+    is how use of a fresh foothold looks — hosts this account does not normally touch matter as much as the
+    commands run there. If the alert fired under SYSTEM or another service principal, this view degrades to
+    agent-telemetry noise; the fleet-wide pattern question is the meaningful substitute in that case.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- always_include: true
+  question: Did this same keylogging pattern fire on other hosts in the same window?
+  context: >-
+    The query mirrors the rule's selection fleet-wide in the alert window, aggregated by host — the
+    service-principal-safe version of the cross-network view, since these events carry no process identity to
+    pivot on. Several hosts producing keystroke-capture content in the same window points to a coordinated
+    deployment — an authorized assessment sweep or a scripted rollout of the capture tool across footholds; a
+    single host points to a host-local action. Coverage is policy-gated per host, so absence elsewhere remains
+    weak evidence.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: ps_script
+      definition: 'Requirements: Script Block Logging must be enabled'
+    detection:
+      selection_basic:
+        ScriptBlockText|contains: Get-Keystrokes
+      selection_high:
+        ScriptBlockText|contains|all:
+        - Get-ProcAddress user32.dll GetAsyncKeyState
+        - Get-ProcAddress user32.dll GetForegroundWindow
+      condition: 1 of selection_*
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    A keylogger is a mid-chain tool — something delivered it and something will collect its output. Earlier
+    detections on the same host in the preceding hours (initial-access activity, defense tampering, download
+    cradles, other offensive-module imports) reconstruct how the capture capability arrived and what stage the
+    activity had reached when this alert fired.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

@@ -1,0 +1,572 @@
+name: New Kernel Driver Via SC.EXE
+id: 5ea47637-0393-42c0-811b-f1cbb9bca319
+description: |
+  Detects sc.exe creating or reconfiguring a service whose type is "kernel" — a service control
+  entry that registers a .sys driver with the Windows kernel. The rule fires when sc.exe runs with
+  "create" or "config" and the command line carries all of "binPath", "type", and "kernel", with a
+  narrow filter for two known antivirus driver installations. Driver installation via sc.exe is also
+  how endpoint agents, hypervisors, storage and printer software, and IT deployment tooling register
+  their kernel components, so the investigation turns on whether the driver, its binary path, the
+  launching parent, and the account behind it belong to a known software installation. Loading a
+  signed but vulnerable third-party driver is the standard route to kernel-mode code execution and
+  to disabling endpoint protection from below user mode; establish what the .sys file is, where it
+  came from, whether it loaded, and whether the installation was expected on this host.
+type: detection
+detection_id: 431a1fdb-4799-4f3b-91c3-a683b003fc49
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-16
+questions:
+- question: Does the sc.exe command line create or configure a service with a kernel type and a binPath pointing at a driver?
+  context: >-
+    The rule requires sc.exe with either "create" or "config", plus "binPath", "type", and "kernel"
+    all present in the same command line. Read the full command line and pull out the service name,
+    the binPath value, the start type, and the display name. A binPath under System32\drivers with a
+    vendor-consistent service name is the routine installation pattern; a binPath in a user-writable
+    directory, a temp folder, or a share is the pattern worth carrying forward.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - alert
+  - process_creation
+- question: Is this user and host expected to install kernel drivers?
+  context: >-
+    Kernel driver registration is normally performed by software installers, agent deployment
+    tooling, or a technician during a documented build or update. A workstation user account, a
+    service account with no software-deployment role, or a host with no pending installation is out
+    of pattern for this operation and is the fastest way to separate routine installation from
+    operator activity.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: Was this driver installation covered by a change ticket, maintenance window, or software deployment?
+  context: >-
+    Most kernel drivers arrive with a product installation or an agent rollout, both of which
+    usually leave a record — a change request, a package push, an imaging run. A matching record
+    that names the same service and binary path closes the alert quickly. No record, on a host where
+    policy expects one, moves the driver itself to the front of the investigation.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - organizational_knowledge
+  - manual_review
+- question: What service was registered, and what driver binary and start type does the service install record show?
+  context: >-
+    The service installation record carries the same configuration sc.exe requested, in structured
+    form rather than parsed from a command line. ImagePath is the driver payload — a path under
+    System32\drivers matching a known product is routine, while a path under a user profile, temp,
+    ProgramData, or a share is not. StartType of boot or system means the driver loads before most
+    user-mode protection, and AccountName shows the privilege the entry runs with.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: system
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 7045
+      condition: selection
+    fields:
+      - ServiceName
+      - ImagePath
+      - StartType
+      - AccountName
+  answer_sources:
+  - process_creation
+- question: Does the Security channel show a matching service installation, and which account requested it?
+  context: >-
+    Event 4697 records service installation with the requesting subject attached, which attributes
+    the driver registration to an account even when the process telemetry is incomplete. Compare
+    ServiceFileName against the binPath seen on the command line, and check ServiceStartType — boot
+    and system start place the driver ahead of user-mode defenses. An installation with no matching
+    4697 on a host that otherwise logs them means either the audit policy excludes it or the
+    registration took a path other than the service control manager.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4697
+      condition: selection
+    fields:
+      - SubjectUserName
+      - ServiceName
+      - ServiceFileName
+      - ServiceType
+      - ServiceStartType
+      - ServiceAccount
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: What was written under the Services registry key for this driver, and what values were set?
+  context: >-
+    Service creation lands as registry writes under HKLM\System\CurrentControlSet\Services\<name>,
+    where ImagePath holds the driver path, Type distinguishes a kernel driver from a user-mode
+    service, Start encodes boot/system/auto/demand, and Group controls load order. These values are
+    the durable persistence record and survive the process that wrote them. Writes to this key from
+    a process other than the alerting sc.exe — or edits made after the service was created — point
+    to configuration being tuned outside the installer.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_key:
+        TargetObject|contains: '\CurrentControlSet\Services\'
+      selection_value:
+        TargetObject|endswith:
+          - '\ImagePath'
+          - '\Start'
+          - '\Type'
+          - '\Group'
+      condition: selection and selection_key and selection_value
+    fields:
+      - TargetObject
+      - Details
+      - Image
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: Did a driver actually load into the kernel on this host after the service was registered, and is it signed?
+  context: >-
+    Registering the service is only the setup step — the payload matters once the driver image is
+    loaded. Compare the loaded driver path against the binPath from the command line. Signature
+    subject identifies the vendor, and a signed driver is not by itself reassuring here — the
+    established route to kernel code execution is installing a legitimately signed third-party
+    driver that contains an exploitable primitive. Take the hash of any driver that does not match
+    an installed product and check it against known-vulnerable driver lists.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: driver_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signature
+      - Signed
+      - SignatureStatus
+      - Hashes
+  answer_sources:
+  - process_creation
+  - external_threat_intel
+  - manual_review
+- question: Is the service currently running, and what account is it using?
+  context: >-
+    A kernel service created with a demand start does not load until something starts it, and one
+    created with boot or system start loads on the next restart. Read the service name and start
+    type out of the command line, then query the current state on the host with sc query and sc qc.
+    A driver service that is already running means the kernel component is resident now; one that is
+    configured but not started means the load is still pending.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - manual_review
+  - edr_console
+- question: What process spawned sc.exe, and is that parent chain expected for a driver installation?
+  context: >-
+    The parent is the strongest discriminator for this rule. Installers and deployment agents drive
+    sc.exe from msiexec.exe, a vendor setup executable, a management agent, or services.exe, and
+    those parents come with their own install context. An interactive cmd.exe or powershell.exe, a
+    script host, or a parent chain rooted in a remote-execution service points at an operator rather
+    than a package. Walk up from the parent to see what launched it and what else it started.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: When this host has previously fired the rule's pattern, what parents and users normally drive kernel driver installation, and does the current alert fit that pattern?
+  context: >-
+    The query mirrors the rule's selection structure scoped to this host, so the parent and user
+    distribution reflects how kernel driver installation has actually run here rather than generic
+    sc.exe usage. A host that installs drivers regularly under an installer parent and a deployment
+    account has a stable profile; the same host suddenly doing it under a different parent or a
+    different account is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \sc.exe
+        CommandLine|contains:
+        - create
+        - config
+        CommandLine|contains|all:
+        - binPath
+        - type
+        - kernel
+      filter_optional_avira_driver:
+      - CommandLine|contains|all:
+        - create netprotection_network_filter
+        - 'type= kernel start= '
+        - binPath= System32\drivers\netprotection_network_filter
+        - DisplayName= netprotection_network_filter
+        - group= PNP_TDI tag= yes
+      - CommandLine|contains|all:
+        - create avelam binpath=C:\Windows\system32\drivers\avelam.sys
+        - type=kernel start=boot error=critical group=Early-Launch
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+  answer_sources:
+  - process_creation
+- question: Has this user previously installed kernel drivers, and does that history fit their role?
+  context: >-
+    The query mirrors the rule's selection structure scoped to this user, so the result is the
+    user's 90-day history of kernel driver installation aggregated by host rather than generic
+    sc.exe use. A deployment or engineering account with a steady history across many hosts reads as
+    routine tooling; a first occurrence for an account whose role does not include installing
+    software or agents is the one to pursue.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \sc.exe
+        CommandLine|contains:
+        - create
+        - config
+        CommandLine|contains|all:
+        - binPath
+        - type
+        - kernel
+      filter_optional_avira_driver:
+      - CommandLine|contains|all:
+        - create netprotection_network_filter
+        - 'type= kernel start= '
+        - binPath= System32\drivers\netprotection_network_filter
+        - DisplayName= netprotection_network_filter
+        - group= PNP_TDI tag= yes
+      - CommandLine|contains|all:
+        - create avelam binpath=C:\Windows\system32\drivers\avelam.sys
+        - type=kernel start=boot error=critical group=Early-Launch
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+  always_include: true
+- question: Has this parent process historically driven kernel driver installation on this host or across the environment, or is the parent new for this activity?
+  context: >-
+    Driver installation often runs as SYSTEM or under a machine account, and when it does the user
+    field attributes nothing. The launch mechanism is the meaningful pivot instead. The query
+    mirrors the rule's selection structure scoped to the alerting parent, so the result is the
+    90-day history of this parent driving kernel driver installation. A parent that already accounts
+    for the same activity across many hosts is deployment automation; a parent new to this pattern
+    is the deviation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \sc.exe
+        CommandLine|contains:
+        - create
+        - config
+        CommandLine|contains|all:
+        - binPath
+        - type
+        - kernel
+      filter_optional_avira_driver:
+      - CommandLine|contains|all:
+        - create netprotection_network_filter
+        - 'type= kernel start= '
+        - binPath= System32\drivers\netprotection_network_filter
+        - DisplayName= netprotection_network_filter
+        - group= PNP_TDI tag= yes
+      - CommandLine|contains|all:
+        - create avelam binpath=C:\Windows\system32\drivers\avelam.sys
+        - type=kernel start=boot error=critical group=Early-Launch
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  always_include: true
+- question: What else did this user do across the environment around this time?
+  context: >-
+    Tracking the account's activity across all hosts shows whether the driver installation sits
+    inside a wider session — remote execution, defense tampering, credential access — or stands
+    alone. The same account registering drivers on several hosts in a short window is either a
+    deployment sweep or a rollout of kernel-level tooling by an operator; the surrounding binaries
+    usually tell which.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+  always_include: true
+- question: Did this same parent-driven kernel driver installation fire on other hosts in the same window, or is the activity isolated to this host?
+  context: >-
+    Under a service principal the user pivot returns agent telemetry from every host and answers
+    nothing. Whether the same launch mechanism fired elsewhere does answer it. The query mirrors the
+    rule's selection structure scoped to the alerting parent, fleet-wide, in the alert window.
+    Several hosts in the same window points at pushed or scheduled software deployment; a single
+    host points at a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \sc.exe
+        CommandLine|contains:
+        - create
+        - config
+        CommandLine|contains|all:
+        - binPath
+        - type
+        - kernel
+      filter_optional_avira_driver:
+      - CommandLine|contains|all:
+        - create netprotection_network_filter
+        - 'type= kernel start= '
+        - binPath= System32\drivers\netprotection_network_filter
+        - DisplayName= netprotection_network_filter
+        - group= PNP_TDI tag= yes
+      - CommandLine|contains|all:
+        - create avelam binpath=C:\Windows\system32\drivers\avelam.sys
+        - type=kernel start=boot error=critical group=Early-Launch
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  always_include: true
+- question: Was sc.exe executed from its expected path?
+  context: >-
+    sc.exe normally runs from System32 or SysWOW64. A copy running from a temp directory, a user
+    profile, or a staging folder suggests the binary was relocated or renamed to sidestep path-based
+    allowlisting, and OriginalFileName still reports sc.exe even when the file has been renamed.
+    Compare Image against OriginalFileName to spot the mismatch.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+  answer_sources:
+  - process_creation
+- question: How often has this host fired the rule's kernel driver pattern over the past 90 days, and what command-line structures are typical?
+  context: >-
+    The query mirrors the rule's selection structure scoped to this host, so the count reflects
+    kernel driver installation specifically rather than all sc.exe use. A host that installs drivers
+    on a predictable cadence with recurring service names and System32\drivers paths has an
+    established profile; no prior history at all makes the alerting invocation the first of its
+    kind. Compare the historical command lines against the alerting one — the service name, binPath,
+    and start type are what differ.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \sc.exe
+        CommandLine|contains:
+        - create
+        - config
+        CommandLine|contains|all:
+        - binPath
+        - type
+        - kernel
+      filter_optional_avira_driver:
+      - CommandLine|contains|all:
+        - create netprotection_network_filter
+        - 'type= kernel start= '
+        - binPath= System32\drivers\netprotection_network_filter
+        - DisplayName= netprotection_network_filter
+        - group= PNP_TDI tag= yes
+      - CommandLine|contains|all:
+        - create avelam binpath=C:\Windows\system32\drivers\avelam.sys
+        - type=kernel start=boot error=critical group=Early-Launch
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - CommandLine
+  answer_sources:
+  - process_creation
+- question: Were other persistence or defense-tampering LOLBins used on this host in the past day?
+  context: >-
+    Kernel driver installation is rarely the only step. The same session commonly registers a
+    scheduled task, writes autorun registry values, adjusts boot configuration, disables recovery
+    options, or reconfigures the firewall. Finding several of these tools running under the same
+    parent or account in the same window separates a stacked operation from a single installer
+    action. sc.exe is excluded from the list because the alert already covers it.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\reg.exe'
+          - '\netsh.exe'
+          - '\wevtutil.exe'
+          - '\bcdedit.exe'
+          - '\vssadmin.exe'
+          - '\diskshadow.exe'
+          - '\dnscmd.exe'
+          - '\wmic.exe'
+          - '\bitsadmin.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Have other hosts fired the rule's kernel driver pattern in the past week, and does the cross-host distribution look like consistent automation or one-off activity?
+  context: >-
+    The query mirrors the rule's selection structure with no host scope, so the result is a
+    fleet-wide count of kernel driver installation rather than generic sc.exe usage. Many hosts
+    firing the same pattern in a short span is the signature of a software or agent rollout and is
+    usually confirmable against the deployment record. One host, or a small set with nothing in
+    common, points to activity driven at the host rather than pushed to it.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \sc.exe
+        CommandLine|contains:
+        - create
+        - config
+        CommandLine|contains|all:
+        - binPath
+        - type
+        - kernel
+      filter_optional_avira_driver:
+      - CommandLine|contains|all:
+        - create netprotection_network_filter
+        - 'type= kernel start= '
+        - binPath= System32\drivers\netprotection_network_filter
+        - DisplayName= netprotection_network_filter
+        - group= PNP_TDI tag= yes
+      - CommandLine|contains|all:
+        - create avelam binpath=C:\Windows\system32\drivers\avelam.sys
+        - type=kernel start=boot error=critical group=Early-Launch
+      condition: selection and not 1 of filter_optional_*
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation

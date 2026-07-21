@@ -1,0 +1,428 @@
+name: Forest Blizzard APT - Custom Protocol Handler Creation
+id: 27b15bd2-d81d-499c-a2b8-cb25878baeb6
+description: |
+  Detects the creation of a custom URL protocol handler named "rogue" in the registry — a
+  write whose key path contains \PROTOCOLS\Handler\rogue\CLSID and whose value data is the
+  fixed class identifier {026CC6D7-34B2-33D5-B551-CA31EB6CE345}. Registering a scheme under
+  Software\Classes\PROTOCOLS\Handler binds it to a COM class, so any process that resolves a
+  URL using the scheme loads that class's server DLL; the post-compromise tooling associated
+  with this handler pairs the registration with exploitation of CVE-2022-38028 in the Print
+  Spooler to load a payload DLL inside spoolsv.exe and launch processes at SYSTEM. No
+  legitimate software registers this handler name or class identifier, so the investigation
+  should confirm the write, attribute the writing process and its parent chain, locate the
+  companion CLSID registration and any dropped payload files, and determine whether the
+  handler was invoked and a companion scheduled task was installed.
+type: detection
+detection_id: 5cdeb555-65de-4767-99fe-e26807465148
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-09
+questions:
+- question: Do the registry key path and value data match the rogue protocol handler registration this rule detects?
+  context: The rule fires when both criteria hold — the key path (TargetObject) contains
+    \PROTOCOLS\Handler\rogue\CLSID and the value data (Details) is exactly
+    {026CC6D7-34B2-33D5-B551-CA31EB6CE345}. Review the returned event against both criteria.
+    The scheme name and hard-coded class identifier have no legitimate software association,
+    so a confirmed match is very unlikely to be a false positive.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this user or host expected to register custom URL protocol handlers?
+  context: Protocol handlers under a user hive are normally created by software installers
+    for known schemes such as mailto or a collaboration app's link handler. A scheme named
+    rogue tied to a fixed class identifier has no product association, so the value of this
+    check is identifying whose session performed the write, whether that account holds admin
+    rights, and what it was doing at the time. User attribution is present on most endpoint
+    registry events; when User is a machine account or missing, pivot on the writing process
+    shown in Image.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Does the owner of the affected user profile recall installing software or running anything unusual around this time?
+  context: The handler was written under a user-context hive, so the account's owner may have
+    direct knowledge. If they recall nothing that could have installed a handler — no software
+    installs, no elevation prompts, no administrative activity — treat the session as likely
+    compromised and focus on how the writing process arrived. If they do recall something,
+    capture exactly what was run and where it came from.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What process wrote the handler key, and what parent chain launched that process?
+  context: Registration of this handler has been observed from a dedicated executable launched
+    by a batch script, not from any installer framework. The writing process's own creation
+    event carries its parent lineage — an interactive shell, a script interpreter, or a
+    remote-execution service parent tells you how the tooling arrived. If the immediate parent
+    is itself a shell or script host, trace the grandparent as well.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What other processes did the responsible process spawn?
+  context: A process that performs this action rarely stops there. Listing the children it launched shows
+    whether the activity was an isolated change or one step in a longer chain - payload execution,
+    additional persistence, or follow-on tooling. Note this shows what the acting process started,
+    not what started alongside it. Sibling processes cannot be identified from this telemetry,
+    because this event type does not record the acting process's parent.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: What was written under the PROTOCOLS\Handler key, and what does a handler registration in this location achieve?
+  context: Keys under Software\Classes\PROTOCOLS\Handler map a URL scheme to a pluggable
+    protocol implementation. The CLSID value binds the scheme to a COM class, and the DLL
+    registered for that class loads into whatever process resolves a URL using the scheme —
+    an execution and persistence primitive that needs no Run key or service entry. Here the
+    scheme name is rogue and the class identifier is fixed; a crafted URL (observed as
+    rogue9471://go) resolves the scheme and loads the registered payload DLL inside a
+    privileged process.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: What COM registration exists for the CLSID the handler points to, and what server DLL does it name?
+  context: The handler write is only half of the mechanism. A companion write under
+    Software\Classes\CLSID\{026CC6D7-34B2-33D5-B551-CA31EB6CE345} — typically its Server
+    value — names the DLL that loads when the scheme is resolved; observed payloads are DLLs
+    with a wayzgoose name stem staged under actor-created directories. The path in Details is
+    the artifact to verify on disk and, once it executes or loads, to hash for a reputation
+    check.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains: '{026CC6D7-34B2-33D5-B551-CA31EB6CE345}'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- question: What other registry modifications landed on this host in the same session?
+  context: The tooling that registers this handler writes several keys in one pass — the
+    PROTOCOLS\Handler entry and the CLSID class registration at minimum — and hands-on
+    operators often add persistence or configuration changes in the same window. Group the
+    host's registry writes by key path and writing process; the alerting key will appear in
+    the results, and the signal is what else was written by the same Image or in the same
+    minutes. If the host is registry-noisy, narrow to the writing process's executable name
+    or to security-relevant hive paths such as Run, Services, Policies, and Winlogon.
+  range: +/-30m
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - User
+- question: Did the writing process or its children drop files to disk, and is the referenced payload DLL present?
+  context: A protocol handler only executes something if the DLL its class registration points
+    to exists on disk. The registering process and its children have been observed writing
+    batch files to C:\ProgramData, payload DLLs, and a JavaScript constraints file under the
+    driver store that triggers the scheme. File-write events carry no hash — if a payload is
+    present, hash it from a later execution or module load, or retrieve it for a reputation
+    lookup.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Was the handler invoked — did the Print Spooler spawn child processes after the registration?
+  context: In observed use, a patched print-path JavaScript constraints file resolves the
+    rogue scheme, which loads the registered DLL inside spoolsv.exe; the DLL then acts as a
+    launcher, spawning processes at SYSTEM. spoolsv.exe rarely spawns children in normal
+    operation, so any child in the hours after the write — especially one running from
+    ProgramData or a user-writable path — indicates the mechanism went live. Execution
+    typically follows registration within minutes; the wider window catches delayed
+    invocation.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: '\spoolsv.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - User
+- question: Was a scheduled task created or deleted alongside the handler registration?
+  context: Deployments of this tooling register a minute-interval scheduled task (observed
+    under the name \Microsoft\Windows\WinSrv) that runs a batch file such as servtask.bat
+    from C:\ProgramData, and delete the same task during cleanup. Both the create and delete
+    invocations matter — a delete without a matching create in the window suggests cleanup of
+    an older foothold on this host.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: '\schtasks.exe'
+      selection_markers:
+        CommandLine|contains:
+          - '\Microsoft\Windows\WinSrv'
+          - 'servtask.bat'
+          - 'execute.bat'
+          - 'doit.bat'
+      condition: selection and selection_markers
+    fields:
+      - Image
+      - CommandLine
+      - User
+- question: Were the companion files associated with this tooling written on this host?
+  context: The chain around this handler drops recognizable artifacts — batch files named
+    execute.bat, doit.bat, and servtask.bat in C:\ProgramData; auxiliary DLLs with a
+    wayzgoose name stem; and a modified MPDW-constraints.js under the DriverStore
+    FileRepository path that triggers the scheme. A hit on any of these names corroborates
+    the full chain; their absence does not clear the host, since file names are trivially
+    changed.
+  range: +/-24h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_names:
+        TargetFilename|contains:
+          - '\servtask.bat'
+          - '\execute.bat'
+          - '\doit.bat'
+          - 'wayzgoose'
+          - 'MPDW-constraints.js'
+      condition: selection and selection_names
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Has the process that wrote this key ever run on this host before?
+  context: The registering executable has been observed under arbitrary, benign-sounding
+    names, so its history matters more than its name. Zero or near-zero prior executions of
+    this binary on the host over the lookback indicates a first-seen tool that arrived as
+    part of this activity; any history that does exist dates when it first appeared and under
+    which accounts it ran.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: Has this handler key been modified before on this host?
+  context: A PROTOCOLS\Handler subkey for a scheme named rogue should have no modification
+    history at all. Any earlier writes date when the handler first appeared — useful for
+    scoping how long the foothold has existed — and repeated re-writes of the same value can
+    indicate a persistence mechanism refreshing itself. Endpoint telemetry records no
+    registry deletions, so judge cleanup from this re-modification history rather than
+    expecting a removal event.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - Details
+      - Image
+- question: What other process activity occurred on this host around the registry write?
+  context: The registration sits mid-chain — exploitation and payload staging come before it,
+    task registration and SYSTEM-level launches after. Aggregating the host's process starts
+    by image and parent collapses agent heartbeat noise into high-count rows while novel
+    parent-child pairs stand out at low counts; scan the low-count rows for shells, script
+    hosts, and binaries running from ProgramData or other user-writable paths.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Were other persistence mechanisms installed on this host beyond the handler?
+  context: Operators rarely rely on a single foothold — this handler is typically paired with
+    at least a scheduled task, and backup mechanisms via services, Run keys, or WMI
+    subscriptions are common. Grouping persistence-capable tool executions in the surrounding
+    hours shows which mechanisms landed together. The scheduled-task question targets the
+    known task and script names for this tooling; this sweep catches any other persistence
+    tooling invoked in the same window.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- question: Was the same handler key written on any other host in the environment?
+  context: This registration is host-local and operator-driven — nothing distributed by group
+    policy or packaged software writes it — so a second host with the same key means the
+    tooling was deployed more than once, commonly via lateral movement using credentials
+    taken after escalation. Compare the writing Image and the Details values across hosts;
+    identical values point to the same kit and the same operator.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+      - Details
+- question: Did other detections fire on this host in the hours before this alert?
+  context: This write happens after initial access and alongside privilege escalation through
+    a print-spooler flaw, so earlier alerts on the host — exploitation or spooler-related
+    detections, credential access, defense tampering, or suspicious script execution — help
+    reconstruct how the session reached this point. Read the alert sequence as a timeline
+    leading up to the registration.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

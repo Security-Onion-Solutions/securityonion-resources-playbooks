@@ -1,0 +1,443 @@
+name: Abuse of Service Permissions to Hide Services Via Set-Service
+id: 3c8b7c35-3dc4-4154-8b98-238a8881e8a3
+description: |
+  Detects use of the PowerShell 7 Set-Service cmdlet to rewrite a Windows
+  service's security descriptor with a DACL that hides the service from
+  enumeration tools such as sc.exe and Get-Service. The rule fires only when
+  all three conditions hold together: the image is pwsh.exe (or its
+  OriginalFileName is pwsh.dll), the command line contains both Set-Service and
+  the deny-access-control-entry string DCLCWPDTSD, and the command line carries
+  the -SecurityDescriptorSddl or -sd parameter that applies the SDDL. The
+  DCLCWPDTSD rights mask in a deny ACE strips list, read, and query rights so
+  the service no longer appears to standard tooling while continuing to run.
+  Hiding a service is almost never a routine administrative action, so the
+  investigation should confirm which service was targeted, decode the full SDDL
+  that was applied, determine whether the service binary or startup
+  configuration was also changed, and establish whether the same activity
+  appears elsewhere on the host or fleet.
+type: detection
+detection_id: 514e4c3a-c77d-4cde-a00f-046425e2301e
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the command line run Set-Service with a hidden-service SDDL applied
+    via -SecurityDescriptorSddl or -sd, matching what this rule detects?
+  context: Before investing investigation time, confirm the alert is a true positive.
+    The rule fires only when all three conditions hold together in one pwsh.exe
+    execution - the image is pwsh.exe (or OriginalFileName pwsh.dll), the command
+    line contains both Set-Service and the deny-ACE string DCLCWPDTSD, and the
+    command line carries the -SecurityDescriptorSddl or -sd parameter. Read the exact
+    command line and confirm all three are present, and note which service name the
+    SDDL is being applied to.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to modify service security descriptors from
+    PowerShell?
+  context: Rewriting a service DACL to hide the service is not part of normal service
+    administration. Knowing whether the acting account and host function involve service
+    management - a server admin, a deployment account, an endpoint that hosts managed
+    services - is often the fastest path to separating a rare but legitimate hardening
+    action from an attacker concealing a planted service.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Decode the full SDDL string - which service was targeted, and what access
+    does the deny ACE remove?
+  context: The command line carries the full security descriptor being applied. Identify
+    the service name passed to -Name or -InputObject, then decode the SDDL. The deny
+    ACE rights mask DCLCWPDTSD removes list (DC), read-control, write, delete, and
+    query rights so the service stops appearing in sc.exe and Get-Service output while
+    still running. Note which trustees (IU interactive users, SU service, BA built-in
+    administrators) the deny ACEs apply to, since broad denials to administrators
+    indicate deliberate concealment rather than a permissions tweak.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains|all:
+          - 'Set-Service '
+          - DCLCWPDTSD
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Was the targeted service's registry Security subkey modified, and does the
+    stored descriptor now contain the deny ACE?
+  context: Set-Service -SecurityDescriptorSddl writes the new descriptor into the
+    service's registry key under HKLM\SYSTEM\CurrentControlSet\Services\<service>\Security.
+    A registry modification of a Services Security value in the same window as the
+    PowerShell execution confirms the SDDL was committed rather than rejected. The
+    Security value is where the hiding actually takes effect, so this is the ground-truth
+    artifact even if the command-line evidence is incomplete.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains:
+          - '\Services\'
+          - '\Security'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- question: Was the targeted service's binary path or startup configuration also
+    changed around this time?
+  context: Hiding a service is usually paired with making it persist and run. Look for
+    changes to the same service's ImagePath (the binary it launches) or its StartupType
+    in the surrounding window. A service that was hidden and also pointed at an
+    operator-controlled binary or set to autostart is a configured persistence
+    mechanism, not an isolated descriptor edit. The binary path determines what actually
+    executes when the hidden service runs.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains|all:
+          - '\Services\'
+      filter_value:
+        TargetObject|endswith:
+          - '\ImagePath'
+          - '\Start'
+      condition: selection and filter_value
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- question: Was the service name or SDDL obfuscated, and what does it decode to?
+  context: The service identifier and the SDDL string can be assembled at runtime with
+    string concatenation, backtick escaping, format operators, or variable substitution
+    to keep the literal service name out of plain sight, and PowerShell 7 can run the
+    whole sequence from a -EncodedCommand payload. Reconstruct the effective command to
+    confirm exactly which service is being hidden and that no additional cmdlets (for
+    example New-Service or a credential change) are chained into the same invocation.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did PowerShell script block logging capture the full Set-Service script
+    content?
+  context: Script block logging records the deobfuscated script that PowerShell actually
+    executed, including the resolved service name and the complete SDDL string, even
+    when the command line was assembled or encoded. This is ground truth about what ran.
+    If PowerShell operational logging is not ingested in this environment, treat zero
+    results as a visibility gap rather than evidence nothing ran, and decode the
+    SDDL from the alerting command line directly.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Were PowerShell security controls bypassed or weakened before this execution?
+  context: Operators frequently disable or bypass PowerShell protections before running
+    a payload. Common precursors include AMSI bypass (patching amsi.dll in memory),
+    execution policy changes (-ExecutionPolicy Bypass or -ep bypass), and downgrade
+    attacks that fall back to PowerShell v2 to avoid logging. Bypass activity shortly
+    before a service-hiding command strengthens the case that the descriptor change is
+    part of hands-on-keyboard activity rather than a sanctioned script.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: What process spawned this PowerShell session, and is that parent chain
+    expected?
+  context: The parent process reveals how the service-hiding command was launched. A
+    user-driven administrative action usually shows explorer.exe or an interactive shell;
+    an unexpected parent such as a script host, a remote-execution service, or a process
+    running under an automation account points to scripted or remote operator activity.
+    The parent is where the decision to hide the service was made, so walking up the tree
+    helps reconstruct how the actor reached this host.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: When this host has previously run this Set-Service hidden-service pattern,
+    what parents and users drove it, and does the current alert fit?
+  context: Even legitimate tooling leaves a baseline. This query mirrors the rule's
+    selection structure scoped to this host, so the resulting parent and user
+    distribution reflects how this specific service-hiding pattern has historically run
+    here rather than generic pwsh.exe usage. A new parent process, an unexpected user
+    account, or a first-ever occurrence is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \pwsh.exe
+      - OriginalFileName: pwsh.dll
+      selection_sddl:
+        CommandLine|contains|all:
+        - 'Set-Service '
+        - DCLCWPDTSD
+      selection_cmdlet:
+        CommandLine|contains:
+        - '-SecurityDescriptorSddl '
+        - '-sd '
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \pwsh.exe
+      - OriginalFileName: pwsh.dll
+      selection_sddl:
+        CommandLine|contains|all:
+        - 'Set-Service '
+        - DCLCWPDTSD
+      selection_cmdlet:
+        CommandLine|contains:
+        - '-SecurityDescriptorSddl '
+        - '-sd '
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \pwsh.exe
+      - OriginalFileName: pwsh.dll
+      selection_sddl:
+        CommandLine|contains|all:
+        - 'Set-Service '
+        - DCLCWPDTSD
+      selection_cmdlet:
+        CommandLine|contains:
+        - '-SecurityDescriptorSddl '
+        - '-sd '
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the acting account's activity across all hosts reveals whether the
+    service-hiding command was a single event or part of activity spanning multiple
+    endpoints. If the same user ran service modifications or related tooling on other
+    hosts, the scope of the incident is larger than one machine.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \pwsh.exe
+      - OriginalFileName: pwsh.dll
+      selection_sddl:
+        CommandLine|contains|all:
+        - 'Set-Service '
+        - DCLCWPDTSD
+      selection_cmdlet:
+        CommandLine|contains:
+        - '-SecurityDescriptorSddl '
+        - '-sd '
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining the activity surrounding the
+    service-hiding command reveals what led to it and what followed - the creation of
+    the service being hidden, a binary drop, reconnaissance, or other configuration
+    changes. Novel parent-child pairs at low counts are what to scan for against the
+    high-count noise of routine system processes.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host - defense tampering, reconnaissance, or
+    credential access - may reveal the attack stages that preceded the service-hiding
+    command and help reconstruct the full timeline. Concealing a service is typically a
+    later persistence step, so prior alerts give context for how the actor reached the
+    point of reconfiguring a service.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Were other process-based persistence mechanisms installed on this host?
+  context: Attackers rarely rely on a single persistence mechanism. Around the time a
+    service is hidden, they commonly establish or back up persistence through different
+    techniques - scheduled tasks, additional services, registry Run keys, BITS jobs, or
+    WMI subscriptions. Multiple persistence installations in the same timeframe indicate
+    intentional stacking rather than an isolated administrative change.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine

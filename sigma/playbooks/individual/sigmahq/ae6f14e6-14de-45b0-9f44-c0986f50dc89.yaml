@@ -1,0 +1,411 @@
+name: Change Default File Association To Executable Via Assoc
+id: 68403871-04c1-48b1-aef7-ddd46e3a2a77
+description: |
+  Detects cmd.exe running the built-in assoc utility with a command line that contains both 'assoc ' and exefile, while not
+  matching the benign '.exe=exefile' restore pattern. Changing a file extension's default handler to exefile (or any
+  executable handler) causes an arbitrary program to launch whenever a file of that extension is opened, which establishes
+  a user- or system-triggered persistence and privilege-escalation foothold. Legitimate use is rare and almost always an
+  administrator repairing a broken association; investigate which extension was remapped, what handler it now points to,
+  and whether any process execution followed a subsequent file open.
+type: detection
+detection_id: ae6f14e6-14de-45b0-9f44-c0986f50dc89
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- question: Does the command line show assoc being used to set a file extension's handler to an executable type?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule fires when cmd.exe runs a command
+    line containing both 'assoc ' and exefile and the command is not the benign '.exe=exefile' restore. Read the full command
+    line and confirm which extension is being remapped and to which handler.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to remap file extension handlers from the command line?
+  context: Legitimate administrative activity can trigger this detection. Direct command-line use of assoc to change a default
+    handler is unusual outside of break/fix work. Knowing whether the user role and host function involve repairing file
+    associations is often the fastest path to distinguishing a true positive from routine maintenance.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Is this parent expected to spawn cmd.exe running assoc, and what started the parent?
+  context: The parent-child relationship is a core signal. Interactive administrative use typically has explorer.exe or a
+    console host in the chain. A parent such as a script host, an Office application, or a remote-execution service spawning
+    cmd.exe to remap a handler points to automated or hands-off-keyboard activity. Tracing the parent's own origin reveals
+    whether the execution chain is interactive or scripted.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What other child processes did the same parent spawn around this time?
+  context: If a suspicious parent spawned the cmd.exe that ran assoc, it likely spawned other processes too. Examining sibling
+    processes reveals the full scope of activity from that parent; multiple children performing reconnaissance, file drops,
+    or additional configuration changes from the same parent suggests orchestration rather than an isolated administrative
+    command. host.name is included as a fallback because the parent identifier may be unavailable.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: What exactly did this assoc command do — which extension was remapped and to what handler?
+  context: The full command line reveals the specific change. Decode which file extension is on the left of the equals sign
+    and which handler type is on the right; a remap to exefile or another executable handler means files of that extension
+    will launch a program when opened. This query scopes to assoc executions on this host within the window, so a multi-step
+    sequence (for example, querying the current association, then changing it) is visible together.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains|all:
+          - 'assoc '
+          - 'exefile'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Was the file association registry key for the remapped extension changed on this host around the same time?
+  context: assoc writes the new default handler into the registry under the file extension and file-type keys. Correlating
+    the command-line execution with the registry modification confirms the association actually changed and shows the final
+    handler path, including any change made directly to the registry without using assoc. A handler value pointing at an
+    interpreter or a user-writable path is the anomaly worth chasing.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_assoc:
+        TargetObject|contains:
+          - '\exefile\'
+          - '\shell\open\command'
+      condition: selection and selection_assoc
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- question: After the association changed, did opening a file of the remapped extension launch an unexpected program?
+  context: The payoff of this technique is execution when a user or process opens a file of the remapped extension. Look for
+    process executions on this host after the change whose parent is explorer.exe or a document or mail handler, and whose
+    image is an interpreter (powershell.exe, wscript.exe, cscript.exe, mshta.exe, rundll32.exe) or an unsigned binary in a
+    user-writable path. That chain is the triggered execution this association enables.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith:
+          - '\explorer.exe'
+      filter_interpreters:
+        Image|endswith:
+          - '\powershell.exe'
+          - '\wscript.exe'
+          - '\cscript.exe'
+          - '\mshta.exe'
+          - '\rundll32.exe'
+          - '\cmd.exe'
+      condition: selection and filter_interpreters
+    fields:
+      - Image
+      - CommandLine
+      - User
+- question: What child processes did this cmd.exe instance spawn afterward?
+  context: The processes spawned by the alerting cmd.exe reveal its actual impact beyond the association change itself.
+    Follow-on execution of interpreters, download utilities, or additional configuration tools points to a broader operation
+    rather than a single one-off command.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: When this host has previously fired this assoc-to-executable pattern, what parents and users normally drive it,
+    and does the current alert fit?
+  context: Even routine repair work can match this rule. The query mirrors the rule's selection scoped to this host, so the
+    resulting parent and user distribution reflects how this specific firing pattern has historically run here. A new parent
+    process, an unexpected user account, or a first-time appearance of the pattern is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \cmd.exe
+      - OriginalFileName: Cmd.Exe
+      selection_cli:
+        CommandLine|contains|all:
+        - 'assoc '
+        - exefile
+      filter:
+        CommandLine|contains: .exe=exefile
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_* and not filter) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Have other hosts fired this assoc-to-executable pattern in the past week, and does the distribution look like
+    automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of this
+    firing pattern rather than generic cmd.exe usage. Many hosts firing the same pattern points to scripted deployment or
+    vendor automation; one host or a small unrelated set points to manual operator activity. Use the host distribution to
+    calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \cmd.exe
+      - OriginalFileName: Cmd.Exe
+      selection_cli:
+        CommandLine|contains|all:
+        - 'assoc '
+        - exefile
+      filter:
+        CommandLine|contains: .exe=exefile
+      condition: all of selection_* and not filter
+    fields:
+    - host.name
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \cmd.exe
+      - OriginalFileName: Cmd.Exe
+      selection_cli:
+        CommandLine|contains|all:
+        - 'assoc '
+        - exefile
+      filter:
+        CommandLine|contains: .exe=exefile
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_* and not filter) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \cmd.exe
+      - OriginalFileName: Cmd.Exe
+      selection_cli:
+        CommandLine|contains|all:
+        - 'assoc '
+        - exefile
+      filter:
+        CommandLine|contains: .exe=exefile
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_* and not filter) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints.
+    If the same user triggered similar configuration changes or tool execution on multiple hosts, the scope of the activity
+    may be larger than a single association change.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \cmd.exe
+      - OriginalFileName: Cmd.Exe
+      selection_cli:
+        CommandLine|contains|all:
+        - 'assoc '
+        - exefile
+      filter:
+        CommandLine|contains: .exe=exefile
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_* and not filter) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate context: what led
+    to this event, what happened after, and whether the association change is part of a larger sequence. Novel parent-child
+    pairs at low counts stand out against high-count agent telemetry.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — defense tampering, reconnaissance, or credential access — may reveal the
+    attack stages that preceded the association change and help reconstruct the full timeline. Persistence is usually
+    established after an initial foothold, so prior alerts often carry the explanatory context.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Were other process-based persistence mechanisms installed on this host?
+  context: Attackers rarely rely on a single persistence mechanism. After establishing a file-association foothold, they
+    commonly install backup mechanisms using different techniques — scheduled tasks, services, registry Run keys, BITS jobs,
+    or WMI subscriptions. Multiple persistence installations from the same timeframe indicate intentional stacking rather
+    than isolated administrative action.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- question: Was there a change ticket, maintenance window, or documented approval for this file association change?
+  context: Many organizations require change tickets for system modifications, especially persistence-relevant changes such
+    as remapping a default file handler. A corresponding ticket suggests authorized break/fix work; absence of one when
+    policy requires it suggests the change was unauthorized. This check can quickly close a false positive or escalate a
+    true positive.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine

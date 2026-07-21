@@ -1,0 +1,294 @@
+name: Hiding User Account Via SpecialAccounts Registry Key
+id: 0e275702-9145-4449-8308-0d4060fefa83
+description: |
+  Detects a DWORD value of 0 written under HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\SpecialAccounts\UserList,
+  which hides the account named by the value from the Windows logon screen. Legitimate use is narrow - some OEM,
+  kiosk, or service accounts are intentionally hidden by IT - while the malicious pattern pairs this write with a
+  freshly created local account, often admin-group membership and remote-access configuration changes, so the
+  operator's account stays invisible to anyone at the console. The investigation should identify the hidden account,
+  who created and hid it, whether it holds privileges, and whether it has been used to log on.
+type: detection
+detection_id: f8aebc67-a56d-4ec9-9fbe-7b0e8b7b4efd
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-10
+questions:
+- question: Does the registry write set a UserList value to 0 as this rule detects?
+  context: Before investing investigation time, confirm the alert is a true positive - the TargetObject must fall
+    under Winlogon\SpecialAccounts\UserList and the Details must be DWORD (0x00000000). The value name at the end of
+    the key path is the account being hidden; note it, because every later step pivots on that account name.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this host one where an intentionally hidden account is expected?
+  context: Some environments deliberately hide OEM support, kiosk, or automation accounts from the logon screen, and
+    those hosts carry a known list of intentionally hidden names. If the hidden account is not on that list - or the
+    host has no business hiding accounts at all - treat the write as unauthorized. User attribution is present on
+    most endpoint registry events; when it is a machine account or missing, pivot on the writing process instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: What process wrote the UserList value, and what spawned it?
+  context: This value is normally written by reg.exe from an elevated shell or by management tooling. The parent
+    chain of the writing process distinguishes an administrator working interactively (explorer or an admin console
+    up the chain) from a compromise pattern - a database service process, web-server worker, script host, or dropped
+    executable driving the modification.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - Image
+      - CommandLine
+- question: Which account does the UserList value hide, and is that account expected to exist?
+  context: The value name appended to SpecialAccounts\UserList is the account being hidden - the key's only purpose
+    is logon-screen visibility, so a 0 write here always means someone wants an account unseen. Attacker-created
+    accounts in this position frequently mimic service naming or carry a trailing $ so they also stay out of casual
+    net-user listings; check the account name against your inventory of legitimate local accounts and whether it is
+    privileged.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: What exactly was written to this value and does anything else live under the same key?
+  context: Confirm the Details field is DWORD (0x00000000) - the hide flag - rather than a 1 (unhide) or a removal of
+    a previous entry. Multiple values under SpecialAccounts\UserList mean multiple accounts have visibility overrides
+    on this host; each name is a separate account to verify against your legitimate-accounts inventory.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- question: Was a local account created on this host around the time the hide value was written?
+  context: The hide-account write typically lands minutes after the account itself is created - the operator creates
+    a local account, adds it to a privileged group, then hides it from the logon screen. Security log event 4720
+    records account creation with the creating subject; match the new account name against the value name from the
+    registry write.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      service: security
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4720
+      condition: selection
+    fields:
+      - TargetUserName
+      - SubjectUserName
+- question: Were account-management commands run on this host around the alert?
+  context: Hidden-account operations are usually scripted through net.exe - account creation, password set, and
+    Administrators group addition arrive as a burst of net user and net localgroup commands immediately before the
+    hide write. The command lines reveal the account name, whether it was granted admin membership, and expiry
+    settings chosen to keep the account alive.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\net.exe'
+          - '\net1.exe'
+        CommandLine|contains:
+          - 'user'
+          - 'localgroup'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Has the hidden account been used to log on since the value was written?
+  context: A hidden account only matters once it is used. Security log event 4624 records logon sessions - review
+    logons on this host after the write for the hidden account name, paying attention to the logon type (interactive,
+    network, or remote desktop) and the source address. A remote-interactive logon under the hidden name shifts the
+    investigation from configuration change to active access.
+  range: +24h
+  query: |
+    aggregation: true
+    logsource:
+      service: security
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4624
+      condition: selection
+    fields:
+      - TargetUserName
+      - LogonType
+      - IpAddress
+- question: Were other registry modifications made on this host in the same session?
+  context: Account hiding rarely arrives alone - the same session commonly sets remote-access and credential-related
+    values such as enabling Remote Desktop connections, relaxing token filtering for local accounts, or turning on
+    plaintext credential caching. Clusters of registry writes from the same process within the window reveal how much
+    of the host's configuration was changed beyond the alerting value.
+  range: +/-30m
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - User
+- question: What other process activity occurred on this host around the alert?
+  context: The hide write is usually one step in a longer hands-on sequence - payload decoding, account creation,
+    security tool termination, or persistence installation often land within minutes of it. Aggregated parent-child
+    pairs collapse repetitive agent noise into high-count rows while novel pairs stand out at low counts; those
+    low-count novel pairs are what to scan for.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Has this UserList value been modified before on this host?
+  context: An intentionally hidden support account is typically configured once at provisioning time, so a matching
+    write months ago with the same value name supports a benign explanation. A first-ever write to this key - or a
+    new value name appearing among previously stable entries - points to a fresh, unmanaged change.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - Details
+      - Image
+- question: Does this host normally run the process that wrote the value?
+  context: If the writer is reg.exe, frequency alone says little - what matters is whether reg.exe historically runs
+    under the same user and parent seen at alert time. If the writer is a non-standard binary, zero or very low
+    historical counts indicate a freshly introduced executable performing account manipulation, which fits the
+    compromise pattern rather than administration.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: Were UserList hide values written on other hosts?
+  context: The same hidden-account write appearing across multiple hosts indicates either a managed configuration
+    (imaging or policy that hides a standard support account) or an operator repeating the same playbook as they move
+    laterally. Compare the value names and writing processes across hosts - identical account names written by
+    deployment tooling read as managed; varied timing from shells or one-off binaries reads as spread.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+      - Details
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Hidden-account creation typically follows initial access and privilege escalation - brute-force
+    authentication bursts, exploitation of an exposed service, payload decoding, or security tool tampering. Earlier
+    detections on the same host help reconstruct the stages that led to the account manipulation.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

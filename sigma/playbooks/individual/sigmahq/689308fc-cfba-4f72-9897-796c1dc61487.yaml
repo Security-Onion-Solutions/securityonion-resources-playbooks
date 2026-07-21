@@ -1,0 +1,537 @@
+name: Potential Conti Ransomware Activity
+id: 7186aa94-6622-4bfe-bb69-d69781088564
+description: |
+  Detects a process whose command line carries the complete argument set used by the Conti ransomware
+  family's encryptor: -m, -net, -size, -nomutex, and -p followed by a UNC path ending in $. All of these
+  substrings must be present in the same command line for the rule to fire. The combination selects an
+  encryption mode, enables encryption of reachable network shares, sets a file-size threshold, suppresses
+  the single-instance mutex check, and points the encryptor at an administrative share on a remote host,
+  so a match means remote share encryption was requested rather than local-only encryption. The rule
+  constrains only the command line, not the binary name or path, because the encryptor is commonly renamed
+  and is also invoked through regsvr32.exe or rundll32.exe. Investigation should confirm the exact command
+  line and the UNC target it names, identify what launched it, determine whether file writes and ransom
+  notes followed, and establish the current recovery state of the host from live system state.
+type: detection
+detection_id: 689308fc-cfba-4f72-9897-796c1dc61487
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-16
+questions:
+- question: >-
+    Does the alerting command line contain all of the rule's required arguments, and what UNC path follows
+    the -p flag?
+  context: >-
+    The rule requires every one of -m, -net, -size, -nomutex, and -p with a UNC path ending in $ to be
+    present in the same command line. Confirm each substring is present and read the -p value: it names the
+    administrative share the encryptor was pointed at, which is the first fact the rest of the
+    investigation depends on.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - alert
+  - process_creation
+- question: Is this user and host expected to run a file-encryption utility against a remote administrative share?
+  context: >-
+    Backup, migration, and archival tooling can encrypt or copy data across shares, but such tooling is
+    normally a named product invoked by a service account on a known server. Establish whether the account
+    and host in the alert have any role that involves bulk operations against administrative shares, and
+    whether the account is interactive, a service principal, or a machine account.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: >-
+    What did each argument specify, and were several invocations of this argument set run on the host
+    against different UNC targets?
+  context: >-
+    Decode the arguments individually: -m selects the encryption mode, -net enables encryption of reachable
+    network shares, -size sets the file-size threshold that decides full versus partial encryption,
+    -nomutex removes the single-instance guard so multiple copies can run concurrently, and -p names the
+    target path. Operators typically issue one invocation per target share, so this query lists every
+    command on the host carrying the same argument set in the surrounding window, along with the binary
+    behind it and its working directory. The binary name is not constrained by the rule and is frequently
+    a renamed executable or a DLL launched through regsvr32.exe or rundll32.exe.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains|all:
+        - '-m '
+        - '-net '
+        - '-size '
+        - '-nomutex '
+        - -p \\\\
+        - $
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - CurrentDirectory
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: What process spawned this command, and is that parent chain consistent with an operator pushing a payload?
+  context: >-
+    The launch mechanism separates hands-on-keyboard execution from scripted rollout. A batch file under
+    cmd.exe, a PowerShell parent, a remote-execution service parent, or regsvr32.exe and rundll32.exe
+    loading the encryptor as a DLL each point to a different deployment method and a different set of
+    artifacts to collect. A long-lived parent may have started hours or days before the alert, so the
+    lookup window is deliberately wide.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: What recovery-inhibiting commands were executed on this host?
+  context: >-
+    Encryption is normally preceded or followed by commands that remove the paths back to a clean state:
+    shadow copy deletion through vssadmin or wmic, boot recovery disabling through bcdedit, backup catalog
+    deletion through wbadmin, and Windows Recovery Environment disabling through reagentc. This query
+    surfaces those commands on the host regardless of which binary issued them. Process telemetry shows
+    only that a command ran, not whether it succeeded, so confirm the current state directly on the host
+    with vssadmin list shadows, bcdedit /enum, reagentc /info, and wbadmin get versions, and confirm
+    offline, tape, or cloud backup status through the organization's backup systems.
+  range: +24h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_recovery:
+        Image|endswith:
+          - '\vssadmin.exe'
+          - '\wmic.exe'
+          - '\bcdedit.exe'
+          - '\wbadmin.exe'
+          - '\reagentc.exe'
+          - '\diskshadow.exe'
+      selection_cmdline:
+        CommandLine|contains:
+          - 'delete shadows'
+          - 'shadowcopy delete'
+          - 'recoveryenabled'
+          - 'bootstatuspolicy'
+          - 'delete catalog'
+          - 'delete systemstatebackup'
+          - 'boot.ini'
+          - 'winre.wim'
+          - '/disable'
+      condition: selection and (selection_recovery or selection_cmdline)
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+  - manual_review
+  - edr_console
+- question: What other destructive or recovery-inhibiting actions occurred on this host?
+  context: >-
+    The encryptor invocation is usually one step in a sequence that also stops security services, kills
+    processes holding file handles open, changes file ownership and permissions, and clears logs. Listing
+    the destructive utilities that ran on the host in the surrounding window shows how much of that
+    sequence completed and which accounts drove it. If they share a single parent, the sequence was
+    scripted rather than typed.
+  range: +/-30m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_destructive:
+        Image|endswith:
+          - '\vssadmin.exe'
+          - '\wmic.exe'
+          - '\bcdedit.exe'
+          - '\wbadmin.exe'
+          - '\cipher.exe'
+          - '\fsutil.exe'
+          - '\icacls.exe'
+          - '\takeown.exe'
+          - '\attrib.exe'
+          - '\sc.exe'
+          - '\net.exe'
+          - '\net1.exe'
+          - '\powershell.exe'
+          - '\taskkill.exe'
+      condition: selection and selection_destructive
+    fields:
+      - Image
+      - User
+  answer_sources:
+  - process_creation
+- question: What non-system executables ran on this host after the alert?
+  context: >-
+    The rule fires on the request to encrypt, not on the encryption itself. Listing the processes that ran
+    on the host in the following window, with common system paths filtered out, shows what else was staged
+    or executed alongside the encryptor: copies of the same binary under different names, execution from
+    temporary or user-writable directories, and scripts that fan the payload out to further targets.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      filter_known:
+        Image|startswith:
+          - 'C:\Program Files'
+          - 'C:\Windows\System32\svchost'
+          - 'C:\Windows\System32\wbem'
+      condition: selection and not filter_known
+    fields:
+      - Image
+      - CommandLine
+      - CurrentDirectory
+  answer_sources:
+  - file_event
+  - process_creation
+  - manual_review
+- question: How many files did the alerting process write after it started, and to which folders and extensions?
+  context: >-
+    Encryption presents as a high count of file writes and renames within seconds of each other, spread
+    across user document folders, network share mount points, and system paths. Aggregating the file
+    activity of this exact process shows the write rate and the target paths, which together indicate
+    whether encryption ran and how far it progressed. Unfamiliar or randomly generated extensions on the
+    written filenames identify which files are affected. A low count with the process still running means
+    encryption is in progress rather than finished.
+  range: +30m
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - TargetFilename
+  answer_sources:
+  - file_event
+  - edr_console
+- question: Were ransom notes written to this host, and which process wrote them?
+  context: >-
+    Ransom notes are dropped into each folder the encryptor touched, so their locations map the folders
+    affected and their timing marks the end of the encryption pass. The process identified as writing them
+    is the encryptor itself, which is the pivot back to its command line and parent when the binary has
+    been renamed. Note names vary between builds, so treat a zero result as inconclusive and review the
+    written filenames on the host directly.
+  range: +24h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_note:
+        TargetFilename|contains:
+          - 'readme'
+          - 'decrypt'
+          - 'recover'
+          - 'restore_files'
+          - 'how_to'
+          - 'ransom'
+      condition: selection and selection_note
+    fields:
+      - TargetFilename
+      - Image
+      - ProcessGuid
+  answer_sources:
+  - file_event
+  - manual_review
+- question: Which SMB destinations did this host connect to around the time of the alert?
+  context: >-
+    The -net flag and the UNC path in the -p argument mean the encryptor was directed at a remote
+    administrative share, which requires an SMB session to that host. Connections on ports 445 and 139 in
+    the alert window show which systems were actually reached, and whether the reach extended beyond the
+    single share named in the command line. Compare the destinations returned here against that UNC target
+    to size the set of hosts whose data is exposed.
+  range: +/-30m
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationPort:
+          - 445
+          - 139
+      condition: selection
+    fields:
+      - DestinationIp
+      - Image
+  answer_sources:
+  - network_connection
+- question: Is this same detection firing on other hosts in the environment?
+  context: >-
+    The same encryptor command is normally pushed to many systems in one pass, often within minutes.
+    Searching for this detection across all hosts gives the count of systems that received it and the
+    first-to-last timeline of the rollout, which sets the scope for containment and determines which
+    systems need recovery assessment.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        rule.uuid|expand: '%rule_uuid%'
+      condition: selection
+    fields:
+      - host.name
+      - rule.name
+      - event.severity_label
+  answer_sources:
+  - process_creation
+  - alert
+- question: >-
+    Has this host produced the rule's argument set before, and if so under which parents and users?
+  context: >-
+    The query mirrors the rule's selection scoped to this host, so the result is this host's own history of
+    this exact argument set rather than generic binary usage. Given the argument combination, the expected
+    result is zero prior events, which makes the alert a first occurrence. Any prior history here is worth
+    reading closely for the parent and account that produced it, since it would place the start of the
+    activity earlier than the alert.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - '-m '
+        - '-net '
+        - '-size '
+        - '-nomutex '
+        - -p \\\\
+        - $
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+  answer_sources:
+  - process_creation
+- question: >-
+    Have other hosts produced the rule's argument set in the past week, and how is that distributed across
+    the fleet?
+  context: >-
+    The query mirrors the rule's selection with no host scope, giving a fleet-wide count of this argument
+    set over the past week. Several hosts returning it points to a pushed deployment and identifies the set
+    of systems to assess; a single host points to activity that has not spread yet or was staged from
+    elsewhere. Read the host list against the UNC targets named in the command lines to see whether the
+    fleet-wide hits are sources, targets, or both.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - '-m '
+        - '-net '
+        - '-size '
+        - '-nomutex '
+        - -p \\\\
+        - $
+      condition: selection
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- question: Has this user produced the rule's argument set before, and does that history fit their role?
+  context: >-
+    The query mirrors the rule's selection scoped to this user, so the result is the account's own 90-day
+    history of this argument set, aggregated by host. A first occurrence for the account, combined with the
+    account's normal duties, tells the analyst whether the credentials were used outside their usual
+    pattern. Prior hits on other hosts would extend the timeline and the affected host set backwards.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - '-m '
+        - '-net '
+        - '-size '
+        - '-nomutex '
+        - -p \\\\
+        - $
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+  always_include: true
+- question: Has this parent process driven the rule's argument set before, or is the parent new for this activity?
+  context: >-
+    When the alert fires under a service principal or a machine account, the user field does not attribute
+    the behavior and the launch mechanism is the meaningful pivot. This query scopes the rule's selection
+    to the alerting parent process across the environment, so the result is that parent's 90-day history of
+    driving this argument set, aggregated by host. A parent that has never driven it before is the
+    deviation to chase; a parent with a long history of it would indicate an established process worth
+    identifying before acting.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - '-m '
+        - '-net '
+        - '-size '
+        - '-nomutex '
+        - -p \\\\
+        - $
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  always_include: true
+- question: What else did this user do across the environment around this time?
+  context: >-
+    The account's activity on other hosts in the alert window shows whether the encryptor invocation was a
+    single action or one step in a pass across systems. Look for remote-execution utilities, file copies to
+    administrative shares, and repeats of the encryptor pattern under different names. When the alert fires
+    under SYSTEM or a machine account this query returns routine agent telemetry and the parent-scoped view
+    of the same window is the meaningful answer instead.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+  always_include: true
+- question: >-
+    Did this same parent-driven pattern fire on other hosts in the same window, or is the activity isolated
+    to this host?
+  context: >-
+    Under a service principal, tracking the user account across the environment returns agent telemetry
+    from every host rather than the actor's activity. Scoping the rule's selection to the alerting parent
+    process fleet-wide within the alert window answers the question that matters instead: several hosts in
+    the same window means the encryptor was pushed by a common mechanism and the affected set is larger
+    than this host; a single host means the trigger was local.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - '-m '
+        - '-net '
+        - '-size '
+        - '-nomutex '
+        - -p \\\\
+        - $
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  always_include: true
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Encryption is the last stage of an intrusion, so the hours before it usually carry the stages that made
+    it possible: remote access, credential access, security service tampering, and staging of exfiltration
+    tooling. Earlier detections on this host reconstruct that timeline and identify the entry point that
+    still needs to be closed, which matters as much as the encryption itself.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+  answer_sources:
+  - alert

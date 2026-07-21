@@ -1,0 +1,345 @@
+name: Scheduled TaskCache Change by Uncommon Program
+id: 45a055b1-5378-4b8e-b2e3-f5497eaad2ed
+description: |
+  Detects a write to the Windows Task Scheduler TaskCache registry tree
+  (SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\) by a program
+  outside the expected set. Windows normally routes task registration through the
+  Task Scheduler service, so writes by svchost.exe, services.exe, TiWorker.exe,
+  MoUsoCoreWorker.exe, and other Windows and updater processes are excluded; a
+  registration written directly by an uncommon program signals a scheduled task
+  created outside the normal Task Scheduler flow, a common persistence and
+  privilege-escalation technique (T1053.005). Legitimate installers and management
+  tooling occasionally write here, so the investigation should identify which task
+  was registered (the TaskCache subkey name), the writing program and how it was
+  launched, the task's configured action or payload, and whether that payload has
+  executed or still persists.
+type: detection
+detection_id: 4720b7df-40c3-48fd-bbdf-fd4b3c464f0d
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-03
+questions:
+- question: 'Do the registry key path and writing program match a TaskCache registration by an uncommon program?'
+  context: >-
+    Before investing investigation time, confirm the alert is a true positive. Review the exact registry path
+    (TargetObject) under SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\, the value data (Details),
+    and the writing process (Image). The rule fires when the write lands in the TaskCache tree and the writing program
+    is outside the known-good set (svchost.exe, services.exe, TiWorker.exe, MoUsoCoreWorker.exe, and other Windows and
+    updater processes). Note whether the writer is a Windows component that was simply missed by the exclusion list or an
+    unexpected binary.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: 'Is this user, host, and writing program expected to register scheduled tasks directly in the registry?'
+  context: >-
+    Legitimate task creation flows through the Task Scheduler service or an installer; a direct TaskCache write by another
+    program is unusual. Knowing whether the account and host normally register tasks this way is often the fastest path to
+    separating routine software behavior from persistence. User attribution is present on most endpoint registry events, but
+    a machine account (HOST$) or SYSTEM is common for service-driven writes -- when the user is a service principal, pivot on
+    the writing process (Image) to judge legitimacy.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: 'Which scheduled task was registered under TaskCache, and does the task name and writing program look legitimate?'
+  context: >-
+    The subkey after ...\Schedule\TaskCache\Tree\ (or the {GUID} under \Tasks\) identifies the registered task. Randomized or
+    GUID-like task names, names that imitate built-in Windows tasks, or a name written by an unexpected program are common for
+    tasks created outside the normal Task Scheduler flow. The Details value and the writing process (Image) together indicate
+    what the task represents and whether the registration is routine software behavior or attacker-driven.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: 'What value data was written to this TaskCache key, and what task action or payload does it encode?'
+  context: >-
+    TaskCache values hold the task's configuration -- under \Tasks\{GUID} the Actions value carries the command or program the
+    task runs, and sibling values hold the trigger and the run-as principal. Decode the Details for an executable path, a script,
+    or base64/hex-encoded content that reveals the task's payload. A path into Temp, AppData, ProgramData, or Public, or an
+    encoded command, points to a malicious action. If Details is empty or binary, the payload lives in a sibling value under the
+    same task GUID subkey -- pivot there.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- question: 'What program wrote this task registration, and what was its full command line?'
+  context: >-
+    The task was registered by writing the registry directly rather than through schtasks.exe, so the writing process is the
+    program of interest. Its command line shows how it was invoked and may reveal a payload path, a script, or an encoded blob.
+    A writer that is a script host (wscript, mshta, powershell) or a binary dropped into a user-writable directory points to
+    attacker-driven registration; a signed installer or management agent points to routine deployment.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: 'Has the registered task already executed, and what did the Task Scheduler service launch?'
+  context: >-
+    A registered task runs as a child of the Task Scheduler service (svchost.exe hosting the Schedule service). Tasks set to run
+    at logon or startup fire on the next restart; recurring tasks may have already executed several times. Processes spawned by
+    the scheduler after the registration show whether the task's payload ran, under what context it executed, and what it did.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: '\svchost.exe'
+        ParentCommandLine|contains: 'Schedule'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: 'Is the executable or script the task runs present on disk, and did the writing process drop it?'
+  context: >-
+    A scheduled task is only effective if the program it references exists on disk. Correlating file activity by the
+    registry-writing process and its children reveals whether the payload was dropped in the same session as the registration,
+    commonly into a user-writable path. The file-write event carries no hash; if the payload is present, hash it from a later
+    execution or retrieve it for a reputation lookup.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: 'Is the scheduled task still registered on the host?'
+  context: >-
+    Persistence is only active if the task still exists. Confirming the task is still registered -- by listing scheduled tasks
+    on the host or checking the Task Scheduler -- determines whether the mechanism needs remediation. Registry deletion of the
+    task is not directly observable from endpoint telemetry, so verify the task's current state on the live host and review the
+    key's re-modification history rather than expecting a deletion event.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: 'Were other registry modifications made on this host in the same window?'
+  context: >-
+    Tasks created for persistence often land alongside other registry changes -- additional task registrations, Run/RunOnce
+    keys, service definitions, or security-policy edits. Registry writes from the same program within a short window reveal
+    whether this was an isolated change or part of a broader configuration push. The triggering key appears in the results; the
+    signal is what else was modified and by which writing process.
+  range: +/-30m
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - User
+- question: 'What process spawned the program that wrote this task, and is that parent chain expected?'
+  context: >-
+    The parent of the writing program reveals how it was launched. A registration written by a program spawned from Office
+    applications, script hosts (wscript, mshta), or a command shell points to macro-driven or scripted persistence, whereas a
+    parent of explorer.exe or a known installer is more routine. Trace the parent to understand how the uncommon writer came to
+    run at all.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - Image
+      - CommandLine
+- question: 'Does this host normally run the program that wrote the task?'
+  context: >-
+    A writing program that has never run on this host before is more suspicious than one that runs regularly. Zero or very low
+    historical counts fit a dropped tool creating persistence; a high, steady count fits established software. Weigh the result
+    against the writer identified earlier and against the host's normal software profile.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: 'Was the same TaskCache key written on other hosts in the environment?'
+  context: >-
+    The same task registration appearing on multiple hosts may indicate a Group Policy deployment, a mass software
+    installation, or lateral movement pushing the same persistence. If only this host shows the write, the activity is more
+    likely targeted. Compare the writing program and value data across hosts to tell coordinated deployment from a one-off
+    registration.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+      - Details
+- question: 'What other process activity occurred on this host around the time of the registration?'
+  context: >-
+    Task-based persistence rarely occurs in isolation. Process activity in the minutes around the registry write may show the
+    delivery that preceded it or the actions that followed -- reconnaissance, credential access, or additional persistence.
+    Aggregating by process and parent collapses routine agent telemetry into high-count rows while novel parent-child pairs
+    stand out at low counts.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: 'Did other detections fire on this host in the hours before the task registration?'
+  context: >-
+    Alerts rarely happen in isolation. Earlier detections on the same host -- defense tampering, reconnaissance, or credential
+    access -- may reveal the stages that preceded the persistence and help reconstruct the timeline. The sequence of alerts
+    often tells the fuller story of how the host reached this point.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: 'Was there a change ticket, maintenance window, or documented approval for this scheduled task?'
+  context: >-
+    Many organizations require change tickets for persistence mechanisms and system configuration changes. A corresponding
+    ticket suggests authorized deployment; the absence of one when policy requires it suggests the registration was
+    unauthorized. This check can quickly close a false positive or escalate a true positive.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: 'Is registering a task by writing the registry directly consistent with how this organization deploys scheduled tasks?'
+  context: >-
+    Organizations typically create tasks through Group Policy, deployment tooling, or the Task Scheduler interface, all of which
+    route through the Task Scheduler service. A task written directly into TaskCache by another program bypasses that flow and
+    may indicate an attacker avoiding standard tooling -- or, less commonly, an installer taking a shortcut. Understanding the
+    normal procedure helps distinguish the two.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine

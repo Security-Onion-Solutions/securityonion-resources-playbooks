@@ -1,0 +1,428 @@
+name: PowerShell Set-Acl On Windows Folder - PsScript
+id: b409b76e-4c6b-4e86-8a55-3e594a247975
+description: |
+  Fires when PowerShell script-block content (EID 4104) contains all three of the Set-Acl cmdlet with an
+  -AclObject argument, a -Path pointing under the Windows directory (any quoting form or $env:windir), and
+  access-rule content granting FullControl or Allow rights. Rewriting the ACL of a file under the Windows
+  directory is how an actor makes a protected system file writable — typically after taking ownership with
+  takeown or SetOwner — as the setup step for replacing or patching it, for example swapping a service DLL
+  such as termsrv.dll for persistence (T1222 / T1505.005). Legitimate occurrences are narrow, usually
+  servicing, installation, or repair work by administrators or deployment tooling. The investigation should
+  read the full script for the target path and the identity granted access, establish who ran it and whether
+  ownership utilities ran alongside, and determine whether the target file was modified after the grant.
+  Script-block capture is policy-gated per host — default installs log only content matching built-in
+  suspicious-strings checks, so absence of surrounding 4104 evidence is not absence of activity.
+type: detection
+detection_id: 3bf1d859-3a7e-44cb-8809-a99e066d3478
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-17
+questions:
+- question: Does the script block call Set-Acl with -AclObject on a path under the Windows directory, granting FullControl or Allow access?
+  context: The rule requires all three elements in one script block — the Set-Acl cmdlet with an -AclObject
+    argument, a -Path value pointing under the Windows directory (quoted or unquoted, forward or back
+    slashes, or via $env:windir), and access-rule content containing FullControl or Allow. Long scripts are
+    split across multiple 4104 events, so this retrieves every chunk of the alerting block in sequence order
+    and the match is judged on the complete script, not the alerting fragment.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - ScriptBlockText
+- question: Is this user expected to modify permissions on files under the Windows directory?
+  context: ACL changes under the Windows directory are normally made by servicing, installers, or deployment
+    tooling running as SYSTEM, or occasionally by an administrator repairing or hardening an installation.
+    The query shows the alerting block's host, user, and on-disk script path. An ordinary user account, a
+    host outside the administrative estate, or execution outside business hours and any maintenance window
+    moves this away from routine administration — weigh the acting account against the set of accounts
+    actually authorized to change system-file permissions.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - host.name
+      - user.name
+      - Path
+- question: Is the script still on disk, and what process wrote it there?
+  context: When the script block ran from a file, its path is recorded on the event and the file can be
+    retrieved for hashing and full review — the query finds file activity for that path, including the
+    process and account that staged it. Interactive or in-memory execution records no path and this query
+    then returns nothing, which for a permissions-modification script is itself notable, since fileless
+    execution is a deliberate choice. Also preserve a copy of the file the script granted access to, so its
+    integrity can be checked against a known-good version.
+  range: +/-24h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What does the full script do — which Windows-directory path is targeted, and which identity is granted access?
+  context: Script-block content is logged after decoding, so any -EncodedCommand wrapper is already
+    unwrapped; only string-level obfuscation inside the script (concatenation, format operators, backticks)
+    still needs manual work. Read the reassembled script for the usual Get-Acl, access-rule modification,
+    and Set-Acl sequence — the -Path value names the target file or folder, the access rule names the
+    identity receiving FullControl or Allow rights, and a SetOwner call or takeown pairing means ownership
+    was also taken. A grant to an ordinary user, Everyone, or a newly created account on a protected system
+    file is the escalation-enabling change this rule anticipates.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - powershell.sequence
+      - powershell.total
+      - ScriptBlockText
+- question: Do the Security logs record a permissions change on a Windows-directory object at this time?
+  context: Event 4670 records a DACL change on an audited object, including the object path, the old and new
+    security descriptors, and the process that made the change — the object-side confirmation of what the
+    script text claims happened. This coverage depends on object-access auditing being configured for the
+    target (a File System audit policy plus a SACL on the object), which most environments enable only
+    selectively, so an empty result is a visibility limit rather than evidence the change failed.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        EventID: 4670
+        ObjectName|contains: ':\Windows'
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - ObjectName
+      - SubjectUserName
+      - ProcessName
+- question: Were files under the Windows directory modified after the permissions change?
+  context: The exact target path exists only in the script text, so this anchor is content-derived — a
+    host-scoped survey of file activity under the Windows directory, aggregated by writing process and path.
+    Routine servicing writes come from TrustedInstaller and update components; a write from a PowerShell
+    host, a user-context process, or to the specific path named in the script is the follow-through showing
+    the weakened ACL was used. Permissions modification against protected system files is commonly the setup
+    for replacing or patching them, as with service DLLs abused for persistence — compare the target file's
+    hash and signature against a known-good copy. A modification landing within a few minutes of the ACL
+    change is the coupling to look for (a 300-second correlation window is the usual starting point).
+  range: +1h
+  query: |
+    aggregation: true
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains: ':\Windows'
+      condition: selection
+    fields:
+      - Image
+      - TargetFilename
+- question: Did ownership- or permission-modification utilities run on this host around the script?
+  context: Set-Acl on a protected system file usually fails until ownership is taken first, so the technique
+    typically appears as a pair — takeown or an ownership change followed by the ACL grant. This lists
+    executions of takeown, icacls and cacls, attrib, and command-line Set-Acl invocations on the host in the
+    surrounding hour. The same pairing also occurs in legitimate repair work, so read it together with who
+    ran the commands and whether a change record exists for the host.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_tools:
+        CommandLine|contains:
+          - 'takeown'
+          - 'cacls'
+          - 'attrib '
+          - 'Set-Acl '
+      condition: selection and selection_tools
+    fields:
+      - Image
+      - CommandLine
+      - User
+- question: Were PowerShell security controls bypassed or weakened before this execution?
+  context: Actors commonly weaken controls before running meaningful PowerShell — execution-policy bypass
+    flags, AMSI tampering (AmsiUtils, amsiInitFailed), Defender preference changes, or a downgrade to
+    PowerShell v2 to avoid script-block logging. Any of these on the same host in the hour before the alert
+    makes the routine-administration explanation harder to sustain and belongs in the timeline alongside the
+    ACL change.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: Is full script block logging enabled on this host, or only suspicious-content logging?
+  context: PowerShell logs every script block at verbose level only when the Script Block Logging policy is
+    enabled; by default it logs only content matching built-in suspicious-strings checks, at warning level.
+    On a warning-only host the alerting block is a fragment of the host's PowerShell activity and the
+    absence of other 4104 evidence says little. Use the level distribution here to calibrate how complete
+    every other script-channel result in this investigation is.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - log.level
+- question: What other PowerShell script activity occurred on this host around the alert?
+  context: Attacker PowerShell rarely runs as a single block — reconnaissance, ownership changes, the ACL
+    grant, and follow-on tooling produce a cluster of script blocks in a short window, and surrounding
+    blocks from the same session often contain the target path and granted identity in plaintext. The
+    log.level column shows whether the host logs every block (verbose) or only automatically flagged content
+    (warning); on a warning-only host this view is partial by design and absence of surrounding blocks is
+    weak evidence.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - user.name
+      - log.level
+      - Path
+      - ScriptBlockText
+- question: Did the PowerShell session spawn follow-on activity after the script ran?
+  context: A 4104 event records script content, not outcome, and carries no process link — this pivots by
+    host, user, and time to the children of the user's PowerShell hosts in the half hour after the block was
+    logged. Tools launched to take ownership, modify the newly writable file, or restart the service that
+    loads it appear here. If the alert fired under SYSTEM or another service principal the user anchor is
+    broad; read the results with that in mind rather than dropping it.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        User|expand: '%User%'
+        ParentImage|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+          - '\powershell_ise.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- always_include: true
+  question: Has this user previously produced this Set-Acl-on-Windows pattern, and does that history fit their role?
+  context: The query mirrors the rule's own selection scoped to this user — a 90-day history of this
+    specific pattern aggregated by host, not generic PowerShell use. An administrator who runs repair or
+    hardening scripts reads differently from an account producing this pattern for the first time; weigh the
+    count against the user's role and typical toolset. History covers only hosts logging the PowerShell
+    channel, and non-flagged content appears only where full script-block logging is enabled, so zero
+    history is weaker evidence on a default-logging fleet.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: ps_script
+      definition: bade5735-5ab0-4aa7-a642-a11be0e40872
+    detection:
+      selection_cmdlet:
+        ScriptBlockText|contains|all:
+        - 'Set-Acl '
+        - '-AclObject '
+      selection_paths:
+        ScriptBlockText|contains:
+        - -Path "C:\Windows
+        - -Path "C:/Windows
+        - -Path 'C:\Windows
+        - -Path 'C:/Windows
+        - -Path C:\\Windows
+        - -Path C:/Windows
+        - -Path $env:windir
+        - -Path "$env:windir
+        - -Path '$env:windir
+      selection_permissions:
+        ScriptBlockText|contains:
+        - FullControl
+        - Allow
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: Which hosts have historically produced this script pattern, and is the alerting host among them?
+  context: When the alert fires under a service principal, user identity does not attribute the behavior,
+    and script-block events carry no process identity to pivot on — the pattern itself is the pivot. This
+    mirrors the rule's selection fleet-wide over 90 days, aggregated by host. A pattern that appears
+    routinely across many hosts suggests deployment or repair automation; one that has never appeared
+    before, or only on this host, is the deviation worth chasing. Only hosts shipping the PowerShell channel
+    (and, for non-flagged content, with full logging enabled) can appear, so absence elsewhere is weak
+    evidence.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: ps_script
+      definition: bade5735-5ab0-4aa7-a642-a11be0e40872
+    detection:
+      selection_cmdlet:
+        ScriptBlockText|contains|all:
+        - 'Set-Acl '
+        - '-AclObject '
+      selection_paths:
+        ScriptBlockText|contains:
+        - -Path "C:\Windows
+        - -Path "C:/Windows
+        - -Path 'C:\Windows
+        - -Path 'C:/Windows
+        - -Path C:\\Windows
+        - -Path C:/Windows
+        - -Path $env:windir
+        - -Path "$env:windir
+        - -Path '$env:windir
+      selection_permissions:
+        ScriptBlockText|contains:
+        - FullControl
+        - Allow
+      condition: all of selection_*
+    fields:
+    - host.name
+- always_include: true
+  question: What else did this user do across the network around this time?
+  context: Tracking the account's activity across all hosts in the surrounding window reveals lateral
+    movement or the same tooling being staged on multiple endpoints. Hosts this account does not normally
+    touch matter as much as the commands run there. If the alert fired under SYSTEM or another service
+    principal this view degrades to agent-telemetry noise, and the fleet-wide pattern question is the
+    meaningful substitute.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- always_include: true
+  question: Did this same script pattern fire on other hosts in the same window?
+  context: The query mirrors the rule's selection fleet-wide in the alert window, aggregated by host — the
+    service-principal-safe version of the cross-network view, since these events carry no process identity
+    to pivot on. Several hosts producing the pattern in the same window points to pushed or scheduled
+    automation; a single host points to a host-local action. Coverage is policy-gated per host, so absence
+    elsewhere remains weak evidence on a default-logging fleet.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: ps_script
+      definition: bade5735-5ab0-4aa7-a642-a11be0e40872
+    detection:
+      selection_cmdlet:
+        ScriptBlockText|contains|all:
+        - 'Set-Acl '
+        - '-AclObject '
+      selection_paths:
+        ScriptBlockText|contains:
+        - -Path "C:\Windows
+        - -Path "C:/Windows
+        - -Path 'C:\Windows
+        - -Path 'C:/Windows
+        - -Path C:\\Windows
+        - -Path C:/Windows
+        - -Path $env:windir
+        - -Path "$env:windir
+        - -Path '$env:windir
+      selection_permissions:
+        ScriptBlockText|contains:
+        - FullControl
+        - Allow
+      condition: all of selection_*
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — defense tampering, credential access, reconnaissance — may
+    reveal how the actor reached a position from which they could rewrite system-file permissions at all.
+    The preceding alert timeline helps reconstruct the sequence that led to the ACL change rather than
+    treating it as an isolated event.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

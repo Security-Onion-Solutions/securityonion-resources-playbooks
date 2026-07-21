@@ -1,0 +1,326 @@
+name: Malicious DLL File Dropped in the Teams or OneDrive Folder
+id: 1cf67655-91d1-4119-b2e6-0076bdd9a673
+description: |
+  Detects creation of a DLL named iphlpapi.dll under %LocalAppData%\Microsoft, the install location of the OneDrive and Teams applications. iphlpapi.dll is a legitimate Windows IP Helper library that normally resides in System32; the signed OneDrive and Teams executables load it by name at startup. Planting a same-named DLL inside the application's own directory causes the signed binary to load the attacker-supplied library from that directory ahead of the real one (DLL search-order hijacking / side-loading), granting execution under a trusted, signed process for persistence, privilege escalation, and defense evasion. Confirm whether the written DLL is the legitimate Microsoft library or an unsigned/foreign substitute, whether a signed application actually loaded it, what process dropped it, and what the host did afterward.
+type: detection
+detection_id: 1908fcc1-1b92-4272-8214-0fbaf2fa5163
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-03
+questions:
+- question: Does the written file match this rule — a DLL named iphlpapi.dll under %LocalAppData%\Microsoft?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the exact file path, the operation performed (created, renamed, or deleted), and the responsible process. The rule fires only when both conditions hold together — the filename ends in iphlpapi.dll AND the path contains \AppData\Local\Microsoft (the OneDrive/Teams install tree). A legitimate iphlpapi.dll belongs in System32, not under a user profile.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this user and host expected to write a DLL into the Teams or OneDrive application directory?
+  context: End users and the applications themselves do not normally drop new DLLs into %LocalAppData%\Microsoft; those directories are populated by the OneDrive/Teams installers and their update services. If the responsible process is an Office application, a script host, an archive tool, or an unknown binary rather than the app's own updater, treat the write as suspicious. When the User is a machine or service account, judge by the writing process and host role instead of the account name.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is the DLL still on disk, or was it deleted or renamed after the alert?
+  context: The file's post-alert lifecycle drives both urgency and next steps. A DLL still on disk can be retrieved, hashed, and compared against the legitimate System32 iphlpapi.dll; a file deleted or renamed shortly after creation suggests anti-forensic cleanup or a stager that swaps the library after the signed app has loaded it. A deletion within seconds of creation shifts the investigation toward what loaded or executed in between.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What process wrote this DLL, and how was it invoked?
+  context: The file event carries the responsible process's identifier, so pivoting on it reveals the dropper — its command line, working directory, and immediate parent. A DLL planted for side-loading is frequently written by a macro-enabled Office application, a script host (wscript, mshta, powershell), an archive/extractor, or a copy from a staging path; each parent points at a different delivery vector. Legitimate placement, by contrast, comes from the OneDrive/Teams updater running under its normal service chain.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - CurrentDirectory
+- question: What is in the dropped DLL — its imports, embedded strings, and packing?
+  context: This is content analysis of the file itself, distinct from a hash/reputation lookup. Retrieve the DLL from disk and examine its export table (a side-loading DLL commonly re-exports or proxies the real iphlpapi API set so the host application keeps working), imported APIs, embedded URLs or IP addresses, mutex names, packer signatures, and signing status. Compare its exports and size against a known-good System32 iphlpapi.dll; a foreign or trojanized library will diverge. Content retrieval requires manual pull from the endpoint or an offline analysis environment.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: When a signed process loaded this DLL, what was its hash and signature status, and is it known malicious?
+  context: A DLL carries no hash on the file-write event, but it does on the module-load event. This query looks for iphlpapi.dll being loaded and reads its hash and code-signing status. The legitimate library is Microsoft-signed; a side-loaded substitute is typically unsigned or signed by an unrelated party. Submit the hash to threat intelligence to determine whether it is known malicious, benign, or previously unseen, and compare it against a baseline hash of the genuine System32 iphlpapi.dll to confirm substitution. If the DLL is present but was never loaded, hash it manually from its on-disk path.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - Image
+      - ImageLoaded
+      - Signed
+      - Signature
+      - SignatureStatus
+      - Hashes
+- question: After the DLL was dropped, did the host initiate outbound network connections that could indicate command-and-control?
+  context: Side-loading grants code execution inside a trusted, signed process; the loaded DLL commonly beacons out to a remote controller once active. Correlate the file drop with subsequent egress connections from the host, paying particular attention to connections originating from the OneDrive or Teams process to unfamiliar destinations, cloud-fronted hosts, or non-standard ports. Absence of network activity does not clear the artifact, but a beacon shortly after the drop confirms the DLL executed and reached its next stage.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+      condition: selection
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationPort
+- question: What other files did the responsible process write or delete around the alert?
+  context: A process that drops one side-loading DLL often drops several components — a loader, a configuration blob, a decoy document, or additional libraries staged for other signed applications. The breadth, paths, and extensions of the writer's other file activity (and that of its direct children, since droppers often delegate) distinguish a single planted artifact from a staging operation and enumerate what else needs review.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What else has been written to the Teams/OneDrive application directory recently, and by which processes?
+  context: The %LocalAppData%\Microsoft tree is normally written only by the OneDrive/Teams installers and update services. Other recent arrivals in the same directory — additional DLLs, executables, or configuration files from an unexpected writer — reveal whether this is an isolated plant or a directory under active abuse, and identify which other artifacts belong to the same activity. A single unfamiliar writing process across several files is the signal to chase.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains: '\AppData\Local\Microsoft\'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: Has an iphlpapi.dll been written to this location on this host before?
+  context: A DLL that has never appeared at this path on this host is more suspicious than a recurring one. Zero or very low historical counts under %LocalAppData%\Microsoft indicate a first-time plant rather than a routine application update. Weigh the count against the host's OneDrive/Teams update cadence — legitimate updater writes would recur on a predictable schedule; a one-off write outside that pattern is the deviation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: Is this same DLL being dropped to the application directory on other hosts?
+  context: Finding the same side-loading DLL written under %LocalAppData%\Microsoft on multiple hosts points to a distributed campaign — a phishing wave, a shared malicious document, or a push mechanism — rather than a single targeted plant. If it is present on only one host, the activity may be targeted or host-local; if on many, map the distribution timeline and identify the common delivery vector.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        TargetFilename|endswith|expand: '%file_basename%'
+      condition: selection
+    fields:
+      - host.name
+      - TargetFilename
+      - Image
+- always_include: true
+  question: Has this user previously produced this drop pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection scoped to this user — the result is the user's 90-day history of iphlpapi.dll being written under \AppData\Local\Microsoft (not generic file activity), aggregated by host. A user who has never produced this pattern is more suspicious than one who does so regularly. Because the write is frequently performed by a machine or service account rather than the interactive user, weigh this alongside the parent-process history.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        TargetFilename|contains|all:
+        - iphlpapi.dll
+        - \AppData\Local\Microsoft
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: Has this program historically driven this drop pattern on this host or across the environment, or is the program new for this activity?
+  context: When the write fires under a service principal or machine account, user identity does not attribute behavior; the meaningful pivot is the launch mechanism. The query mirrors the rule's selection scoped to the alerting program, so the result is the 90-day history of this program writing this specific pattern. A new or rare program for this pattern is the deviation worth chasing; a program that already accounts for many prior writes is likely the OneDrive/Teams updater or another vendor automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        TargetFilename|contains|all:
+        - iphlpapi.dll
+        - \AppData\Local\Microsoft
+      _pb_scope:
+        Image|endswith|expand: '%Image%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts in the alert window reveals whether the drop is isolated or part of broader movement. If the same user account triggered similar activity on multiple endpoints, the scope may be larger than one host. When the alert fires under SYSTEM or a machine account this pivot returns broad agent-telemetry noise, so weigh it together with the parent-driven, pattern-scoped view.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- always_include: true
+  question: Did this same program-driven drop pattern fire on other hosts in the same window — is this a coordinated rollout or isolated to this host?
+  context: Under a service principal, asking what else the user did returns agent-telemetry noise because every host runs the same system-owned processes constantly. The meaningful question is whether the same launch mechanism dropped this DLL elsewhere. The query mirrors the rule's selection scoped to the alerting program, fleet-wide, in the alert window. Multiple hosts in the same window points to pushed or scheduled distribution; a single host points to a host-local trigger such as a document opened by one user.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        TargetFilename|contains|all:
+        - iphlpapi.dll
+        - \AppData\Local\Microsoft
+      _pb_scope:
+        Image|endswith|expand: '%Image%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining process activity in a tight window around the drop reveals what led to it (a document opening, a script host launching) and what followed (the signed application starting, child processes spawning). Aggregating by process and parent collapses routine agent noise into high-count rows while novel parent-child pairs stand out at low counts — those are what to scan for.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — macro execution, script-host activity, reconnaissance, or defense tampering — may reveal the delivery stage that preceded the DLL plant and help reconstruct the full timeline. The alert sequence on a host often tells the attack story — initial access followed by staging followed by side-loading for persistence.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Were files dropped to other persistence locations on this host around the same time?
+  context: DLL side-loading is itself a persistence and execution mechanism, and attackers rarely rely on a single foothold. After planting one library, they commonly add backup persistence — dropping executables or scripts into a Startup folder or into paths referenced by registry Run/RunOnce keys. These file-based drops bypass command-line persistence tooling entirely, so file-event monitoring is what captures them. Drops to these locations in the same timeframe indicate intentional stacking rather than an isolated update.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist_paths:
+        TargetFilename|contains:
+          - '\Start Menu\Programs\Startup\'
+          - '\Windows\System32\Tasks\'
+          - '\Windows\Tasks\'
+      condition: selection and selection_persist_paths
+    fields:
+      - TargetFilename
+      - Image

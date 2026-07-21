@@ -1,0 +1,411 @@
+name: Wmiexec Default Output File
+id: 7376d202-efc8-47da-bee3-44e35407ce56
+description: |
+  Detects creation of the default output file that the wmiexec remote-execution tool writes on a
+  target host — a file in the Windows directory or at a drive root named with a leading double
+  underscore followed by an epoch-style timestamp (for example __1645636397.851114). The tool
+  authenticates to the host over DCOM/WMI from a remote system, spawns each command as a cmd.exe
+  launched with /Q /c under wmiprvse.exe, and redirects the command output to this file on the
+  ADMIN$ share before reading it back over SMB. On a successful command the tool deletes the file,
+  so a file left on disk means the session was interrupted or the write path was not cleaned up;
+  either way the write reflects remote command execution rather than local activity. Because the
+  file is written by the service side of the SMB session, the responsible process on the alert is
+  usually the System process, so attribution runs through the inbound network session, the
+  authenticating account, and the wmiprvse.exe command chain rather than a local parent lineage.
+type: detection
+detection_id: 8d5aca11-22b3-4f22-b7ba-90e60533e1fb
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-09
+questions:
+- question: Does the alerting file match the wmiexec output-file naming pattern, and where on disk was it written?
+  context: >-
+    Before investing investigation time, confirm the alert is a true positive. The rule fires on a
+    file whose path ends in the wmiexec output pattern — a leading __ followed by an epoch-style
+    timestamp — created directly in the Windows directory or at a drive root, for example
+    C:\Windows\__1645636397.851114. Review the exact TargetFilename on the triggering event to
+    confirm the name matches and note the writing process, which for a share-side write is usually
+    the System process rather than a local tool.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this host one that legitimately receives remote WMI command execution, and does the account context fit?
+  context: >-
+    Remote command execution over WMI is normal for some administrative and monitoring tooling but
+    rare on most endpoints. Knowing whether this host is a routine target of remote administration,
+    and whether the account tied to the session is an expected administrator, is often the fastest
+    way to separate sanctioned use from an operator using the tool. User on a share-side write is
+    frequently the System or a machine account; when it is, judge by host role and pivot to the
+    authenticating account on the inbound logon.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is the output file still on disk, or was it deleted shortly after it was created?
+  context: >-
+    The tool deletes this output file after a command completes successfully, so a file that remains
+    on disk generally means the session was interrupted or the command failed before cleanup — not
+    that nothing ran. A file still present can be retrieved and read to recover the captured output;
+    a rapid create-then-delete is the tool's normal cleanup and shifts focus to what executed in
+    between. Interpret the operation type on each event to tell creation from deletion.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What command output did this file capture?
+  context: >-
+    This file holds the redirected stdout and stderr of the commands the operator ran through the
+    remote session. Retrieving it from the host, when it is still on disk, and reading its contents
+    reveals exactly which commands executed and the results returned — hostnames, directory
+    listings, account enumeration, or the output of follow-on tooling. The file itself is captured
+    output, not an executable, so treat it as evidence to read rather than a payload to detonate.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: What commands did the remote operator execute, and do they run as cmd.exe /Q /c children of wmiprvse.exe?
+  context: >-
+    The file write carries no command line, and the share-side writer is usually the System process,
+    so the executed commands are not on the alert event. The tool runs each command as a cmd.exe
+    launched with /Q /c under wmiprvse.exe, executing as the authenticating account rather than
+    System. Pull those child processes on this host around the alert to recover the operator's
+    commands and the account they ran under. Absence of these events can mean command-line auditing
+    is not collected rather than that nothing ran.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: '\wmiprvse.exe'
+        Image|endswith: '\cmd.exe'
+        CommandLine|contains: '/Q /c'
+      condition: selection
+    fields:
+      - CommandLine
+      - User
+      - ParentImage
+- question: What remote host initiated the inbound session to this host, and is it an expected administrative source?
+  context: >-
+    Remote WMI execution needs a source. Inbound connections to this host on the DCOM endpoint (135),
+    SMB (445), and remote-management ports around the alert reveal where the session originated — a
+    known jump box, a workstation that should not be initiating remote execution, or an unfamiliar
+    internal address. A source contacting many hosts on these ports in a short window points to
+    active spread rather than a one-off administrative task.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationPort:
+          - 445
+          - 135
+          - 3389
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - SourceIp
+      - DestinationPort
+- question: Which account authenticated the inbound network logon to this host, and from what source address?
+  context: >-
+    The tool authenticates over DCOM/SMB with a valid credential or a stolen NTLM hash, producing a
+    network logon on this host. The account name, source address, and logon type on that event
+    identify who drove the session and from where; a network logon (type 3) by a privileged account
+    from an unexpected host, or one with no matching interactive logon history, points to credential
+    theft or hash reuse. If security logon events are not collected in this environment, treat
+    missing results as a visibility gap and pivot to the account shown on the executed command
+    processes.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        EventID:
+          - 4624
+          - 4625
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - TargetUserName
+      - IpAddress
+      - LogonType
+- question: What processes ran on this host in the window after the remote session was established?
+  context: >-
+    Remote execution is a means to an end — after establishing access, operators run reconnaissance,
+    dump credentials, or stage further tooling. Aggregating process activity in the window following
+    the alert shows what the session was used for. Compare the accounts and binaries against the
+    host's routine activity; new tooling or credential-access utilities appearing under the
+    authenticating account tie the file write to a larger operation.
+  range: +30m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - User
+      - Image
+- question: Has this output-file pattern been written on this host before?
+  context: >-
+    The filename embeds a per-session timestamp, so the exact name is always new; the meaningful
+    baseline is whether files matching the tool's output pattern have appeared on this host at all.
+    A host with no prior history of this pattern makes the activity stand out; a host that shows
+    periodic matches may run administrative tooling that produces similar files, which reframes the
+    finding. Compare the writing processes on any historical matches.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+      - TargetFilename|re: \\Windows\\__1\d{9}\.\d{1,7}$
+      - TargetFilename|re: C:\\__1\d{9}\.\d{1,7}$
+      - TargetFilename|re: D:\\__1\d{9}\.\d{1,7}$
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+      - TargetFilename
+      - Image
+- question: Have files matching this output-file pattern appeared on any other hosts recently?
+  context: >-
+    The same output-file pattern landing on multiple hosts in a short period indicates the
+    remote-execution tool is being used across the environment — the signature of lateral movement
+    or a sweep rather than an isolated action. A single host suggests a targeted operation. Review
+    which hosts show the pattern and the timing to reconstruct the sequence and scope containment.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+      - TargetFilename|re: \\Windows\\__1\d{9}\.\d{1,7}$
+      - TargetFilename|re: C:\\__1\d{9}\.\d{1,7}$
+      - TargetFilename|re: D:\\__1\d{9}\.\d{1,7}$
+      condition: selection
+    fields:
+      - host.name
+      - TargetFilename
+      - Image
+- always_include: true
+  question: Has the account on this write produced this same output-file pattern before, and does that history fit its role?
+  context: >-
+    This history counts prior file writes matching the tool's output pattern attributed to the same
+    account over the last 90 days, grouped by host. Because share-side writes are commonly attributed
+    to the System or a machine account, the count often reflects the pattern's overall history rather
+    than a specific human user; read it as how routine this pattern is for the account context, and
+    weigh a first-time appearance more heavily than a recurring one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+      - TargetFilename|re: \\Windows\\__1\d{9}\.\d{1,7}$
+      - TargetFilename|re: C:\\__1\d{9}\.\d{1,7}$
+      - TargetFilename|re: D:\\__1\d{9}\.\d{1,7}$
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: Has this launch mechanism produced the output-file pattern before on this host or across the environment?
+  context: >-
+    When the write is attributed to a service principal, the account does not attribute behavior, so
+    the meaningful pivot is the launching process. This counts the 90-day history of the alerting
+    program driving this specific output-file pattern, grouped by host. A program that already
+    accounts for many prior events is established automation; a new or rare program for this pattern
+    is the deviation worth chasing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+      - TargetFilename|re: \\Windows\\__1\d{9}\.\d{1,7}$
+      - TargetFilename|re: C:\\__1\d{9}\.\d{1,7}$
+      - TargetFilename|re: D:\\__1\d{9}\.\d{1,7}$
+      _pb_scope:
+        Image|endswith|expand: '%Image%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: What else did this account do across the environment around the time of the alert?
+  context: >-
+    Tracking the account's activity across all hosts in the alert window can reveal whether the same
+    identity is executing on multiple systems — a common indication that the scope is larger than one
+    host. When the alert fires under the System or a machine account, this view degenerates into
+    routine agent telemetry; in that case the launch-mechanism and output-pattern scope questions
+    carry the lateral-movement signal instead.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- always_include: true
+  question: Did this same launch mechanism produce the output-file pattern on other hosts in the alert window?
+  context: >-
+    This checks whether the alerting program drove the same output-file pattern elsewhere in
+    the environment during the alert window. Multiple hosts producing the pattern from the same
+    mechanism at once points to scheduled or pushed automation, or simultaneous execution across
+    hosts; a single host points to a host-local trigger. It complements the account view, which
+    degenerates when the write runs under a service principal.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+      - TargetFilename|re: \\Windows\\__1\d{9}\.\d{1,7}$
+      - TargetFilename|re: C:\\__1\d{9}\.\d{1,7}$
+      - TargetFilename|re: D:\\__1\d{9}\.\d{1,7}$
+      _pb_scope:
+        Image|endswith|expand: '%Image%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What other process activity occurred on this host around the time of the alert?
+  context: >-
+    A remote-execution artifact rarely appears in isolation. Aggregating process activity in a tight
+    window around the alert surfaces what ran immediately before and after the write. Novel
+    parent-child pairs stand out at low counts against high-count routine telemetry, which is what
+    points to reconnaissance, credential access, or staging tied to the session.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host — reconnaissance, credential access, or other
+    remote-execution activity — can reveal the stages that preceded this write and help place it on a
+    timeline. Remote command execution often follows an initial foothold established elsewhere, so
+    prior alerts help reconstruct how the session began.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: >-
+    What authentication method was used -- legitimate credentials, pass-the-hash, or Kerberos
+    ticket?
+  context: >-
+    The authentication method reveals how the attacker gained access. Pass-the-hash (NTLM type 3
+    logons with no prior type 1) and pass-the-ticket attacks bypass password requirements.
+    Legitimate credential use suggests the attacker obtained valid passwords through dumping,
+    phishing, or prior compromise.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - User
+      - CommandLine

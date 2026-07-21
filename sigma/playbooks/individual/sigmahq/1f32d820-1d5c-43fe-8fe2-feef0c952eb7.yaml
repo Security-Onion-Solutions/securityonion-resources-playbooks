@@ -1,0 +1,379 @@
+name: Emotet Loader Execution Via .LNK File
+id: 7ec64816-824b-4b51-859c-3fce9ae16196
+description: |
+  Detects a cmd.exe or powershell.exe process spawned by cmd.exe, explorer.exe, or powershell.exe whose command line contains findstr, .vbs, and .lnk together. This combination corresponds to an Emotet loader delivery pattern in which a zipped Windows shortcut carries a script body appended after a marker string: when the shortcut is opened, it runs findstr against itself to locate the marker, copies everything following it into a .vbs file, and hands that script to a script host for execution. The .lnk is the delivery artifact and the .vbs is the staged loader, so a single command line referencing both alongside findstr is not a pattern routine administration produces. The investigation should determine which shortcut ran, where the shortcut and the extracted .vbs landed on disk, whether a script host executed the .vbs, what that script fetched or launched, and whether the same shortcut reached other users or hosts.
+type: detection
+detection_id: 1f32d820-1d5c-43fe-8fe2-feef0c952eb7
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-16
+questions:
+- question: Does the command line contain findstr, .vbs, and .lnk together under one of the expected parent and child binaries?
+  context: >-
+    The rule fires only when all three conditions hold at once: the parent binary ends in cmd.exe, explorer.exe, or powershell.exe, the executing binary ends in cmd.exe or powershell.exe, and the command line contains all of findstr, .vbs, and .lnk. Read the exact command line and confirm each element is present rather than a partial or coincidental match — note the shortcut path passed to findstr, the marker string being searched for, and the output .vbs path, since those three values anchor the rest of the investigation.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Is this user and host expected to run findstr against a shortcut file to extract a script?
+  context: >-
+    Scripted extraction of content out of a .lnk file into a .vbs is not a task ordinary workstation use or scripted administration produces, and no packaging or deployment workflow reads a shortcut's own bytes this way. Knowing the account's role and the host's function is the fastest way to separate a genuine loader execution from a rare in-house script. If the account is a service principal or machine account, attribute the activity through the launching process instead of the user name.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Is this parent expected to spawn cmd.exe or powershell.exe here, and what started the parent?
+  context: >-
+    The parent identifies how the shortcut was opened. An explorer.exe parent is consistent with a user double-clicking the .lnk, which points the investigation at how the file arrived — mail attachment, archive extraction, or browser download. A cmd.exe or powershell.exe parent means the command was chained from an earlier stage rather than launched interactively, so tracing the parent's own origin shows what started the chain and whether the grandparent is an archiver, a mail client, or a browser.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What other child processes did the same parent spawn?
+  context: >-
+    The extraction step is one command in a longer sequence — the shortcut typically also copies, renames, or launches the script it wrote, and the loader that follows spawns further processes. Listing every child of the exact parent instance shows the full run of the chain from that launch, including any script host or download step that the alerting command line does not itself reveal. If the parent process identifier resolves to NODATA, fall back to the host and time window.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: What exactly did the findstr command do — which shortcut did it read, what marker did it search for, and where did the output go?
+  context: >-
+    Parse the command line end to end. The shortcut path names the delivery artifact, the search string is the marker separating the shortcut's normal content from the appended script body, and the redirection or copy target is the path the .vbs was written to. The working directory tells you where the shortcut was opened from. The query is scoped to this binary on this host with the same findstr, .vbs, and .lnk pattern, so multi-step extraction chains that span several sequential invocations appear together rather than as the single alerting event.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|contains|all:
+          - findstr
+          - .vbs
+          - .lnk
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Was the command encoded or obfuscated, and what does it decode to?
+  context: >-
+    Shortcut-embedded commands are frequently padded with whitespace, carets, backticks, quoted fragments, or variable substitution to break up the findstr and .vbs strings and stretch the command past the length an analyst reads at a glance. If the executing binary is powershell.exe, check for -EncodedCommand or -enc and decode the base64 payload; if it is cmd.exe, strip the caret escaping and variable expansion to recover the literal extraction command. The recovered text names the marker string and the output script path.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did PowerShell script block logging capture the full script content?
+  context: >-
+    Event ID 4104 records the deobfuscated script content PowerShell actually executed, which is ground truth when the alerting command line is obfuscated and when the extracted script is handed to PowerShell rather than to a script host. If PowerShell operational logs are not ingested in this environment, treat an empty result as a visibility gap rather than evidence that nothing ran, and recover the command from the alerting command line instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Where did the .lnk file land on disk, and which process wrote it there?
+  context: >-
+    The shortcut is the delivery artifact, and the process that wrote it names the delivery vector — an archiver extracting a zip, a browser completing a download, or a mail client saving an attachment. A shortcut written into Downloads, Temp, Desktop, or an AppData profile folder minutes before the alert is the arrival event; note the file name, since a document-style name ending in .doc.lnk is the lure. File-write events carry no hash, so if the shortcut is still present, retrieve it for analysis rather than expecting a hash on the write itself.
+  range: -24h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_lnk:
+        TargetFilename|endswith: '.lnk'
+      selection_paths:
+        TargetFilename|contains:
+          - '\Downloads\'
+          - '\Temp\'
+          - '\Desktop\'
+          - '\AppData\Roaming\'
+          - '\AppData\Local\'
+      condition: selection_host and selection_lnk and selection_paths
+    fields:
+      - TargetFilename
+      - Image
+      - ProcessGuid
+- question: Was a .vbs file written to disk on this host around the alert, and where?
+  context: >-
+    The extraction step's whole purpose is to produce a script file, so a .vbs write on this host in the same window is the direct product of the alerting command. Script execution from a temporary directory or a user profile path is the pattern to look for; a .vbs under Temp, AppData, or ProgramData that appears seconds after the findstr invocation is the staged loader. The writing process should be the same cmd.exe or powershell.exe instance from the alert — if it is not, a different stage produced the script. The write event carries no hash; if the file persists, hash it from the later execution event or retrieve it directly.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith: '.vbs'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - ProcessGuid
+- question: Did a script host or interpreter execute the extracted .vbs after this command ran?
+  context: >-
+    Writing the script is staging; executing it is where the loader runs. Look for wscript.exe, cscript.exe, mshta.exe, cmd.exe, or powershell.exe launched with the extracted .vbs path on its command line in the hours after the alert. Execution confirms the chain progressed past extraction, and the executing process is where the follow-on download or injection originates — pivot from it to its own children and network activity. The timing matters: execution within seconds of the write is automated chaining, while a delay to the next logon points at a separate launch mechanism. No matching execution means the loader was staged but has not run.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - \wscript.exe
+          - \cscript.exe
+          - \mshta.exe
+          - \cmd.exe
+          - \powershell.exe
+        CommandLine|contains: '.vbs'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- question: Were PowerShell security controls bypassed or weakened before this execution?
+  context: >-
+    Loader chains that hand a script to PowerShell commonly clear the way first — an execution policy bypass so the extracted script runs unprompted, an AMSI patch so its content is not scanned, a downgrade to version 2 so script block logging does not record it, or a real-time monitoring change. Finding one of these in the hour before the extraction indicates the chain was prepared rather than incidental, and tells you which telemetry from that window is unreliable.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: Does this parent normally spawn this command interpreter on this host?
+  context: >-
+    An explorer.exe parent spawning cmd.exe or powershell.exe is routine on most workstations, so a high count here is expected and the command line is the discriminator rather than the pairing. A cmd.exe or powershell.exe parent spawning another interpreter is less routine, and a low or zero count for that pairing on this host indicates the nesting is new. Read the historical command lines to see what this pairing normally does when it does occur.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- always_include: true
+  question: Has this user previously produced this findstr-against-a-shortcut pattern, and does that history fit their role?
+  context: >-
+    The query mirrors the rule's selection scoped to this user, so the result is the user's 90-day history of this specific pattern rather than generic use of cmd.exe or powershell.exe, aggregated by host. A user with no prior history of extracting script content from a shortcut is the ordinary case for this rule; a user with a standing history is worth reconciling against a documented in-house script before treating the count as clearing the alert.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith:
+        - \cmd.exe
+        - \explorer.exe
+        - \powershell.exe
+        Image|endswith:
+        - \cmd.exe
+        - \powershell.exe
+        CommandLine|contains|all:
+        - findstr
+        - .vbs
+        - .lnk
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: Has this parent process historically driven this pattern on this host or across the environment, or is the parent new for this activity?
+  context: >-
+    When the alert fires under a service principal or machine account, the user name does not attribute the behavior and the launch mechanism is the meaningful pivot. The query mirrors the rule's selection scoped to the alerting parent process, so the result is the 90-day history of this parent driving this specific pattern rather than generic parent-and-binary co-occurrence. A parent that is new for this pattern is the deviation to chase; a parent already accounting for a large volume of prior events points at vendor or operating-system automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith:
+        - \cmd.exe
+        - \explorer.exe
+        - \powershell.exe
+        Image|endswith:
+        - \cmd.exe
+        - \powershell.exe
+        CommandLine|contains|all:
+        - findstr
+        - .vbs
+        - .lnk
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: What else did this user do across the environment around this time?
+  context: >-
+    Delivery reaches a person, not a machine, so the account is the thread that connects the shortcut to anything else it touched. Tracking the user's process activity across all hosts in the hour around the alert shows whether the same account opened the attachment on more than one endpoint or moved on to other tooling. This is distinct from historical frequency — it asks what the account did in this window. When the alert fires under SYSTEM, LOCAL SERVICE, NETWORK SERVICE, or a machine account, this returns agent-telemetry volume and the parent-driven fleet question carries the answer instead.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- always_include: true
+  question: Did this same parent-driven pattern fire on other hosts in the same window?
+  context: >-
+    The query mirrors the rule's selection scoped to the alerting parent process, fleet-wide, in the alert window. Several hosts producing the same extraction pattern within the same hour is consistent with a mail wave reaching multiple recipients who each opened the shortcut, and changes the response from single-host containment to identifying every recipient of the message. A single host points at a host-local trigger. Under a service principal this is the meaningful fleet question, since a user pivot would return agent telemetry from every endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith:
+        - \cmd.exe
+        - \explorer.exe
+        - \powershell.exe
+        Image|endswith:
+        - \cmd.exe
+        - \powershell.exe
+        CommandLine|contains|all:
+        - findstr
+        - .vbs
+        - .lnk
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What other process activity occurred on this host around the time of the alert?
+  context: >-
+    Loader execution sits between delivery and payload, so the surrounding window holds both ends — an archiver or mail client immediately before, and a script host, download, or injection immediately after. Aggregating by executing and parent binary collapses agent and operating-system telemetry into high-count rows while novel pairings stand out at low counts. Note whether the activity falls inside normal working hours for this user, since off-hours execution narrows the legitimate explanations further.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host may reveal the stages that preceded this execution — an archive extraction, a suspicious download, a script host launch, or defense tampering. A loader extraction following an earlier delivery or tampering alert reads differently from one with no prior activity, and the alert timeline reconstructs the order the stages ran in.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

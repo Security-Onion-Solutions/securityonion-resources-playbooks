@@ -1,0 +1,376 @@
+name: UAC Bypass Using Disk Cleanup
+id: 884f641d-0263-49fa-9cbb-0459e24909dc
+description: |
+  Detects a User Account Control bypass that abuses the DiskCleanup scheduled task: cleanmgr.exe is launched
+  with "/autoclean /d C:" by the Task Scheduler service host (svchost.exe -k netsvcs -p -s Schedule) at High or
+  System integrity. The method (UACMe method 34) leverages environment-variable expansion in the scheduled task
+  to run an attacker-controlled command at elevated integrity without a consent prompt. Legitimate disk cleanup
+  invoked interactively does not run from this parent or carry this exact auto-clean command line, so the
+  investigation should confirm the parent chain, determine what ran at elevated integrity afterward, and check
+  whether the elevation was preceded by registry setup or other escalation attempts.
+type: detection
+detection_id: b697e69c-746f-4a86-9f59-7bfff8eab881
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the command line match the cleanmgr.exe auto-clean pattern launched by the Schedule service host at high integrity?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule fires when the command line
+    ends with the cleanmgr.exe "/autoclean /d C:" pattern, the parent command line is the Task Scheduler service host
+    (svchost.exe -k netsvcs -p -s Schedule), and the integrity level is High or System. Verify all three against the
+    triggering event.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentCommandLine
+      - CommandLine
+      - IntegrityLevel
+- question: Is this user and host expected to run disk cleanup through the scheduled task at elevated integrity?
+  context: Legitimate maintenance can trigger detections. Knowing whether the user role and host function are consistent
+    with elevated, task-scheduled disk cleanup is often the fastest path to distinguishing a true positive from routine
+    operations. The abuse path runs the same binary as benign cleanup, so the user and host expectation matters more than
+    the binary itself.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Is the Task Scheduler service host expected to spawn this cleanmgr.exe instance, and what started the service host?
+  context: The parent-child relationship is the core signal. The detection fires on svchost.exe -k netsvcs -p -s Schedule
+    spawning cleanmgr.exe at high integrity. Tracing the service host's own origin and confirming the scheduled-task lineage
+    distinguishes a legitimate maintenance task from an attacker-registered task that abuses environment-variable expansion
+    to run an elevated command.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What other child processes did the same Schedule service host instance spawn?
+  context: If the scheduled-task service host launched the detected cleanmgr.exe, it may have launched other processes in the
+    same window. Multiple children from the same elevated service-host instance reveals the full scope of what the abused
+    scheduled task executed.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: What does the full cleanmgr.exe command line do, and does it carry any extra arguments beyond the standard auto-clean switches?
+  context: The full command line reveals the specific action taken. The bypass relies on environment-variable expansion in the
+    scheduled task, so any value beyond the expected "/autoclean /d C:" — an injected path, an extra binary, or an unexpanded
+    variable — is the payload the analyst needs to read. Decode every argument and current directory.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains: 'cleanmgr.exe'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Were registry keys associated with the DiskCleanup scheduled task or UAC bypass written shortly before the elevation?
+  context: This method sets up elevated execution by manipulating values the scheduled task expands at run time, often through
+    HKCU environment keys or UAC-related shell-handler keys. Finding the registry write in the minutes before the elevated
+    cleanmgr.exe launch confirms the bypass setup and ties the registry tampering to the elevation within a tight time window.
+    If registry auditing is not collected in this environment, treat zero results as a visibility gap rather than evidence
+    nothing was written.
+  range: -15m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains:
+          - '\Environment'
+          - '\Classes\ms-settings'
+          - '\Classes\Folder'
+          - '\Shell\Open\command'
+          - '\DiskCleanup'
+          - '\Volatile Environment'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- question: Did reg.exe, powershell.exe, or cmd.exe write UAC-bypass-related registry values on this host before the elevation?
+  context: Many UAC bypass techniques write a command into a registry key that an auto-elevated process reads and executes.
+    The DiskCleanup variant relies on scheduled-task variable expansion, but operators frequently combine methods, so a
+    command-line registry write to ms-settings, mscfile, exefile, Environment, or Shell\Open\command keys around the same
+    time confirms the bypass mechanism and reveals the exact payload staged for elevated execution.
+  range: -15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\reg.exe'
+          - '\powershell.exe'
+          - '\cmd.exe'
+        CommandLine|contains:
+          - 'ms-settings'
+          - 'mscfile'
+          - 'Classes\exefile'
+          - 'Classes\Folder'
+          - 'Environment'
+          - 'Shell\Open\command'
+          - 'DelegateExecute'
+      condition: selection
+    fields:
+      - CommandLine
+      - Image
+- question: What action was performed with elevated privileges after the UAC bypass?
+  context: UAC bypass is a means to an end. After elevating, operators install persistence, dump credentials, tamper with
+    security tools, or access protected resources. Examining High or System integrity processes spawned on this host shortly
+    after the elevated cleanmgr.exe launch reveals the objective. Common elevated proxy binaries to watch for include sdclt.exe,
+    eventvwr.exe, fodhelper.exe, and computerdefaults.exe.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        IntegrityLevel:
+          - 'High'
+          - 'System'
+          - 'S-1-16-16384'
+          - 'S-1-16-12288'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - IntegrityLevel
+- question: Were other privilege escalation techniques attempted on this host?
+  context: Operators who attempt one UAC bypass often try multiple methods until one succeeds, especially when the OS version
+    or configuration blocks certain techniques. Finding additional bypass or escalation alerts from the same user or host
+    confirms deliberate privilege escalation activity rather than a benign maintenance task.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - rule.name
+      - rule.uuid
+      - event.severity_label
+- question: Does the Schedule service host normally spawn cleanmgr.exe with the auto-clean command line on this host?
+  context: Some parent-child relationships are routine and others are inherently suspicious. Historical frequency of the Task
+    Scheduler service host launching cleanmgr.exe distinguishes a recurring legitimate maintenance task from a newly registered
+    task. Zero or very low counts indicate a novel spawning relationship worth chasing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains: 'cleanmgr.exe'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What other processes did the Schedule service host launch on this host around the time of the alert?
+  context: Beyond the detected cleanmgr.exe, the scheduled-task service host may have launched other tools in sequence. Seeing
+    the other processes spawned by the Schedule service host reveals whether the abused task ran a single command or
+    orchestrated additional activity such as reconnaissance, persistence, or credential access.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentCommandLine|contains: '-s Schedule'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|endswith: '"\system32\cleanmgr.exe /autoclean /d C:'
+        ParentCommandLine: C:\Windows\system32\svchost.exe -k netsvcs -p -s Schedule
+        IntegrityLevel:
+        - High
+        - System
+        - S-1-16-16384
+        - S-1-16-12288
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|endswith: '"\system32\cleanmgr.exe /autoclean /d C:'
+        ParentCommandLine: C:\Windows\system32\svchost.exe -k netsvcs -p -s Schedule
+        IntegrityLevel:
+        - High
+        - System
+        - S-1-16-16384
+        - S-1-16-12288
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If
+    the same user triggered similar elevation activity on multiple hosts, the scope of compromise may be larger than this
+    single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  always_include: true
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|endswith: '"\system32\cleanmgr.exe /autoclean /d C:'
+        ParentCommandLine: C:\Windows\system32\svchost.exe -k netsvcs -p -s Schedule
+        IntegrityLevel:
+        - High
+        - System
+        - S-1-16-16384
+        - S-1-16-12288
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate context: what led to
+    the elevation, what happened after, and whether it is part of a larger sequence. Look for reconnaissance, persistence, or
+    defense tampering near the elevated cleanmgr.exe launch.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance, or
+    credential access — may reveal the attack stages that preceded the elevation and help reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

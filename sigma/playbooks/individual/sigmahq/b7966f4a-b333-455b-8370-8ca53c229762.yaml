@@ -1,0 +1,425 @@
+name: Dropping Of Password Filter DLL
+id: 96ba3f6b-ddb0-491a-b15e-50219b07c6a0
+description: |
+  Detects a command line that adds a value to the LSA Notification Packages
+  registry key (HKLM\SYSTEM\CurrentControlSet\Control\Lsa) via reg add, where the
+  data string carries the REG_MULTI_SZ separator "scecli\0" used to append a new
+  password filter DLL alongside the default scecli entry. Registering a password
+  filter DLL is a legitimate Windows password-policy feature, but the same
+  mechanism is abused for credential access: LSASS loads each registered filter at
+  boot and passes every subsequent password change to the DLL's PasswordChangeNotify
+  export in plaintext, capturing cleartext credentials without touching LSASS memory.
+  The investigation should confirm the exact filter name being appended, determine
+  whether a corresponding DLL was dropped into System32 and loaded by lsass.exe, and
+  establish whether the registry write was authorized.
+type: detection
+detection_id: b7966f4a-b333-455b-8370-8ca53c229762
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- question: Does the command line add a password filter to the LSA Notification Packages key — a reg add against HKLM\SYSTEM\CurrentControlSet\Control\Lsa whose data contains the scecli\0 separator?
+  context: Before investing investigation time, confirm the alert is a true positive. The
+    rule fires when a single command line contains all three of reg add, the Lsa control
+    key path, and the literal scecli\0 multi-string separator. The scecli\0 fragment is
+    how reg.exe expresses appending a new value after the default scecli filter in a
+    REG_MULTI_SZ; read the full command and note the filter basename being added after
+    scecli\0, because that name is the DLL the analysis hinges on.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Is this user and host expected to modify LSA Notification Packages?
+  context: Writing a password filter into the LSA configuration is a rare administrative
+    action — it is normally done once during a security product or password-policy
+    deployment, not interactively. Knowing whether the account is a local administrator
+    and whether the host's role (domain controller, server, workstation) involves
+    authentication-policy tooling is often the fastest way to separate a sanctioned change
+    from an attacker establishing a credential-capture foothold.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Was there a change ticket, maintenance window, or documented approval for adding a password filter to the LSA configuration?
+  context: Registering a password filter DLL is a sensitive persistence-class change that
+    most organizations gate behind a change request, especially on domain controllers
+    where it affects every domain account's password changes. A corresponding ticket tied
+    to a security or password-policy deployment suggests authorized activity; absence of
+    one when policy requires it shifts the disposition toward unauthorized credential-capture
+    setup.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What filter basename was appended to Notification Packages, and is it one of the default Microsoft entries or an unknown name?
+  context: The Notification Packages value is a REG_MULTI_SZ list of password filter
+    basenames (no extension) that LSASS loads at boot. The default Microsoft set is scecli,
+    kdcsvc (KDC service), and rassfm — these must be preserved. Any additional name written
+    after the scecli\0 separator is a newly registered filter; an unfamiliar basename
+    (for example a project-style name) is the credential-capture DLL. Parse the data
+    string written by reg add to isolate exactly which name was added beyond the defaults.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- question: What credentials would this filter capture, and does the host root domain accounts or only local accounts?
+  context: A registered password filter receives every password change on the host in
+    plaintext through its PasswordChangeNotify export, before the password is hashed and
+    stored. On a domain controller this captures domain user password changes domain-wide;
+    on a workstation or member server it captures local-account changes. Identify which
+    accounts root their password changes at this host to scope which credentials should be
+    treated as exposed and forced to rotate.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Were other registry modifications made via reg.exe on this host in the same session?
+  context: An operator setting up a password filter often makes adjacent registry changes —
+    querying the current Notification Packages value first, disabling protections, or
+    adding other persistence keys. Finding clusters of reg.exe write operations from the
+    same host within a short window reveals whether this was an isolated change or part of
+    a broader configuration tampering effort.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_reg:
+        Image|endswith:
+          - '\reg.exe'
+          - '\regedit.exe'
+        CommandLine|contains:
+          - ' add '
+          - ' delete '
+          - ' import '
+          - '/s '
+      condition: selection and selection_reg
+    fields:
+      - CommandLine
+- question: Was a DLL dropped into System32 on this host that matches the filter basename added to Notification Packages?
+  context: A registered password filter is only functional if a DLL named after the
+    appended basename exists at C:\Windows\System32\<basename>.dll. Correlating the filter
+    name from the registry write with a recent DLL creation in System32 confirms the
+    persistence is armed and identifies the file to hash and submit for analysis. A
+    System32 DLL with no Microsoft signature matching a new Notification Packages entry is
+    the credential-capture implant.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains: '\System32\'
+        TargetFilename|endswith: '.dll'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: Has lsass.exe loaded a non-Microsoft module on this host, indicating the registered filter was picked up at boot?
+  context: The registry write only takes effect after a reboot, when LSASS reads
+    Notification Packages and loads each listed filter via its module-import resolution.
+    An image-load event showing lsass.exe loading a DLL from System32 that is unsigned or
+    not Microsoft-signed confirms the filter is active and capturing password changes;
+    submit the loaded module's hash to threat intel to determine whether it is a known
+    password-filter implant. If image-load (module-load) telemetry is not collected in this
+    environment, treat the absence of results as a visibility gap and confirm the DLL on disk directly.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: '\lsass.exe'
+        ImageLoaded|contains: '\System32\'
+      filter_signed:
+        Signed: 'true'
+        SignatureStatus: 'Valid'
+      condition: selection and not filter_signed
+    fields:
+      - ImageLoaded
+      - Hashes
+      - Signed
+      - Signature
+- question: When this host has previously fired this Notification Packages pattern, what parents and users drove it, and does the current alert fit?
+  context: Even sanctioned password-filter deployments leave a fingerprint. The query
+    mirrors the rule's exact selection scoped to this host, so the resulting parent/user
+    distribution reflects how this specific registry-write pattern has historically run
+    here — not generic reg.exe usage. A new parent process, an unexpected account, or a
+    first-ever occurrence is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_cmdline:
+        CommandLine|contains|all:
+        - HKLM\SYSTEM\CurrentControlSet\Control\Lsa
+        - scecli\0*
+        - reg add
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection_cmdline) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Have other hosts added a password filter to Notification Packages in the past week, and does the spread look like automation or one-off activity?
+  context: The query mirrors the rule's selection with no host scope, returning a
+    fleet-wide count of this specific Notification Packages write pattern rather than
+    generic reg.exe usage. Many hosts firing the same pattern in a coordinated window
+    points to a scripted security-product or password-policy rollout; one host or a small
+    unrelated set points to manual operator activity. Use the host distribution to
+    calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_cmdline:
+        CommandLine|contains|all:
+        - HKLM\SYSTEM\CurrentControlSet\Control\Lsa
+        - scecli\0*
+        - reg add
+      condition: selection_cmdline
+    fields:
+    - host.name
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_cmdline:
+        CommandLine|contains|all:
+        - HKLM\SYSTEM\CurrentControlSet\Control\Lsa
+        - scecli\0*
+        - reg add
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection_cmdline) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_cmdline:
+        CommandLine|contains|all:
+        - HKLM\SYSTEM\CurrentControlSet\Control\Lsa
+        - scecli\0*
+        - reg add
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection_cmdline) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals whether the same account
+    touched authentication configuration on multiple endpoints. If the same user triggered
+    similar activity on several hosts, the scope of the credential-capture setup may be
+    larger than this single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_cmdline:
+        CommandLine|contains|all:
+        - HKLM\SYSTEM\CurrentControlSet\Control\Lsa
+        - scecli\0*
+        - reg add
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection_cmdline) and _pb_scope
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: A password-filter installation is rarely the first step. Earlier detections on
+    the same host — defense tampering, privilege escalation, or other credential access —
+    may reveal the stages that preceded establishing this credential-capture foothold and
+    help reconstruct the full timeline leading up to the registry write.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Were outbound remote-access connections (RDP, SMB, WinRM, SSH) initiated from this host after
+    this event?
+  context: Credential theft is typically followed by lateral movement. The query returns outbound connections
+    from this host to remote-access ports -- 3389 (RDP), 445 (SMB/PsExec), 5985/5986 (WinRM), 22 (SSH)
+    -- in the hours after the event; the originating Image and User show what drove each connection. Two
+    limits to keep in mind -- credentials exfiltrated and replayed from another machine will not appear
+    here (check security 4624 logons on suspected targets for this account and any accounts with sessions
+    on this host), and the query requires Sysmon network telemetry (EID 3); if that is not collected from
+    this host, treat zero rows as a visibility gap, not as evidence no movement occurred.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
+- question: Which accounts may be compromised, and do any have elevated privileges?
+  context: The severity of a password filter depends on which accounts change passwords on
+    this host. On a domain controller, every domain account — including domain admins,
+    krbtgt, and service accounts — would expose its cleartext password on next change,
+    requiring incident escalation and credential rotation. Cross-reference the affected
+    scope with directory group memberships to identify high-privilege exposure.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Were other process-based persistence mechanisms installed on this host around the same time?
+  context: Attackers rarely rely on a single persistence mechanism. Alongside a password
+    filter, they commonly install backup footholds using scheduled tasks, services,
+    registry Run keys, BITS jobs, or WMI subscriptions. Multiple persistence installations
+    in the same timeframe indicate intentional stacking rather than an isolated
+    administrative action.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine

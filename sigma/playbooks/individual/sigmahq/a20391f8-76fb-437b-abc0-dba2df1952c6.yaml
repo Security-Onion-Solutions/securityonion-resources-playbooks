@@ -1,0 +1,330 @@
+name: Visual Studio NodejsTools PressAnyKey Arbitrary Binary Execution
+id: ab95398f-a39a-440b-aabd-c65078681c0f
+description: |
+  Detects any child process spawned by Microsoft.NodejsTools.PressAnyKey.exe, a Microsoft-signed
+  utility shipped with the Visual Studio Node.js tooling. The binary takes a status keyword, a PID
+  file path, and a path to an executable, then starts that third argument directly via the process
+  API and writes its own PID to the second argument's path — so it can launch any local or
+  file-share-hosted binary as a child while inheriting the trust of a signed Microsoft process.
+  Legitimately it runs only as part of Visual Studio Node.js debugging on developer machines; outside
+  that context an unexpected child indicates trusted-binary proxy execution (T1218). Determine what
+  child was launched, where it came from, whether the PressAnyKey parent itself was legitimately
+  invoked, and whether the child went on to load unsigned modules or open network connections.
+type: detection
+detection_id: a20391f8-76fb-437b-abc0-dba2df1952c6
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- question: Was the parent of the alerting process Microsoft.NodejsTools.PressAnyKey.exe?
+  context: Confirm the alert is a true positive by checking that the parent image of the triggering
+    event ends in Microsoft.NodejsTools.PressAnyKey.exe. The alerting process is the child the LOLBIN
+    was directed to execute; note its Image and command line from the alert, as that child drives the
+    rest of this investigation.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+- question: Is this user and host expected to run Visual Studio Node.js debugging tooling?
+  context: PressAnyKey.exe spawning a child is routine only on developer machines actively running
+    Node.js debugging under Visual Studio. On a server, a non-developer endpoint, or under a service
+    account, the parent should not be present at all, which raises the likelihood of trusted-binary
+    proxy execution over legitimate use.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What exactly is the child binary the LOLBIN launched, and what does its command line do?
+  context: The third argument PressAnyKey.exe receives is passed straight to the process-start API,
+    so the child Image and its full command line define the actual action taken. Decode any flags,
+    encoded content, file paths, or URLs in the child's command line, and note whether the executable
+    path points to a local install directory, a user-writable location, or a remote file share.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - CurrentDirectory
+- question: What invoked Microsoft.NodejsTools.PressAnyKey.exe itself, and with what arguments?
+  context: The parent's own process event shows how the LOLBIN was reached. In legitimate use the
+    grandparent is the Visual Studio IDE (devenv.exe) or a Node.js debug launcher. An interactive
+    shell, a script host, an Office application, or a remote-execution service as the grandparent
+    indicates the binary was repurposed for proxy execution rather than invoked by the IDE.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- question: Does the child command line contain a remote path, URL, or download/execute pattern?
+  context: Proxy execution through a signed binary is most often used to run a payload pulled from a
+    file share or remote host. This sweep flags children on this host whose command line references a
+    UNC share, an HTTP or HTTPS URL, or a path under a user-writable directory — arguments that
+    indicate the proxied binary or its input came from outside the local trusted install.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+      selection_remote:
+        CommandLine|contains:
+          - '\\\\'
+          - 'http://'
+          - 'https://'
+          - '\Users\'
+          - '\Temp\'
+          - '\AppData\'
+          - '\ProgramData\'
+      condition: selection_host and selection_remote
+    fields:
+      - Image
+      - CommandLine
+      - User
+- question: Did the child process load any unsigned or unusual modules after it started?
+  context: A binary launched through the LOLBIN may side-load attacker-supplied libraries to run code
+    while the on-disk executable looks benign. Reviewing modules loaded by the child reveals DLLs
+    pulled from user-writable or temporary locations, which are inconsistent with a binary running
+    only its own signed dependencies. If image-load telemetry is not collected in this environment,
+    treat zero results as a visibility gap rather than evidence nothing loaded.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - CommandLine
+- question: Did the child process open any network connections after it started?
+  context: The reference behavior describes executing a binary located on a remote file share, and a
+    proxied payload commonly retrieves further stages or beacons outbound. Network connections
+    originating from the child binary — especially to external addresses or non-standard ports —
+    indicate the proxied execution had a network objective beyond local-only activity.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- question: What other child processes did Microsoft.NodejsTools.PressAnyKey.exe spawn on this host?
+  context: An operator using the LOLBIN as an execution launcher may drive several stages through it
+    in sequence. Listing every child of the PressAnyKey parent on this host reveals whether the
+    alerting child was a one-off or one step in a chain of proxied executions.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: What other process activity surrounds the PressAnyKey parent on this host in the alert window?
+  context: Beyond its direct children, activity near the parent helps place the execution in context —
+    what ran just before to set it up and what ran just after. Reconnaissance, credential-access, or
+    persistence tooling clustered around the same window strengthens a malicious reading.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Has Microsoft.NodejsTools.PressAnyKey.exe spawned this child binary before on this host?
+  context: Routine Visual Studio debugging spawns a predictable, narrow set of children (the program
+    under debug, node.exe). A child binary this parent has never launched on this host is a novel
+    spawning relationship and is more likely to be proxied execution than developer activity.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Is this parent-child spawning pattern occurring on other hosts?
+  context: The same PressAnyKey parent launching the same child across multiple hosts points to either
+    a fleet-wide developer toolset or a repeated technique deployed across endpoints. A single
+    occurrence is more consistent with targeted or one-off use.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+      - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \Microsoft.NodejsTools.PressAnyKey.exe
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \Microsoft.NodejsTools.PressAnyKey.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the environment around the time of the alert?
+  context: Tracking the acting user across all hosts in the alert window can reveal lateral movement
+    or activity on additional endpoints. The same user driving similar execution on multiple hosts
+    widens the apparent scope.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \Microsoft.NodejsTools.PressAnyKey.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — defense tampering, reconnaissance, or credential
+    access — may reveal the stages that preceded this execution and help reconstruct the timeline that
+    led to the trusted-binary proxy run.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

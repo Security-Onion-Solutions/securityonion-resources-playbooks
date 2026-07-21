@@ -1,0 +1,431 @@
+name: WMI ActiveScriptEventConsumers Activity Via Scrcons.EXE DLL Load
+id: bf4c299b-d66f-4877-856b-f5a35d491635
+description: |
+  Detects the WMI script-consumer host process scrcons.exe loading scripting-engine modules
+  (vbscript.dll, wbemdisp.dll, wshom.ocx, or scrrun.dll), which is how a WMI ActiveScriptEventConsumer
+  runs its script when a bound event filter fires. scrcons.exe is spawned by svchost.exe and normally
+  appears only when a permanent WMI event subscription executes a VBScript/JScript consumer; some
+  management software (for example SCCM) and certain vendor drivers register legitimate consumers, so a
+  load by itself is not proof of abuse. The technique provides event-triggered persistence and, when the
+  subscription is planted from a remote host, lateral movement, with the payload running as SYSTEM and
+  leaving no command line. Investigate which subscription fired, what the script did, the parent chain,
+  any network activity tied to the process, and whether the subscription and consumer were created on
+  this host recently or arrived over the network.
+type: detection
+detection_id: b439f47d-ef52-4b29-9a2f-57d8a96cb6b8
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-10
+questions:
+- question: Did scrcons.exe load one of the WMI scripting-engine modules this rule detects?
+  context: >-
+    Confirm the alert is a true positive by reviewing the loading process (Image) and the loaded module
+    (ImageLoaded) against the rule's criteria. The rule fires only when the WMI script host scrcons.exe
+    loads vbscript.dll, wbemdisp.dll, wshom.ocx, or scrrun.dll, which together indicate a script-based
+    event consumer is executing. The library event carries the module's signing status and hash directly,
+    so verify the load is genuinely scrcons.exe running a scripting engine and not a name collision.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|endswith|expand: '%ImageLoaded%'
+      condition: selection
+    fields:
+      - Image
+      - ImageLoaded
+- question: Is this host expected to run WMI ActiveScript event consumers, and under what account?
+  context: >-
+    Legitimate software registers WMI event consumers, and scrcons.exe appears whenever one fires - SCCM,
+    some backup tools, and certain vendor drivers (for example a Dell brightness-key consumer) are common
+    benign sources. Knowing whether this host has a management or vendor role that would explain a script
+    consumer is often the fastest way to separate routine activity from an unexpected subscription. The
+    payload usually runs as SYSTEM; when the account is SYSTEM or a machine account, pivot on the parent
+    chain and the subscription objects rather than the user.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What spawned scrcons.exe, and is that parent chain the expected svchost.exe lineage?
+  context: >-
+    The library event carries no parent detail, so pivot by ProcessGuid to the process record of
+    scrcons.exe to read its ParentImage and parent command line. A WMI script consumer host is normally
+    spawned by svchost.exe running the WMI service (netsvcs); a parent other than svchost.exe, or a
+    svchost instance launched with an unusual command line, points to the process being started outside
+    the normal WMI trigger path. This attributes the trigger to its launching service.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - Image
+      - CommandLine
+- question: What full set of modules did scrcons.exe load, and are any from non-canonical paths or unsigned?
+  context: >-
+    The scripting DLLs the rule matches are expected to load from system32; the story is in what else
+    scrcons.exe loaded around the same time. Look for modules from %TEMP%, AppData, ProgramData, or Public
+    (side-loading), unsigned modules where signed system DLLs are expected, .NET assemblies loaded from
+    non-system paths (the consumer script staging code in memory), and system DLL names resolved from
+    unexpected directories (search-order hijacking). The scripting-engine load confirms a consumer ran;
+    the surrounding module set shows what the script actually pulled in.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+      - SignatureStatus
+      - Hashes
+- question: For each module scrcons.exe loaded, what is its signing status, hash, and reputation?
+  context: >-
+    The four scripting DLLs are normally genuine Microsoft-signed modules loaded from system32, so a valid
+    Microsoft signature on them is the expected baseline rather than a finding. The anomaly is a scripting
+    DLL that is unsigned, has an invalid or distrusted signature, or resolves from outside system32 - a
+    masquerading or relocated module - or any other loaded module with a suspect signature. Hash lookups
+    against threat intelligence surface known malicious loaders staged by the consumer script.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Hashes
+      - Signed
+      - Signature
+      - SignatureStatus
+- question: Were WMI event subscription objects created or modified on this host, and when?
+  context: >-
+    The DLL load is the trigger firing; the persistence lives in the WMI repository as an
+    __EventFilter, an ActiveScriptEventConsumer, and a __FilterToConsumerBinding tying them
+    together. The WMI-Activity operational channel records these as event 5861 for permanent
+    consumer registration — the CONSUMER column carries the consumer definition and ESS the
+    binding — 5860 for temporary registrations, and 5859 for filter-to-consumer subscription
+    activity, with the Query column and message narrative naming the trigger condition.
+    Correlating the registration timestamps with the time of this trigger shows when the
+    consumer was planted and how long it has persisted. Hosts that do not ship the WMI-Activity
+    channel return no data, so treat zero results as a visibility gap rather than evidence
+    nothing was registered.
+  range: -30d
+  query: |
+    aggregation: false
+    logsource:
+      category: wmi
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID:
+          - 5859
+          - 5860
+          - 5861
+      condition: selection
+    fields:
+      - EventID
+      - winlog.user_data.CONSUMER
+      - winlog.user_data.ESS
+      - winlog.user_data.Query
+      - winlog.user_data.NamespaceName
+      - message
+- question: What child processes did scrcons.exe spawn after the script consumer ran?
+  context: >-
+    The consumer script executes at SYSTEM with no command line of its own; its impact shows up as the
+    processes scrcons.exe launches. A script consumer that only manipulates WMI or in-memory state may
+    spawn nothing, so any child - cmd.exe, powershell.exe, a scripting host, or an unfamiliar binary -
+    reveals the payload's action. Note that a consumer can also inject into an existing process rather
+    than spawn one, in which case this returns nothing and the network and module questions carry the
+    weight.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Did a remote host connect to this host over WMI/DCOM or WinRM before the subscription fired?
+  context: >-
+    A permanent WMI subscription can be planted remotely over DCOM (RPC endpoint mapper on 135 plus a
+    dynamic port) or WinRM (5985/5986), which is what turns this technique into lateral movement. Look for
+    inbound connections on those ports around the time the subscription objects were created, which the
+    subscription-object question dates - the creating session usually precedes the trigger, sometimes by
+    hours or days. An inbound WMI/WinRM session from an unexpected internal source before the consumer was
+    registered indicates the foothold was established from another host.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationPort:
+          - 135
+          - 445
+          - 5985
+          - 5986
+      condition: selection
+    fields:
+      - SourceIp
+      - DestinationPort
+- question: Did scrcons.exe make any external network connections?
+  context: >-
+    A script consumer reaching an external address is the direct sign the payload is doing more than local
+    configuration - staging a download, calling home, or driving remote execution. Connections from
+    scrcons.exe to addresses outside the internal ranges are unusual for a routine event consumer and
+    warrant identifying the destination and correlating it with the loaded modules and any child
+    processes.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      filter_internal:
+        DestinationIp|cidr:
+          - '10.0.0.0/8'
+          - '172.16.0.0/12'
+          - '192.168.0.0/16'
+          - '127.0.0.0/8'
+          - '169.254.0.0/16'
+      condition: selection and not filter_internal
+    fields:
+      - DestinationIp
+      - DestinationPort
+- question: When this host previously loaded these scripting modules into scrcons.exe, what programs and users drove it, and does this alert fit?
+  context: >-
+    Even a legitimately registered consumer fires under a consistent account and cadence. The
+    query mirrors the rule's selection scoped to this host, so the resulting program and user
+    distribution reflects how this exact scrcons.exe scripting-DLL load has historically fired
+    here. Expect the Image column to show scrcons.exe itself; an unexpected account or a
+    first-ever occurrence is the deviation worth chasing, while a steady prior history under
+    SYSTEM points to an established consumer. Image-load events carry no parent lineage - pivot
+    to the scrcons.exe start event if lineage matters.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \scrcons.exe
+        ImageLoaded|endswith:
+        - \vbscript.dll
+        - \wbemdisp.dll
+        - \wshom.ocx
+        - \scrrun.dll
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - Image
+    - User
+- question: Have other hosts loaded these scripting modules into scrcons.exe this week, and does the distribution look like automation or one-off activity?
+  context: >-
+    The query mirrors the rule's selection with no host scope, giving a fleet-wide count of this exact
+    scrcons.exe scripting-DLL load pattern rather than generic WMI usage. Many hosts firing the same
+    pattern points to a management platform or vendor software that registers the same consumer everywhere
+    (a strong benign signal); one host or a small unrelated set points to a targeted subscription. Use the
+    host distribution to calibrate how much weight the single alert carries.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \scrcons.exe
+        ImageLoaded|endswith:
+        - \vbscript.dll
+        - \wbemdisp.dll
+        - \wshom.ocx
+        - \scrrun.dll
+      condition: selection
+    fields:
+    - host.name
+- question: What other process activity occurred on this host around the time of the alert?
+  context: >-
+    A triggered script consumer rarely stands alone. Aggregating process activity in a tight window around
+    the load surfaces what preceded the trigger and what ran just after it. Novel parent-child pairs stand
+    out at low counts against high-count routine telemetry, which is what points to any reconnaissance,
+    privilege use, or staging tied to the consumer firing.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host - reconnaissance, credential access, or defense tampering - may
+    reveal the stages that preceded the subscription firing and help reconstruct the timeline. Event-
+    triggered persistence is often installed after an operator already has a foothold, so prior alerts
+    help place this trigger within a larger sequence rather than treating it as the first event.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Were other process-based persistence mechanisms installed on this host in the same window?
+  context: >-
+    Operators rarely rely on a single foothold. A WMI event subscription is one persistence mechanism;
+    scheduled tasks, services, registry Run keys, or BITS jobs created by schtasks.exe, sc.exe, reg.exe,
+    bitsadmin.exe, or wmic.exe in the surrounding hours indicate the consumer is one part of a stacked
+    persistence set rather than an isolated event. Give particular attention to these tools invoked with
+    payloads in user-writable directories.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- question: Does an administrator or the responsible team recall registering this WMI event consumer?
+  context: >-
+    A WMI ActiveScript event consumer is either deployed by known management tooling or created by an
+    operator, so direct confirmation is a fast way to resolve the alert. If a platform team or a change
+    deployed the subscription, that context closes it; if no one recalls it and it does not match a known
+    management or vendor consumer, the subscription was likely planted by tooling and the investigation
+    should continue into the parent chain, the script's modules, and any network activity. The payload
+    commonly runs as SYSTEM, so ask the team that owns the host or the WMI-based tooling rather than a
+    single end user.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: >-
+    Is the referenced file still on disk for analysis?
+  context: >-
+    If the detected command references a file (downloaded payload, decoded output, script), checking
+    whether it still exists on disk enables deeper analysis -- hash lookups, sandbox submission, or
+    content review.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: >-
+    What host initiated this remote connection, and is it an expected administrative source?
+  context: >-
+    Lateral movement requires a source and destination. Identifying the originating host reveals
+    whether the connection came from a known admin jump box, a compromised workstation, or an
+    unexpected source. Attackers who have compromised one host use it as a pivot point to reach
+    others.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationPort:
+          - 445
+          - 135
+          - 3389
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - SourceIp
+      - DestinationPort

@@ -1,0 +1,344 @@
+name: Potential Pikabot C2 Activity
+id: 5471af6c-1932-4a1e-9c4f-08572028c02f
+description: |
+  Detects an outbound TCP connection initiated by a normally-non-networking Windows system
+  binary (SearchFilterHost.exe, SearchProtocolHost.exe, sndvol.exe, wermgr.exe, or wwahost.exe)
+  whose parent process is rundll32.exe. These binaries rarely originate egress TCP traffic and
+  rundll32.exe rarely parents them for networking, so the combination is anomalous. Pikabot
+  loaders invoke a DLL through rundll32.exe that injects into one of these benign-looking
+  binaries, which then beacons to command-and-control infrastructure over an encrypted channel.
+  Investigation should confirm the destination and port, reconstruct the rundll32 process lineage
+  and the DLL it loaded, and determine whether the connection profile and cadence look like
+  automated beaconing rather than legitimate activity.
+type: detection
+detection_id: cae6cee6-0244-44d2-84ed-e65f548eb7dc
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-10
+questions:
+- question: Do the destination, port, and direction match this rule, and which process initiated the connection?
+  context: Confirm the alert by reviewing the exact destination IP and port, the outbound (egress)
+    direction, the TCP protocol, and the initiating process against the rule's criteria. The rule
+    fires only when one of the listed system binaries makes the connection AND its parent is
+    rundll32.exe, so verify both the initiating Image and the ParentImage on the alerting event.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationIp|expand: '%dst_ip%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - Protocol
+      - Initiated
+- question: Is this host and user expected to originate outbound connections from these indexer and system utility binaries?
+  context: SearchFilterHost.exe, SearchProtocolHost.exe, sndvol.exe, wermgr.exe, and wwahost.exe
+    are legitimate system components, but they are not expected to initiate outbound TCP under
+    rundll32.exe. Knowing whether the host function or a maintenance task could explain such
+    traffic helps separate a true positive from a rare but benign event. These binaries are not
+    part of the normal set of processes that establish encrypted network sessions.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What did the parent rundll32.exe load, and what launched rundll32 itself?
+  context: The rundll32.exe parent is the core signal. Retrieving its own process event reveals the
+    DLL path and exported function it was told to run, which for this loader pattern is often a
+    dropped DLL invoked at a randomized or ordinal export name. Tracing what spawned rundll32.exe
+    (the grandparent, such as msiexec.exe or a shell) shows whether the chain began with a document,
+    an installer package, or an interactive user action.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What other processes did the responsible process spawn?
+  context: A process that performs this action rarely stops there. Listing the children it launched shows
+    whether the activity was an isolated change or one step in a longer chain - payload execution,
+    additional persistence, or follow-on tooling. Note this shows what the acting process started,
+    not what started alongside it. Sibling processes cannot be identified from this telemetry,
+    because this event type does not record the acting process's parent.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: What is the full set of destinations and ports this process connected to around the alert?
+  context: A single alerting connection is one data point; the full connection profile of this
+    binary in the surrounding window shows whether it contacted one endpoint or several, and on
+    which ports. A normally-non-networking binary reaching out to multiple external destinations,
+    or repeatedly to one, is consistent with a beaconing loader rather than an isolated event.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Initiated
+- question: What is the reputation and registration profile of this destination?
+  context: Investigate the destination IP through passive DNS, WHOIS and registration age, hosting
+    provider, TLS certificate details, and threat intelligence. Recently registered domains,
+    self-signed or mismatched certificates, and known command-and-control infrastructure point to
+    an attacker-controlled endpoint. The resolved hostname is frequently absent on the connection
+    event itself, so anchor on the IP and recover the domain from the host's DNS lookups.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationIp|expand: '%dst_ip%'
+      condition: selection
+    fields:
+      - DestinationHostname
+      - DestinationPort
+- question: What domains did this process resolve around the time of the connection?
+  context: The connection event rarely carries the resolved hostname, so the domain behind the
+    destination IP is usually recovered from the DNS lookups this process made just before it
+    connected. A domain that is newly registered, algorithmically generated, or otherwise unusual
+    for this binary supports an attacker-controlled destination. If DNS query logging is not
+    ingested in this environment, treat an empty result as a visibility gap rather than evidence
+    no lookup occurred.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: dns_query
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - QueryName
+- question: Do connections from this host to the destination repeat at regular intervals?
+  context: Encrypted command-and-control channels typically beacon on a fixed or jittered cadence.
+    Listing every connection from this host to the destination over a longer window exposes whether
+    the traffic is periodic (regular check-ins characteristic of a beacon) or a one-off transfer.
+    The correlation window between the process launch, any library loads, and these connections is
+    itself a tuning parameter; widen or narrow it to match the expected beacon interval.
+  range: -24h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationIp|expand: '%dst_ip%'
+      condition: selection
+    fields:
+      - DestinationPort
+      - Image
+      - Initiated
+- question: Did this process load TLS or other encryption libraries consistent with an encrypted channel?
+  context: An encrypted channel requires the process to load cryptographic or secure-transport
+    libraries such as schannel, ncrypt, bcrypt, or the HTTP stack. A normally-non-networking system
+    binary loading these near the time of an outbound connection corroborates encrypted
+    command-and-control. Payload randomness and encryption strength are the discriminators here;
+    where library loads are collected, they confirm the channel was encrypted rather than plaintext.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        ImageLoaded|contains:
+          - \schannel.dll
+          - \ncrypt.dll
+          - \bcrypt.dll
+          - \winhttp.dll
+          - \wininet.dll
+          - \secur32.dll
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+- question: Has this host communicated with this destination before?
+  context: First contact with an external destination is more suspicious than routine communication.
+    Establishing whether the host has any prior history with this endpoint distinguishes new
+    attacker infrastructure from an established business service. Zero or very low historical counts
+    indicate a novel destination for this host.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationIp|expand: '%dst_ip%'
+      condition: selection
+    fields:
+      - DestinationPort
+      - Image
+- question: Does rundll32.exe on this host normally spawn this system binary?
+  context: rundll32.exe parenting SearchFilterHost.exe, SearchProtocolHost.exe, sndvol.exe,
+    wermgr.exe, or wwahost.exe is an unusual pairing. Historical frequency of this specific
+    parent-child relationship on the host separates routine behavior from a novel spawning pattern.
+    Zero or very low counts indicate the relationship is new.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What other outbound connections came from rundll32.exe-spawned processes on this host?
+  context: Beyond the alerting binary, the same rundll32.exe activity may have driven other injected
+    processes to beacon out. Listing outbound connections from rundll32.exe-parented processes on
+    the host around the alert reveals whether several system binaries are contacting external
+    infrastructure as part of one loader operation.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+      condition: selection
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationPort
+- question: Does this host normally see this binary initiating outbound network connections?
+  context: These system binaries run routinely as part of normal Windows operation, so process
+    execution counts alone are not the discriminator. Outbound network activity is. A binary that
+    executes often but has essentially never initiated egress TCP, suddenly connecting out, is the
+    signal. Zero or very low historical connection counts indicate first-time network behavior for
+    this binary.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationPort
+      - DestinationIp
+- question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining process activity around the connection
+    reveals what led to it and what followed, and whether it is part of a larger sequence such as
+    initial delivery, injection, and follow-on tooling. Novel parent-child pairs stand out at low
+    counts against the routine high-count background.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Is this rundll32.exe-to-system-binary connection pattern occurring on other hosts?
+  context: The same parent-child pairing making outbound connections across multiple hosts points to
+    a campaign or a common delivery vector rather than an isolated event. Enterprise-wide comparison
+    helps calibrate scope and identify additional affected hosts. A single occurrence is more likely
+    targeted or benign.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+      - DestinationIp
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host, such as suspicious document execution, injection, or
+    defense tampering, may reveal the delivery and staging steps that preceded this connection and
+    help reconstruct the timeline. The sequence of alerts on a host often tells the story of how the
+    activity reached the command-and-control stage.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

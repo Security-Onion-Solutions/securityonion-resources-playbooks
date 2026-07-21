@@ -1,0 +1,563 @@
+name: Potentially Suspicious Ping/Copy Command Combination
+id: d7c7c01a-cd81-449c-aa87-4e9afd1b5e14
+description: |
+  Detects a single Windows command interpreter command line that carries both a ping invocation and
+  a copy operation together with the ping count flag (-n) and the copy overwrite flag (-y). The rule
+  fires when the alerting process resolves to the command interpreter by either of two alternative
+  identifiers — an Image path ending in \cmd.exe, or an OriginalFileName of Cmd.Exe — and the command
+  line contains "ping" and "copy " alongside " -n " and " -y ". Chaining ping into copy is a common
+  way to build a timed delay into a one-liner: ping -n N against a loopback or unreachable address
+  burns roughly N seconds before the copy runs, which lets a dropper or installer exit before its
+  file is relocated or replaced, while copy /y overwrites the destination with no prompt and no
+  record of what was there before. The same construction appears in legitimate installer and
+  packaging scripts, so the investigation should identify the copy source and destination, determine
+  whether the copied file is known, establish what launched the one-liner, and check whether the
+  original artifact was deleted once the copy completed.
+type: detection
+detection_id: ded2b07a-d12f-4284-9b76-653e37b6c8b0
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-17
+questions:
+- question: >-
+    Does one command line contain ping, copy, -n and -y, and does the alerting process resolve to the
+    command interpreter by either its Image path or its OriginalFileName?
+  context: >-
+    The rule requires four command-line substrings present together — "ping", "copy ", " -n " and
+    " -y " — and separately requires the process to be the command interpreter by either one of two
+    alternative identifiers: an Image path ending in \cmd.exe, or an OriginalFileName of Cmd.Exe.
+    Note which of those two branches fired, because it changes what matters next. An Image-path match
+    is the ordinary case and the binary's identity needs no further work. An OriginalFileName match
+    where the Image path is not \cmd.exe means the interpreter was renamed or copied out of System32,
+    which makes the origin, path, and signing of that binary the load-bearing follow-up. Read the
+    full command line and confirm the ping and copy are actually chained (&, &&, ||, or a for loop)
+    rather than incidental substrings in a filename or a search string.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+  answer_sources:
+  - alert
+  - process_creation
+- question: Is this user and host expected to run command-interpreter one-liners that chain a ping delay into a file copy?
+  context: >-
+    The construction is common in software installers, imaging and packaging scripts, build steps,
+    and hand-written admin batch files, where the ping is a portable substitute for a sleep command.
+    Whether this account and this host routinely run such scripting is usually the fastest way to
+    separate routine packaging work from a staging routine.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: Is the file the copy operation wrote still on disk for analysis?
+  context: >-
+    The copy destination named in the command line is the artifact this alert is really about. If the
+    file is still present, it can be hashed, submitted for analysis, or reviewed directly. This query
+    lists file activity attributed to the alerting process and its direct children, which is how the
+    written path is recovered when the command line uses relative paths or environment variables that
+    do not resolve by reading the text alone.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+  answer_sources:
+  - file_event
+  - manual_review
+- question: Which file did the copy overwrite, and was an existing artifact replaced or removed in the same command?
+  context: >-
+    The copy overwrite flag suppresses the confirmation prompt, so any file already at the
+    destination was replaced with no prompt and no surviving record of its prior content. Read the
+    command line for the copy source and destination, the numeric value passed to -n (the delay in
+    seconds the ping introduces), and any del, erase, rd, attrib, takeown, or icacls verbs chained
+    alongside. A command that copies a file into place and then deletes the source is relocating an
+    artifact away from where it was written; a command that overwrites a system or application binary
+    is replacing a trusted file with attacker-supplied content.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: What are the copy source and destination paths, and what is in the copied file?
+  context: >-
+    Resolve the copy operands before anything else. Relative paths in the command line resolve
+    against the process working directory, so read that alongside the command line rather than
+    assuming the paths are absolute. Once the destination is known, retrieve the file and review its
+    content: for scripts and text files check for base64 blobs, obfuscated strings, embedded URLs or
+    IP addresses; for binaries check imports, embedded strings, packer signatures, and signing
+    status. A copy whose source is a temporary or user-writable directory and whose destination is a
+    system, application, or startup path is a relocation into a trusted location.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+  answer_sources:
+  - manual_review
+  - safe_environment
+  - external_threat_intel
+- question: If the copied file has executed, what is its hash and does it have known AV or threat-intel detections?
+  context: >-
+    A file's hash is recorded when it runs, not when it is written, so the hash pivot is the
+    execution event rather than the copy. This query looks on the alerting host for processes started
+    directly by the alerting command and for any execution out of the staging directories a delayed
+    copy typically targets, and reads their hashes. Submit a hash to a reputation service or internal
+    threat intel to establish whether the file is known malicious, known benign, or previously
+    unseen. If the copied file is present but has not executed, it will not appear here — retrieve it
+    from the destination path and hash it manually.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      selection_staged:
+        Image|contains:
+          - '\Users\Public\'
+          - '\AppData\Local\Temp\'
+          - '\AppData\Roaming\'
+          - '\Windows\Temp\'
+          - '\ProgramData\'
+          - '\PerfLogs\'
+      condition: selection_host and (selection_child or selection_staged)
+    fields:
+      - Image
+      - CommandLine
+      - Hashes
+  answer_sources:
+  - process_creation
+  - external_threat_intel
+- question: What process spawned this command-interpreter one-liner, and is that parent chain expected?
+  context: >-
+    The parent reveals how the one-liner was invoked and is usually more informative than the
+    interpreter itself. An installer, a packaging or deployment agent, or a management framework as
+    the parent fits the delayed-copy construction. A document handler, script host, browser, archive
+    utility, or a binary running from a user-writable directory as the parent does not, and points at
+    the one-liner being a stage handed down from something else. Where the parent is itself
+    unexpected, walk one level further up its own lineage.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Were files deleted from staging or temporary directories on this host around the time of the copy?
+  context: >-
+    The delay-then-copy construction is frequently the middle step of a relocate-and-clean routine:
+    the payload is copied to its resting place, then the original in the temporary or staging
+    directory is removed once the process that wrote it has exited. Deletions in \Users\Public\,
+    \AppData\Local\Temp\, \AppData\Roaming\, \Windows\Temp\, \ProgramData\, or \PerfLogs\ in the same
+    window as the copy, especially ones attributed to the same lineage, indicate the source artifact
+    was cleaned up after relocation. Note the deleted paths — they are what to look for in backups or
+    shadow copies if the file itself needs recovering. If file deletion telemetry is not collected in
+    this environment, treat zero results as a visibility gap rather than as evidence nothing was
+    removed.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_delete
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_paths:
+        TargetFilename|contains:
+          - '\Users\Public\'
+          - '\AppData\Local\Temp\'
+          - '\AppData\Roaming\'
+          - '\Windows\Temp\'
+          - '\ProgramData\'
+          - '\PerfLogs\'
+      condition: selection and selection_paths
+    fields:
+      - TargetFilename
+      - Image
+  answer_sources:
+  - file_event
+  - manual_review
+- question: Does the destination file still hold the copied content, or has it been overwritten or removed since?
+  context: >-
+    A relocation may be transient — copied in, executed, and removed — or it may be the file's
+    permanent resting place. Checking the destination path's current state establishes which. If the
+    destination is a system or application binary that was overwritten, the original should be
+    restored from a known-good source before the host is returned to service; if the destination is
+    empty, the artifact was removed after use and recovery depends on backups or shadow copies.
+    Confirm the current state on the host directly rather than inferring it from the command line.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - edr_console
+  - manual_review
+- question: What ran on this host in the hour after the delayed copy completed?
+  context: >-
+    The delay exists so that something happens after it. The numeric value passed to -n sets roughly
+    how many seconds elapse before the copy runs, so the copy and everything downstream of it land
+    after the alerting process started, not at the same instant. Aggregating process creation on the
+    host over the following hour collapses routine agent and system telemetry into high-count rows
+    while a newly copied binary executing for the first time appears as a low-count entry. Look
+    specifically for execution out of the copy destination.
+  range: +1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - User
+  answer_sources:
+  - process_creation
+- question: Were other indicator-removal or defense-tampering commands run on this host around the same time?
+  context: >-
+    Relocating and overwriting a file is one form of indicator handling; an operator cleaning up
+    after a drop often also clears event logs, removes shadow copies, stops services, or deletes
+    registry values in the same working session. Finding several such commands in the same window,
+    under the same user or the same parent, indicates the copy is one step in a cleanup sequence
+    rather than an isolated packaging action. Ignore the alerting command itself in the results and
+    read what surrounds it.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_tamper:
+        Image|endswith:
+          - '\wevtutil.exe'
+          - '\vssadmin.exe'
+          - '\bcdedit.exe'
+          - '\wbadmin.exe'
+          - '\netsh.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\powershell.exe'
+        CommandLine|contains:
+          - 'cl '
+          - 'clear-log'
+          - 'delete shadows'
+          - 'recoveryenabled'
+          - 'DisableRealtimeMonitoring'
+          - 'advfirewall'
+          - 'stop'
+          - 'delete'
+      condition: selection and selection_tamper
+    fields:
+      - Image
+      - User
+  answer_sources:
+  - process_creation
+- question: >-
+    When this host has previously produced this ping-and-copy pattern, what parents and users drove
+    it, and does the current alert fit that history?
+  context: >-
+    This query mirrors the rule's selection structure scoped to this host, so the parent and user
+    distribution it returns reflects how this specific pattern — not command-interpreter usage in
+    general — has run here over the past two weeks. A host that produces this every night under an
+    installer or deployment agent has a packaging routine behind it, and the alerting event should
+    match that parent and that account. A first occurrence, a new parent, or an interactive account
+    where the history is all service-driven is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_cmd:
+      - Image|endswith: \cmd.exe
+      - OriginalFileName: Cmd.Exe
+      selection_action:
+        CommandLine|contains|all:
+        - ping
+        - 'copy '
+      selection_cli_1:
+        CommandLine|contains|windash: ' -n '
+      selection_cli_2:
+        CommandLine|contains|windash: ' -y '
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+  answer_sources:
+  - process_creation
+- always_include: true
+  question: Has this user previously produced this ping-and-copy pattern, and does that history fit their role?
+  context: >-
+    This query mirrors the rule's selection structure scoped to this account, so the result is the
+    user's 90-day history of this specific pattern rather than their general use of the command
+    interpreter, aggregated by host. A packaging engineer, build account, or software-deployment
+    service principal with a long history across many hosts is behaving normally. A user account with
+    no prior occurrences, or one whose role involves no scripting or software distribution, is the
+    case to pursue. Weigh the count against what the account is meant to do.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_cmd:
+      - Image|endswith: \cmd.exe
+      - OriginalFileName: Cmd.Exe
+      selection_action:
+        CommandLine|contains|all:
+        - ping
+        - 'copy '
+      selection_cli_1:
+        CommandLine|contains|windash: ' -n '
+      selection_cli_2:
+        CommandLine|contains|windash: ' -y '
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+- always_include: true
+  question: >-
+    Has this parent process historically driven this ping-and-copy pattern here or across the
+    environment, or is the parent new for this activity?
+  context: >-
+    When the alert fires under SYSTEM, a service account, or a computer account, the user field
+    attributes nothing and the meaningful pivot is the launch mechanism. This query mirrors the
+    rule's selection structure scoped to the alerting parent process, so the result is the 90-day
+    history of that parent driving this specific pattern, aggregated by host. A parent already
+    accounting for thousands of prior events across many hosts is vendor or operating-system
+    automation. A parent that has never driven this pattern before, or drives it only on this host,
+    is the deviation worth chasing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_cmd:
+      - Image|endswith: \cmd.exe
+      - OriginalFileName: Cmd.Exe
+      selection_action:
+        CommandLine|contains|all:
+        - ping
+        - 'copy '
+      selection_cli_1:
+        CommandLine|contains|windash: ' -n '
+      selection_cli_2:
+        CommandLine|contains|windash: ' -y '
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- always_include: true
+  question: What else did this user do across the environment around this time?
+  context: >-
+    Tracking the account's activity across all hosts in the alert window shows whether the copy is a
+    local packaging step or part of activity spanning several endpoints. The same account driving
+    comparable staging on multiple hosts widens the scope of what needs review. If the alert fired
+    under a service principal, this returns routine agent telemetry and the parent-scoped view of the
+    same window is the meaningful answer instead.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+- always_include: true
+  question: >-
+    Did this same parent-driven ping-and-copy pattern fire on other hosts in the same window, or is
+    the activity isolated to this host?
+  context: >-
+    Under a service principal, asking what else the user did across the environment returns agent
+    telemetry from every host. The answerable question is whether the same launch mechanism produced
+    the same pattern elsewhere. This query mirrors the rule's selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Several hosts in the same hour points
+    at scheduled or pushed automation rolling out a package; a single host points at a host-local
+    trigger and keeps the investigation local.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_cmd:
+      - Image|endswith: \cmd.exe
+      - OriginalFileName: Cmd.Exe
+      selection_action:
+        CommandLine|contains|all:
+        - ping
+        - 'copy '
+      selection_cli_1:
+        CommandLine|contains|windash: ' -n '
+      selection_cli_2:
+        CommandLine|contains|windash: ' -y '
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- question: >-
+    Have other hosts produced this ping-and-copy pattern in the past week, and does the cross-host
+    distribution look like consistent automation or one-off activity?
+  context: >-
+    This query mirrors the rule's selection structure with no host scope, so the result is a
+    fleet-wide count of this specific pattern rather than the command interpreter's general
+    footprint. Many hosts producing it points at a deployment package or vendor installer that ships
+    the construction, which recasts the alert as a tuning candidate. One host, or a small set of
+    unrelated hosts, points at operator activity and raises the value of the parent and destination
+    questions. Use the host distribution alongside parent consistency to calibrate how far to take
+    this.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_cmd:
+      - Image|endswith: \cmd.exe
+      - OriginalFileName: Cmd.Exe
+      selection_action:
+        CommandLine|contains|all:
+        - ping
+        - 'copy '
+      selection_cli_1:
+        CommandLine|contains|windash: ' -n '
+      selection_cli_2:
+        CommandLine|contains|windash: ' -y '
+      condition: all of selection_*
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- question: Were files dropped to persistence locations on this host around the time of the copy?
+  context: >-
+    A copy that places a file into a Startup folder or writes a scheduled-task definition directly
+    under the Tasks directories achieves persistence without ever invoking schtasks, sc, or reg, so
+    command-line detection of persistence tooling never sees it. Because the alerting command is a
+    file copy with the overwrite flag set, these paths are exactly where its destination may land.
+    File write events capture the drop regardless of which process performed it — check whether the
+    written path corresponds to the copy destination and whether the file is one the environment
+    expects there.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist_paths:
+        TargetFilename|contains:
+          - '\Start Menu\Programs\Startup\'
+          - '\Windows\System32\Tasks\'
+          - '\Windows\Tasks\'
+      condition: selection and selection_persist_paths
+    fields:
+      - TargetFilename
+      - Image
+  answer_sources:
+  - file_event

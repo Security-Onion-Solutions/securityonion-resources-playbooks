@@ -1,0 +1,530 @@
+name: Suspicious File Creation In Uncommon AppData Folder
+id: d8c8ba12-ac24-4206-a16a-3b5546fb2664
+description: |
+  Detects an executable, installer, or script file being written somewhere under a user's AppData tree that is
+  outside the three well-known subdirectories. The rule requires all of its conditions together: the path starts
+  with C:\Users\, contains \AppData\, and ends with one of .bat, .cmd, .cpl, .dll, .exe, .hta, .iso, .lnk, .msi,
+  .ps1, .psm1, .scr, .vbe, or .vbs — and the path does not contain \AppData\Local\, \AppData\LocalLow\, or
+  \AppData\Roaming\. Applications place their per-user data in Local, LocalLow, and Roaming by convention, so a
+  payload written to a sibling directory such as \AppData\Temp\ or \AppData\Update\ still sits in a user-writable
+  location while landing outside the AppData paths that monitoring and allowlists most often carve out. A small
+  number of applications do create their own directories directly under AppData, so the investigation should
+  establish which process performed the write, whether that directory belongs to an application installed on the
+  host, what the file contains, and whether it subsequently executed or was registered to run.
+type: detection
+detection_id: d7b50671-d1ad-4871-aa60-5aa5b331fe04
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-17
+questions:
+- question: Did the file land in an AppData subfolder outside Local, LocalLow, and Roaming, and does it carry one
+    of the extensions this rule detects?
+  context: Confirm the alert before investing time. The rule requires all three path conditions together — a path
+    beginning C:\Users\, an \AppData\ segment, and an executable, installer, or script extension — while excluding
+    anything under Local, LocalLow, or Roaming. Read the directory immediately under AppData and note whether it
+    names a recognizable application. Check the operation type as well, since a creation is a drop while a modification
+    updates something already present. The signer columns describe the writing process; read them for coherence with
+    the file being written, not as a verdict.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+  answer_sources:
+  - alert
+  - file_event
+- question: Is this user and host expected to have an application that stores executable content directly under AppData
+    rather than in Local, LocalLow, or Roaming?
+  context: A handful of applications — some self-updating tools, portable builds, and in-house packaging — do create
+    their own directory directly under AppData and keep binaries or scripts there. Developer workstations and hosts
+    running unpackaged or vendor-specific tooling are where that appears legitimately; a general-purpose desktop rarely
+    has one. Check the software inventory for an application matching the directory name. When the account is a machine
+    or service principal, judge by the host's role and the writing process rather than by user identity.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: Is the file still on disk, or was it deleted or renamed after the alert?
+  context: The file's post-alert lifecycle drives the next step. A file still on disk can be retrieved, hashed, and
+    analyzed; one deleted seconds after it was written points to a self-removing stage and moves the question to what
+    executed in between. A rename shortly after creation is also common when a stage relocates itself into a directory
+    it intends to run from.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+  answer_sources:
+  - file_event
+  - manual_review
+- question: What process wrote this file, and what launched that process?
+  context: The alert names the writing process but not its origin. Retrieving that process's own start event supplies
+    its full command line and the parent that launched it, neither of which appears on a file event. An installer
+    or updater launched by services.exe or by a management agent has a routine explanation for creating its own AppData
+    directory. A browser, mail client, archive utility, script host, or Office application as the writer or parent
+    indicates the file arrived through a download or a document rather than through an installation.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+  answer_sources:
+  - process_creation
+- question: What was the writing process doing around the time of the write, and where was it running from?
+  context: A file event carries no command line, so the writer's operation has to be read from its process events.
+    This view returns every execution of that binary on the host in the surrounding minutes along with the working
+    directory each ran from. An unpacking or installation routine typically runs once from a package or download location;
+    several sequential invocations, or a working directory in a temporary or download path, describe a staging sequence
+    instead. The working directory also frequently names where the written file was copied from.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: What is inside the written file, and does its content show obfuscation or embedded network indicators?
+  context: 'Retrieve and read the file; the query confirms its on-disk path and which process placed it there. What
+    to look for depends on the extension the rule matched. For scripts (.bat, .cmd, .ps1, .psm1, .vbs, .vbe, .hta):
+    base64 or hex blobs, string-concatenation reconstruction, embedded URLs or IP addresses, and download-and-execute
+    routines. For binaries (.exe, .dll, .scr, .cpl): imports, embedded strings, packer signatures, and whether the
+    file is signed and by whom. For containers and shortcuts (.iso, .msi, .lnk): what they carry or point at — a .lnk
+    target naming an interpreter with arguments is the whole payload. Compare extracted host names, addresses, and
+    string constants against threat intelligence.'
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+  answer_sources:
+  - file_event
+  - manual_review
+  - safe_environment
+  - external_threat_intel
+- question: If the written file has executed, what is its hash — and does it have known AV or threat intel detections?
+  context: A hash is recorded when a file runs, not when it is written, so the file-creation event carries none. A
+    dropped .exe or .scr matches the image leg of this query and the recorded hash is the file's own. A script or
+    a .cpl, .msi, or .lnk executes through an interpreter or handler with its path in the command line instead, and
+    on that leg the recorded hash belongs to the interpreter, not to the written file — take the hash from the on-disk
+    path in that case. A .dll loaded rather than launched will not appear here at all; check module-load events for
+    it. Submit the file's hash to reputation services. A file written but never executed also produces no result.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_direct:
+        Image|endswith|expand: '%TargetFilename%'
+      selection_interpreter:
+        CommandLine|contains|expand: '%TargetFilename%'
+      condition: selection and 1 of selection_*
+    fields:
+      - Image
+      - CommandLine
+      - Hashes
+  answer_sources:
+  - process_creation
+  - external_threat_intel
+- question: Was the file executed in the hours after it was written, and what ran it?
+  context: The write is only the staging step; whether the file ran determines the urgency and the scope of the rest
+    of the investigation. This view covers both routes — the file running as its own process, and an interpreter or
+    handler running it with its path on the command line. The invoking process matters as much as the fact of execution
+    itself, since a shortcut, scheduled task, or service launching from an AppData subdirectory describes an established
+    trigger rather than a one-off run. No result alongside a file still on disk suggests the trigger has not fired
+    yet.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_direct:
+        Image|endswith|expand: '%TargetFilename%'
+      selection_interpreter:
+        CommandLine|contains|expand: '%TargetFilename%'
+      condition: selection and 1 of selection_*
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+  - image_load
+- question: Was the written file registered for automatic execution through a run key or a shell extension?
+  context: A file staged in a user-writable directory needs something to invoke it. Registry-based autostart is the
+    common mechanism, and the value data records the full path, so a run key or shell extension naming this file ties
+    the drop to a persistence step and predicts execution at the next logon even if nothing has run yet. Value data
+    is not recorded for every write, so read a result with an empty data column against the key path itself. No result
+    does not rule out a trigger — a scheduled task, a shortcut in a Startup folder, or a service is the alternative,
+    and each is worth checking directly.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Details|contains|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+  answer_sources:
+  - manual_review
+  - edr_console
+- question: What other files did the responsible process write or delete around the alert?
+  context: A process that drops one file into an uncommon AppData directory often drops several — an installer expanding
+    a package, a loader staging a configuration file next to its payload, or a routine that writes then removes intermediate
+    files. The breadth, paths, and extensions of the writer's other file activity separate a single artifact from a
+    staging sequence and enumerate what else needs review. The correlation covers the writer and its direct children,
+    since droppers frequently delegate the write. A browser, installer, or sync client writes constantly, so volume
+    alone is not the signal here — read where the writes land.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+  answer_sources:
+  - file_event
+- question: What else has been written to uncommon AppData directories on this host recently, and by which processes?
+  context: Location drives suspicion for this rule, so the surrounding contents of the location are the context. This
+    view mirrors the rule's directory criteria without the extension constraint, listing everything written under AppData
+    outside Local, LocalLow, and Roaming on this host over the past week, grouped by path and writing process. A directory
+    with a long history and one consistent writer is an application that keeps its data there. A directory that appeared
+    recently, or one where an unfamiliar process accounts for many arrivals, is a location under active use — and the
+    other files listed under it belong to the same activity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains: '\AppData\'
+      filter_main:
+        TargetFilename|contains:
+        - '\AppData\Local\'
+        - '\AppData\LocalLow\'
+        - '\AppData\Roaming\'
+      condition: selection and not filter_main
+    fields:
+      - TargetFilename
+      - Image
+  answer_sources:
+  - file_event
+- question: Has a file with this name been written to this host before?
+  context: A file name that has never appeared on the host over 90 days is a different proposition from one written
+    on every application update. A recurring history with a consistent writing process points to an update or packaging
+    routine that has been running all along and only now matched the rule; a first appearance, or a name that shows
+    up once at the time of the alert, points to a drop. Read the writing process alongside the count — the same name
+    written by a different process than before is worth as much attention as a new name.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+  answer_sources:
+  - file_event
+- question: Has a file with this name been written on any other hosts in the environment?
+  context: The same file name arriving on several hosts in the same day separates a distribution — a software deployment,
+    or a payload pushed to multiple endpoints — from an artifact confined to one host. Read the full paths in the
+    results. The same name landing in the same uncommon AppData directory across hosts describes one mechanism acting
+    on all of them, while the same name in ordinary application directories elsewhere suggests a common file name rather
+    than related activity. Generic names produce coincidental matches, so corroborate with the writing process and
+    the hash.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        TargetFilename|endswith|expand: '%file_basename%'
+      condition: selection
+    fields:
+      - host.name
+      - TargetFilename
+      - Image
+  answer_sources:
+  - file_event
+- always_include: true
+  question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's criteria scoped to this user, so the result is the user's 90-day history of
+    executable and script files being written into uncommon AppData directories, aggregated by host. A user who has
+    never produced this pattern is a different proposition from one whose account produces it on every host they touch,
+    which usually means a tool in their normal kit keeps its files there. Weigh the count against the account's role.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        TargetFilename|startswith: C:\Users\
+        TargetFilename|contains: \AppData\
+        TargetFilename|endswith:
+        - .bat
+        - .cmd
+        - .cpl
+        - .dll
+        - .exe
+        - .hta
+        - .iso
+        - .lnk
+        - .msi
+        - .ps1
+        - .psm1
+        - .scr
+        - .vbe
+        - .vbs
+      filter_main:
+        TargetFilename|startswith: C:\Users\
+        TargetFilename|contains:
+        - \AppData\Local\
+        - \AppData\LocalLow\
+        - \AppData\Roaming\
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection and not filter_main) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+- always_include: true
+  question: Has this program historically produced the rule's pattern on this host or across the environment, or is
+    it new for this activity?
+  context: 'When the alert fires under a machine account or a service principal, user identity does not attribute the
+    behavior, and a file event carries no parent to pivot on. The acting program is the meaningful pivot: the query
+    mirrors the rule''s criteria scoped to the alerting binary, so the result is the 90-day history of this program
+    writing executable or script content into uncommon AppData directories rather than generic use of the binary. A
+    program that is new or rare for this pattern is the deviation worth chasing; one already accounting for thousands
+    of prior events across many hosts is vendor or platform automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        TargetFilename|startswith: C:\Users\
+        TargetFilename|contains: \AppData\
+        TargetFilename|endswith:
+        - .bat
+        - .cmd
+        - .cpl
+        - .dll
+        - .exe
+        - .hta
+        - .iso
+        - .lnk
+        - .msi
+        - .ps1
+        - .psm1
+        - .scr
+        - .vbe
+        - .vbs
+      filter_main:
+        TargetFilename|startswith: C:\Users\
+        TargetFilename|contains:
+        - \AppData\Local\
+        - \AppData\LocalLow\
+        - \AppData\Roaming\
+      _pb_scope:
+        Image|endswith|expand: '%Image%'
+      condition: (selection and not filter_main) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- always_include: true
+  question: What else did this user do across the network around this time?
+  context: Tracking the account's activity across all hosts shows whether the file staging is confined to this endpoint
+    or is one instance of the same account acting in several places. The same user driving comparable activity on multiple
+    hosts widens the scope of the investigation. When the alert fires under SYSTEM, LOCAL SERVICE, NETWORK SERVICE,
+    or a machine account — which is common for writes performed by installers and update services — this view returns
+    routine background activity rather than operator activity, and the program-scoped view is the meaningful one.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+- always_include: true
+  question: Did this same program produce this pattern on other hosts in the same window, or is the activity isolated
+    to this host?
+  context: 'Under a service principal, asking what else the user did across the network returns routine background
+    activity, and a file event carries no parent to pivot on. The useful question is whether the same program wrote
+    the same kind of file into an uncommon AppData directory elsewhere: the query mirrors the rule''s criteria scoped
+    to the alerting binary, fleet-wide, in the alert window. Multiple hosts in the same window points to scheduled
+    or pushed automation, such as a deployment rolling out a package; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        TargetFilename|startswith: C:\Users\
+        TargetFilename|contains: \AppData\
+        TargetFilename|endswith:
+        - .bat
+        - .cmd
+        - .cpl
+        - .dll
+        - .exe
+        - .hta
+        - .iso
+        - .lnk
+        - .msi
+        - .ps1
+        - .psm1
+        - .scr
+        - .vbe
+        - .vbs
+      filter_main:
+        TargetFilename|startswith: C:\Users\
+        TargetFilename|contains:
+        - \AppData\Local\
+        - \AppData\LocalLow\
+        - \AppData\Roaming\
+      _pb_scope:
+        Image|endswith|expand: '%Image%'
+      condition: (selection and not filter_main) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host place the write in a timeline. A download utility running, a document
+    handler spawning an interpreter, or an archive being extracted shortly before the write identifies how the file
+    arrived; a detection after it identifies the next stage. The ordering and spacing of the alerts also indicate whether
+    the activity tracks a user's working hours or ran unattended.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+  answer_sources:
+  - alert

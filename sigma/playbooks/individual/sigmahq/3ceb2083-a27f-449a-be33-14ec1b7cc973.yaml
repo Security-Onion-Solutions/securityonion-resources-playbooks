@@ -1,0 +1,480 @@
+name: Silence.EDA Detection
+id: ded95e8e-cbf0-454d-ba05-a20c46e5cfd3
+description: |
+  Fires when PowerShell script-block content (EID 4104) contains both the Empire-framework agent markers
+  (System.Diagnostics.Process command execution, Stop-Computer/Restart-Computer handling, $cmdargs, Close-Dnscat2Tunnel)
+  and the dnscat2 tunneling functions (New-RandomDNSField, piping commands through nslookup, SYN-option encoding,
+  session state handling) — together the EmpireDNSAgent (EDA) backdoor, a PowerShell agent that carries its
+  command-and-control over DNS via repeated nslookup invocations and includes a shutdown/reboot kill capability.
+  There is no routine administrative script that combines these functions, so the investigation centers on reading the
+  complete script to extract the tunnel domain and session options, confirming whether the tunnel actually ran (DNS
+  query bursts, nslookup egress, child processes), whether the host was shut down or restarted, and how many hosts
+  carry the same pattern. Script-block capture is policy-gated per host — on default installs only content matching
+  built-in suspicious-strings checks is logged — so absence of surrounding 4104 evidence is not absence of activity.
+type: detection
+detection_id: 3ceb2083-a27f-449a-be33-14ec1b7cc973
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-17
+questions:
+- question: Does the script block contain both the Empire agent markers and the dnscat2 tunneling functions this rule requires?
+  context: >-
+    Confirm the alert is a true positive by reading the complete script. The rule fires only when both selections match
+    in the same block — the Empire agent framework markers (System.Diagnostics.Process, Stop-Computer,
+    Restart-Computer, Exception in execution, $cmdargs, Close-Dnscat2Tunnel) AND the dnscat2 DNS-tunnel functions
+    (nslookup command piping, New-RandomDNSField, SYN-option hex encoding, session state fields). Long scripts are
+    split across multiple 4104 events, so this retrieves every chunk of the alerting block (sequence/total order) and
+    the match is judged on the whole script, not the alerting fragment.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - ScriptBlockText
+- question: Is there any expected reason for this user or host to run a DNS-tunneling PowerShell agent?
+  context: >-
+    The query shows the alerting block's host, user, and on-disk script path (blank for interactive or in-memory
+    execution). Unlike dual-use administrative tooling, an Empire-based DNS tunnel has no routine business function —
+    the realistic benign explanations are a sanctioned security assessment or a defender detonating a sample. A SYSTEM
+    or service-account user points to an automated launch mechanism (scheduled task, service, deployment tooling) that
+    itself needs explaining.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - host.name
+      - user.name
+      - Path
+- question: Is this agent execution part of an authorized penetration test or red team engagement?
+  context: >-
+    Empire-derived agents and dnscat2 tunnels are standard components of authorized security assessments. Before
+    investing investigation time, check whether a penetration test or red team exercise is active on this host or
+    network segment and whether its scope covers DNS-tunnel tooling. An authorized engagement with matching timing and
+    host scope resolves the alert; without one, treat the agent as attacker tooling. The query lists the user's
+    PowerShell host executions for matching against engagement records.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        User|expand: '%User%'
+        Image|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+          - '\powershell_ise.exe'
+      condition: selection
+    fields:
+    - CommandLine
+- question: What does the complete script do, and which DNS domain or server does the tunnel use?
+  context: >-
+    Script-block content is logged after decoding, so any -EncodedCommand wrapper is already unwrapped; only
+    string-level obfuscation inside the script (concatenation, format operators, backticks) still needs manual work.
+    Read the complete reassembled script for the tunnel's target domain or explicit DNS server setting (the nslookup
+    server directive), the session and SYN options, how received commands are executed through
+    System.Diagnostics.Process, and the conditions under which the agent calls Stop-Computer or Restart-Computer. The
+    domain or server value is the pivot for the DNS-query and network-connection questions and for blocking.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - powershell.sequence
+      - powershell.total
+      - ScriptBlockText
+- question: Does the agent script exist on disk, and what process wrote it?
+  context: >-
+    When the script block ran from a file, its path is recorded on the event. An agent script on disk in a
+    user-writable or staging location (Temp, AppData, ProgramData, Downloads) implies a delivery step that wrote it —
+    the file-creation event identifies the process and account that staged it. Interactive or in-memory execution logs
+    no path at all, which for this content is itself notable: a fileless launch is a deliberate evasion choice, and the
+    delivery question then moves to the parent-process and precursor-alert views.
+  range: +/-24h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - EventType
+      - TargetFilename
+      - Image
+      - User
+- question: Which parent process launched the PowerShell host that ran this script?
+  context: >-
+    Script-block events carry no process identity, so this pivots by host and user over the preceding day to list the
+    user's PowerShell launches with their parents. An agent like this is typically started by its delivery mechanism —
+    an Office application, a script host, a scheduled task, a service, or a remote-execution tool — while an
+    interactive console descending from explorer.exe or a terminal would need a person at the keyboard to have pasted
+    the agent in. The parent and its command line are the closest available view of how the agent arrived.
+  range: -24h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        User|expand: '%User%'
+        Image|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+          - '\powershell_ise.exe'
+      condition: selection
+    fields:
+    - ParentImage
+    - ParentCommandLine
+- question: What DNS lookups did PowerShell or nslookup issue around the alert, and do they show a tunneling pattern?
+  context: >-
+    This agent moves its traffic through repeated nslookup invocations, so a live tunnel produces a burst of queries —
+    many lookups to one domain, with long random-looking subdomain labels that carry encoded data (the agent builds
+    random DNS fields and hex-encodes session options). Aggregating this host's DNS activity by querying process and
+    domain surfaces that pattern; check any domain found against the value extracted from the script and against
+    threat intelligence. Because nslookup can be pointed at an explicit server, some or all tunnel traffic may bypass
+    the system resolver — pair this with the outbound-connection view before reading an empty result as "no tunnel
+    traffic".
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: dns_query
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\nslookup.exe'
+          - '\powershell.exe'
+          - '\pwsh.exe'
+      condition: selection
+    fields:
+      - QueryName
+      - Image
+- question: What external endpoints did the PowerShell or nslookup processes connect to?
+  context: >-
+    When the agent's nslookup is pointed at an explicit server, the tunnel talks directly to an attacker-controlled DNS
+    server instead of the corporate resolver — outbound port 53 traffic from nslookup or PowerShell to an address that
+    is not an internal resolver is the connection-level signature of that mode. DNS tunnels also show a
+    volume asymmetry (many small outbound requests carrying data, minimal inbound), and any non-DNS ports in the
+    results would indicate an additional channel beyond the tunnel. Compare destinations against the server or domain
+    extracted from the script.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        User|expand: '%User%'
+        Image|endswith:
+          - '\nslookup.exe'
+          - '\powershell.exe'
+          - '\pwsh.exe'
+      condition: selection
+    fields:
+    - DestinationIp
+    - DestinationHostname
+    - DestinationPort
+- question: Did the PowerShell session spawn follow-on processes after the script block was logged?
+  context: >-
+    A 4104 event records script content, not outcome, and carries no process link — this pivots by host, user, and
+    time to the children of the user's PowerShell hosts in the half hour after the block was logged. For this agent,
+    expect repeated nslookup.exe children while the tunnel is alive, and watch for anything else: commands received
+    over the tunnel are executed through System.Diagnostics.Process, so reconnaissance tools, cmd.exe, or follow-on
+    payloads appearing as children of the same PowerShell host are the operator's hands-on activity. If the alert fired
+    under SYSTEM or another service principal, the user anchor is broad; read the results with that in mind rather
+    than dropping it.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        User|expand: '%User%'
+        ParentImage|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+          - '\powershell_ise.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- question: Did this host shut down or restart after the script block was logged?
+  context: >-
+    The agent's kill capability calls Stop-Computer and Restart-Computer, so the impact to verify is a host status
+    change. In the System event log, Event ID 1074 records an initiated shutdown or restart with the initiating process
+    and account, 6006 marks a clean shutdown, and 6008 an unexpected one. A status change in the window after the alert
+    — outside any maintenance window, or initiated by an account without an operational reason to power-cycle the host
+    — confirms the impact stage executed; correlate the initiating account with the user on the alerting block and
+    whether that account has shutdown privileges on this host.
+  range: +24h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: system
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID:
+          - 1074
+          - 6006
+          - 6008
+      condition: selection
+    fields:
+      - EventID
+      - Provider_Name
+- question: Is this same detection firing on other hosts in the environment?
+  context: >-
+    An operator who has deployed a DNS-tunnel agent to several hosts can issue the shutdown command to all of them in
+    quick succession — the same detection appearing on multiple hosts in a short window means the deployment is wider
+    than this host and determines the scope for containment. The timeline from first to last firing shows the rollout
+    order, and the host list is the working set for eradication.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        rule.uuid|expand: '%rule_uuid%'
+      condition: selection
+    fields:
+      - host.name
+      - rule.name
+      - event.severity_label
+- question: Were PowerShell security controls bypassed or weakened before this execution?
+  context: >-
+    Operators commonly weaken controls before launching an agent — execution-policy bypass flags, AMSI tampering
+    (AmsiUtils, amsiInitFailed), Defender preference changes, or downgrading to PowerShell v2 to avoid script-block
+    logging. Any of these on the same host in the hour before the alert is part of the same intrusion timeline and
+    also warns that the script-block channel may have been blinded for parts of the activity.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    A deployed agent is a mid-chain artifact, not a starting point — earlier detections on the same host (delivery,
+    credential access, defense tampering, lateral movement) may reveal how the agent arrived and what preceded it. The
+    preceding alert timeline helps reconstruct the sequence rather than treating the tunnel as an isolated event.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Is full script-block logging enabled on this host, or only suspicious-content logging?
+  context: >-
+    PowerShell logs every script block at verbose level only when the Script Block Logging policy is enabled; by
+    default it logs only content matching built-in suspicious-strings checks, at warning level. On a warning-only host
+    the alerting block is a fragment of the host's PowerShell activity, and the absence of other 4104 evidence says
+    little — module-level logging is typically not collected at all in most environments. Use the level distribution
+    here to calibrate how complete every other script-channel result in this investigation is.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - log.level
+- always_include: true
+  question: Has this user produced this agent's script pattern before, and does any history fit an authorized activity?
+  context: >-
+    The query mirrors the rule's own selection scoped to this user — a 90-day history of this specific
+    Empire-plus-dnscat2 pattern aggregated by host, not generic PowerShell use. For this content the realistic benign
+    history is a security tester re-running assessment tooling; any other repeat occurrence widens the intrusion
+    window backwards. History covers only hosts logging the PowerShell channel, and non-flagged content appears only
+    where full script-block logging is enabled, so zero history is weaker evidence on a default-logging fleet.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: ps_script
+      definition: 'Requirements: Script Block Logging must be enabled'
+    detection:
+      empire:
+        ScriptBlockText|contains|all:
+        - System.Diagnostics.Process
+        - Stop-Computer
+        - Restart-Computer
+        - Exception in execution
+        - $cmdargs
+        - Close-Dnscat2Tunnel
+      dnscat:
+        ScriptBlockText|contains|all:
+        - set type=$LookupType`nserver
+        - $Command | nslookup 2>&1 | Out-String
+        - New-RandomDNSField
+        - '[Convert]::ToString($SYNOptions, 16)'
+        - $Session.Dead = $True
+        - $Session["Driver"] -eq
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (empire and dnscat) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: Which hosts have produced this script pattern in the last 90 days, and is the alerting host among them?
+  context: >-
+    When the alert fires under a service principal, user identity does not attribute the behavior, and script-block
+    events carry no process identity to pivot on — the pattern itself is the pivot. This mirrors the rule's selection
+    fleet-wide over 90 days, aggregated by host. Multiple hosts with this pattern means the agent is (or was) deployed
+    more widely than the alerting host; only hosts shipping the PowerShell channel (and, for non-flagged content, with
+    full logging enabled) can appear, so absence elsewhere is weak evidence.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: ps_script
+      definition: 'Requirements: Script Block Logging must be enabled'
+    detection:
+      empire:
+        ScriptBlockText|contains|all:
+        - System.Diagnostics.Process
+        - Stop-Computer
+        - Restart-Computer
+        - Exception in execution
+        - $cmdargs
+        - Close-Dnscat2Tunnel
+      dnscat:
+        ScriptBlockText|contains|all:
+        - set type=$LookupType`nserver
+        - $Command | nslookup 2>&1 | Out-String
+        - New-RandomDNSField
+        - '[Convert]::ToString($SYNOptions, 16)'
+        - $Session.Dead = $True
+        - $Session["Driver"] -eq
+      condition: empire and dnscat
+    fields:
+    - host.name
+- always_include: true
+  question: What else did this user do across the network around this time?
+  context: >-
+    The same account acting on several hosts in the alert window widens the scope — an agent launch on one host paired
+    with logons or tooling on others is how an operator working from a foothold looks. Hosts this account does not
+    normally touch matter as much as the binaries run there. If the alert fired under SYSTEM or another service
+    principal, this view degrades to agent-telemetry noise; the fleet-wide pattern question is the meaningful
+    substitute in that case.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- always_include: true
+  question: Did this same script pattern fire on other hosts in the same window?
+  context: >-
+    The query mirrors the rule's selection fleet-wide in the alert window, aggregated by host — the
+    service-principal-safe version of the cross-network view, since these events carry no process identity to pivot
+    on. Several hosts producing the pattern in the same window points to a pushed or scheduled rollout of the agent; a
+    single host points to a host-local launch. Coverage is policy-gated per host, so absence elsewhere remains weak
+    evidence on a default-logging fleet.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: ps_script
+      definition: 'Requirements: Script Block Logging must be enabled'
+    detection:
+      empire:
+        ScriptBlockText|contains|all:
+        - System.Diagnostics.Process
+        - Stop-Computer
+        - Restart-Computer
+        - Exception in execution
+        - $cmdargs
+        - Close-Dnscat2Tunnel
+      dnscat:
+        ScriptBlockText|contains|all:
+        - set type=$LookupType`nserver
+        - $Command | nslookup 2>&1 | Out-String
+        - New-RandomDNSField
+        - '[Convert]::ToString($SYNOptions, 16)'
+        - $Session.Dead = $True
+        - $Session["Driver"] -eq
+      condition: empire and dnscat
+    fields:
+    - host.name

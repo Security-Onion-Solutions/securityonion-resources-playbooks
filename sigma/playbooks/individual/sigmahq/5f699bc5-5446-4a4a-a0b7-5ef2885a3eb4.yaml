@@ -1,0 +1,341 @@
+name: RDP Over Reverse SSH Tunnel
+id: ffa0deeb-facd-4a92-b6db-e9a7c84b0ed6
+description: |
+  Detects svchost.exe -- the service host that runs the Remote Desktop service (termsvcs) -- initiating an outbound connection from source port 3389 to a loopback address (127.0.0.0/8 or ::1). The rule fires only when all of these hold together: the process is svchost.exe, the connection is outbound (Initiated true), the source port is 3389, and the destination is a loopback address. This pattern appears when the RDP session reaches the service over loopback rather than directly across the network, which is what a local relay produces: a reverse SSH tunnel or similar port-forwarder binds a listener on loopback and forwards the RDP session out to an external endpoint, letting an operator reach RDP without exposing port 3389 on the network. Legitimate loopback RDP is uncommon; the investigation should identify the local process bound to the loopback port, determine where that process connects externally, confirm which account is driving the session, and establish whether any tunnel or port-forwarding tool is authorized on this host.
+type: detection
+detection_id: 5f699bc5-5446-4a4a-a0b7-5ef2885a3eb4
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-09
+questions:
+- question: Did svchost.exe initiate an outbound connection from source port 3389 to a loopback address, and is that the process the alert names?
+  context: >-
+    Confirm the alert against the rule's criteria, all of which must hold at once: the initiating process is svchost.exe, the direction is outbound (Initiated), the source port is 3389, and the destination is a loopback address (127.0.0.0/8 or ::1). Because the destination is loopback rather than a routable host, reputation and resolution lookups on the destination are not the pivot here -- the relevant target is the local process bound to the loopback port. The anchor on the loopback destination will return other loopback traffic on this host, so read the svchost row with source port 3389 to confirm the match.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationIp|expand: '%dst_ip%'
+      condition: selection
+    fields:
+      - Image
+      - DestinationIp
+      - Initiated
+      - SourcePort
+- question: Is this host expected to accept RDP sessions, and is remote-tunnel or port-forwarding software expected here?
+  context: >-
+    Legitimate loopback RDP is unusual, so knowing whether the host's function includes remote-desktop administration and whether tunneling tools have any sanctioned purpose here is often the fastest way to separate a true positive from an approved admin workflow. Tune expectations to the account type: service accounts and machine accounts rarely drive interactive RDP, so a privileged or service context reaching RDP over loopback deserves closer scrutiny.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Is a reverse SSH tunnel or port-forwarding tool authorized on this host?
+  context: >-
+    Organizations that permit administrative tunneling typically maintain an allowlist of sanctioned tools and the hosts entitled to use them; any relay outside that list -- even a well-known SSH client -- may be shadow IT or operator-deployed access. The specific relay is identified by the tunnel-identification question; here, judge whether tunneling of RDP is permitted on this host at all, regardless of which tool performed it.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+- question: Is there a documented maintenance window, ticket, or admin procedure that explains an SSH tunnel exposing RDP on this host?
+  context: >-
+    Legitimate tunneled remote access usually correlates with an active support ticket, a scheduled maintenance window, or a documented administrative procedure. If no such context exists, the tunnel may have been established for persistent operator access or by a user circumventing controls. Capture any recorded business purpose for the forwarded RDP session to match against the technical findings.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Which local tunneling or port-forwarding process relayed this RDP session to the loopback address?
+  context: >-
+    RDP over loopback is produced by a local relay: a reverse SSH client or port-forwarder binds a loopback listener and forwards the RDP session out to an external host, encapsulating the RDP protocol inside the tunnel so it is obscured from network inspection. Identify the tunneling process running on this host around the alert and read its command line -- SSH forwarding flags such as -R, -L, or -D reveal the tunnel direction and the forwarded port. The listed binaries cover common SSH clients and port-forwarders; other relays exist, so treat this as a starting set and broaden if none match.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\ssh.exe'
+          - '\plink.exe'
+          - '\putty.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - User
+- question: Where does the tunneling process connect externally, and on what port?
+  context: >-
+    The reverse tunnel's control channel is an outbound connection from the relay process to an external host -- often port 22, but any port is possible. Identifying that destination reveals the far end of the tunnel and the external infrastructure the RDP session is being exposed to; a large asymmetry between bytes sent and received is consistent with an active tunneled session carrying screen data. Process-anchored fields are present only on endpoint-sourced network records, not on sensor-only connection events, so absent process attribution does not rule out the connection.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        Image|endswith:
+          - '\ssh.exe'
+          - '\plink.exe'
+          - '\putty.exe'
+      filter_loopback:
+        DestinationIp|cidr:
+          - 127.0.0.0/8
+          - ::1/128
+      condition: selection and not filter_loopback
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Initiated
+- question: Which account is driving the RDP session reached through the tunnel, and is that logon expected?
+  context: >-
+    The tunneled session runs under an account, and whether that account is a routine RDP user, a privileged administrator, or a service identity changes the meaning of the alert. Interactive RDP logons and network logons carry different credential implications; the authoritative logon-type and credential detail typically live in host logon records rather than endpoint process telemetry, so treat the process-level user here as a starting point and corroborate against logon history.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - User
+      - CommandLine
+- question: What source addresses are reaching RDP or SSH on this host, and does RDP arrive only from loopback?
+  context: >-
+    A reverse tunnel makes the RDP session arrive from the loopback address rather than from a real client on the network; if the only source hitting RDP on this host is 127.0.0.1, that itself confirms the session is being relayed locally rather than served to a network client. Compare against any known administrative jump hosts entitled to reach this system, and note SSH (port 22) connections that point to the tunnel's presence.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationPort:
+          - 3389
+          - 22
+      condition: selection
+    fields:
+      - SourceIp
+      - DestinationPort
+- question: What processes ran on this host in the window right after the tunneled RDP session was established?
+  context: >-
+    A tunneled RDP session is a means to hands-on activity on the host. Examining what executed in the minutes after the connection reveals the operator's objectives; post-access execution commonly surfaces command interpreters and utilities (cmd.exe, powershell.exe, certutil.exe). Correlate against the connection time -- a short window keeps the results tied to this session rather than unrelated background activity.
+  range: +30m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - User
+      - Image
+- question: Were command interpreters or reconnaissance tools launched on this host in the window after the tunnel was established?
+  context: >-
+    RDP-based access is a means to hands-on-keyboard activity; post-access execution of interpreters and reconnaissance utilities inside the correlation window is the follow-on to investigate. Reading the command lines of these specific processes -- command shells, script hosts, and download or discovery tools -- shows what the operator did once the session was live, which a coarse process count cannot.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\cmd.exe'
+          - '\powershell.exe'
+          - '\certutil.exe'
+          - '\net.exe'
+          - '\whoami.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - User
+- question: Has this user account used lateral-movement or tunneling tools to reach other hosts in the environment?
+  context: >-
+    Operators rarely stop at one system. If the same account is running remote-execution or
+    tunneling tools across multiple hosts within a short window, the scope of compromise is
+    larger than this one alert. Scope the finding to uncommon or first-time access between the
+    source and other hosts, and allowlist known administrative jump boxes and deployment tooling
+    to keep the result meaningful. If the user field is a machine or service account, pivot on
+    the host instead. If this alert fired under SYSTEM, LOCAL SERVICE, NETWORK SERVICE, or a
+    machine account (name ending in $), this query intentionally returns nothing — a user pivot
+    on a service principal matches every host's background automation, not an actor; assess
+    movement through the host- and program-scoped questions instead.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      selection_lateral:
+        Image|endswith:
+        - \psexec.exe
+        - \psexec64.exe
+        - \mstsc.exe
+        - \ssh.exe
+        - \plink.exe
+        - \wmic.exe
+      filter_svcprin_builtin:
+        User:
+        - SYSTEM
+        - LOCAL SERVICE
+        - NETWORK SERVICE
+      filter_svcprin_machine:
+        User|endswith: $
+      condition: (selection and selection_lateral) and not 1 of filter_svcprin_*
+    fields:
+    - host.name
+    - Image
+- question: When this host has previously produced the rule's loopback-RDP pattern, what programs and users drove it, and does the current alert fit?
+  context: >-
+    Even a normally benign service like the Remote Desktop host can be relayed. This query
+    mirrors the rule's selection -- svchost.exe, outbound, source port 3389, loopback
+    destination -- scoped to this host, so the resulting program and user distribution reflects
+    how this specific firing pattern has run here rather than generic svchost activity. A new
+    acting program, an unexpected account, or a first-time appearance of the pattern is the
+    deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection_img:
+        Image|endswith: \svchost.exe
+        Initiated: 'true'
+        SourcePort: 3389
+      selection_destination:
+        DestinationIp|cidr:
+        - 127.0.0.0/8
+        - ::1/128
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - Image
+    - User
+- question: Have other hosts produced the rule's loopback-RDP pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: >-
+    This query mirrors the rule's selection with no host scope, so the result is a fleet-wide count of the loopback-RDP pattern rather than generic svchost usage. Many hosts producing the same pattern points to a scripted or vendor-driven deployment; one host or a small unrelated set points to hands-on operator activity. Use the host distribution to calibrate how broadly the tunneling has been set up.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection_img:
+        Image|endswith: \svchost.exe
+        Initiated: 'true'
+        SourcePort: 3389
+      selection_destination:
+        DestinationIp|cidr:
+        - 127.0.0.0/8
+        - ::1/128
+      condition: all of selection_*
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Alerts rarely occur in isolation. Aggregating process activity around the connection surfaces what led to it and what followed -- reconnaissance, a download or dropper, privilege escalation, or additional persistence. Novel parent-child pairs stand out at low counts against the high-count agent and operating-system telemetry that dominates a host.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host -- defense tampering, reconnaissance, credential access, or a suspicious download -- may reveal the stages that preceded the tunnel setup and help reconstruct the timeline. A loopback-RDP connection following an earlier execution or tampering alert reads very differently from one with no prior activity.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: >-
+    What external endpoint is this tool connecting to?
+  context: >-
+    Remote access tools establish outbound connections to relay servers, cloud infrastructure, or
+    attacker-controlled endpoints. The destination reveals whether the tool is connecting to the
+    vendor's legitimate infrastructure (e.g., AnyDesk relay servers) or to a custom/suspicious
+    endpoint. Tunneling tools may expose internal services to arbitrary external addresses.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationHostname
+      - DestinationPort

@@ -1,0 +1,358 @@
+name: DLL Load via LSASS
+id: 03145dbe-08a9-4844-9112-d6b518052c87
+description: |
+  Detects a registry write to the NTDS DirectoryServiceExtPt or LsaDbExtPt values that does not match the
+  legitimate domain-controller configuration (lsass.exe referencing ntdsa.dll / lsadb.dll). These values
+  are read by lsass.exe at startup and cause it to load the referenced DLL into its own process, so
+  pointing them at an attacker-supplied DLL yields code execution inside lsass with the ability to read
+  credentials, plus persistence that survives reboot. On a domain controller these values legitimately load
+  the directory-service and LSA database extensions; anywhere else, or with any other DLL, the write is the
+  setup step of an LSASS DLL-load implant. Investigation should identify the process that wrote the value
+  and what launched it, decode the DLL path, confirm whether the DLL loaded into lsass and exists on disk,
+  and assess persistence and credential exposure.
+type: detection
+detection_id: b3503044-60ce-4bf4-bbcb-e3db98788823
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-10
+questions:
+- question: Does the alerting write set an NTDS LSASS-extension value to something other than the legitimate directory-service DLLs?
+  context: >-
+    Before investing investigation time, confirm the alert is a true positive. The rule fires when a value
+    whose path contains CurrentControlSet\Services\NTDS\DirectoryServiceExtPt or \NTDS\LsaDbExtPt is written
+    AND it is not the legitimate domain-controller case (lsass.exe referencing ntdsa.dll or lsadb.dll).
+    Review the exact TargetObject and Details on the triggering event. On a domain controller these values
+    load the genuine directory-service extensions; on any other host, or referencing any other DLL, the
+    write is the setup for lsass loading an arbitrary DLL.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this host a domain controller, and is this user expected to modify NTDS extension-point values?
+  context: >-
+    The DirectoryServiceExtPt and LsaDbExtPt values are a directory-service mechanism that legitimately
+    appears only on domain controllers loading ntdsa.dll / lsadb.dll. Knowing whether this host is a DC and
+    whether the writing account has any sanctioned reason to change these values is the fastest way to
+    separate a benign DC configuration from an implant setup. On a member server or workstation there is no
+    legitimate reason for these values to exist at all. User attribution is present on roughly 94% of
+    endpoint registry events; when it is a machine account or SYSTEM, judge by the writing process instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Which NTDS extension value was written, and why does this key cause lsass to load a DLL?
+  context: >-
+    The DirectoryServiceExtPt and LsaDbExtPt values under CurrentControlSet\Services\NTDS are read by
+    lsass.exe at startup; each names a DLL that lsass loads into its own address space. A DLL loaded here
+    runs with the privileges of lsass and can read the credential material lsass holds, which is why this is
+    both a persistence and a credential-access primitive. Confirming the exact value and the writing process
+    establishes that this is the LSASS extension-point mechanism rather than an unrelated NTDS edit, and
+    sets up decoding the DLL path.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: What DLL path was written to the extension value, and where does it point?
+  context: >-
+    The Details field holds the path to the DLL that lsass will load. Decode it: the legitimate values are
+    %systemroot%\system32\ntdsa.dll and %systemroot%\system32\lsadb.dll on a domain controller, so any other
+    path - a DLL in a user-writable directory, a non-system location, or an unfamiliar name in system32 - is
+    the attacker module. If it references a path outside system32 or a recently created file, that path
+    becomes the lead for confirming the DLL on disk and its origin. Details is present on roughly 79% of
+    registry modifications and should be populated for this string value.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- question: What process wrote this value, and what launched that process?
+  context: >-
+    The registry event carries no command line, so pivot by ProcessGuid to the writing process to read its
+    Image, full command, and parent lineage. Writing these NTDS values requires local administrator or
+    SYSTEM rights, so the writer is typically reg.exe, powershell.exe, or a custom tool; its parent chain
+    shows whether the change came from an interactive admin session, a script host, or an unsigned binary. A
+    non-administrative or scripted origin for a change that requires high privilege points to an implant
+    being installed rather than a sanctioned directory-service configuration.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: Did lsass.exe load a non-standard or unsigned module consistent with the written path?
+  context: >-
+    The registry value only takes effect when lsass loads the DLL, which happens at the next lsass start,
+    typically after a reboot. Listing modules loaded by lsass.exe on this host and filtering to unsigned or
+    non-Microsoft DLLs shows whether the referenced module actually loaded into the credential process. A
+    match confirms the implant is live inside lsass; if nothing appears yet, the DLL is staged and will load
+    on the next restart, so the value should be removed before then. If image-load telemetry is not
+    collected for this host, treat zero results as a visibility gap rather than evidence nothing loaded.
+  range: +7d
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: '\lsass.exe'
+      filter_signed:
+        Signed: 'true'
+        Signature: 'Microsoft Windows'
+      condition: selection and not filter_signed
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+      - SignatureStatus
+      - Hashes
+- question: After this write, did lsass restart or the host reboot, and what activity followed?
+  context: >-
+    Because the DLL loads when lsass next starts, the window after the write is where the implant becomes
+    active. Look for a host reboot or an lsass restart following the change, and for process, logon, or
+    network activity that would indicate the loaded DLL executing - unexpected child activity around lsass,
+    new outbound connections, or credential-use patterns. Activity that begins only after a reboot following
+    this write ties the persistence value to the code now running inside lsass.
+  range: +24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: After this write, was the extension value restored to the legitimate DLL or changed again?
+  context: >-
+    Registry key or value deletions are not observable in this telemetry, so durability is judged from the
+    value's re-modification history rather than from a delete event. If a later write restores the value to
+    the legitimate ntdsa.dll/lsadb.dll path or blanks it, the change may have been reverted after the DLL
+    loaded once; if the attacker path remains, the implant is set to reload on every lsass start. Compare the
+    Details values written to the key over the following window.
+  range: +24h
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - Details
+      - Image
+- question: Has this NTDS extension value been modified before on this host?
+  context: >-
+    These values should be set once when a domain controller is promoted and effectively never change
+    afterward, and should not exist at all on non-DC hosts. A history with no prior writes makes this a
+    first-time change and raises its weight; a genuine DC would show the value established long ago with the
+    legitimate DLL. Compare the historical Details values to see whether the legitimate extension was ever
+    present or whether this attacker path is new.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - Details
+      - Image
+- question: Was the same NTDS extension value written on other hosts in the environment?
+  context: >-
+    The same write across several hosts indicates the technique was applied broadly - a sweep to plant the
+    LSASS implant across multiple systems - while a single host suggests a targeted operation. Compare the
+    Details values across hosts to see whether they point at the same DLL and whether the writing process is
+    consistent, which separates a single hands-on action from repeated use of the technique and sizes the
+    exposure.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+      - Details
+- question: What other registry modifications were made on this host in the same window?
+  context: >-
+    An actor installing an LSASS DLL-load implant often makes other changes in the same session - disabling
+    LSA protection or WDigest to enrich what the loaded DLL can read, installing services, or adding other
+    persistence keys. Clustering the registry writes on this host in a short window around the alert reveals
+    the full scope of changes and which process made them. The NTDS value appears in the results; the signal
+    is what else was modified and by which process.
+  range: +/-30m
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - User
+- question: Were other process-based persistence mechanisms installed on this host in the same window?
+  context: >-
+    An actor who plants an LSASS DLL-load implant frequently establishes additional footholds. Scheduled
+    tasks, services, registry Run keys, or WMI subscriptions created by schtasks.exe, sc.exe, reg.exe, or
+    wmic.exe near the NTDS write indicate the extension-point change was one part of a broader persistence
+    setup rather than an isolated action.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- question: What other process activity occurred on this host around the time of the alert?
+  context: >-
+    Installing an LSASS implant sits in the middle of an intrusion, so the surrounding process activity often
+    shows how the actor gained the privilege to write these values and what they did next. Aggregating
+    process creations in a tight window around the alert collapses routine agent telemetry into high-count
+    rows while novel parent-child pairs stand out at low counts - a script host launching the writer,
+    reconnaissance, or privilege-escalation tools are the low-count neighbors that reveal the wider operation.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Planting an LSASS DLL-load implant requires administrative access and usually follows earlier stages.
+    Earlier detections on the same host - credential access, defense tampering, execution of scripting tools,
+    or reconnaissance - help reconstruct how the actor reached the privilege needed for this change and place
+    it within the larger sequence.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Does an administrator recall a sanctioned change to these directory-service extension values?
+  context: >-
+    Outside of domain-controller promotion, these values have no routine reason to change, so direct
+    confirmation from the responsible administrator is a fast way to resolve the alert. A documented DC
+    configuration or an approved directory-service extension deployment explains it; if no one recalls the
+    change - especially on a non-DC host - the account may be compromised or an implant is being installed,
+    and the investigation should continue into the writing process, the referenced DLL, and any load into
+    lsass.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine

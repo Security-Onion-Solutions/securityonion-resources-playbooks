@@ -1,0 +1,515 @@
+name: Suspicious ScreenSave Change by Reg.exe
+id: c84e688f-7ea6-4813-b16f-e021cfa851a2
+description: |
+  Detects reg.exe modifying screensaver settings under HKCU\Control Panel\Desktop. The rule fires when a
+  reg.exe command writes to that key AND configures at least ONE of these screensaver controls: enabling the
+  screensaver (ScreenSaveActive=1), setting a timeout (ScreenSaveTimeout), disabling the secure-screensaver
+  password prompt (ScreenSaverIsSecure=0), or registering a screensaver executable (SCRNSAVE.EXE pointing at a
+  .scr file). Adversaries abuse this because a screensaver is a Portable Executable that the operating system
+  launches automatically after a configured period of user inactivity, giving them a logon-independent execution
+  trigger. Legitimate causes include group policy enforcement and user-driven personalization. The investigation
+  should determine which screensaver value was changed, what executable the SCRNSAVE.EXE value points to, whether
+  that payload exists on disk, who initiated the change, and whether it was an approved configuration action.
+type: detection
+detection_id: 0fc35fc3-efe6-4898-8a37-0b233339524f
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-04
+questions:
+- question: Did reg.exe write to HKCU\Control Panel\Desktop and set EITHER the screensaver active flag, OR a timeout, OR the secure-screensaver flag, OR a .scr executable path?
+  context: |
+    Before investing investigation time, confirm the alert is a true positive. The rule fires when reg.exe
+    targets the Control Panel\Desktop key AND at least one of four screensaver branches matches. Review the full
+    command line and note WHICH branch fired: ScreenSaveActive=1 (enable), ScreenSaveTimeout (inactivity delay),
+    ScreenSaverIsSecure=0 (drop the unlock-password prompt), or SCRNSAVE.EXE pointing at a .scr file. The branch
+    that fired determines which downstream questions carry weight, especially the SCRNSAVE.EXE branch, which names
+    the executable that will run on inactivity.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Is this user and host expected to change screensaver registry settings via command-line reg.exe?
+  context: |
+    Legitimate administrative activity and group policy can change screensaver settings. Knowing whether the user
+    role and host function are consistent with command-line screensaver configuration is often the fastest path to
+    distinguishing routine personalization or policy enforcement from an operator establishing an inactivity-based
+    execution trigger.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What exact screensaver value name and data were written, and does the SCRNSAVE.EXE path point to a legitimate screensaver?
+  context: |
+    The registry_set event linked to the same process exposes the actual key path and the value data as structured
+    fields instead of requiring the analyst to parse reg.exe's command line. The value name identifies the branch
+    (ScreenSaveActive, ScreenSaveTimeout, ScreenSaverIsSecure, SCRNSAVE.EXE). When SCRNSAVE.EXE is the value, the
+    data is the path to the .scr that executes on inactivity. A .scr under System32 is typically benign; one under
+    a user-writable location such as a temp or profile directory is the data point that turns this into persistence.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- question: What process spawned this reg.exe, and what started that parent?
+  context: |
+    The parent of reg.exe reveals how the screensaver change was driven. A user-driven change typically descends
+    from explorer.exe or a console session; a policy push descends from a group-policy or management agent chain.
+    A parent such as a script host, an Office application, or a shell launched from a downloaded file points to an
+    automated or operator-driven modification. Tracing the parent's own origin (grandparent) shows whether the
+    chain is interactive or scripted.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What other child processes did the same parent spawn around this time?
+  context: |
+    If the parent that launched reg.exe also spawned other processes, those siblings reveal the broader operation.
+    Multiple reg.exe invocations setting several screensaver values in sequence, or reg.exe alongside file drops or
+    download tools from the same parent, indicates orchestrated activity rather than a single isolated setting change.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Were other registry modifications made on this host in the same session?
+  context: |
+    The screensaver branches are often set together (enable the screensaver, drop the secure-unlock prompt, and
+    register the .scr in a single operation), so finding several reg.exe writes clustered in time reveals whether
+    the full screensaver-persistence configuration was assembled. Registry changes beyond the Desktop key in the
+    same window may show parallel objectives such as autorun keys or security-setting changes.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_reg:
+        Image|endswith:
+          - '\reg.exe'
+          - '\regedit.exe'
+        CommandLine|contains:
+          - ' add '
+          - ' delete '
+          - ' import '
+          - '/s '
+      condition: selection and selection_reg
+    fields:
+      - CommandLine
+- question: Did a .scr screensaver process execute on this host shortly after the registry change?
+  context: |
+    Screensaver persistence completes when the registered .scr executable launches after the configured period of
+    user inactivity. Confirming that a .scr process actually ran (or did not yet run) establishes whether the
+    persistence trigger has fired and what executable the operating system invoked. Pay attention to the path: a
+    .scr launched from a user-writable directory rather than System32 is the executable the SCRNSAVE.EXE value
+    pointed at.
+  range: +24h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: '.scr'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- question: Does the SCRNSAVE.EXE-referenced .scr executable exist on disk, and what is it?
+  context: |
+    Screensaver persistence is only effective if the .scr the registry points to exists at that path. If the
+    SCRNSAVE.EXE value names an executable in a user-writable or unusual location, confirming the file is present
+    and analyzing its hash determines whether the persistence mechanism is armed and what would run on next
+    inactivity. Absence of the referenced file suggests a staged or failed configuration.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_reg:
+        Image|endswith: \reg.exe
+        CommandLine|contains:
+        - HKEY_CURRENT_USER\Control Panel\Desktop
+        - HKCU\Control Panel\Desktop
+      selection_option_1:
+        CommandLine|contains|all:
+        - /v ScreenSaveActive
+        - /t REG_SZ
+        - /d 1
+        - /f
+      selection_option_2:
+        CommandLine|contains|all:
+        - /v ScreenSaveTimeout
+        - /t REG_SZ
+        - '/d '
+        - /f
+      selection_option_3:
+        CommandLine|contains|all:
+        - /v ScreenSaverIsSecure
+        - /t REG_SZ
+        - /d 0
+        - /f
+      selection_option_4:
+        CommandLine|contains|all:
+        - /v SCRNSAVE.EXE
+        - /t REG_SZ
+        - '/d '
+        - .scr
+        - /f
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection_reg and 1 of selection_option_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_reg:
+        Image|endswith: \reg.exe
+        CommandLine|contains:
+        - HKEY_CURRENT_USER\Control Panel\Desktop
+        - HKCU\Control Panel\Desktop
+      selection_option_1:
+        CommandLine|contains|all:
+        - /v ScreenSaveActive
+        - /t REG_SZ
+        - /d 1
+        - /f
+      selection_option_2:
+        CommandLine|contains|all:
+        - /v ScreenSaveTimeout
+        - /t REG_SZ
+        - '/d '
+        - /f
+      selection_option_3:
+        CommandLine|contains|all:
+        - /v ScreenSaverIsSecure
+        - /t REG_SZ
+        - /d 0
+        - /f
+      selection_option_4:
+        CommandLine|contains|all:
+        - /v SCRNSAVE.EXE
+        - /t REG_SZ
+        - '/d '
+        - .scr
+        - /f
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection_reg and 1 of selection_option_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: |
+    Tracking the user's activity across all hosts reveals whether the same account drove screensaver or registry
+    changes on multiple endpoints. The same user triggering similar activity across hosts widens the potential
+    scope of the operation.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_reg:
+        Image|endswith: \reg.exe
+        CommandLine|contains:
+        - HKEY_CURRENT_USER\Control Panel\Desktop
+        - HKCU\Control Panel\Desktop
+      selection_option_1:
+        CommandLine|contains|all:
+        - /v ScreenSaveActive
+        - /t REG_SZ
+        - /d 1
+        - /f
+      selection_option_2:
+        CommandLine|contains|all:
+        - /v ScreenSaveTimeout
+        - /t REG_SZ
+        - '/d '
+        - /f
+      selection_option_3:
+        CommandLine|contains|all:
+        - /v ScreenSaverIsSecure
+        - /t REG_SZ
+        - /d 0
+        - /f
+      selection_option_4:
+        CommandLine|contains|all:
+        - /v SCRNSAVE.EXE
+        - /t REG_SZ
+        - '/d '
+        - .scr
+        - /f
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection_reg and 1 of selection_option_*) and _pb_scope
+    fields:
+    - host.name
+- question: When this host has previously fired the screensaver-change pattern, what parents and users normally drive it, and does the current alert fit?
+  context: |
+    Even routine tooling can be abused. The query mirrors the rule's selection structure scoped to this host, so
+    the resulting parent and user distribution reflects how the rule's specific firing pattern has historically run
+    here, not generic reg.exe usage. A new parent process, an unexpected user account, or an unusual command-line
+    pattern is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_reg:
+        Image|endswith: \reg.exe
+        CommandLine|contains:
+        - HKEY_CURRENT_USER\Control Panel\Desktop
+        - HKCU\Control Panel\Desktop
+      selection_option_1:
+        CommandLine|contains|all:
+        - /v ScreenSaveActive
+        - /t REG_SZ
+        - /d 1
+        - /f
+      selection_option_2:
+        CommandLine|contains|all:
+        - /v ScreenSaveTimeout
+        - /t REG_SZ
+        - '/d '
+        - /f
+      selection_option_3:
+        CommandLine|contains|all:
+        - /v ScreenSaverIsSecure
+        - /t REG_SZ
+        - /d 0
+        - /f
+      selection_option_4:
+        CommandLine|contains|all:
+        - /v SCRNSAVE.EXE
+        - /t REG_SZ
+        - '/d '
+        - .scr
+        - /f
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection_reg and 1 of selection_option_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Was reg.exe executed from its expected System32 path?
+  context: |
+    reg.exe executed from a non-standard path (outside System32 or SysWOW64) may indicate the binary was copied or
+    renamed to evade path-based allowlists. A reg.exe running from a user's temp or profile directory is more
+    notable than one in System32. OriginalFileName confirms the true identity of the binary regardless of its
+    on-disk name.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- question: How often has this host fired the screensaver-change pattern over the past 90 days, and what command-line structures are typical?
+  context: |
+    A pattern with no prior history on a host is more notable than one used regularly under stable parents. The
+    query mirrors the rule's selection structure scoped to this host, so the count reflects the rule's specific
+    firing pattern rather than generic reg.exe usage. The command-line projection lets the analyst compare typical
+    invocation patterns against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_reg:
+        Image|endswith: \reg.exe
+        CommandLine|contains:
+        - HKEY_CURRENT_USER\Control Panel\Desktop
+        - HKCU\Control Panel\Desktop
+      selection_option_1:
+        CommandLine|contains|all:
+        - /v ScreenSaveActive
+        - /t REG_SZ
+        - /d 1
+        - /f
+      selection_option_2:
+        CommandLine|contains|all:
+        - /v ScreenSaveTimeout
+        - /t REG_SZ
+        - '/d '
+        - /f
+      selection_option_3:
+        CommandLine|contains|all:
+        - /v ScreenSaverIsSecure
+        - /t REG_SZ
+        - /d 0
+        - /f
+      selection_option_4:
+        CommandLine|contains|all:
+        - /v SCRNSAVE.EXE
+        - /t REG_SZ
+        - '/d '
+        - .scr
+        - /f
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection_reg and 1 of selection_option_*) and _pb_scope
+    fields:
+    - CommandLine
+- question: Were other process-based persistence mechanisms installed on this host?
+  context: |
+    Attackers rarely rely on a single persistence mechanism. After establishing one foothold via the screensaver
+    trigger, they commonly install backups using different techniques such as scheduled tasks, services, registry
+    Run keys, or BITS jobs. Multiple persistence installations in the same timeframe indicate intentional stacking
+    rather than an isolated configuration change.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- question: Did other detections fire on this host in the hours before this alert?
+  context: |
+    Alerts rarely happen in isolation. Earlier detections on the same host such as defense tampering,
+    reconnaissance, or credential access may reveal the attack stages that preceded the screensaver change and help
+    reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

@@ -1,0 +1,399 @@
+name: Potentially Suspicious WDAC Policy File Creation
+id: c9bf4c12-758e-486b-885d-ad1916ae8939
+description: |
+  Detects creation of a Windows Defender Application Control (WDAC) policy file under C:\Windows\System32\CodeIntegrity\ by a process outside the known-good set of WDAC management tools (Configuration Manager, WDAC Wizard, PowerShell running ConvertFrom-CIPolicy/CiTool/Copy-Item, and Windows Update servicing). WDAC policies are deny-by-default, machine-wide code-integrity rules; an actor with administrative access can plant a crafted policy that blocks an EDR/AV driver or executable from loading while allow-listing a path for their own tooling, then reboot to activate it and take defenses offline. Legitimate deployment happens through change-managed tooling and produces the same file writes, so the investigation centers on which process wrote the policy, what the policy actually permits or blocks, and whether activation (a policy refresh or reboot) followed.
+type: detection
+detection_id: 1d2de8a6-4803-4fde-b85b-f58f3aa7a705
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-03
+questions:
+- question: Was a WDAC policy file created under CodeIntegrity by a process outside the known-good WDAC tooling?
+  context: Before investing investigation time, confirm the alert is a true positive. Review the exact path (a write under \Windows\System32\CodeIntegrity\), the operation performed, and the responsible process against the rule's allowlist — Configuration Manager, WDAC Wizard, the signed PowerShell CIPolicy/CiTool/Copy-Item flows, and Windows Update servicing. The writing process is the pivot here, because the rule fires precisely when the writer is not on that list.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this user and host expected to author or deploy WDAC code-integrity policies?
+  context: Legitimate WDAC policy deployment is an administrative, change-managed action on managed endpoints. A workstation or server with no WDAC management role writing into CodeIntegrity is unexpected and is often the fastest path to separating routine servicing from abuse. When the user is a machine or service account, judge by the writing process and the host's function instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: What process and command line created the WDAC policy file?
+  context: The file event names the writing process but not its command line. Pivot to that process's creation event to read the full command — a ConvertFrom-CIPolicy/CiTool/Copy-Item invocation, an in-memory .NET loader, or an unexpected interpreter. The command reveals whether the write came from a recognized deployment workflow or an ad-hoc, scripted drop.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - Image
+      - ParentImage
+- question: What does the WDAC policy file actually permit or block?
+  context: Retrieve the policy binary from CodeIntegrity and inspect it. A malicious policy typically adds a Deny rule targeting a specific EDR/AV driver or executable name so the sensor fails to load, and/or an over-permissive Allow rule that whitelists a staging path for attacker tooling. Compiled policies are binary; string-inspect or convert them for referenced security-product filenames and broad allow paths, then compare against the approved policy baseline.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: Is this policy binary a known, approved deployment artifact or an unrecognized one?
+  context: WDAC policy files are applied by the code-integrity subsystem at boot, not executed as a process, so an execution-hash lookup usually returns nothing — this query captures only the rare case where a same-named binary was later run. In practice, retrieve the .cip or .p7b file from CodeIntegrity, hash it, and compare against the policies the change-managed deployment tooling produces. A policy binary that matches no approved artifact is the finding.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - Image
+      - Hashes
+- question: What process spawned the one that wrote the policy, and is that chain expected?
+  context: The parent reveals how the write was launched. A WDAC management workflow has predictable parents — a management-agent service or an administrator's interactive shell. An unexpected parent such as a script host, an in-memory .NET loader, or a remote-execution service points to abuse rather than deployment.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - Image
+      - CommandLine
+- question: Is the WDAC policy file still in CodeIntegrity, or was it removed or replaced after the alert?
+  context: The policy's post-alert lifecycle drives next steps. A policy still on disk can be retrieved, hashed, and its allow/deny rules inspected; a policy deleted or swapped shortly after creation suggests staging or cleanup. Because activation requires a reboot, a policy that lands and stays until a restart is the higher-risk path.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Was the policy activated after it was written — a policy refresh or a reboot on this host?
+  context: A WDAC policy only takes effect once applied, via a CiTool update, a RefreshPolicy invocation, or a system restart. Look for those actions on the host after the file write. A policy write immediately followed by a forced reboot is the activation pattern that would take an EDR/AV sensor offline on the next boot.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains:
+          - 'CiTool --update-policy'
+          - 'RefreshPolicy'
+          - 'shutdown /r'
+          - 'Restart-Computer'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: What other files did the responsible process write or delete around the alert?
+  context: A process planting a code-integrity policy may also stage other components — the loader that wrote it, dropped tooling, or additional policy files. The breadth, paths, and extensions of the process's other file activity distinguish a single policy write from broader staging and enumerate what else needs review.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What else has been written to the CodeIntegrity policy directory recently, and by which processes?
+  context: The CodeIntegrity directory and its CiPolicies\Active subfolder have a small set of legitimate writers — deployment tooling and Windows servicing. Other recent arrivals there, such as extra policy files or writes from unfamiliar processes, reveal whether this is an isolated drop or a directory under active manipulation.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains: '\Windows\System32\CodeIntegrity\'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: Has a WDAC policy file been written to this host before?
+  context: On an endpoint under managed WDAC deployment, policy writes recur on a schedule; on a host with no WDAC management role, the first-ever write into CodeIntegrity is notable. Low or zero prior counts indicate this is not routine policy servicing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- always_include: true
+  question: Has this user produced this WDAC-policy-write pattern before, and does that fit their role?
+  context: The query counts this user's 90-day history of the rule's exact firing pattern — writes to CodeIntegrity by an off-list process — grouped by host, not generic file activity. A user who has never produced this pattern is more suspicious than one who does so as part of a known WDAC management duty; weigh the count against whether policy deployment belongs to their role.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection_target:
+        TargetFilename|contains: \Windows\System32\CodeIntegrity\
+      filter_main_images:
+        Image|endswith:
+        - \Microsoft.ConfigurationManagement.exe
+        - \WDAC Wizard.exe
+        - C:\Program Files\PowerShell\7-preview\pwsh.exe
+        - C:\Program Files\PowerShell\7\pwsh.exe
+        - C:\Windows\System32\dllhost.exe
+        - C:\Windows\System32\WindowsPowerShell\v1.0\powershell_ise.exe
+        - C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+        - C:\Windows\SysWOW64\dllhost.exe
+        - C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell_ise.exe
+        - C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe
+      filter_main_cli:
+      - CommandLine|contains|all:
+        - ConvertFrom-CIPolicy -XmlFilePath
+        - '-BinaryFilePath '
+      - CommandLine|contains: CiTool --update-policy
+      - CommandLine|contains|all:
+        - Copy-Item -Path
+        - -Destination
+      filter_main_system:
+        Image: System
+      filter_main_wuauclt:
+        Image: C:\Windows\System32\wuauclt.exe
+      filter_main_wuaucltcore:
+        Image:
+        - C:\Windows\UUS\arm64\wuaucltcore.exe
+        - C:\Windows\UUS\Packages\Preview\arm64\wuaucltcore.exe
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection_target and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: Has this program driven WDAC-policy writes before on this host or across the fleet, or is it new to this activity?
+  context: When the alert fires under a machine or service account, user identity does not attribute the behavior — the launch mechanism does. The query counts the 90-day history of this program driving the rule's exact pattern, grouped by host. A program that already accounts for many prior writes is deployment automation; a new or rare program for this pattern is the deviation to chase.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection_target:
+        TargetFilename|contains: \Windows\System32\CodeIntegrity\
+      filter_main_images:
+        Image|endswith:
+        - \Microsoft.ConfigurationManagement.exe
+        - \WDAC Wizard.exe
+        - C:\Program Files\PowerShell\7-preview\pwsh.exe
+        - C:\Program Files\PowerShell\7\pwsh.exe
+        - C:\Windows\System32\dllhost.exe
+        - C:\Windows\System32\WindowsPowerShell\v1.0\powershell_ise.exe
+        - C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+        - C:\Windows\SysWOW64\dllhost.exe
+        - C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell_ise.exe
+        - C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe
+      filter_main_cli:
+      - CommandLine|contains|all:
+        - ConvertFrom-CIPolicy -XmlFilePath
+        - '-BinaryFilePath '
+      - CommandLine|contains: CiTool --update-policy
+      - CommandLine|contains|all:
+        - Copy-Item -Path
+        - -Destination
+      filter_main_system:
+        Image: System
+      filter_main_wuauclt:
+        Image: C:\Windows\System32\wuauclt.exe
+      filter_main_wuaucltcore:
+        Image:
+        - C:\Windows\UUS\arm64\wuaucltcore.exe
+        - C:\Windows\UUS\Packages\Preview\arm64\wuaucltcore.exe
+      _pb_scope:
+        Image|endswith|expand: '%Image%'
+      condition: (selection_target and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: What else did this user do across the environment around the time of the alert?
+  context: Tracking the user's activity across hosts in the alert window reveals whether the policy write is isolated or part of movement across multiple endpoints. When the alert fires under SYSTEM or a machine account, this view fills with agent telemetry and the parent-driven fleet view is the meaningful read.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- always_include: true
+  question: Did the same program-driven policy-write pattern fire on other hosts in the same window?
+  context: Under a service principal, per-user cross-host activity is agent-telemetry noise. The meaningful question is whether the same launch mechanism wrote WDAC policies elsewhere in the alert window. Multiple hosts point to scheduled or pushed automation — including a domain-wide policy distribution — while a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection_target:
+        TargetFilename|contains: \Windows\System32\CodeIntegrity\
+      filter_main_images:
+        Image|endswith:
+        - \Microsoft.ConfigurationManagement.exe
+        - \WDAC Wizard.exe
+        - C:\Program Files\PowerShell\7-preview\pwsh.exe
+        - C:\Program Files\PowerShell\7\pwsh.exe
+        - C:\Windows\System32\dllhost.exe
+        - C:\Windows\System32\WindowsPowerShell\v1.0\powershell_ise.exe
+        - C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+        - C:\Windows\SysWOW64\dllhost.exe
+        - C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell_ise.exe
+        - C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe
+      filter_main_cli:
+      - CommandLine|contains|all:
+        - ConvertFrom-CIPolicy -XmlFilePath
+        - '-BinaryFilePath '
+      - CommandLine|contains: CiTool --update-policy
+      - CommandLine|contains|all:
+        - Copy-Item -Path
+        - -Destination
+      filter_main_system:
+        Image: System
+      filter_main_wuauclt:
+        Image: C:\Windows\System32\wuauclt.exe
+      filter_main_wuaucltcore:
+        Image:
+        - C:\Windows\UUS\arm64\wuaucltcore.exe
+        - C:\Windows\UUS\Packages\Preview\arm64\wuaucltcore.exe
+      _pb_scope:
+        Image|endswith|expand: '%Image%'
+      condition: (selection_target and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+- question: What other process activity occurred on this host around the alert?
+  context: A policy write is often one step in a sequence. Surrounding process activity — reconnaissance, privilege checks, execution of a loader, or a reboot command — shows what led to the write and what followed, and whether it belongs to a larger operation.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Was the same policy file written to any other hosts in the environment?
+  context: A malicious WDAC policy pushed through Group Policy or administrative shares lands the same policy file on many machines at once, disabling defenses fleet-wide after reboot. The same policy filename appearing across multiple hosts points to a distributed rollout rather than a single-host action; a single host suggests a targeted attempt.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        TargetFilename|endswith|expand: '%file_basename%'
+      condition: selection
+    fields:
+      - host.name
+      - TargetFilename
+      - Image
+- question: Did other detections fire on this host in the hours before this alert?
+  context: A defense-evasion action rarely stands alone. Earlier detections on the same host — credential access, reconnaissance, or execution of remote-access tooling — help place the policy write in a timeline and indicate how the actor reached the point of tampering with code-integrity controls.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

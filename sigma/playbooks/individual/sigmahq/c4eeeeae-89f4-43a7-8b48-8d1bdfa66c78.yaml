@@ -1,0 +1,433 @@
+name: Scheduled Task Executing Encoded Payload from Registry
+id: efe79df9-5db9-4958-a89d-211d01448416
+description: |
+  Detects a schtasks.exe /Create command line that registers a task whose action runs PowerShell to read a base64-encoded
+  payload out of the Windows Registry and execute it. The rule fires only when all of these appear together in one command
+  line: a schtasks /Create, a registry read (Get-ItemProperty or gp against an HKCU/HKLM/registry:: path), and a base64 decode
+  (FromBase64String or encodedcommand). This combination is the registry-resident loader pattern: the payload bytes live in
+  a registry value, the scheduled task re-reads and decodes them on a trigger, leaving little on disk. Legitimate scheduled
+  tasks rarely chain a registry read into an inline base64 decode, so the investigation should determine what task was created,
+  what the decoded payload does, whether the task persists, and whether the surrounding activity looks like operator hands-on
+  or sanctioned automation.
+type: detection
+detection_id: c4eeeeae-89f4-43a7-8b48-8d1bdfa66c78
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- question: Does the command line create a scheduled task that reads a registry value and base64-decodes it via PowerShell?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule fires only when one schtasks.exe
+    /Create command line contains ALL of a registry read (Get-ItemProperty or gp against HKCU/HKLM/registry::/HKEY_) AND a
+    base64 decode (FromBase64String or encodedcommand). Verify all of those elements are present in the same command line,
+    not assembled from unrelated fragments.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to create scheduled tasks that decode registry-stored PowerShell payloads?
+  context: Legitimate administrative activity can trigger detections, but a task that re-reads and decodes a registry-resident
+    payload is an unusual deployment pattern. Knowing whether this user role and host function normally register scheduled
+    tasks, and whether they would ever do so via an inline registry-read-and-decode command, is the fastest path to separating
+    a sanctioned action from a foothold.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Was there a change ticket, maintenance window, or documented approval for creating this scheduled task?
+  context: Persistence mechanisms such as scheduled tasks are commonly gated by change control. A corresponding ticket or maintenance
+    window suggests authorized deployment; absence of one when policy requires it suggests the task was created outside normal
+    process. This check can quickly close a false positive or escalate a true positive.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What scheduled task was created, and what command does it execute? Identify the task name, schedule, and run-as account.
+  context: The schtasks command line carries the task name (/TN), the command to run (/TR), the schedule (/SC such as ONLOGON,
+    MINUTE, DAILY), and the run-as account (/RU, where SYSTEM is high-risk). Randomized or GUID-style task names and short
+    recurring schedules are common for loader tasks. Read the /TR value to see the exact PowerShell that will run on each trigger.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What does the registry-read PowerShell decode to, and what does the decoded payload do?
+  context: The task action reads a value with Get-ItemProperty (or gp) from a registry path under HKCU, HKLM, or a registry provider path, and passes it through
+    FromBase64String or -encodedcommand. Decode the base64 to recover the actual script. Loader payloads of this pattern typically
+    reconstruct and execute (IEX) a second-stage script, load a .NET assembly into memory, or pull further chunks from additional
+    registry values. Identify the registry path and value name being read so the stored payload itself can be examined.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did PowerShell script block logging capture the deobfuscated content the task action actually executed?
+  context: Script block logging (Event ID 4104) records the deobfuscated script PowerShell runs, even when the command line
+    is base64-encoded. This is ground truth for what the registry-stored payload decodes to once the task fires. If PowerShell
+    operational logs are not ingested in this environment, treat zero results as a visibility gap rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Does the Security event log show a Task Scheduler registration event for this task, and who registered it?
+  context: Task creation also writes a Security log entry (Event ID 4698, task created; 4702, task updated) recording the task
+    name, the subject account that registered it, and the task XML. This is an independent witness to the schtasks process
+    event and survives even if the schtasks command line is later cleared. Compare the registering account and timestamp against
+    the process-creation evidence to confirm the task was actually registered and by whom.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID:
+          - 4698
+          - 4702
+      condition: selection
+    fields:
+      - TaskName
+      - SubjectUserName
+      - TaskContent
+- question: When is the task scheduled to run, and has the Task Scheduler already launched the payload?
+  context: The trigger determines when the persistence activates. Tasks set to run at logon or boot fire on the next restart;
+    short recurring schedules (every few minutes) may have already executed multiple times. This query looks for processes
+    the Task Scheduler service spawned, which is where the decoded PowerShell payload would surface after the task fires.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: '\svchost.exe'
+        ParentCommandLine|contains: 'Schedule'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Is the scheduled task still registered on the system?
+  context: Persistence is only effective if the task still exists, and some operators delete the task after it runs to reduce
+    artifacts. Confirming the task is still present (via schtasks /query /tn for the task name, or through endpoint tooling)
+    determines whether the persistence mechanism is active and needs remediation. Use the task name recovered from the creation
+    command line.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What process spawned schtasks.exe, and is that parent chain expected?
+  context: The parent reveals how the task creation was invoked. Routine task deployment usually comes from predictable parents
+    (deployment agents, services.exe, an interactive admin shell under explorer.exe). A parent like powershell.exe, wscript.exe,
+    mshta.exe, or an Office application points to scripted or macro-driven creation rather than an administrator at a console.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_img:
+      - Image|endswith: \schtasks.exe
+      - OriginalFileName: schtasks.exe
+      selection_cli_create:
+        CommandLine|contains: /Create
+      selection_cli_encoding:
+        CommandLine|contains:
+        - FromBase64String
+        - encodedcommand
+      selection_cli_get:
+        CommandLine|contains:
+        - Get-ItemProperty
+        - ' gp '
+      selection_cli_hive:
+        CommandLine|contains:
+        - 'HKCU:'
+        - 'HKLM:'
+        - 'registry::'
+        - HKEY_
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_img:
+      - Image|endswith: \schtasks.exe
+      - OriginalFileName: schtasks.exe
+      selection_cli_create:
+        CommandLine|contains: /Create
+      selection_cli_encoding:
+        CommandLine|contains:
+        - FromBase64String
+        - encodedcommand
+      selection_cli_get:
+        CommandLine|contains:
+        - Get-ItemProperty
+        - ' gp '
+      selection_cli_hive:
+        CommandLine|contains:
+        - 'HKCU:'
+        - 'HKLM:'
+        - 'registry::'
+        - HKEY_
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around the time of the alert?
+  context: Tracking the user's activity across all hosts reveals lateral movement or staging on multiple endpoints. If the same
+    user triggered similar task creations or PowerShell activity on more than one host, the scope of compromise may be larger
+    than the single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_img:
+      - Image|endswith: \schtasks.exe
+      - OriginalFileName: schtasks.exe
+      selection_cli_create:
+        CommandLine|contains: /Create
+      selection_cli_encoding:
+        CommandLine|contains:
+        - FromBase64String
+        - encodedcommand
+      selection_cli_get:
+        CommandLine|contains:
+        - Get-ItemProperty
+        - ' gp '
+      selection_cli_hive:
+        CommandLine|contains:
+        - 'HKCU:'
+        - 'HKLM:'
+        - 'registry::'
+        - HKEY_
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Was schtasks.exe executed from its expected System32 path?
+  context: schtasks.exe run from a non-standard path (outside System32 or SysWOW64) may indicate the binary was copied or renamed
+    to evade path-based allowlists. Compare the Image path against the expected location and check OriginalFileName to confirm
+    the running binary is the genuine Task Scheduler client.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- question: How often has this host fired this exact schtasks-plus-registry-decode pattern over the past 90 days, and what command-line structures are typical?
+  context: A pattern with no prior history on a host is more suspicious than one seen regularly under stable parents. The query
+    mirrors the rule's full selection structure scoped to this host, so the count reflects this specific firing pattern rather
+    than generic schtasks usage. The CommandLine projection lets you compare typical invocation patterns against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_img:
+      - Image|endswith: \schtasks.exe
+      - OriginalFileName: schtasks.exe
+      selection_cli_create:
+        CommandLine|contains: /Create
+      selection_cli_encoding:
+        CommandLine|contains:
+        - FromBase64String
+        - encodedcommand
+      selection_cli_get:
+        CommandLine|contains:
+        - Get-ItemProperty
+        - ' gp '
+      selection_cli_hive:
+        CommandLine|contains:
+        - 'HKCU:'
+        - 'HKLM:'
+        - 'registry::'
+        - HKEY_
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - CommandLine
+- question: Have other hosts fired this same schtasks-plus-registry-decode pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: The query mirrors the rule's full selection structure with no host scope, so the result is a fleet-wide count of
+    this firing pattern rather than generic schtasks usage. Many hosts firing the identical pattern points to scripted deployment;
+    one host or a small unrelated set points to manual operator activity. Use the host distribution and parent consistency
+    to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_img:
+      - Image|endswith: \schtasks.exe
+      - OriginalFileName: schtasks.exe
+      selection_cli_create:
+        CommandLine|contains: /Create
+      selection_cli_encoding:
+        CommandLine|contains:
+        - FromBase64String
+        - encodedcommand
+      selection_cli_get:
+        CommandLine|contains:
+        - Get-ItemProperty
+        - ' gp '
+      selection_cli_hive:
+        CommandLine|contains:
+        - 'HKCU:'
+        - 'HKLM:'
+        - 'registry::'
+        - HKEY_
+      condition: all of selection_*
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host such as defense tampering, reconnaissance,
+    or credential access may reveal the stages that preceded this task creation and help reconstruct the timeline that led
+    to a registry-resident loader being scheduled.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

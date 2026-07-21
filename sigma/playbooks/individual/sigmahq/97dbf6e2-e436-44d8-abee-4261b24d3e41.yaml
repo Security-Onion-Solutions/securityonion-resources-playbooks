@@ -1,0 +1,360 @@
+name: Microsoft IIS Connection Strings Decryption
+id: 73ec84b0-6700-425f-9c99-2f2b054e3d86
+description: |
+  Detects aspnet_regiis.exe launched with both connectionStrings and the -pdf flag, which decrypts and displays the
+  encrypted connectionStrings section of an IIS web.config and recovers cleartext database credentials (SQL service-account
+  and app-specific passwords). The rule fires when the binary (or any PE whose original file name is aspnet_regiis.exe) AND
+  the connectionStrings + -pdf argument pair are both present. Legitimate use is rare and usually tied to maintenance or
+  deployment; in post-exploitation it commonly follows web-server access via a web shell and feeds credential pivoting into
+  SQL Servers and Active Directory. Investigation should confirm the argument pattern, attribute the launching account and
+  parent process, and trace follow-on use of the recovered credentials.
+type: detection
+detection_id: 97dbf6e2-e436-44d8-abee-4261b24d3e41
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the command line match what this rule detects — aspnet_regiis run with connectionStrings and the -pdf flag?
+  context: Confirm the alert is a true positive by reviewing the exact command line and binary against the rule's criteria.
+    The rule fires only when the launching binary is aspnet_regiis.exe (or a PE whose original file name is aspnet_regiis.exe)
+    AND the command line contains both connectionStrings and -pdf. The -pdf switch is the decrypt-and-display action; its
+    presence with connectionStrings is what separates a credential-decryption attempt from re-encryption or unrelated
+    aspnet_regiis maintenance.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to decrypt IIS connection strings?
+  context: Decrypting connectionStrings is a maintenance or deployment action normally performed by a known administrator
+    during a change window, on a host that runs IIS. If the host is not an IIS web server, or the account is a service
+    principal or a user with no administrative role over this application, the activity is harder to explain as routine.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Which connectionStrings section and IIS application were targeted, and what credentials does it expose?
+  context: aspnet_regiis -pdf connectionStrings -app /<app-name> decrypts the connectionStrings section of a specific
+    application's web.config, recovering whatever is stored there — typically SQL service-account passwords and
+    app-specific database accounts. Read the full command line to identify the targeted -app path (or the default site if
+    none is given); the named application determines which database credentials are now exposed and must be rotated.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What process spawned aspnet_regiis and is that parent chain expected?
+  context: A maintenance run is usually launched from an interactive shell under explorer.exe or a known deployment agent.
+    A parent such as w3wp.exe, cmd.exe or powershell.exe spawned from a web-server worker process, mshta.exe, or a scripting
+    host points to web-shell-driven execution rather than administrator action. Identify the immediate parent, then walk up
+    to see what launched it.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Did a web-server worker process or scripting host sit anywhere in the parent chain above aspnet_regiis?
+  context: When credential decryption follows web-server compromise, the launching chain commonly traces back to an IIS
+    worker process (w3wp.exe) or a command interpreter spawned by one, rather than to an administrator's interactive
+    session. Surfacing recent w3wp.exe-parented command interpreters on this host helps establish whether a web shell or
+    in-process RCE was the entry vector for this decryption.
+  range: -6h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: \w3wp.exe
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - User
+- question: What files did aspnet_regiis read or write around the decryption, and was the cleartext output staged to disk?
+  context: The -pdf switch decrypts and displays connectionStrings, so the recovered credentials may be captured to a file
+    via redirection or a follow-on write rather than only printed to the console. This query is anchored on
+    aspnet_regiis.exe itself, so rows are files the decryption tool touched; writes into user-writable staging
+    locations indicate the decrypted credentials were persisted for exfiltration. A zero is expected when the output
+    was only printed to the console or redirected by the invoking shell — the parent/invocation question covers that
+    path. If file telemetry is not collected here, treat zero results as a visibility gap, not evidence nothing was
+    written.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: \aspnet_regiis.exe
+      condition: selection
+    fields:
+      - Image
+      - TargetFilename
+      - User
+      - EventType
+- question: Does this host normally run aspnet_regiis?
+  context: A host that has never run aspnet_regiis, or runs it only rarely, makes a first-time decryption more notable. Zero
+    or very low historical counts indicate first-time or rare execution; a steady cadence points to recurring deployment or
+    maintenance tooling.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: When this host previously ran aspnet_regiis with connectionStrings and -pdf, what parents and users drove it, and
+    does the current alert fit that pattern?
+  context: The query mirrors the rule's selection scoped to this host, so the resulting parent/user distribution reflects how
+    this specific decryption pattern (not generic aspnet_regiis usage) has run here before. A new parent process, an
+    unexpected account, or a first-ever occurrence is the deviation worth chasing; a recurring administrator-and-shell pair
+    points to established maintenance.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_name:
+      - Image|endswith: \aspnet_regiis.exe
+      - OriginalFileName: aspnet_regiis.exe
+      selection_args:
+        CommandLine|contains|all:
+        - connectionStrings
+        - ' -pdf'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Have other hosts run aspnet_regiis with connectionStrings and -pdf in the past week, and does the distribution
+    look like automation or one-off activity?
+  context: The query mirrors the rule's selection with no host scope, giving a fleet-wide count of this decryption pattern
+    rather than generic aspnet_regiis usage. Many hosts firing the same pattern points to scripted deployment or vendor
+    automation; one host or a small unrelated set points to manual operator activity. Use the host distribution to calibrate
+    severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_name:
+      - Image|endswith: \aspnet_regiis.exe
+      - OriginalFileName: aspnet_regiis.exe
+      selection_args:
+        CommandLine|contains|all:
+        - connectionStrings
+        - ' -pdf'
+      condition: all of selection*
+    fields:
+    - host.name
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_name:
+      - Image|endswith: \aspnet_regiis.exe
+      - OriginalFileName: aspnet_regiis.exe
+      selection_args:
+        CommandLine|contains|all:
+        - connectionStrings
+        - ' -pdf'
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_name:
+      - Image|endswith: \aspnet_regiis.exe
+      - OriginalFileName: aspnet_regiis.exe
+      selection_args:
+        CommandLine|contains|all:
+        - connectionStrings
+        - ' -pdf'
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints.
+    If the same account drove similar activity on other hosts in the same window, the scope of credential exposure may be
+    larger than this single decryption.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_name:
+      - Image|endswith: \aspnet_regiis.exe
+      - OriginalFileName: aspnet_regiis.exe
+      selection_args:
+        CommandLine|contains|all:
+        - connectionStrings
+        - ' -pdf'
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection*) and _pb_scope
+    fields:
+    - host.name
+- question: Which accounts may be compromised, and do any have elevated privileges?
+  context: The severity of this credential theft depends on the privilege of the accounts stored in the decrypted
+    connectionStrings. A SQL service account that is also a domain user enables pivoting into Active Directory; domain-admin
+    or broadly privileged accounts require incident escalation, while an isolated app account may only need monitoring.
+    Cross-reference each recovered account against directory group memberships.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Were outbound remote-access connections (RDP, SMB, WinRM, SSH) initiated from this host after
+    this event?
+  context: Credential theft is typically followed by lateral movement. The query returns outbound connections
+    from this host to remote-access ports -- 3389 (RDP), 445 (SMB/PsExec), 5985/5986 (WinRM), 22 (SSH)
+    -- in the hours after the event; the originating Image and User show what drove each connection. Two
+    limits to keep in mind -- credentials exfiltrated and replayed from another machine will not appear
+    here (check security 4624 logons on suspected targets for this account and any accounts with sessions
+    on this host), and the query requires Sysmon network telemetry (EID 3); if that is not collected from
+    this host, treat zero rows as a visibility gap, not as evidence no movement occurred.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Credential decryption on a web server rarely happens in isolation. Earlier detections on the same host — web-shell
+    indicators, reconnaissance, or initial-access activity — may reveal the entry vector and the attack stages that preceded
+    this event, helping reconstruct the timeline back to the original compromise.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

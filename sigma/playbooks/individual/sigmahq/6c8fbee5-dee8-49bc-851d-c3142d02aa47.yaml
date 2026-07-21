@@ -1,0 +1,425 @@
+name: Allow Service Access Using Security Descriptor Tampering Via Sc.EXE
+id: 0d42b76c-37ac-465d-9fd9-c76b1f313893
+description: |
+  Detects sc.exe invoked with the sdset verb to write a service security descriptor that adds an Allow ACE
+  (A;) granting access to a trustee SID such as Everyone (WD), Authenticated Users, Interactive (IU), Service
+  (SU), Built-in Administrators (BA), or Local System (SY). Loosening a service DACL lets a low-privilege
+  principal start, stop, or reconfigure a SYSTEM-context service, which is a fileless and persistent route to
+  privilege escalation and persistence. Legitimate use is rare and usually tied to deliberate administrative
+  hardening or vendor agent configuration; the investigation should determine which service was modified, what
+  rights were granted to which principal, whether the change was authorized, and whether the service was then
+  started or reconfigured to execute attacker-controlled code.
+type: detection
+detection_id: 6c8fbee5-dee8-49bc-851d-c3142d02aa47
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the command line show sc.exe running sdset with an Allow ACE granting access to a trustee SID?
+  context: Confirm the alert is a true positive by reviewing the triggering event. The rule fires only when the
+    image resolves to sc.exe AND the command line contains both sdset and an Allow ACE marker (A;) AND it grants
+    a recognized trustee alias (;IU, ;SU, ;BA, ;SY, or ;WD). Read the full SDDL string to confirm all three
+    conditions are present rather than a benign sdshow or query.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to modify service security descriptors from the command line?
+  context: Editing a service DACL with sc.exe sdset is an uncommon administrative action normally limited to a
+    small set of platform engineers or a vendor agent. If the account and host are not associated with service
+    hardening work, the activity is harder to explain as routine and warrants closer review.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Which service had its security descriptor modified, and what binary and account does that service execute?
+  context: The sdset command names the target service, but the service installation record reveals the binary
+    path, start type, and service account behind it. A service that runs under LocalSystem, points at a binary
+    in a world-writable directory (C:\Users\Public, C:\Windows\Temp), or masquerades as a legitimate name is the
+    persistence payload the loosened DACL is meant to protect. Match the service named in the sdset command line
+    against recent service installation records to recover its configuration.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: system
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 7045
+      condition: selection
+    fields:
+      - ServiceName
+      - ImagePath
+      - StartType
+      - AccountName
+- question: Is there a service installation record in the Security log for the service whose descriptor was modified?
+  context: The Security channel records service installation under event 4697, which captures the service name,
+    image path, service type, and account as a separate corroborating record from the process telemetry that
+    fired this alert. Cross-referencing the
+    descriptor change against 4697 confirms whether the service was newly created around the same time or already
+    existed and was only reconfigured. If Security audit logging for service installation is not enabled in this
+    environment, treat zero results as a visibility gap rather than evidence nothing was installed.
+  range: -24h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4697
+      condition: selection
+    fields:
+      - ServiceName
+      - ServiceFileName
+      - ServiceAccount
+      - ServiceType
+- question: Were registry values under the Services hive modified around the time of the descriptor change?
+  context: Service configuration ultimately lives under HKLM\System\CurrentControlSet\Services. A descriptor
+    change is often paired with edits to a service subkey such as ImagePath, Start, or the Security value to
+    point the service at a new binary or change its start type. Registry value-set events on Services subkeys in
+    the same window show whether the DACL change was part of a broader reconfiguration of the service.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains: '\System\CurrentControlSet\Services\'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- question: Is the modified service currently running, and what account is it using?
+  context: A loosened DACL is only useful if the service can be started by the granted principal. Checking the
+    current state shows whether the persistence is active now, was already stopped, or is set to start on demand.
+    A service running as LocalSystem grants full system privileges to whoever can start it; a service running as
+    a specific account indicates the level of access the granted trustee gains. Run sc query or sc qc against the
+    service named in the sdset command to read its live status.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What process spawned sc.exe, and is that parent chain expected for service administration?
+  context: The parent process shows how sc.exe was invoked. Interactive service hardening typically descends from
+    explorer.exe, a console shell, or a known management agent. A parent such as a script host, an Office
+    application, a browser child, or a freshly written binary points to invocation by a script or implant rather
+    than a human administrator.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Was sc.exe executed from its expected System32 or SysWOW64 path?
+  context: sc.exe running from outside System32 or SysWOW64 may have been copied or renamed to evade path-based
+    allowlists or to carry an altered binary. Compare the Image path and OriginalFileName from the triggering
+    event against the expected location for the service control utility.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- question: Was there a change ticket or documented approval to modify this service's access control?
+  context: Service DACL hardening is occasionally performed deliberately, but as a controlled change it normally
+    has an associated ticket or maintenance record. A corresponding approval suggests authorized hardening;
+    absence of one when policy requires it pushes the activity toward unauthorized persistence setup.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_sc:
+      - Image|endswith: \sc.exe
+      - OriginalFileName: sc.exe
+      selection_sdset:
+        CommandLine|contains|all:
+        - sdset
+        - A;
+      selection_trustee:
+        CommandLine|contains:
+        - ;IU
+        - ;SU
+        - ;BA
+        - ;SY
+        - ;WD
+      filter_optional_hexnode:
+        ParentImage: C:\Hexnode\Hexnode Agent\Current\HexnodeAgent.exe
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_* and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_sc:
+      - Image|endswith: \sc.exe
+      - OriginalFileName: sc.exe
+      selection_sdset:
+        CommandLine|contains|all:
+        - sdset
+        - A;
+      selection_trustee:
+        CommandLine|contains:
+        - ;IU
+        - ;SU
+        - ;BA
+        - ;SY
+        - ;WD
+      filter_optional_hexnode:
+        ParentImage: C:\Hexnode\Hexnode Agent\Current\HexnodeAgent.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_* and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around the time of the descriptor change?
+  context: Tracking the account's activity across all hosts reveals lateral movement or parallel actions on other
+    endpoints. If the same user drove similar service or persistence activity on multiple hosts, the scope of the
+    operation may be larger than this single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_sc:
+      - Image|endswith: \sc.exe
+      - OriginalFileName: sc.exe
+      selection_sdset:
+        CommandLine|contains|all:
+        - sdset
+        - A;
+      selection_trustee:
+        CommandLine|contains:
+        - ;IU
+        - ;SU
+        - ;BA
+        - ;SY
+        - ;WD
+      filter_optional_hexnode:
+        ParentImage: C:\Hexnode\Hexnode Agent\Current\HexnodeAgent.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_* and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - host.name
+- question: When this host previously fired this sdset pattern, what parents and users drove it, and does the current alert fit?
+  context: Even legitimate tools get abused. The query mirrors the rule's selection structure scoped to this
+    host, so the resulting parent and user distribution reflects how this specific sdset-with-Allow-ACE pattern
+    has historically run here rather than generic sc.exe usage. A new parent process, an unexpected account, or
+    an unusual command-line structure is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_sc:
+      - Image|endswith: \sc.exe
+      - OriginalFileName: sc.exe
+      selection_sdset:
+        CommandLine|contains|all:
+        - sdset
+        - A;
+      selection_trustee:
+        CommandLine|contains:
+        - ;IU
+        - ;SU
+        - ;BA
+        - ;SY
+        - ;WD
+      filter_optional_hexnode:
+        ParentImage: C:\Hexnode\Hexnode Agent\Current\HexnodeAgent.exe
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_* and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Were other persistence or tamper LOLBins used on this host recently?
+  context: Operators who tamper with one service's access control often stage additional persistence or defense
+    changes with related living-off-the-land binaries. Finding schtasks, reg, at, netsh, wevtutil, bcdedit, or
+    vssadmin executing on the same host around this time strengthens the case that the descriptor change is part
+    of deliberate persistence setup rather than an isolated administrative action.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\reg.exe'
+          - '\at.exe'
+          - '\netsh.exe'
+          - '\wevtutil.exe'
+          - '\bcdedit.exe'
+          - '\vssadmin.exe'
+          - '\diskshadow.exe'
+          - '\dnscmd.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- question: How often has this host fired this sdset pattern over the past 90 days, and what command-line structures are typical?
+  context: A descriptor-tampering pattern with no prior history on a host is more suspicious than one seen
+    regularly under stable parents. The query mirrors the rule's selection structure scoped to this host, so the
+    count reflects this specific sdset-with-Allow-ACE pattern rather than generic sc.exe usage. The CommandLine
+    projection lets the analyst compare typical SDDL patterns and granted trustees against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_sc:
+      - Image|endswith: \sc.exe
+      - OriginalFileName: sc.exe
+      selection_sdset:
+        CommandLine|contains|all:
+        - sdset
+        - A;
+      selection_trustee:
+        CommandLine|contains:
+        - ;IU
+        - ;SU
+        - ;BA
+        - ;SY
+        - ;WD
+      filter_optional_hexnode:
+        ParentImage: C:\Hexnode\Hexnode Agent\Current\HexnodeAgent.exe
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_* and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - CommandLine
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Service-descriptor tampering is usually a late step in a hands-on-keyboard sequence. Earlier
+    detections on the same host — privilege escalation, credential access, defense tampering, or reconnaissance —
+    may reveal how the operator reached the point of editing service access control and help reconstruct the
+    timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

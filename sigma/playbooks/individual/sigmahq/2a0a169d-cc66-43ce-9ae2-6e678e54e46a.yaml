@@ -1,0 +1,538 @@
+name: Registry Modification Attempt Via VBScript - PowerShell
+id: 945015a7-e1b0-4e4b-89dc-9724ca7d0cbe
+description: >-
+  Detects PowerShell script blocks (Script Block Logging, Event ID 4104) whose content
+  contains CreateObject, Wscript.shell, and .RegWrite together — the VBScript idiom for
+  instantiating the WScript.Shell COM object and writing a registry value — embedded in
+  PowerShell instead of going through reg.exe, regedit.exe, or PowerShell's native registry
+  cmdlets. The indirection is used to modify autostart and policy keys for persistence,
+  defense evasion, or privilege escalation while avoiding the tools registry monitoring
+  usually watches, though some administrative and installer scripts use the same objects
+  legitimately. The investigation should recover the full script, identify the registry key
+  and value data written, establish what launched the PowerShell host and whether a VBScript
+  file was staged to disk, and check whether the pattern is new to the user, the host, and
+  the fleet.
+type: detection
+detection_id: 2a0a169d-cc66-43ce-9ae2-6e678e54e46a
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-17
+questions:
+- question: Does the script block contain CreateObject, Wscript.shell, and .RegWrite together?
+  context: >-
+    The rule fires only when all three strings appear in one script block — the pattern of
+    VBScript-style code that instantiates the WScript.Shell COM object and calls its
+    RegWrite method. Long scripts are split across multiple 4104 events, so read every
+    chunk of the alerting block (sequence/total order) and confirm the strings belong to an
+    actual registry-write construct rather than incidental mentions such as comments,
+    documentation text, or a security tool's own scanning logic.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - ScriptBlockText
+  answer_sources:
+  - alert
+  - ps_script
+- question: Is this user or host expected to run scripts that write the registry through WScript.Shell?
+  context: >-
+    Some legitimate admin and installer scripts modify the registry through COM objects
+    rather than reg.exe or the native cmdlets, and blocks logged under SYSTEM often come
+    from deployment or agent tooling. Check the user's role, the host's function, and the
+    on-disk script path shown here against known automation before treating the block as
+    attacker activity.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - host.name
+      - user.name
+      - Path
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: Which process launched the PowerShell host that compiled this script, and is that launch chain expected?
+  context: >-
+    Script block events carry no process linkage, so recover the launch context from the
+    PowerShell host launches on this host under this user. An office application, browser,
+    or unusual service binary as the parent points to delivery through a document, a
+    download, or an exploited service; explorer.exe or a terminal fits interactive use. The
+    command line also shows flags script delivery typically sets, such as -nop, -w hidden,
+    or -enc. Known-good registry tooling (regedit.exe, msiexec.exe) does not explain a
+    write routed through a PowerShell-embedded COM call.
+  range: -24h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        User|expand: '%User%'
+        Image|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+          - '\powershell_ise.exe'
+      condition: selection
+    fields:
+    - Image
+    - CommandLine
+    - ParentImage
+    - ParentCommandLine
+  answer_sources:
+  - process_creation
+- question: What other processes ran under this user on this host around the script block?
+  context: >-
+    The PowerShell channel records no parent identity, so the host-and-user window is the
+    closest available view of sibling activity. Look for script hosts (wscript.exe,
+    cscript.exe), reg.exe, staging utilities, or anything launched from user-writable paths
+    near the block — several related processes in a short window suggest orchestration
+    rather than a lone interactive command.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        User|expand: '%User%'
+      condition: selection
+    fields:
+    - Image
+    - CommandLine
+  answer_sources:
+  - process_creation
+- question: What does the complete script do, and does obfuscation conceal the registry write?
+  context: >-
+    Reassemble every chunk of the block (sequence/total order) and read the whole script.
+    The 4104 channel records what PowerShell actually compiles, so -EncodedCommand wrappers
+    are already unwrapped; only in-script obfuscation — string concatenation, Chr() chains,
+    format operators, backticks, variable substitution — still needs manual decoding.
+    Identify the operational intent behind the RegWrite call, in particular the exact key
+    path and value data it sets, whether the value data is itself an encoded payload staged
+    for later execution, and whether the script writes VBScript out to a file or drives the
+    COM object directly in-process. Paths, URLs, or binaries named in the script are the
+    artifacts to chase in the file and process questions.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - powershell.sequence
+      - powershell.total
+      - ScriptBlockText
+  answer_sources:
+  - ps_script
+  - manual_review
+- question: What registry key and value did the scripting process actually write, and is it a known persistence or evasion location?
+  context: >-
+    The registry telemetry shows the write as structured fields — key path (TargetObject)
+    and value data (Details) — regardless of whether the script drove the COM object
+    in-process or through a spawned script host. Autostart locations
+    (Run/RunOnce/RunOnceEx, Winlogon\Shell, Windows\Load, Policies\Explorer\Run, Session
+    Manager\BootExecute) indicate persistence; policy keys indicate security-setting
+    tampering; long or base64-looking value data suggests a payload staged in the registry
+    for fileless execution. Read the signer columns for coherence with the key being
+    written, not as a verdict — nearly every scripting host is trusted-signed.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        User|expand: '%User%'
+        Image|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+          - '\powershell_ise.exe'
+          - '\wscript.exe'
+          - '\cscript.exe'
+      condition: selection
+    fields:
+    - TargetObject
+    - Details
+    - Image
+    - process.code_signature.subject_name
+    - process.code_signature.trusted
+  answer_sources:
+  - process_creation
+- question: Does the alerting script exist on disk, and what created it?
+  context: >-
+    When the block ran from a file, its path is recorded on the event. A registry-writing
+    script in a user-writable or staging location (Temp, AppData, ProgramData, Downloads)
+    implies a delivery step that wrote it — find the file-creation event to identify the
+    process and account that staged it. No recorded path means interactive or in-memory
+    execution, which for this content is itself worth noting, since keeping a
+    registry-write payload off disk is a deliberate evasion choice.
+  range: +/-24h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - EventType
+      - TargetFilename
+      - Image
+      - User
+  answer_sources:
+  - file_event
+  - manual_review
+- question: Were VBScript files written on this host around the alert, and by what process?
+  context: >-
+    A PowerShell block containing VBScript source often writes it out as a script file and
+    executes it with wscript.exe or cscript.exe, which requires the file to exist on disk.
+    This anchor is content-derived — the extensions come from the rule's VBScript pattern,
+    not from a recorded artifact path — so treat the result as a survey. PowerShell writing
+    a script file into a staging directory followed by a script-host launch is the
+    delivery chain to look for; an empty result is consistent with the RegWrite call
+    running in-process through the COM object, which leaves no script file behind.
+  range: +/-24h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith:
+          - '.vbs'
+          - '.vbe'
+          - '.wsf'
+      condition: selection
+    fields:
+      - EventType
+      - TargetFilename
+      - Image
+      - User
+  answer_sources:
+  - file_event
+- question: Which process loaded the WScript.Shell COM library or the VBScript engine around the alert?
+  context: >-
+    Script block events carry no process identity, but the module that implements
+    WScript.Shell (wshom.ocx) must load into whichever process performed the write.
+    powershell.exe loading wshom.ocx fits in-process COM use of the object; wscript.exe or
+    cscript.exe loading vbscript.dll fits execution of a staged script file; scrrun.dll
+    (FileSystemObject) indicates file-handling capability alongside the registry write. An
+    unexpected host process loading these scripting modules is worth chasing in its own
+    right.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|endswith:
+          - '\wshom.ocx'
+          - '\vbscript.dll'
+          - '\scrrun.dll'
+      condition: selection
+    fields:
+      - Image
+      - ImageLoaded
+  answer_sources:
+  - process_creation
+- question: Did the PowerShell session spawn follow-on activity after the script ran?
+  context: >-
+    A 4104 event records script content, not execution outcome. If the script staged a
+    VBScript file, launched a script host, ran reg.exe, or started whatever the new
+    registry value points to, that activity appears as children of the user's PowerShell
+    hosts shortly after the block was logged. The event carries no process link, so this
+    pivots by host, user, and time. Under SYSTEM the user anchor is broad because
+    deployment tooling shares it — weigh individual children rather than the raw count.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        User|expand: '%User%'
+        ParentImage|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+          - '\powershell_ise.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+  answer_sources:
+  - process_creation
+- question: Were other registry modifications made on this host in the same window?
+  context: >-
+    An operator who sets one key rarely stops there — a Run key for persistence is commonly
+    paired with security-setting or policy changes. This surfaces command-line-visible
+    registry writes (reg.exe, regedit imports, and script hosts invoking registry cmdlets
+    or RegWrite from their arguments) around the alert. Writes made inside script content
+    never reach a command line, so pair this with the registry-event view of what the
+    scripting process wrote.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_reg:
+        Image|endswith:
+          - '\reg.exe'
+          - '\regedit.exe'
+        CommandLine|contains:
+          - ' add '
+          - ' delete '
+          - ' import '
+          - '/s '
+      selection_script_write:
+        Image|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+          - '\wscript.exe'
+          - '\cscript.exe'
+        CommandLine|contains:
+          - 'Set-ItemProperty'
+          - 'New-ItemProperty'
+          - 'New-Item '
+          - 'RegWrite'
+          - 'reg add'
+      condition: selection and (selection_reg or selection_script_write)
+    fields:
+    - CommandLine
+  answer_sources:
+  - process_creation
+- question: Is the executable or script referenced by the new registry value present on disk?
+  context: >-
+    Registry persistence only works if the payload the value points to exists at that path
+    when the key is read. Take the path from the value data recovered in the registry-event
+    question and look for it among the files this session wrote — a payload dropped shortly
+    after the write means the mechanism is live and will execute at the next trigger. The
+    file-write event carries no hash; if the payload is present, hash it from a later
+    execution or retrieve it for a reputation lookup. Registry deletions are not observable
+    in this telemetry, so judge cleanup by the key's re-modification history and payload
+    execution rather than looking for a removal event.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        host.name|expand: '%hostname%'
+        User|expand: '%User%'
+      selection_child:
+        host.name|expand: '%hostname%'
+        User|expand: '%User%'
+      condition: 1 of selection_*
+    fields:
+    - TargetFilename
+    - Image
+    - EventType
+  answer_sources:
+  - file_event
+  - manual_review
+- question: Were PowerShell security controls bypassed or weakened before this execution?
+  context: >-
+    Operators often disable or bypass PowerShell security controls before running their
+    payload. Common precursors include AMSI bypass (patching amsi.dll via AmsiUtils or
+    setting amsiInitFailed), execution-policy overrides (-ExecutionPolicy Bypass, -ep
+    bypass), real-time monitoring changes (Set-MpPreference, DisableRealtimeMonitoring),
+    and downgrade to PowerShell version 2, which lacks script block logging. Any of these
+    in the preceding hour reads as preparation for the alerting block rather than routine
+    administration.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Is full script block logging enabled on this host, or only suspicious-content capture?
+  context: >-
+    PowerShell logs script blocks at verbose level when the Script Block Logging policy is
+    enabled, and only automatically-flagged suspicious content (at warning level) when it
+    is not. On a warning-only host this alert shows a fragment of the host's PowerShell
+    activity, not all of it, and absence of other script-block evidence is not absence of
+    activity. The level distribution calibrates how much weight every other script-block
+    query in this investigation can carry.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - log.level
+  answer_sources:
+  - ps_script
+- always_include: true
+  question: Has this user produced script blocks with this VBScript registry-write content before, and does that fit their role?
+  context: >-
+    The query mirrors the rule's selection scoped to this user — their 90-day history of
+    script blocks containing the CreateObject/Wscript.shell/RegWrite combination,
+    aggregated by host. Administrators and packaging teams whose tooling writes the
+    registry through COM may produce this routinely; a first-ever occurrence from a user
+    whose role involves no scripting reads differently. Weigh the count against what the
+    user's job plausibly involves.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        ScriptBlockText|contains|all:
+        - CreateObject
+        - Wscript.shell
+        - .RegWrite
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+- always_include: true
+  question: Which hosts have produced this script pattern in the past 90 days, and is the alerting host among them?
+  context: >-
+    When the alert fires under SYSTEM or another service principal, user identity does not
+    attribute behavior, and script block events carry no process identity to pivot on, so
+    the pattern itself is the pivot. The query mirrors the rule's selection fleet-wide
+    over 90 days, aggregated by host. A pattern that routinely appears on many hosts fits
+    deployed tooling or a vendor product; one that has never appeared before, or only on
+    this host, is the deviation worth chasing. Only hosts shipping the PowerShell channel
+    (and, for non-flagged content, with full Script Block Logging enabled) can appear here.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        ScriptBlockText|contains|all:
+        - CreateObject
+        - Wscript.shell
+        - .RegWrite
+      condition: selection
+    fields:
+    - host.name
+  answer_sources:
+  - ps_script
+- always_include: true
+  question: What else did this user do across the network around this time?
+  context: >-
+    If the same account was active on several hosts in this window, the registry-writing
+    script may be one step of movement between them, and the per-host binary summary shows
+    what else the account ran. When the alert fired under SYSTEM or another service
+    principal this view fills with routine service activity — in that case the fleet-wide
+    script-pattern check is the meaningful breadth question.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+- always_include: true
+  question: Did this script pattern fire on other hosts in the same window, or is it isolated to this host?
+  context: >-
+    The query mirrors the rule's selection fleet-wide in the alert window, aggregated by
+    host — the meaningful breadth check when user identity is a service principal and no
+    process identity exists on this channel. Several hosts in the same window points to
+    scheduled or pushed automation, which change records should corroborate; a single host
+    points to a host-local trigger. Coverage is policy-gated per host, so absence
+    elsewhere is weak evidence.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        ScriptBlockText|contains|all:
+        - CreateObject
+        - Wscript.shell
+        - .RegWrite
+      condition: selection
+    fields:
+    - host.name
+  answer_sources:
+  - ps_script

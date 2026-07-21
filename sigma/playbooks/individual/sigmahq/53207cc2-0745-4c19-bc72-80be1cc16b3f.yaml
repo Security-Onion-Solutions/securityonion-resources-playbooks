@@ -1,0 +1,479 @@
+name: Potential CVE-2023-21554 QueueJumper Exploitation
+id: a0ca94fe-3616-4572-89d1-3698044dba9c
+description: |
+  Detects the Message Queuing service process (mqsvc.exe) spawning a command interpreter, script host, or
+  system utility. Both conditions must hold together: the parent path ends in \Windows\System32\mqsvc.exe and
+  the child image is one of cmd.exe, cscript.exe, mshta.exe, powershell.exe, pwsh.exe, regsvr32.exe,
+  rundll32.exe, schtasks.exe, wmic.exe, wscript.exe, or wsl.exe. mqsvc.exe brokers queued messages and has no
+  routine reason to launch any of those binaries, so a child under it means code is executing inside the
+  service process — the outcome of CVE-2023-21554 (QueueJumper), in which a single crafted packet to 1801/tcp
+  yields unauthenticated code execution in the mqsvc.exe context. MSMQ is an optional Windows component that
+  is not installed by default, so its presence is itself worth explaining. The investigation should establish
+  why the service is on this host, whether 1801/tcp is reachable from untrusted networks, what the child
+  command did, and whether persistence or further tooling followed.
+type: detection
+detection_id: 53207cc2-0745-4c19-bc72-80be1cc16b3f
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-16
+questions:
+- question: Does the alerting event show mqsvc.exe as the parent and one of the rule's listed interpreters or system binaries as the child?
+  context: >-
+    The rule fires only when both parts hold together — the parent path ends in \Windows\System32\mqsvc.exe
+    and the child image is one of cmd.exe, cscript.exe, mshta.exe, powershell.exe, pwsh.exe, regsvr32.exe,
+    rundll32.exe, schtasks.exe, wmic.exe, wscript.exe, or wsl.exe. Confirm both against the event, and note
+    which child binary fired, because that determines which follow-on questions carry weight.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+  answer_sources:
+  - alert
+  - process_creation
+- question: Is this user and host expected to perform command execution under the Message Queuing service?
+  context: >-
+    The Message Queuing service runs as a long-running system service that brokers messages between
+    applications; interactive or scripted command execution beneath it is not part of its normal operation.
+    Knowing the host's role — a queuing-dependent application server versus a general workstation — and the
+    account on the event is the fastest way to separate an administrator's local test from execution nobody
+    initiated.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: Is mqsvc.exe expected to spawn this child, and what started the Message Queuing service instance itself?
+  context: >-
+    mqsvc.exe hosts the Message Queuing service. It brokers messages and does not launch interpreters or
+    system utilities in normal operation, so any child under it originates from code already running inside
+    the service context. CVE-2023-21554 grants an unauthenticated remote caller exactly that position. Looking
+    up the parent's own creation event shows when the service started and under what account, which bounds the
+    window in which the service could have been reached.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+  answer_sources:
+  - process_creation
+- question: What other child processes did the same mqsvc.exe instance spawn?
+  context: >-
+    Code executing inside a service process rarely launches only one child — a download step, a discovery
+    command, and a persistence step are commonly issued in sequence. Enumerating every child of the exact
+    parent instance shows the full set of actions taken through the service rather than only the one that
+    fired the rule.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Is the Message Queuing service installed on this host by design, and how long has mqsvc.exe been running here?
+  context: >-
+    MSMQ ships with Windows but is not enabled by default; it is added deliberately as an optional feature,
+    and on a host with no queuing application it is attack surface rather than function. The service listens
+    on 1801/tcp, and CVE-2023-21554 is reachable through a single crafted packet to that port, so whether 1801
+    is exposed to untrusted networks decides whether remote exploitation was possible. The 90-day history of
+    mqsvc.exe start events shows whether the service is long-established here or was recently introduced.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: '\mqsvc.exe'
+      condition: selection
+    fields:
+      - User
+  answer_sources:
+  - process_creation
+  - asset_inventory
+  - organizational_knowledge
+- question: What exactly did the spawned child command do, and if schtasks.exe fired, what task name, command, and schedule were registered?
+  context: >-
+    The child's full command line is the operation. Decode any base64, escaped, or concatenated arguments and
+    identify the concrete action — a file download, an in-memory load, a discovery command. When the child is
+    schtasks.exe, the arguments name the task (/TN), the command it runs (/TR), the trigger (/SC), and the
+    account it runs as (/RU); a task registered to run as SYSTEM from code inside a service process is a
+    persistence step rather than administration.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Was the command encoded or obfuscated, and what does it decode to?
+  context: >-
+    When the child is powershell.exe or pwsh.exe, -EncodedCommand (-enc) base64, backtick escaping, string
+    concatenation, and variable substitution are the usual ways the real instruction is hidden. Decoding
+    reveals the payload — a download cradle, a reverse shell, or a reflective .NET assembly load. Code running
+    inside a service process has no operational reason to obscure its own arguments, so obfuscation here is
+    itself a finding.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: Did PowerShell script block logging capture the full script content?
+  context: >-
+    Event ID 4104 records the deobfuscated script text PowerShell actually compiled, even when the command
+    line was encoded, which makes it ground truth for what ran under the service context. If PowerShell
+    operational logs are not ingested in this environment, treat zero results as a visibility gap rather than
+    evidence nothing ran, and decode the alerting command line directly instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+  answer_sources:
+  - powershell_script_block
+- question: Were PowerShell security controls bypassed or weakened in the hour before this execution?
+  context: >-
+    Execution-policy bypass flags, AMSI patching, real-time monitoring changes, and downgrades to PowerShell
+    v2 are common preparation steps before a payload runs. Finding them on this host shortly before a
+    service-spawned interpreter shows the activity included deliberate groundwork rather than a single stray
+    command.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: When is the task scheduled to run, and has the Task Scheduler already executed it?
+  context: >-
+    A task created from the service context activates on its own trigger — at boot, at logon, or on a
+    recurring interval — independent of the process that registered it. Processes spawned by the Task
+    Scheduler service after the alert show whether the payload has already run. If no schtasks.exe child fired
+    on this alert, this still surfaces scheduler-launched activity on the host in the following hours.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: '\svchost.exe'
+        ParentCommandLine|contains: 'Schedule'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Is the scheduled task still registered on the system?
+  context: >-
+    Persistence only holds if the task still exists, and some operations delete the task once the payload has
+    run in order to reduce forensic artifacts. Read the task name from the creation command line, then query
+    the host's task store directly to confirm whether the entry is still present and what it points at.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - manual_review
+  - edr_console
+- question: Has this user previously produced the rule's mqsvc.exe parent-child pattern, and does that history fit their role?
+  context: >-
+    The query mirrors the rule's selection scoped to the account on the event, so the result is that user's
+    90-day history of mqsvc.exe spawning one of these binaries, grouped by host — not generic use of cmd.exe
+    or powershell.exe. A user with no prior history of this pattern is a deviation. MSMQ activity is
+    service-driven, so the account is frequently SYSTEM or a service identity, in which case the count says
+    little about any person and the launch-mechanism history is the better pivot.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        ParentImage|endswith: \Windows\System32\mqsvc.exe
+        Image|endswith:
+        - \cmd.exe
+        - \cscript.exe
+        - \mshta.exe
+        - \powershell.exe
+        - \pwsh.exe
+        - \regsvr32.exe
+        - \rundll32.exe
+        - \schtasks.exe
+        - \wmic.exe
+        - \wscript.exe
+        - \wsl.exe
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+  always_include: true
+- question: Has mqsvc.exe historically driven this pattern on this host or across the environment, or is the parent new for this activity?
+  context: >-
+    When the alert fires under a service principal, user identity does not attribute the behavior; the launch
+    mechanism does. The query mirrors the rule's selection scoped to the alerting parent process, giving the
+    90-day history of mqsvc.exe driving this specific pattern, grouped by host. Because the Message Queuing
+    service has no routine reason to spawn interpreters, a near-zero count is the expected baseline, and a
+    non-zero one points at an application that shells out through the queue — identify it before treating the
+    alert as exploitation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        ParentImage|endswith: \Windows\System32\mqsvc.exe
+        Image|endswith:
+        - \cmd.exe
+        - \cscript.exe
+        - \mshta.exe
+        - \powershell.exe
+        - \pwsh.exe
+        - \regsvr32.exe
+        - \rundll32.exe
+        - \schtasks.exe
+        - \wmic.exe
+        - \wscript.exe
+        - \wsl.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  always_include: true
+- question: What else did this user account do across the environment around this time?
+  context: >-
+    Tracking the account's activity on every host in the alert window reveals whether the same identity drove
+    activity beyond this one process. If the event's user is SYSTEM, a service identity, or a computer
+    account, this returns routine service and agent telemetry from across the fleet — read it for unfamiliar
+    binaries rather than for volume, and rely on the parent-scoped fleet question for the meaningful answer.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+  always_include: true
+- question: Did the same mqsvc.exe-driven pattern fire on other hosts in the same window, or is the activity isolated to this host?
+  context: >-
+    Under a service principal, a user pivot returns fleet-wide agent noise. The meaningful question is whether
+    the same launch mechanism fired elsewhere, so the query mirrors the rule's selection scoped to the
+    alerting parent process, fleet-wide, in the alert window. Several MSMQ hosts producing this pattern at
+    once fits remote reach into an exposed 1801/tcp listener across the estate; a single host points at a
+    host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        ParentImage|endswith: \Windows\System32\mqsvc.exe
+        Image|endswith:
+        - \cmd.exe
+        - \cscript.exe
+        - \mshta.exe
+        - \powershell.exe
+        - \pwsh.exe
+        - \regsvr32.exe
+        - \rundll32.exe
+        - \schtasks.exe
+        - \wmic.exe
+        - \wscript.exe
+        - \wsl.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  always_include: true
+- question: What other process activity occurred on this host around the time of the alert?
+  context: >-
+    Aggregating every process creation on the host by image and parent collapses repetitive service and agent
+    telemetry into high-count rows, leaving novel parent-child pairs visible at low counts. Scan for discovery
+    commands, credential-access tooling, and persistence mechanisms in the same window.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+  answer_sources:
+  - process_creation
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host help place this event in a sequence — network-facing exploitation,
+    then execution, then persistence. Exploitation of a listening service is typically the first stage, so an
+    absence of earlier alerts is consistent with initial access happening here rather than evidence the host
+    is clean.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+  answer_sources:
+  - alert
+- question: Were other process-based persistence mechanisms installed on this host?
+  context: >-
+    Code that gains execution inside a service process commonly installs more than one foothold — a scheduled
+    task alongside a service, or a registry Run key alongside a BITS job. Grouping every persistence-tool
+    execution on the host across the surrounding four hours shows which mechanisms were touched, including any
+    that ran outside the alerting event.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation

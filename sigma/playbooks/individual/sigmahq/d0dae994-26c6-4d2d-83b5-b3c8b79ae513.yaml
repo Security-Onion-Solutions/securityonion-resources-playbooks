@@ -1,0 +1,380 @@
+name: PUA - WebBrowserPassView Execution
+id: 4580c143-1433-4231-81ec-c90c2df579e7
+description: |
+  Detects execution of WebBrowserPassView, a portable password-recovery utility that extracts
+  saved credentials from web browsers (Internet Explorer, Firefox, Chrome, Safari, Opera). The rule
+  fires when a process either reports the file Description "Web Browser Password Viewer" or runs an
+  Image whose filename ends in WebBrowserPassView.exe. Legitimate use is limited to an owner
+  recovering their own saved passwords; the same tool is far more often staged by an operator to
+  harvest stored browser credentials from a foothold host. Investigation should confirm the tool
+  identity, establish whether the run was sanctioned, determine which browser credential stores were
+  read, identify which accounts may now be exposed, and look for follow-on use of the recovered
+  credentials.
+type: detection
+detection_id: d0dae994-26c6-4d2d-83b5-b3c8b79ae513
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-09
+questions:
+- question: Does this process match WebBrowserPassView by either its file description or its image name?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule matches
+    on either branch — a process whose file Description is "Web Browser Password Viewer", or an Image
+    whose filename ends in WebBrowserPassView.exe. Review the alerting event and note which branch fired.
+    A renamed binary that still carries the original Description matches on Description alone, while a
+    file named WebBrowserPassView.exe matches on Image regardless of its embedded metadata. The branch
+    that fired tells you whether the operator tried to disguise the tool.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - Description
+- question: Is this user and host expected to run a browser password-recovery tool?
+  context: Legitimate use of WebBrowserPassView is narrow — typically an owner recovering their own
+    saved passwords on their own machine. Knowing whether the user role and host function are consistent
+    with that explanation is often the fastest path to distinguishing a benign self-service recovery
+    from credential harvesting on a foothold. A shared server, a service account, or a host the user
+    does not normally operate is far less consistent with benign recovery.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What credential stores did this tool target? Decode the full command line for output paths
+    and browser-store flags.
+  context: WebBrowserPassView reads the saved-password stores of installed browsers — Chrome and Edge
+    Login Data, the Firefox profile key/login database, Internet Explorer and Opera vaults. The command
+    line reveals whether the operator directed output to a file (for example /stext, /scomma, /shtml
+    export switches) and which stores were in scope. An export switch writing to a file confirms intent
+    to exfiltrate the recovered credentials rather than view them interactively. Note that the tool
+    decrypts the on-disk databases via DPAPI under the current user, so the credentials it can recover
+    are those of the logged-on account.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What process spawned this tool and is that parent chain expected?
+  context: The parent process reveals how the tool was launched and under which context. An interactive
+    explorer.exe launch is consistent with a user double-clicking the tool; script hosts (wscript.exe,
+    cscript.exe, powershell.exe), an archive or download utility, or a remote access session as the
+    parent point to delivery by a loader or hands-on staging from a prior foothold rather than a
+    deliberate user action.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Did this host read or write the browser credential-store files around the time of the alert?
+  context: The recovered credentials come from specific on-disk databases, and reads or copies of those
+    files corroborate that the tool actually accessed stored passwords rather than merely launching.
+    File events touching Chrome or Edge "Login Data", the Firefox "logins.json" and "key4.db", or the
+    Internet Explorer/Opera credential vaults — especially close in time to the process execution —
+    confirm credential-store access. A short interval between the file reads and the tool's execution is
+    the time correlation worth pinning down; a copy of these files to a staging or output location
+    indicates exfiltration intent.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_paths:
+        TargetFilename|contains:
+        - \User Data\Default\Login Data
+        - \User Data\Default\Network\Cookies
+        - \Mozilla\Firefox\Profiles\
+        - logins.json
+        - key4.db
+        - \Microsoft\Vault\
+      condition: selection_host and selection_paths
+    fields:
+      - TargetFilename
+      - Image
+      - User
+- question: Which accounts may be compromised, and do any have elevated privileges?
+  context: The severity of this credential theft depends on what the recovered browser passwords unlock.
+    Saved browser credentials frequently include reused passwords for internal portals, cloud consoles,
+    VPNs, and administrative interfaces. Enumerate the accounts and sites whose passwords were stored in
+    the affected profile and cross-reference them with directory group memberships — any that map to
+    domain admin, cloud admin, or service accounts require escalation, while a standard user's personal
+    logins may only need a password reset.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Were outbound remote-access connections (RDP, SMB, WinRM, SSH) initiated from this host after
+    this event?
+  context: Credential theft is typically followed by lateral movement. The query returns outbound connections
+    from this host to remote-access ports -- 3389 (RDP), 445 (SMB/PsExec), 5985/5986 (WinRM), 22 (SSH)
+    -- in the hours after the event; the originating Image and User show what drove each connection. Two
+    limits to keep in mind -- credentials exfiltrated and replayed from another machine will not appear
+    here (check security 4624 logons on suspected targets for this account and any accounts with sessions
+    on this host), and the query requires Sysmon network telemetry (EID 3); if that is not collected from
+    this host, treat zero rows as a visibility gap, not as evidence no movement occurred.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
+- question: Is WebBrowserPassView on the organization's approved software list, and is there a sanctioned
+    reason for it here?
+  context: WebBrowserPassView is a potentially-unwanted password-recovery utility, not standard business
+    software. Organizations rarely sanction it, and where they do it is usually for a narrow IT
+    password-migration task. A copy present on an endpoint that is not on the approved list — even if it
+    was downloaded by the user — should be treated as unauthorized credential tooling regardless of intent
+    until a sanctioned use is confirmed. Establish whether any documented task or ticket called for running
+    this tool on this host.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+- question: What child processes did this tool spawn afterward?
+  context: WebBrowserPassView is a self-contained viewer and does not normally spawn child processes. Any
+    children — command interpreters, script hosts, archive or copy utilities, or transfer tools — point to
+    the recovery being one step in a larger hands-on sequence, such as packaging the exported credentials
+    or moving them off the host. Examine the spawned processes and their command lines for staging or
+    exfiltration behavior.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: When this host has previously fired this pattern, what parents and users normally drive it,
+    and does the current alert fit?
+  context: Even where the tool has run before, the firing pattern's history tells you what is normal here.
+    This query mirrors the rule's selection structure scoped to this host, so the resulting parent/user
+    distribution reflects how this specific detection has historically fired rather than generic activity.
+    A new parent process, an unexpected user account, or a first-ever appearance is the deviation worth
+    chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - Description: Web Browser Password Viewer
+      - Image|endswith: \WebBrowserPassView.exe
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Have other hosts fired this pattern in the past week, and does the cross-host distribution look
+    like consistent automation or one-off activity?
+  context: This query mirrors the rule's selection structure with no host scope, so the result is a
+    fleet-wide count of the rule's firing pattern rather than generic activity. Many hosts firing the same
+    pattern points to scripted or pushed deployment of the tool; a single host or a small unrelated set
+    points to manual operator activity. Use the host distribution and parent consistency to calibrate
+    severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - Description: Web Browser Password Viewer
+      - Image|endswith: \WebBrowserPassView.exe
+      condition: selection
+    fields:
+    - host.name
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - Description: Web Browser Password Viewer
+      - Image|endswith: \WebBrowserPassView.exe
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - Description: Web Browser Password Viewer
+      - Image|endswith: \WebBrowserPassView.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning
+    multiple endpoints. If the same user drove similar activity on several hosts, the scope of the
+    credential harvesting may be larger than the single alerting host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - Description: Web Browser Password Viewer
+      - Image|endswith: \WebBrowserPassView.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate
+    context — what led to this event, what happened after, and whether it is part of a larger sequence.
+    Look for reconnaissance, additional credential tooling, archive or transfer utilities, or persistence
+    mechanisms near the alert time.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — initial access, defense
+    tampering, reconnaissance, or other credential access — may reveal the attack stages that preceded the
+    browser-credential harvesting and help reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

@@ -1,0 +1,469 @@
+name: Suspicious ShellExec_RunDLL Call Via Ordinal
+id: ab64e43a-7167-43a5-9c39-7f5b5ae1cd49
+description: |
+  Detects a process whose parent command line invokes the ShellExec_RunDLL export of SHELL32.DLL by ordinal number
+  (#568, #570, #572, #576) instead of by name, which is a way to bypass detections that match on the export name in
+  the command line. The rule fires when the parent command line references SHELL32.DLL AND one of those ordinals, AND
+  EITHER the parent command line also contains a suspicious token (comspec, iex, Invoke-, msiexec, odbcconf, regsvr32,
+  or a user-writable path such as Desktop, ProgramData, Temp, Users\Public) OR the spawned child is one of a set of
+  proxy-execution and scripting binaries (bash, bitsadmin, cmd, cscript, curl, mshta, msiexec, msxsl, odbcconf,
+  powershell, pwsh, regsvr32, schtasks, wmic, wscript). Legitimate software occasionally calls shell helpers via
+  ordinal, so the investigation should confirm the ordinal call really launched the observed child, decode what that
+  child does, and trace the parent chain that reached rundll32 to determine whether this is signed-software behavior or
+  an attacker proxying execution through a trusted Microsoft binary.
+type: detection
+detection_id: 8823e85d-31d8-473e-b7f4-92da070f0fc6
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the parent command line invoke SHELL32.DLL by ordinal, and did it launch the observed child?
+  context: >-
+    Confirm the alert is a true positive by reading the parent command line on the triggering event. It must reference
+    SHELL32.DLL together with one of the four flagged ordinals (568, 570, 572, or 576, written as #568 and so on in the
+    command line), and the rule fires when EITHER the parent command line also carries a suspicious token (comspec, iex,
+    Invoke-, msiexec, odbcconf, regsvr32, or a user-writable path) OR the spawned child is one of the proxy-execution or
+    scripting binaries the rule lists. Note which branch fired - if the child-binary branch matched, the identity and
+    origin of that child binary carry the investigative weight; if the parent-token branch matched, the suspicious token
+    or path in the parent command line is the lead.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentCommandLine
+      - Image
+- question: Is this user and host expected to run shell helper proxy execution via rundll32 and an ordinal call?
+  context: Legitimate installers, control-panel applets, and some signed software invoke shell32 helpers through
+    rundll32, occasionally by ordinal. Knowing whether this host's function and this user's role make rundll32-driven
+    proxy execution routine is often the fastest way to separate vendor behavior from an attacker using a trusted
+    Microsoft binary to launch a payload.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What spawned the rundll32 parent, and is that grandparent chain expected to reach an ordinal shell call?
+  context: The parent command line ran the ordinal shell call, but what launched that parent determines whether the
+    chain is legitimate. A grandparent such as explorer.exe following a user double-click differs sharply from an
+    auto-elevating helper or an Office or script-host process reaching rundll32. Trace the parent's own origin to see
+    where the execution chain started.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What exactly did the spawned child binary do? Decode its full command line and working directory.
+  context: The ordinal shell call exists to launch the child; the child's command line reveals the actual operation -
+    a proxy-execution chain (odbcconf regsvr loading a DLL, regsvr32 or msiexec loading a remote payload), a download,
+    or a script. Decode every flag, path, and any encoded content, and note whether the binary runs from or references a
+    user-writable directory.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Does the child command line carry proxy-execution or download arguments rather than a benign payload?
+  context: System-binary proxy execution uses trusted binaries to run externally hosted or unsigned payloads through
+    command-line arguments. The child here is filtered to those launched with proxy-execution or retrieval indicators -
+    odbcconf regsvr or DSN actions, regsvr32 with a scriptlet or remote object, msiexec installing from a URL, curl or
+    bitsadmin fetching a file, or mshta/wscript/cscript running a script. A populated result means the child is doing
+    more than a benign local action.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      selection_proxy:
+        CommandLine|contains:
+          - 'regsvr'
+          - 'configdriver'
+          - 'INSTALLDRIVER'
+          - 'SETFILEDSNDIR'
+          - 'scrobj'
+          - '/i:'
+          - 'http://'
+          - 'https://'
+          - '/transfer'
+          - 'DownloadString'
+          - 'DownloadFile'
+          - 'IEX'
+          - 'Invoke-'
+      condition: selection and selection_proxy
+    fields:
+      - CommandLine
+      - ParentImage
+- question: What modules did the spawned child binary load after the ordinal shell call?
+  context: Proxy-execution chains map an attacker DLL into a trusted process rather than running a named executable -
+    odbcconf and regsvr32 load DLLs, and rundll32 maps DLLs that it does not normally load. Reviewing the modules loaded
+    by the child binary around the alert surfaces unsigned or unusually located DLLs that the command line alone does
+    not reveal. If module-load telemetry is not collected in this environment, treat an empty result as a visibility gap
+    rather than evidence nothing loaded.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+- question: Did the spawned child binary make outbound network connections after launch?
+  context: Proxy-execution chains frequently reach out to retrieve a payload or to a command-and-control endpoint - the
+    trusted binary fetches a remote scriptlet, DLL, or installer, or beacons after loading. Reviewing outbound
+    connections from the child binary around the alert shows whether the local execution pivoted to the network. If
+    network telemetry for this host is not collected, treat an empty result as a visibility gap.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        Initiated: 'true'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- question: What other children did the same rundll32 parent instance spawn?
+  context: If the rundll32 parent that made the ordinal call spawned the detected child, it may have spawned others in
+    the same chain. Examining the siblings of the exact parent instance reveals whether one ordinal call fanned out into
+    multiple proxy-execution or scripting binaries, which points to orchestration rather than an isolated benign call.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: What other processes did rundll32 spawn on this host in the hours around the alert?
+  context: Beyond the immediate siblings of this one parent instance, an attacker proxying execution through rundll32
+    may invoke it repeatedly for successive stages. Listing what rundll32 spawned on this host across a wider window
+    reveals whether the ordinal call is part of a sequence of proxy-execution invocations.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: '\rundll32.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Has this child binary run on this host before, and how often?
+  context: A proxy-execution or scripting binary that is routine on a host is far less concerning than one appearing for
+    the first time. Low or zero historical counts of this child binary on this host indicate a novel execution worth
+    chasing; high counts suggest established automation or administrative use.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent_img:
+        ParentCommandLine|contains: SHELL32.DLL
+      selection_parent_ordinal:
+        ParentCommandLine|contains:
+        - '#568'
+        - '#570'
+        - '#572'
+        - '#576'
+      selection_susp_cli_parent:
+      - ParentCommandLine|contains:
+        - comspec
+        - iex
+        - Invoke-
+        - msiexec
+        - odbcconf
+        - regsvr32
+      - ParentCommandLine|contains:
+        - \Desktop\
+        - \ProgramData\
+        - \Temp\
+        - \Users\Public\
+      selection_susp_child_img:
+        Image|endswith:
+        - \bash.exe
+        - \bitsadmin.exe
+        - \cmd.exe
+        - \cscript.exe
+        - \curl.exe
+        - \mshta.exe
+        - \msiexec.exe
+        - \msxsl.exe
+        - \odbcconf.exe
+        - \powershell.exe
+        - \pwsh.exe
+        - \regsvr32.exe
+        - \schtasks.exe
+        - \wmic.exe
+        - \wscript.exe
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_parent_* and 1 of selection_susp_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent_img:
+        ParentCommandLine|contains: SHELL32.DLL
+      selection_parent_ordinal:
+        ParentCommandLine|contains:
+        - '#568'
+        - '#570'
+        - '#572'
+        - '#576'
+      selection_susp_cli_parent:
+      - ParentCommandLine|contains:
+        - comspec
+        - iex
+        - Invoke-
+        - msiexec
+        - odbcconf
+        - regsvr32
+      - ParentCommandLine|contains:
+        - \Desktop\
+        - \ProgramData\
+        - \Temp\
+        - \Users\Public\
+      selection_susp_child_img:
+        Image|endswith:
+        - \bash.exe
+        - \bitsadmin.exe
+        - \cmd.exe
+        - \cscript.exe
+        - \curl.exe
+        - \mshta.exe
+        - \msiexec.exe
+        - \msxsl.exe
+        - \odbcconf.exe
+        - \powershell.exe
+        - \pwsh.exe
+        - \regsvr32.exe
+        - \schtasks.exe
+        - \wmic.exe
+        - \wscript.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_parent_* and 1 of selection_susp_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the environment around the time of the alert?
+  context: Tracking the user's activity across all hosts in the alert window reveals lateral movement or activity
+    spanning multiple endpoints. If the same user triggered similar proxy-execution activity elsewhere, the scope is
+    larger than this one host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent_img:
+        ParentCommandLine|contains: SHELL32.DLL
+      selection_parent_ordinal:
+        ParentCommandLine|contains:
+        - '#568'
+        - '#570'
+        - '#572'
+        - '#576'
+      selection_susp_cli_parent:
+      - ParentCommandLine|contains:
+        - comspec
+        - iex
+        - Invoke-
+        - msiexec
+        - odbcconf
+        - regsvr32
+      - ParentCommandLine|contains:
+        - \Desktop\
+        - \ProgramData\
+        - \Temp\
+        - \Users\Public\
+      selection_susp_child_img:
+        Image|endswith:
+        - \bash.exe
+        - \bitsadmin.exe
+        - \cmd.exe
+        - \cscript.exe
+        - \curl.exe
+        - \mshta.exe
+        - \msiexec.exe
+        - \msxsl.exe
+        - \odbcconf.exe
+        - \powershell.exe
+        - \pwsh.exe
+        - \regsvr32.exe
+        - \schtasks.exe
+        - \wmic.exe
+        - \wscript.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_parent_* and 1 of selection_susp_*) and _pb_scope
+    fields:
+    - host.name
+- question: Is the same rundll32-ordinal parent launching this child binary on other hosts?
+  context: The same proxy-execution chain appearing on multiple hosts may indicate a campaign or a self-propagating
+    foothold; a single occurrence is more likely targeted or benign. An environment-wide comparison of this parent and
+    child binary pair calibrates severity and identifies the scope of the activity.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+      - CommandLine
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host - defense tampering, removable-media
+    execution, reconnaissance, or an auto-elevation bypass - may reveal the attack stages that preceded the ordinal shell
+    call and help reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: What other activity occurred on this host around the time of the alert?
+  context: Examining the broader process activity around the alert reveals what led to the ordinal shell call and what
+    followed it. Novel parent-child pairs stand out against the repetitive agent and operating-system telemetry that
+    fills the rest of the window.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage

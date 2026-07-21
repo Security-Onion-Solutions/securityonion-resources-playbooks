@@ -1,0 +1,469 @@
+name: Schtasks Creation Or Modification With SYSTEM Privileges
+id: e0ac79db-cb44-461f-9068-1eb2e9f396df
+description: |
+  Detects a schtasks.exe invocation that creates or changes a scheduled task to run as
+  the SYSTEM account. The rule fires when the command line contains a /create or /change
+  subcommand AND a /ru run-as flag AND a SYSTEM identity token (NT AUT... or the SYSTEM
+  keyword), while excluding a small set of known vendor task names. A task running as
+  LocalSystem needs no password and executes with the highest privilege available to a
+  scheduled job, which makes it a common persistence and privilege-escalation foothold:
+  the configured command runs as SYSTEM at the next trigger and survives reboots.
+  Legitimate software installers and IT automation also create SYSTEM tasks, so the
+  investigation should establish what command the task runs, how the task was authored
+  and triggered, whether the activity was authorized, and whether it fits prior behavior
+  on this host and for this user.
+type: detection
+detection_id: 89ca78fd-b37c-4310-b3d3-81a023f83936
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the schtasks command line create or change a task that runs as SYSTEM?
+  context: Before investing investigation time, confirm the alert is a true positive. The
+    rule fires only when all three conditions hold together in one command line - a /create
+    or /change subcommand, a /ru run-as flag, and a SYSTEM identity token (NT AUTHORITY\SYSTEM
+    or the SYSTEM keyword). Review the exact command line and confirm the task is genuinely
+    being set to run under the SYSTEM account rather than matching one of the keywords
+    incidentally.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Is this user and host expected to create SYSTEM-context scheduled tasks?
+  context: Legitimate administrative activity and software installers can create SYSTEM
+    tasks. Knowing whether the account and the host function are consistent with deploying
+    scheduled-task persistence is often the fastest path to separating routine operations
+    from operator activity. A user-facing workstation account directly invoking schtasks
+    /ru SYSTEM is less expected than a build server or an IT automation account doing so.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What scheduled task was created, and what command will it run as SYSTEM?
+  context: The schtasks command line carries the task name (/TN), the command or program
+    to execute (/TR), and the trigger schedule (/SC). Read these from the alerting command
+    line. The /TR value is the persistence payload that will run with SYSTEM privileges -
+    often a script, a binary in a user-writable path, or a download cradle. A task name
+    that is randomized or impersonates a Microsoft or vendor task, paired with a /TR
+    pointing at a non-system directory, is a strong reason to keep digging.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Is the task's command (/TR) encoded or obfuscated, and what does it decode to?
+  context: Operators frequently hide the scheduled-task payload from casual inspection.
+    The /TR value may carry a base64 PowerShell -EncodedCommand, a certutil -decode step,
+    hex, character-concatenation chains, or environment-variable substitution. Decode the
+    /TR content to reveal the actual operation - a download cradle, a reverse shell, an
+    in-memory loader, or credential theft. Iterate decoding for multi-layer encoding until
+    the payload is readable.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Which account registered the task, and does the registration event confirm it runs as SYSTEM?
+  context: When task auditing is enabled, the Security channel records task creation under
+    event 4698 and task updates under event 4702, capturing the task name, the full task
+    definition, and the account that registered it. Cross-referencing the registering
+    account against the run-as principal shows who authored the SYSTEM task and whether
+    the author is an administrator, a service account, or an unexpected user. If Security
+    audit logging for scheduled tasks is not enabled in this environment, treat zero
+    results as a visibility gap rather than evidence nothing was registered.
+  range: -24h
+  query: |
+    aggregation: false
+    logsource:
+      service: security
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID:
+          - 4698
+          - 4702
+      condition: selection
+    fields:
+      - TaskName
+      - SubjectUserName
+      - TaskContent
+- question: Was a task definition written under the Task Scheduler registry hive around this time?
+  context: Registered tasks are persisted under HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache,
+    where the task definition, trigger, and run-as principal are stored as registry values.
+    A value-set event on a TaskCache subkey in the same window confirms the task was actually
+    committed to the system and provides a registry-side artifact that survives even if the
+    schtasks process record is missed. Direct writes here without a corresponding schtasks
+    process can indicate task creation through an API or WMI path rather than the command line.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains: '\CurrentVersion\Schedule\TaskCache\'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- question: When is the task scheduled to run, and has it already executed as SYSTEM?
+  context: The trigger schedule determines when the SYSTEM payload activates. Tasks set to
+    run at boot or logon fire on the next restart; recurring tasks (every few minutes,
+    daily) may have already executed multiple times. Scheduled tasks launch as children of
+    the Task Scheduler service hosted in svchost.exe, so process-creation events with that
+    parent in the window after task creation reveal whether the payload has already run.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: '\svchost.exe'
+        ParentCommandLine|contains: 'Schedule'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Is the SYSTEM scheduled task still registered on the system?
+  context: Persistence is only effective if the task still exists. Some operators delete
+    the task after it runs to reduce forensic artifacts. Confirming the task named in the
+    /TN argument is still present - via schtasks /query /tn <taskname> /v on the host or
+    through an endpoint console - determines whether the persistence mechanism is currently
+    active and requires removal.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What process spawned schtasks.exe, and is that parent chain expected?
+  context: The parent process shows how schtasks.exe was invoked. Interactive task creation
+    typically descends from explorer.exe, a console shell, or a known management or
+    deployment agent. A parent such as a script host (wscript.exe, mshta.exe), an Office
+    application, a browser child, or a freshly written binary points to invocation by a
+    script or implant rather than a human administrator.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_root:
+        Image|endswith: \schtasks.exe
+        CommandLine|contains:
+        - ' /change '
+        - ' /create '
+      selection_run:
+        CommandLine|contains: '/ru '
+      selection_user:
+        CommandLine|contains:
+        - NT AUT
+        - ' SYSTEM '
+      filter_optional_teamviewer:
+        Image|endswith: \schtasks.exe
+        CommandLine|contains|all:
+        - /TN TVInstallRestore
+        - \TeamViewer_.exe
+      filter_optional_office:
+        CommandLine|contains|all:
+        - Subscription Heartbeat
+        - \HeartbeatConfig.xml
+        - \Microsoft Shared\OFFICE
+      filter_optional_avira:
+        CommandLine|contains:
+        - '/Create /F /RU System /SC WEEKLY /TN AviraSystemSpeedupVerify /TR '
+        - :\Program Files (x86)\Avira\System Speedup\setup\avira_speedup_setup.exe
+        - /VERIFY /VERYSILENT /NOSTART /NODOTNET /NORESTART" /RL HIGHEST
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_* and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_root:
+        Image|endswith: \schtasks.exe
+        CommandLine|contains:
+        - ' /change '
+        - ' /create '
+      selection_run:
+        CommandLine|contains: '/ru '
+      selection_user:
+        CommandLine|contains:
+        - NT AUT
+        - ' SYSTEM '
+      filter_optional_teamviewer:
+        Image|endswith: \schtasks.exe
+        CommandLine|contains|all:
+        - /TN TVInstallRestore
+        - \TeamViewer_.exe
+      filter_optional_office:
+        CommandLine|contains|all:
+        - Subscription Heartbeat
+        - \HeartbeatConfig.xml
+        - \Microsoft Shared\OFFICE
+      filter_optional_avira:
+        CommandLine|contains:
+        - '/Create /F /RU System /SC WEEKLY /TN AviraSystemSpeedupVerify /TR '
+        - :\Program Files (x86)\Avira\System Speedup\setup\avira_speedup_setup.exe
+        - /VERIFY /VERYSILENT /NOSTART /NODOTNET /NORESTART" /RL HIGHEST
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_* and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or
+    parallel activity on multiple endpoints. If the same account created SYSTEM tasks or
+    ran other administrative tooling on several hosts in this window, the scope of the
+    activity may be larger than a single endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_root:
+        Image|endswith: \schtasks.exe
+        CommandLine|contains:
+        - ' /change '
+        - ' /create '
+      selection_run:
+        CommandLine|contains: '/ru '
+      selection_user:
+        CommandLine|contains:
+        - NT AUT
+        - ' SYSTEM '
+      filter_optional_teamviewer:
+        Image|endswith: \schtasks.exe
+        CommandLine|contains|all:
+        - /TN TVInstallRestore
+        - \TeamViewer_.exe
+      filter_optional_office:
+        CommandLine|contains|all:
+        - Subscription Heartbeat
+        - \HeartbeatConfig.xml
+        - \Microsoft Shared\OFFICE
+      filter_optional_avira:
+        CommandLine|contains:
+        - '/Create /F /RU System /SC WEEKLY /TN AviraSystemSpeedupVerify /TR '
+        - :\Program Files (x86)\Avira\System Speedup\setup\avira_speedup_setup.exe
+        - /VERIFY /VERYSILENT /NOSTART /NODOTNET /NORESTART" /RL HIGHEST
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_* and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - host.name
+- question: Was schtasks.exe executed from its expected System32 or SysWOW64 path?
+  context: schtasks.exe running from outside System32 or SysWOW64 may have been copied or
+    renamed to evade path-based allowlists or to carry an altered binary. Compare the Image
+    path and OriginalFileName from the triggering event against the expected location for
+    the Task Scheduler command-line utility.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- question: Were other persistence or tampering LOLBins used on this host recently?
+  context: Operators who establish one persistence foothold often install backups or weaken
+    defenses with related living-off-the-land binaries. After a SYSTEM scheduled task is
+    created, check whether reg.exe, sc.exe, at.exe, netsh.exe, bcdedit.exe, or similar tools
+    ran on the same host in the same timeframe. Several persist-or-tamper LOLBins clustered
+    together strengthens the case for intentional operator activity rather than an isolated
+    administrative action.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\reg.exe'
+          - '\sc.exe'
+          - '\at.exe'
+          - '\netsh.exe'
+          - '\wevtutil.exe'
+          - '\bcdedit.exe'
+          - '\vssadmin.exe'
+          - '\diskshadow.exe'
+          - '\dnscmd.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- question: How often has this host fired the rule's SYSTEM-task pattern over the past 90 days, and what command structures are typical?
+  context: A SYSTEM-task creation pattern with no prior history on a host is more suspicious
+    than one seen regularly under stable parents. The query mirrors the rule's selection
+    structure scoped to this host, so the resulting count reflects the rule's specific
+    firing pattern rather than generic schtasks usage. The command-line projection lets the
+    analyst compare typical invocation patterns against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_root:
+        Image|endswith: \schtasks.exe
+        CommandLine|contains:
+        - ' /change '
+        - ' /create '
+      selection_run:
+        CommandLine|contains: '/ru '
+      selection_user:
+        CommandLine|contains:
+        - NT AUT
+        - ' SYSTEM '
+      filter_optional_teamviewer:
+        Image|endswith: \schtasks.exe
+        CommandLine|contains|all:
+        - /TN TVInstallRestore
+        - \TeamViewer_.exe
+      filter_optional_office:
+        CommandLine|contains|all:
+        - Subscription Heartbeat
+        - \HeartbeatConfig.xml
+        - \Microsoft Shared\OFFICE
+      filter_optional_avira:
+        CommandLine|contains:
+        - '/Create /F /RU System /SC WEEKLY /TN AviraSystemSpeedupVerify /TR '
+        - :\Program Files (x86)\Avira\System Speedup\setup\avira_speedup_setup.exe
+        - /VERIFY /VERYSILENT /NOSTART /NODOTNET /NORESTART" /RL HIGHEST
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_* and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - CommandLine
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host - defense
+    tampering, reconnaissance, credential access, or initial execution - may reveal the
+    attack stages that preceded the SYSTEM-task creation and help reconstruct the timeline.
+    A foothold established before persistence was installed reframes the task creation as
+    one step in a multi-stage operation.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

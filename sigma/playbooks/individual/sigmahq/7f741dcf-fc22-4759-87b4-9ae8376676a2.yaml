@@ -1,0 +1,335 @@
+name: Bypass UAC via Fodhelper.exe
+id: 49d20f69-b971-47f2-87e1-1879268672f2
+description: |
+  Detects a child process spawned by fodhelper.exe. Fodhelper.exe is an auto-elevated Windows binary; an actor can write a
+  command to a per-user registry key (HKCU\Software\Classes\ms-settings\Shell\Open\command with a DelegateExecute value) so
+  that launching fodhelper.exe runs that command at high integrity without a consent prompt, bypassing User Account Control.
+  Legitimate launches of fodhelper.exe rarely spawn child processes, so any child is the signal here. Investigation should
+  identify the spawned child and its command, confirm the per-user registry artifact that set up the bypass, and determine
+  what elevated action followed.
+type: detection
+detection_id: 7f741dcf-fc22-4759-87b4-9ae8376676a2
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- question: Did fodhelper.exe spawn this child process, and what is the child?
+  context: Confirm the alert is real by reviewing the triggering event. The rule fires whenever a process has fodhelper.exe
+    as its parent. Note the child Image and CommandLine — a command interpreter, script host, or unsigned binary launched
+    by fodhelper.exe is the elevated payload the bypass delivered, while an empty or benign child may reflect a rare
+    legitimate launch.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+- question: Is this user and host expected to launch fodhelper.exe and the spawned child?
+  context: Fodhelper.exe is the Windows optional-features settings handler; interactive users rarely invoke it in a way that
+    spawns a child process, and it is almost never driven by automation. Knowing whether this user role and host function
+    would legitimately reach this code path is often the fastest way to separate a routine settings interaction from a
+    deliberate elevation attempt.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What is fodhelper.exe's own process event, and what launched fodhelper.exe itself?
+  context: Retrieve fodhelper.exe's own process_creation event to see how it was started and by whom. A user double-clicking
+    settings produces a different parent chain than a script, command interpreter, or scheduled task launching fodhelper.exe
+    to trigger the auto-elevation. Walk one level up to identify what spawned the bypass.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- question: What exactly did the child process do? Decode its full command line.
+  context: The full command line of the process fodhelper.exe spawned reveals the operational purpose of the elevation —
+    decode any flags, encoded content, file paths, or URLs. This is the action the actor wanted to run at high integrity, so
+    parsing every argument identifies the objective behind the bypass.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%ParentImage%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - CurrentDirectory
+      - IntegrityLevel
+- question: Was the per-user registry key that drives the fodhelper bypass written before the alert?
+  context: The fodhelper bypass works by writing a command into HKCU\Software\Classes\ms-settings\Shell\Open\command with a
+    DelegateExecute value; fodhelper.exe reads that key and runs the command at high integrity. Finding the registry write
+    in the minutes before the alert confirms the bypass mechanism and shows the exact payload that was staged. Absence of a
+    registry_set record can mean the key was set earlier, set through a path this query does not cover, or that registry
+    auditing is not collected in this environment.
+  range: -30m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains:
+          - 'Classes\ms-settings\Shell\Open\command'
+          - 'Classes\ms-settings\Shell\Open\command\DelegateExecute'
+          - 'ms-settings\shell\open\command'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - User
+- question: Did a command interpreter write the ms-settings shell command used to stage the bypass?
+  context: Many UAC bypasses set up via reg.exe, powershell.exe, or cmd.exe writing a command to a per-user class key. For
+    fodhelper this is HKCU\Software\Classes\ms-settings\Shell\Open\command with a DelegateExecute value. Seeing which
+    interpreter performed the write, and the command it staged, confirms the mechanism and identifies the elevated payload.
+  range: -15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\reg.exe'
+          - '\powershell.exe'
+          - '\cmd.exe'
+        CommandLine|contains:
+          - 'ms-settings'
+          - 'mscfile'
+          - 'Classes\exefile'
+          - 'Classes\Folder'
+          - 'Environment'
+          - 'Shell\Open\command'
+          - 'DelegateExecute'
+      condition: selection
+    fields:
+      - CommandLine
+      - Image
+- question: What action was performed with elevated privileges after the UAC bypass?
+  context: UAC bypass is a means to an end — actors elevate to install persistence, dump credentials, tamper with security
+    tools, or reach protected resources. Examining processes running at High or System integrity on this host shortly after
+    fodhelper.exe spawned its child reveals the objective behind the elevation.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        IntegrityLevel:
+          - 'High'
+          - 'System'
+          - 'S-1-16-16384'
+          - 'S-1-16-12288'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - IntegrityLevel
+- question: Did a special-privileges elevation event fire on this host around the time of the alert?
+  context: A successful UAC bypass yields a high-integrity token, which the system records as a privileged logon assignment.
+    Correlating such an elevation event with the fodhelper child within a tight window distinguishes a real bypass that
+    produced elevated rights from a child process that never actually gained them. If privileged-logon auditing is not
+    collected in this environment, treat absence as a visibility gap rather than evidence no elevation occurred.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - rule.name
+      - rule.uuid
+      - event.severity_label
+- question: Were other privilege escalation techniques attempted on this host?
+  context: Actors who attempt one UAC bypass often try several methods until one works, especially when OS version or
+    configuration blocks specific techniques. Multiple bypass or escalation detections from the same user or host in a tight
+    window point to deliberate privilege escalation rather than a one-off false positive.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - rule.name
+      - rule.uuid
+      - event.severity_label
+- question: What other child processes did fodhelper.exe spawn on this host?
+  context: A single fodhelper.exe instance used for elevation may launch more than one process — staging, then the payload,
+    then follow-on tooling. Seeing every child of fodhelper.exe on this host reveals the full scope of activity initiated
+    through the auto-elevated parent.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Has fodhelper.exe spawned this child binary on this host before?
+  context: Legitimate fodhelper.exe launches seldom spawn a child process at all, so historical frequency of this specific
+    parent-child pairing is a strong discriminator. Zero or very low counts indicate a novel spawning relationship
+    consistent with a first-time bypass; a long history may indicate a recurring legitimate or automated workflow.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \fodhelper.exe
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \fodhelper.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If
+    the same user triggered similar elevation activity on more than one host, the scope of the operation may be larger than
+    a single endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \fodhelper.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance, or
+    the registry staging that sets up the bypass — may reveal the attack stages that preceded this elevation and help
+    reconstruct the timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

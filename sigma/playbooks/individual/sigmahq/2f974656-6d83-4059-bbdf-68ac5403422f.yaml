@@ -1,0 +1,560 @@
+name: Hermetic Wiper TG Process Patterns
+id: 617801f9-b5bc-45fe-81a3-88c3b02accde
+description: |
+  Detects process-execution patterns associated with the Hermetic Wiper intrusion set. The rule
+  fires when EITHER an Image ends in \policydefinitions\postgresql.exe (a binary relocated and
+  renamed into a Windows policy directory) OR a command line matches one of two argument patterns:
+  a reference to the staging path CSIDL_SYSTEM_DRIVE\temp\sys.tmp or to the loopback output
+  redirect ' 1> \\127.0.0.1\ADMIN$\__16...', or a command line carrying all three of
+  'powershell -c ', '\comsvcs.dll MiniDump ' and '\winupd.log full' together.
+  The redirect to the local ADMIN$ share over loopback is the output-capture artifact left by
+  SMB/WMI remote-command tooling — the caller writes results to the share and reads them back —
+  and the comsvcs.dll MiniDump pattern writes a full memory dump of a running process to disk for
+  offline credential extraction. This family pairs credential access and remote command execution
+  with a payload that overwrites disk sectors, the boot record, and recovery data, so the
+  investigation should establish which branch fired, decode the full command line, identify the
+  host and account that drove the execution, and then confirm the current disk, boot, and shadow
+  copy state on the host directly — process telemetry records the execution, not the on-disk
+  result.
+type: detection
+detection_id: 2f974656-6d83-4059-bbdf-68ac5403422f
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-16
+questions:
+- question: Does the alerting event match one of this rule's branches — either the postgresql.exe
+    image path, or one of the command-line patterns?
+  context: >-
+    Confirm the alert before investing investigation time. The rule fires on any one of three
+    independent branches: an Image ending in \policydefinitions\postgresql.exe; a CommandLine
+    containing CSIDL_SYSTEM_DRIVE\temp\sys.tmp or the redirect ' 1> \\127.0.0.1\ADMIN$\__16';
+    or a CommandLine carrying 'powershell -c ' and '\comsvcs.dll MiniDump ' and '\winupd.log full'
+    together. Record which branch matched, because it sets the direction of the rest of the
+    investigation — the image branch describes a renamed binary staged in a policy directory, the
+    redirect branch describes remote-command output capture, and the MiniDump branch describes
+    process memory dumping.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - alert
+  - process_creation
+- question: Is this user and host expected to perform the operation the alert shows?
+  context: >-
+    Knowing whether the account and host function fit the behaviour is usually the fastest triage
+    step. Remote command execution that redirects output to ADMIN$, dumping process memory with
+    rundll32 and comsvcs.dll, and running an executable from a Windows policy directory are all
+    outside routine end-user activity; some administration and backup tooling does drive remote
+    command execution, so establish whether this account performs that work on this host.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: What exactly did this command do? Decode every argument, output redirection target,
+    and staged file path.
+  context: >-
+    The full command line carries the operation. Decode the redirection target (a write to
+    \\127.0.0.1\ADMIN$\__<timestamp> is how remote-command tooling captures stdout for the caller
+    to read back over the share), the staging path (CSIDL_SYSTEM_DRIVE\temp\sys.tmp names a drop
+    location that is typically moved into its final path in a following command), and any
+    rundll32 comsvcs.dll MiniDump arguments (target process ID, output file, and the 'full' flag
+    that writes complete process memory). Scoping to this binary on this host over a five-minute
+    window captures the sequential cmd.exe /Q /c invocations that together form one logical
+    operation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: Which remote endpoints do the commands around this alert reference, and did this host
+    contact any of them?
+  context: >-
+    The alerting command line embeds its endpoints as text rather than opening a connection the
+    analyst can pivot on, so the endpoints have to be read out of process telemetry. Staging for
+    this family runs through download cradles that pull a payload from an internal or external
+    host into a temp path, connectivity checks issued with certutil, and the loopback ADMIN$
+    redirect that marks remote-driven execution. Resolve each host, domain, and share path the
+    surrounding commands name, then check reputation and passive DNS for the external ones and
+    ownership for the internal ones.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_endpoint:
+        CommandLine|contains:
+          - 'DownloadFile('
+          - 'DownloadString('
+          - Invoke-WebRequest
+          - \certutil.exe
+          - 'http://'
+          - 'https://'
+          - ' 1> \\\\127.0.0.1\ADMIN$\__16'
+      condition: selection_host and selection_endpoint
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+  - external_threat_intel
+  - manual_review
+- question: What process spawned this one, and is that parent chain expected?
+  context: >-
+    The parent reveals how the command was invoked. Remote-driven execution has characteristic
+    launchers — wmiprvse.exe for WMI-delivered commands, services.exe for a service installed by
+    remote tooling — while a scheduled task shows up under the task scheduler service. A parent of
+    explorer.exe or a terminal points instead at hands-on-keyboard activity in an interactive
+    session. The lookup is unique per process instance, so the long window is intentional:
+    long-running parents often started hours or days before the alert.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: What host initiated this remote connection, and is it an expected administrative
+    source?
+  context: >-
+    Lateral movement requires a source and destination. Identifying the originating host reveals
+    whether the connection came from a known admin jump box, a compromised workstation, or an
+    unexpected source. Attackers who have compromised one host use it as a pivot point to reach
+    others; SMB on 445 and DCOM/WMI on 135 are the paths that produce the loopback ADMIN$ output
+    redirect this rule matches.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationPort:
+          - 445
+          - 135
+          - 3389
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - SourceIp
+      - DestinationPort
+  answer_sources:
+  - network_connection
+  - process_creation
+- question: What authentication method carried this remote execution -- valid credentials,
+    pass-the-hash, or a Kerberos ticket?
+  context: >-
+    The authentication method shows how access was obtained. NTLM type 3 network logons with no
+    prior interactive logon are consistent with hash reuse; ticket-based access shows Kerberos
+    without a password prompt. Valid credential use points back at an earlier dump or theft, which
+    is the same capability the comsvcs.dll MiniDump branch of this rule matches. The account shown
+    here is the one to trace through logon records on the source and destination.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - User
+      - CommandLine
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+- question: What processes were spawned on this host in the 30 minutes after the alerting
+    execution?
+  context: >-
+    Remote execution is a means to an end. The follow-on activity for this family runs through
+    scheduled task creation and execution (schtasks /create, /run), file moves that place a staged
+    temp file into a system or policy directory under a new name, rundll32 loading comsvcs.dll for
+    memory dumping, and short unnamed PowerShell scripts. Aggregating by account and binary over
+    the forward window collapses agent heartbeat noise while a new binary or a new account stands
+    out at low counts.
+  range: +30m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - User
+      - Image
+  answer_sources:
+  - process_creation
+- question: What child processes did the alerting binary spawn afterward?
+  context: >-
+    The children of a staged or remotely launched binary show what it was there to do. A
+    cmd.exe /Q /c wrapper spawning powershell.exe, rundll32.exe, certutil.exe, schtasks.exe, or
+    move operations traces the next stage of the operation. This family's destructive payload
+    overwrites disk sectors, the master boot record, and recovery data, and none of that leaves
+    process telemetry — if the alerting binary is the payload rather than a staging step, confirm
+    the current partition table, boot configuration, and shadow copy state on the host directly
+    rather than inferring it from these results.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+  - edr_console
+  - manual_review
+- question: Has this source host or user account connected to other hosts in the environment?
+  context: >-
+    Attackers rarely stop at one target. If the source host or user account is moving laterally
+    to multiple systems, the scope of compromise is larger. Finding connections to many hosts
+    from a single source within a short window indicates active lateral movement across the
+    environment, which for this family is how a wiper reaches more than the first host. If this
+    alert fired under SYSTEM, LOCAL SERVICE, NETWORK SERVICE, or a machine account (name ending
+    in $), this query intentionally returns nothing — a user pivot on a service principal
+    matches every host's background automation, not an actor; assess movement through the host-
+    and program-scoped questions instead.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      selection_lateral:
+        Image|endswith:
+        - \psexec.exe
+        - \psexec64.exe
+        - \mstsc.exe
+        - \ssh.exe
+        - \plink.exe
+        - \wmic.exe
+      filter_svcprin_builtin:
+        User:
+        - SYSTEM
+        - LOCAL SERVICE
+        - NETWORK SERVICE
+      filter_svcprin_machine:
+        User|endswith: $
+      condition: (selection and selection_lateral) and not 1 of filter_svcprin_*
+    fields:
+    - host.name
+    - Image
+  answer_sources:
+  - network_connection
+  - process_creation
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Alerts rarely happen in isolation. The stages that typically precede this pattern are
+    remote-service or web-shell driven execution, credential access, and defense tampering,
+    sometimes separated from the impact stage by weeks of quiet access. Earlier detections on this
+    host help place the alert in that timeline and identify the entry point.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+  answer_sources:
+  - alert
+- question: When this host has previously matched the rule's pattern, what parents and users drove
+    that activity, and does the current alert fit?
+  context: >-
+    The query mirrors the rule's selection structure scoped to this host, so the resulting
+    parent/user distribution reflects how this specific firing pattern has run here rather than
+    generic binary usage. For a pattern this narrow the expected count is zero; any prior history
+    is worth understanding before treating the current event as new. A new parent process or an
+    unexpected account against an existing history is the deviation to chase.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection1:
+        Image|endswith: \policydefinitions\postgresql.exe
+      selection2:
+      - CommandLine|contains:
+        - CSIDL_SYSTEM_DRIVE\temp\sys.tmp
+        - ' 1> \\\\127.0.0.1\ADMIN$\__16'
+      - CommandLine|contains|all:
+        - 'powershell -c '
+        - '\comsvcs.dll MiniDump '
+        - \winupd.log full
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (1 of selection*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+  answer_sources:
+  - process_creation
+- question: Has this user previously produced the rule's pattern, and does that history fit their
+    role?
+  context: >-
+    The query mirrors the rule's selection structure scoped to this account, so the result is the
+    user's 90-day history of this specific firing pattern across hosts rather than generic use of
+    the binary. Weigh any count against the account's role and normal toolset; an account with no
+    history of remote command execution or memory dumping producing this pattern is the case to
+    escalate. If the alert fired under SYSTEM or a machine account, this pivot does not attribute
+    behaviour and the launch-mechanism history is the meaningful answer.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection1:
+        Image|endswith: \policydefinitions\postgresql.exe
+      selection2:
+      - CommandLine|contains:
+        - CSIDL_SYSTEM_DRIVE\temp\sys.tmp
+        - ' 1> \\\\127.0.0.1\ADMIN$\__16'
+      - CommandLine|contains|all:
+        - 'powershell -c '
+        - '\comsvcs.dll MiniDump '
+        - \winupd.log full
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (1 of selection*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+  always_include: true
+- question: Has this parent process historically driven the rule's pattern on this host or across
+    the environment, or is the parent new for this activity?
+  context: >-
+    When the alert fires under a service principal, user identity does not attribute behaviour and
+    the launch mechanism is the meaningful pivot. The query mirrors the rule's selection structure
+    scoped to the alerting parent, so the result is the 90-day history of this parent driving this
+    specific pattern. A parent that already accounts for thousands of prior events is vendor or OS
+    automation; a parent that is new for this pattern is the deviation to chase.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection1:
+        Image|endswith: \policydefinitions\postgresql.exe
+      selection2:
+      - CommandLine|contains:
+        - CSIDL_SYSTEM_DRIVE\temp\sys.tmp
+        - ' 1> \\\\127.0.0.1\ADMIN$\__16'
+      - CommandLine|contains|all:
+        - 'powershell -c '
+        - '\comsvcs.dll MiniDump '
+        - \winupd.log full
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (1 of selection*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  always_include: true
+- question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the account across all hosts in the alert window shows whether the activity is
+    confined to one system. The same account driving command execution on several hosts in a short
+    window is the pattern that precedes multi-host impact. If the alert fired under SYSTEM, LOCAL
+    SERVICE, NETWORK SERVICE, or a machine account, this returns agent telemetry volume rather
+    than an answer, and the parent-driven view is the one to read.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+  always_include: true
+- question: Did this same parent-driven pattern fire on other hosts in the same window, or is the
+    activity isolated to this host?
+  context: >-
+    Under a service principal the account-wide view returns agent telemetry from every host, so
+    the useful question is whether the same launch mechanism fired elsewhere. The query mirrors the
+    rule's selection structure scoped to the alerting parent, fleet-wide, in the alert window.
+    Several hosts in the same window points at pushed or scheduled execution and widens the host
+    list to check; a single host points at a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection1:
+        Image|endswith: \policydefinitions\postgresql.exe
+      selection2:
+      - CommandLine|contains:
+        - CSIDL_SYSTEM_DRIVE\temp\sys.tmp
+        - ' 1> \\\\127.0.0.1\ADMIN$\__16'
+      - CommandLine|contains|all:
+        - 'powershell -c '
+        - '\comsvcs.dll MiniDump '
+        - \winupd.log full
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (1 of selection*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  always_include: true
+- question: Have other hosts matched the rule's pattern in the past week, and does the cross-host
+    distribution look like consistent automation or one-off activity?
+  context: >-
+    The query mirrors the rule's selection structure with no host scope, so the result is a
+    fleet-wide count of this firing pattern rather than generic usage of the binary. Because the
+    pattern is narrow, any second host is meaningful: several hosts within a short window points at
+    scripted deployment, and the host list is the containment scope to work through. A single host
+    keeps the investigation local.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection1:
+        Image|endswith: \policydefinitions\postgresql.exe
+      selection2:
+      - CommandLine|contains:
+        - CSIDL_SYSTEM_DRIVE\temp\sys.tmp
+        - ' 1> \\\\127.0.0.1\ADMIN$\__16'
+      - CommandLine|contains|all:
+        - 'powershell -c '
+        - '\comsvcs.dll MiniDump '
+        - \winupd.log full
+      condition: 1 of selection*
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- question: Where has this user authenticated recently?
+  context: >-
+    Authentication events show which systems the account reached before and after the detected
+    activity. Logon type 3 records the network logons that carry SMB and WMI command execution,
+    type 10 records remote desktop sessions, and a run of failures followed by a success points
+    at credential guessing. An account authenticating to many systems in a short period,
+    especially after memory dumping, tracks the spread of access. If Security channel events are
+    not collected from the relevant hosts, treat zero results as a visibility gap rather than
+    evidence nothing happened. If this alert fired under SYSTEM, LOCAL SERVICE, NETWORK SERVICE,
+    or a machine account (name ending in $), this query intentionally returns nothing — a user
+    pivot on a service principal matches every host's background automation, not an actor;
+    assess movement through the host- and program-scoped questions instead.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        EventID:
+        - 4624
+        - 4625
+        TargetUserName|expand: '%User%'
+      filter_svcprin_builtin:
+        TargetUserName:
+        - SYSTEM
+        - LOCAL SERVICE
+        - NETWORK SERVICE
+      filter_svcprin_machine:
+        TargetUserName|endswith: $
+      condition: (selection) and not 1 of filter_svcprin_*
+    fields:
+    - host.name
+    - IpAddress
+    - EventID
+    - LogonType
+  answer_sources:
+  - network_connection
+  - manual_review

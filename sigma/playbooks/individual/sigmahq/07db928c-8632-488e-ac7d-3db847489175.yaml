@@ -1,0 +1,610 @@
+name: Forest Blizzard APT - Process Creation Activity
+id: 1502dc50-fb25-45e3-8640-3262d4cd3196
+description: |
+  Fires when at least one of four independent conditions matches: EITHER a process
+  whose SHA256 matches one of two known post-compromise tool binaries, OR schtasks.exe
+  registering a task under \Microsoft\Windows\WinSrv that runs as SYSTEM and points at
+  servtask.bat, execute.bat, or doit.bat, OR schtasks.exe force-deleting a task under
+  \Microsoft\Windows\WinSrv, OR a command line that combines Get-ChildItem, a .save
+  argument, and Compress-Archive -DestinationPath C:\ProgramData\. The branches cover a
+  post-exploitation sequence in which a batch script stages a helper under C:\ProgramData,
+  a SYSTEM-run scheduled task re-executes it, registry hives are saved and compressed for
+  offline credential extraction, and the task is removed afterward to reduce artifacts.
+  Determine which branch fired, decode the task definition or archive command in full,
+  establish whether the staged files are still on disk and whether the task is still
+  registered, and reconstruct what ran before and after on this host.
+type: detection
+detection_id: 07db928c-8632-488e-ac7d-3db847489175
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-16
+questions:
+- question: Which branch of the rule fired — a known tool hash, a WinSrv scheduled-task create or delete, or the hive save-and-compress
+    command line?
+  context: >-
+    The rule fires when any one of four independent selections matches, so identify and note the
+    branch that produced this alert before going further. The hash branch identifies a specific
+    tool binary regardless of its name on disk; the create branch identifies a SYSTEM task under
+    \Microsoft\Windows\WinSrv pointing at a batch file; the delete branch identifies that same task
+    being force-removed; the command-line branch identifies registry hive files being collected and
+    compressed into C:\ProgramData. The branch that fired decides whether the investigation centers
+    on the binary, on task persistence, or on credential staging.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - Hashes
+  answer_sources:
+  - alert
+  - process_creation
+
+- question: Is this user and host expected to register SYSTEM-run scheduled tasks or archive registry hives?
+  context: >-
+    Task registration under \Microsoft\Windows\WinSrv with /RU SYSTEM, and bulk collection of .save
+    hive files into an archive, are both operations that a narrow set of accounts and hosts perform
+    routinely. Deployment servers, backup agents, and endpoint-management tooling produce SYSTEM task
+    registration constantly; a workstation account that has never done either is the deviation to chase.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+
+- question: Which files did the alerting process and its direct children write, and are those files still on disk for analysis?
+  context: >-
+    The batch scripts, the staged helper binary, the .save hive copies, and the resulting archive are
+    the artifacts that carry the payload and the collected credential material. Correlating file writes
+    to the alerting process and its children establishes what landed on disk, where, and whether it is
+    still retrievable for hashing, content review, or offline analysis.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+  answer_sources:
+  - file_event
+  - manual_review
+
+- question: Is this execution part of an authorized penetration test or red team engagement?
+  context: >-
+    Registry hive collection and SYSTEM task persistence are standard steps in authorized assessments,
+    and offensive tooling reuses the same task names and staging directories as the tradecraft it
+    emulates. Check whether an assessment is active on this host or network segment before investing
+    further analysis; an engagement whose scope and timing match resolves the alert.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - organizational_knowledge
+
+- question: What task name (/TN), run-as account (/RU), schedule (/SC), and target command (/TR) does this schtasks command line
+    specify?
+  context: >-
+    Read the arguments end to end. /TN gives the registration path under \Microsoft\Windows\WinSrv,
+    which is chosen to blend with built-in Windows task folders; /TR names the batch file the task
+    executes, typically servtask.bat, execute.bat, or doit.bat under C:\ProgramData; /RU SYSTEM means
+    the payload runs with full local privilege; /SC MINUTE means it re-runs continuously rather than
+    once. On the delete branch, /F removes the same registration, which points at cleanup after the
+    payload has already run.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - process_creation
+
+- question: What was written to the batch files and archives under C:\ProgramData, and what do their contents do?
+  context: >-
+    The staging directory holds the operational content — the batch script that writes and invokes the
+    helper, and the archive that carries the collected hive files. Retrieve each file and read it,
+    checking for encoded or obfuscated strings, embedded paths, the reg save or Compress-Archive
+    invocations, and any secondary binary it launches. Content analysis answers what the payload does;
+    it is a separate step from establishing whether the file is already known.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_batch:
+        TargetFilename|endswith:
+        - '\servtask.bat'
+        - '\execute.bat'
+        - '\doit.bat'
+      selection_staging:
+        TargetFilename|contains: '\ProgramData\'
+        TargetFilename|endswith:
+        - '.zip'
+        - '.save'
+        - '.bat'
+      condition: selection_host and (selection_batch or selection_staging)
+    fields:
+      - TargetFilename
+      - Image
+  answer_sources:
+  - file_event
+  - manual_review
+  - safe_environment
+  - external_threat_intel
+
+- question: If the staged batch files or helper binaries have executed on this host, what are their hashes and are they already
+    known to threat intel?
+  context: >-
+    A hash is recorded when a file runs, not when it is written, so the execution event is where the
+    identity of the staged artifact appears. Submit any hash returned here to internal threat intel or
+    a reputation service. On a batch-file match the process is the interpreter, so the hash belongs to
+    cmd.exe rather than the script — retrieve the script from its C:\ProgramData path and hash it
+    directly. If nothing returns, the file may have been staged but never executed.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_direct:
+        Image|endswith:
+        - '\servtask.bat'
+        - '\execute.bat'
+        - '\doit.bat'
+      selection_interpreter:
+        CommandLine|contains:
+        - '\ProgramData\servtask.bat'
+        - '\ProgramData\execute.bat'
+        - '\ProgramData\doit.bat'
+      condition: selection and (selection_direct or selection_interpreter)
+    fields:
+      - Image
+      - CommandLine
+      - Hashes
+  answer_sources:
+  - process_creation
+  - external_threat_intel
+
+- question: Has the Task Scheduler service already launched the registered task on this host?
+  context: >-
+    A task registered with /SC MINUTE fires within a minute of registration and keeps firing until it
+    is removed, so the payload has usually run several times by the time the alert is reviewed. Tasks
+    execute as children of the Task Scheduler service, so the processes it spawned after registration
+    show whether the batch file ran and what it launched in turn.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: '\svchost.exe'
+        ParentCommandLine|contains: 'Schedule'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+
+- question: Is the task under \Microsoft\Windows\WinSrv still registered on the system?
+  context: >-
+    The task is only an active persistence mechanism while it exists, and this tradecraft deletes its
+    own registration once the payload has run. Query the host directly for the task name taken from the
+    command line to establish whether it is still present, and treat its absence as evidence that
+    cleanup already happened rather than as evidence nothing was installed.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - manual_review
+  - edr_console
+
+- question: What process spawned the alerting process, and is that parent chain expected?
+  context: >-
+    The parent reveals how the operation was driven. A batch script invoked from an interactive shell
+    produces a cmd.exe parent; management tooling produces a service or agent parent; an exploited
+    service produces a parent that has no business launching task registration or archive commands at
+    all. Walk the chain upward from here to find the process that started the sequence.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+
+- question: What other process activity occurred on this host around the time of the alert?
+  context: >-
+    The behaviors this rule targets sit in the middle of a sequence — a script stages files, a task is
+    registered, hives are collected, the task is deleted. Aggregating process activity in a tight window
+    around the alert collapses routine agent telemetry into high-count rows and leaves novel
+    parent-child pairs standing out at low counts, which is where the preceding and following stages
+    surface.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+  answer_sources:
+  - process_creation
+  - file_event
+  - registry_event
+
+- always_include: true
+  question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: >-
+    The query mirrors the rule's selection logic scoped to this user, so the result is the user's 90-day
+    history of these specific branches rather than generic schtasks.exe usage, aggregated by host. An
+    account that has produced this pattern regularly across many hosts points at an administrative or
+    deployment role; an account with no prior history is the deviation worth chasing. Weigh the count
+    against what the account is provisioned to do.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_hashes:
+        Hashes|contains:
+        - SHA256=6b311c0a977d21e772ac4e99762234da852bbf84293386fbe78622a96c0b052f
+        - SHA256=c60ead92cd376b689d1b4450f2578b36ea0bf64f3963cfa5546279fa4424c2a5
+      selection_schtasks_create:
+        Image|endswith: \schtasks.exe
+        CommandLine|contains|all:
+        - Create
+        - /RU
+        - SYSTEM
+        - \Microsoft\Windows\WinSrv
+        CommandLine|contains:
+        - servtask.bat
+        - execute.bat
+        - doit.bat
+      selection_schtasks_delete:
+        Image|endswith: \schtasks.exe
+        CommandLine|contains|all:
+        - Delete
+        - '/F '
+        - \Microsoft\Windows\WinSrv
+      selection_powershell:
+        CommandLine|contains|all:
+        - Get-ChildItem
+        - .save
+        - Compress-Archive -DestinationPath C:\ProgramData\
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+
+- always_include: true
+  question: Has this parent process historically driven the rule's pattern here or elsewhere, or is the parent new for this
+    activity?
+  context: >-
+    When the alert fires under SYSTEM or a machine account, user identity attributes nothing and the
+    launch mechanism is the meaningful pivot. The query mirrors the rule's selection logic scoped to the
+    alerting parent process, so the result is the 90-day history of this parent driving these branches,
+    aggregated by host. A parent already accounting for thousands of prior events across the fleet is
+    management tooling; a parent that has never driven this before is the deviation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_hashes:
+        Hashes|contains:
+        - SHA256=6b311c0a977d21e772ac4e99762234da852bbf84293386fbe78622a96c0b052f
+        - SHA256=c60ead92cd376b689d1b4450f2578b36ea0bf64f3963cfa5546279fa4424c2a5
+      selection_schtasks_create:
+        Image|endswith: \schtasks.exe
+        CommandLine|contains|all:
+        - Create
+        - /RU
+        - SYSTEM
+        - \Microsoft\Windows\WinSrv
+        CommandLine|contains:
+        - servtask.bat
+        - execute.bat
+        - doit.bat
+      selection_schtasks_delete:
+        Image|endswith: \schtasks.exe
+        CommandLine|contains|all:
+        - Delete
+        - '/F '
+        - \Microsoft\Windows\WinSrv
+      selection_powershell:
+        CommandLine|contains|all:
+        - Get-ChildItem
+        - .save
+        - Compress-Archive -DestinationPath C:\ProgramData\
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+
+- always_include: true
+  question: What else did this user do across the environment around this time?
+  context: >-
+    Following the account across every host in a one-hour window shows whether the activity is confined
+    to this endpoint or is being repeated elsewhere, which separates a host-local operation from lateral
+    movement. If the alert fired under SYSTEM or a machine account, expect this to return routine agent
+    telemetry from every host — read the parent-scoped fleet question instead.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+
+- always_include: true
+  question: Did the same parent-driven pattern fire on other hosts in this window, or is the activity isolated to this host?
+  context: >-
+    Under a service principal, tracking the user across the environment returns agent noise, so the
+    useful pivot is whether the same launch mechanism produced the same branches elsewhere in the alert
+    window. The query mirrors the rule's selection logic scoped to the alerting parent, fleet-wide.
+    Several hosts at once points at pushed or scheduled automation; a single host points at a host-local
+    trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_hashes:
+        Hashes|contains:
+        - SHA256=6b311c0a977d21e772ac4e99762234da852bbf84293386fbe78622a96c0b052f
+        - SHA256=c60ead92cd376b689d1b4450f2578b36ea0bf64f3963cfa5546279fa4424c2a5
+      selection_schtasks_create:
+        Image|endswith: \schtasks.exe
+        CommandLine|contains|all:
+        - Create
+        - /RU
+        - SYSTEM
+        - \Microsoft\Windows\WinSrv
+        CommandLine|contains:
+        - servtask.bat
+        - execute.bat
+        - doit.bat
+      selection_schtasks_delete:
+        Image|endswith: \schtasks.exe
+        CommandLine|contains|all:
+        - Delete
+        - '/F '
+        - \Microsoft\Windows\WinSrv
+      selection_powershell:
+        CommandLine|contains|all:
+        - Get-ChildItem
+        - .save
+        - Compress-Archive -DestinationPath C:\ProgramData\
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+
+- question: When this host has previously fired the rule's pattern, what parents and users normally drive it, and does the
+    current alert fit that history?
+  context: >-
+    The query mirrors the rule's selection logic scoped to this host, so the parent and user distribution
+    it returns reflects how these specific branches have run here over two weeks, not how often
+    schtasks.exe runs generally. A parent or account that appears here for the first time is the anomaly;
+    a distribution dominated by one management parent suggests the branches are being matched by an
+    established process.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_hashes:
+        Hashes|contains:
+        - SHA256=6b311c0a977d21e772ac4e99762234da852bbf84293386fbe78622a96c0b052f
+        - SHA256=c60ead92cd376b689d1b4450f2578b36ea0bf64f3963cfa5546279fa4424c2a5
+      selection_schtasks_create:
+        Image|endswith: \schtasks.exe
+        CommandLine|contains|all:
+        - Create
+        - /RU
+        - SYSTEM
+        - \Microsoft\Windows\WinSrv
+        CommandLine|contains:
+        - servtask.bat
+        - execute.bat
+        - doit.bat
+      selection_schtasks_delete:
+        Image|endswith: \schtasks.exe
+        CommandLine|contains|all:
+        - Delete
+        - '/F '
+        - \Microsoft\Windows\WinSrv
+      selection_powershell:
+        CommandLine|contains|all:
+        - Get-ChildItem
+        - .save
+        - Compress-Archive -DestinationPath C:\ProgramData\
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+  answer_sources:
+  - process_creation
+
+- question: Have other hosts fired the rule's pattern in the past week, and does the cross-host distribution look like consistent
+    automation or one-off activity?
+  context: >-
+    The query mirrors the rule's selection logic with no host scope, so the result is a fleet-wide count
+    of these branches rather than generic schtasks.exe usage. Many hosts firing the same branch points at
+    scripted deployment or vendor automation reusing the task path; one host, or a small unrelated set,
+    points at operator-driven activity. Use the host distribution and the consistency of the parents to
+    calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_hashes:
+        Hashes|contains:
+        - SHA256=6b311c0a977d21e772ac4e99762234da852bbf84293386fbe78622a96c0b052f
+        - SHA256=c60ead92cd376b689d1b4450f2578b36ea0bf64f3963cfa5546279fa4424c2a5
+      selection_schtasks_create:
+        Image|endswith: \schtasks.exe
+        CommandLine|contains|all:
+        - Create
+        - /RU
+        - SYSTEM
+        - \Microsoft\Windows\WinSrv
+        CommandLine|contains:
+        - servtask.bat
+        - execute.bat
+        - doit.bat
+      selection_schtasks_delete:
+        Image|endswith: \schtasks.exe
+        CommandLine|contains|all:
+        - Delete
+        - '/F '
+        - \Microsoft\Windows\WinSrv
+      selection_powershell:
+        CommandLine|contains|all:
+        - Get-ChildItem
+        - .save
+        - Compress-Archive -DestinationPath C:\ProgramData\
+      condition: 1 of selection_*
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+
+- question: Were other process-based persistence mechanisms installed on this host in the same timeframe?
+  context: >-
+    Operations that register a scheduled task rarely stop there — services, registry Run keys, BITS jobs,
+    COM server registrations, and WMI subscriptions are commonly stacked so that removing one leaves the
+    others intact. Surveying every persistence tool executed on this host in a four-hour window around the
+    alert shows whether the task was the only mechanism installed or one of several.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation

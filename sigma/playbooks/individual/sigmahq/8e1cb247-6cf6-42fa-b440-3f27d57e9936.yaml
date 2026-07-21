@@ -1,0 +1,479 @@
+name: Potential Persistence Via Microsoft Office Add-In
+id: 8f98b1aa-146a-4057-a763-d2af2fbd1e71
+description: |
+  Detects a file being written to a Microsoft Office add-in load location — either a .wll dropped
+  into a Word Startup folder, a .xll dropped into an Excel Startup folder, a .xlam dropped into an
+  Excel XLSTART folder, or a .xlam / .xla / .ppam dropped into the Microsoft AddIns folder. Office
+  automatically loads add-ins from these trusted user-profile paths every time the corresponding
+  application starts, so a file placed there executes on each launch with no registry Run key and
+  no scheduled task. Legitimate causes are genuine add-in installs performed by an installer, an IT
+  deployment, or the Office application itself; malicious use drops a code-bearing add-in (WLL and
+  XLL are DLLs; XLAM / XLA / PPAM are VBA-bearing archives) to gain recurring execution. The add-in's
+  content is not visible in this telemetry and the payload does not run until the Office app is next
+  launched, so "nothing executed yet" is expected rather than an all-clear. Investigate which branch
+  fired, what process wrote the file, whether a matching auto-load registry key was set, and whether
+  the Office application later spawned anomalous children.
+type: detection
+detection_id: 8e1cb247-6cf6-42fa-b440-3f27d57e9936
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-09
+questions:
+- question: Does the alerting file write place an add-in extension into a Microsoft Office add-in load location?
+  context: >-
+    Confirm the alert is a true positive before investing time. The rule fires when a file write matches
+    any one of four branches: a .wll written into a \Microsoft\Word\Startup\ path, a .xll written into a
+    \Microsoft\Excel\Startup\ path, a .xlam written into a Microsoft\Excel\XLSTART\ path, or a .xlam /
+    .xla / .ppam written into a \Microsoft\Addins\ path. Review the exact TargetFilename and note which
+    branch fired, because the branch identifies the targeted application (Word, Excel, or PowerPoint) and
+    the extension tells you whether the add-in is a compiled DLL (.wll / .xll) or a VBA-bearing archive
+    (.xlam / .xla / .ppam) — that distinction drives where you look for the load and the execution.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this user and host expected to install Microsoft Office add-ins?
+  context: >-
+    Legitimate add-in installs are typically performed by an installer, a managed IT deployment, or the
+    Office application itself, on a predictable set of hosts and accounts. Knowing whether the writing
+    account and host function fit that expectation is often the fastest way to separate a sanctioned
+    add-in install from a persistence drop. User attribution is present on roughly 94% of endpoint file
+    events; when the account is a machine or service account, judge by the writing process and host role
+    instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: What process wrote the add-in file, and what was its full command line?
+  context: >-
+    The file event carries no command line, so pivot to the writing process by its ProcessGuid to read
+    the full command that created the add-in. An Office application or a known installer writing the file
+    is consistent with a legitimate add-in install; a script host (wscript.exe, cscript.exe, mshta.exe,
+    powershell.exe), an archive or extraction tool, or a browser child process writing an add-in into a
+    trusted Office path points to a persistence drop. The command line also reveals the source path the
+    add-in was copied from and whether more than one add-in path was touched.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- question: What is inside the dropped add-in file, and is it code-bearing or obfuscated?
+  context: >-
+    The add-in's content is not captured by file-write telemetry, so retrieve the file from its on-disk
+    path or through endpoint tooling and inspect it. WLL and XLL files are DLLs — check imports, embedded
+    strings, packer signatures, and signing status. XLAM, XLA, and PPAM files are archives that carry VBA
+    project streams — extract and read the macro code for auto-run handlers (Workbook_Open, AutoExec),
+    shell-outs, encoded strings, embedded URLs, or IP addresses. Because the payload only runs when the
+    Office application is next launched, the file may be present and dormant; absence of execution is
+    expected and is not evidence the drop is benign.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: What process spawned the writer, and is that parent chain expected for an add-in install?
+  context: >-
+    The parent of the writing process reveals how the add-in drop was invoked. A managed installer or an
+    interactive session launched from explorer.exe is consistent with a legitimate install; a writer
+    spawned by an Office application, a script host, or an unsigned binary points to scripted persistence.
+    This lookup retrieves the parent record directly; walk further up the tree if the immediate parent is
+    itself a generic host process.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - Image
+      - CommandLine
+- question: Did an Office application spawn script hosts or living-off-the-land binaries on this host after the add-in was written?
+  context: >-
+    The persistence payoff is deferred: the add-in loads and executes only when Word, Excel, or PowerPoint
+    is next started. A common post-load signature is an Office process spawning a scripting engine or
+    proxy-execution binary such as mshta.exe, powershell.exe, rundll32.exe, regsvr32.exe, cmd.exe, or
+    wscript.exe. This query aggregates such children under an Office parent on the host after the drop; a
+    match ties the dropped add-in to actual code execution. Because the launch may be hours or days later,
+    an empty result within this window does not clear the drop.
+  range: +24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_parent:
+        ParentImage|endswith:
+          - '\WINWORD.EXE'
+          - '\EXCEL.EXE'
+          - '\POWERPNT.EXE'
+          - '\OUTLOOK.EXE'
+      selection_child:
+        Image|endswith:
+          - '\mshta.exe'
+          - '\powershell.exe'
+          - '\pwsh.exe'
+          - '\rundll32.exe'
+          - '\regsvr32.exe'
+          - '\cmd.exe'
+          - '\wscript.exe'
+          - '\cscript.exe'
+      condition: selection and selection_parent and selection_child
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- question: Was a matching Office add-in auto-load registry key set on this host around the same time?
+  context: >-
+    Several add-in persistence variants pair the dropped file with a registry value that tells the Office
+    application to load it — Excel OPEN entries under the Excel Options key, an Add-in Manager entry, or a
+    PowerPoint AddIns key. A registry write to one of these keys close to the file drop confirms the add-in
+    was wired to auto-load rather than merely staged on disk, and the Details value names the add-in path.
+    Add-ins dropped into a Startup or XLSTART folder auto-run without a registry key, so an absent key does
+    not rule out persistence.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_keys:
+        TargetObject|contains:
+          - '\Excel\Options'
+          - '\Excel\Add-in Manager'
+          - '\Word\Options'
+          - '\PowerPoint\AddIns\'
+          - '\Office\Word\Addins\'
+          - '\Office\Excel\Addins\'
+          - '\Office\PowerPoint\Addins\'
+      condition: selection and selection_keys
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- question: Has the dropped add-in been loaded into an Office process, and what is its hash and signer?
+  context: >-
+    Compiled add-ins (.wll / .xll are DLLs) surface as a library load inside the hosting Office process,
+    and that load event carries the DLL's hash and code-signing details. This query looks for the add-in
+    path being loaded on the host; submit the returned hash to threat intelligence and check the signer
+    against expected add-in vendors. VBA-bearing add-ins (.xlam / .xla / .ppam) are not loaded as libraries
+    and will not appear here — hash those from the on-disk file instead. Because loading only happens on
+    the next Office launch, no result within this window is expected for a freshly dropped add-in.
+  range: +7d
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signature
+      - SignatureStatus
+      - Hashes
+- question: Has this add-in file been seen before on this host?
+  context: >-
+    An add-in path that has never carried this file before is more notable than one that is rewritten on a
+    schedule. A history with no prior writes makes this a first-time appearance and raises its weight; a
+    history of periodic writes to the same add-in path points to a managed deployment that routinely
+    refreshes it. Compare the writing process across the history to see whether the same tooling has always
+    maintained this add-in.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: Was this same add-in file written to Office add-in paths on other hosts in the environment?
+  context: >-
+    The same add-in written across many hosts suggests a centrally managed deployment or an update pushed by
+    administration; the same file confined to one host suggests a targeted drop. Compare the writing process
+    across hosts to see whether it is consistent with a management tool or with ad-hoc tampering, and note
+    the timeline of appearances to distinguish a coordinated rollout from a single incident.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        TargetFilename|endswith|expand: '%file_basename%'
+      condition: selection
+    fields:
+      - host.name
+      - TargetFilename
+      - Image
+- question: What else has recently been written into the Office add-in directories on this host, and by which processes?
+  context: >-
+    The Word Startup, Excel Startup, Excel XLSTART, and Microsoft AddIns folders have a small set of
+    processes that legitimately write there. Other recent arrivals in the same add-in directories reveal
+    whether this is an isolated drop or a location under active use, and whether multiple add-ins were placed
+    together. A single unfamiliar writer touching several add-in files is the pattern to isolate from routine
+    installer activity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains:
+          - '\Microsoft\Word\Startup\'
+          - '\Microsoft\Excel\Startup\'
+          - 'Microsoft\Excel\XLSTART\'
+          - '\Microsoft\Addins\'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: What other files did the responsible process write or delete around the alert?
+  context: >-
+    A process that drops one add-in often stages more than one artifact — additional add-ins, a loader, a
+    configuration file, or a source payload copied in before the drop. The breadth, paths, and extensions of
+    the writing process's other file activity distinguish a single add-in install from a broader staging
+    operation and enumerate what else needs review. The alert's file event carries the responsible process
+    identifiers, so this covers the writer and its direct children.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- always_include: true
+  question: Has this user produced this add-in-drop pattern before, and does that history fit their role?
+  context: >-
+    This query mirrors the rule's own selection structure scoped to the writing user, returning the user's
+    90-day history of writing add-ins into Office trusted paths (not generic file activity), aggregated by
+    host. A user who has never produced this pattern is more notable than one who does so routinely; weigh the
+    count against whether the account belongs to someone who develops or deploys Office add-ins. When the
+    alert fires under a machine or service account, user identity does not attribute the behavior — read the
+    parent-process history instead.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection_wlldropped:
+        TargetFilename|contains: \Microsoft\Word\Startup\
+        TargetFilename|endswith: .wll
+      selection_xlldropped:
+        TargetFilename|contains: \Microsoft\Excel\Startup\
+        TargetFilename|endswith: .xll
+      selection_xladropped:
+        TargetFilename|contains: Microsoft\Excel\XLSTART\
+        TargetFilename|endswith: .xlam
+      selection_generic:
+        TargetFilename|contains: \Microsoft\Addins\
+        TargetFilename|endswith:
+        - .xlam
+        - .xla
+        - .ppam
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: Has the writing process historically driven this add-in-drop pattern, or is this program new for this activity?
+  context: >-
+    When the alert fires under a service or machine account, the meaningful pivot is the launch mechanism
+    rather than the user. This query mirrors the rule's selection structure scoped to the alerting program, returning the 90-day history of that process writing add-ins into Office trusted paths,
+    aggregated by host. A program that already accounts for many prior add-in writes is deployment or vendor
+    automation; a program that is new for this activity is the deviation worth chasing. This runs alongside the
+    user-history pivot because at alert time either identity may be the one that attributes the behavior.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection_wlldropped:
+        TargetFilename|contains: \Microsoft\Word\Startup\
+        TargetFilename|endswith: .wll
+      selection_xlldropped:
+        TargetFilename|contains: \Microsoft\Excel\Startup\
+        TargetFilename|endswith: .xll
+      selection_xladropped:
+        TargetFilename|contains: Microsoft\Excel\XLSTART\
+        TargetFilename|endswith: .xlam
+      selection_generic:
+        TargetFilename|contains: \Microsoft\Addins\
+        TargetFilename|endswith:
+        - .xlam
+        - .xla
+        - .ppam
+      _pb_scope:
+        Image|endswith|expand: '%Image%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Was there a change ticket, deployment, or documented approval for this add-in install?
+  context: >-
+    Many organizations deploy and update Office add-ins through a managed process with a corresponding change
+    record. A matching ticket, software-deployment job, or approved request suggests authorized activity;
+    absence of one when policy requires it suggests the add-in was placed outside sanctioned channels. This
+    check can quickly close a false positive or escalate a true positive.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Were other process-based persistence mechanisms installed on this host in the same window?
+  context: >-
+    An add-in drop is one persistence foothold; attackers commonly stack a second mechanism using a different
+    technique. Scheduled tasks, services, registry Run keys, BITS jobs, or WMI subscriptions created by
+    schtasks.exe, sc.exe, reg.exe, bitsadmin.exe, or wmic.exe near the add-in write indicate intentional
+    stacking rather than an isolated install. Multiple persistence installations in the same timeframe raise
+    the priority of the whole cluster.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- question: What other process activity occurred on this host around the time of the alert?
+  context: >-
+    An add-in drop rarely happens in isolation. Aggregating process activity in a tight window around the
+    alert surfaces what led up to the drop — a phishing document being opened, an archive being extracted, a
+    script host running — and what ran immediately after. Novel parent-child pairs stand out at low counts
+    against high-count routine telemetry, which is what points to the delivery and staging around the
+    persistence write.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host — a malicious document opening, a script host executing, or other
+    file drops — may reveal the delivery stages that preceded this add-in write and help reconstruct the
+    timeline. Add-in persistence is frequently established after initial access through a document or download,
+    so prior alerts help place this write within the larger sequence.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

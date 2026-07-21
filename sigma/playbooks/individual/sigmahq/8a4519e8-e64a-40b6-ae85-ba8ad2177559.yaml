@@ -1,0 +1,281 @@
+name: Renamed BrowserCore.EXE Execution
+id: d26dc54c-84ff-4637-9712-3cc099d6adeb
+description: |
+  Detects a process whose embedded PE metadata reports an OriginalFileName of BrowserCore.exe while the on-disk image is named something other than BrowserCore.exe. BrowserCore.exe is a legitimate Windows component that participates in retrieving the Azure AD Primary Refresh Token (PRT); copying it to an arbitrary path and renaming it is a known way to extract PRTs while evading name-based detection. Investigation should confirm the on-disk-name vs. metadata mismatch, determine how the renamed binary arrived, decode what it did, and assess whether Azure tokens or credentials were exposed.
+type: detection
+detection_id: 8a4519e8-e64a-40b6-ae85-ba8ad2177559
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- question: Does this process carry the OriginalFileName BrowserCore.exe while running under a different on-disk name?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule fires when the PE metadata OriginalFileName equals BrowserCore.exe and the process image is NOT named BrowserCore.exe. Verify both halves of that mismatch in the triggering event — the metadata says BrowserCore.exe, but the executable on disk is named something else.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - OriginalFileName
+- question: Is this user and host expected to run a process carrying BrowserCore.exe metadata from a non-standard path?
+  context: The legitimate BrowserCore.exe lives in a Windows system path and is invoked by the browser/identity stack, not copied elsewhere and renamed. Knowing whether this user role and host function would ever legitimately invoke this component from an arbitrary location is often the fastest way to separate a true positive from an unusual but benign deployment.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What is the actual identity of this binary based on its metadata and hash?
+  context: The on-disk Image name is arbitrary, but the embedded OriginalFileName (BrowserCore.exe) and the code-signing chain still reflect the original Windows component. Compare the Image path against OriginalFileName to confirm the rename, and check the signature status — a Microsoft signature on a renamed copy is consistent with a lifted-and-relocated system binary, while an unsigned or broken signature points to a tampered or rebuilt tool. Submit the hash for reputation lookup to determine whether this is the stock component, a known offensive build, or a novel binary.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Hashes
+- question: How did this renamed BrowserCore.exe arrive on the host?
+  context: A renamed copy of BrowserCore.exe does not appear spontaneously — it was copied from the system path, downloaded, extracted from an archive, or dropped by another process. The file_event for this basename shows the creating process (Image), which reveals the delivery mechanism. A user-writable landing spot (Temp, Downloads, AppData) points to download or extraction; the writing process identifies the dropper, copy tool, or remote-admin channel.
+  range: -30d
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains|expand: '%file_name%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: What did this renamed binary do at the command line, and does it indicate Azure PRT or token extraction?
+  context: BrowserCore.exe participates in retrieving the Azure AD Primary Refresh Token. Decode the full command line of the triggering process to determine what it requested — PRT extraction, token retrieval, or another operation. The arguments and any output paths identify which token or credential store was the target and what the extracted material could authenticate to.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What process spawned this renamed binary, and is that parent chain expected?
+  context: The parent process reveals how the renamed binary was invoked. The legitimate BrowserCore.exe is launched by the browser/identity stack; a renamed copy invoked from a shell (cmd.exe, powershell.exe), a script host (wscript.exe, mshta.exe), or an operator tool points to hands-on use rather than normal token retrieval. Walk up the chain by querying the parent's own parent if the immediate parent is itself unexpected.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What did this binary do after execution, and is the same renamed binary present on other hosts?
+  context: Renaming the component evades name-based detection while it performs its function. Examining the child processes, file writes, and network activity that followed reveals the actual objective — token staging, exfiltration of extracted material, or follow-on tooling. The same renamed binary appearing on multiple hosts points to deliberate distribution rather than an isolated test.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Which accounts and tokens may be exposed, and do any have elevated privileges?
+  context: A Primary Refresh Token authenticates the signed-in user to Azure AD and the apps it federates, so the severity depends on the privilege level of the account on this host. A token tied to a privileged or admin-eligible account requires escalation; a standard user account may only need monitoring and a token reset. Cross-reference the logged-on user against directory group memberships and role assignments.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Were outbound remote-access connections (RDP, SMB, WinRM, SSH) initiated from this host after
+    this event?
+  context: Credential theft is typically followed by lateral movement. The query returns outbound connections
+    from this host to remote-access ports -- 3389 (RDP), 445 (SMB/PsExec), 5985/5986 (WinRM), 22 (SSH)
+    -- in the hours after the event; the originating Image and User show what drove each connection. Two
+    limits to keep in mind -- credentials exfiltrated and replayed from another machine will not appear
+    here (check security 4624 logons on suspected targets for this account and any accounts with sessions
+    on this host), and the query requires Sysmon network telemetry (EID 3); if that is not collected from
+    this host, treat zero rows as a visibility gap, not as evidence no movement occurred.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
+- question: When this host has previously fired this renamed-BrowserCore pattern, what parents and users normally drive it, and does the current alert fit?
+  context: The query mirrors the rule's selection structure scoped to this host, so the parent/user distribution reflects how this specific renamed-metadata pattern has historically run here — not generic process activity. A new parent process, an unexpected user account, or a first-ever occurrence is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        OriginalFileName: BrowserCore.exe
+      filter_realbrowsercore:
+        Image|endswith: \BrowserCore.exe
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection and not 1 of filter_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        OriginalFileName: BrowserCore.exe
+      filter_realbrowsercore:
+        Image|endswith: \BrowserCore.exe
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection and not 1 of filter_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        OriginalFileName: BrowserCore.exe
+      filter_realbrowsercore:
+        Image|endswith: \BrowserCore.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not 1 of filter_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or repeated use of the same technique on multiple endpoints. If the same user triggered similar activity elsewhere in the window, the scope of credential exposure is larger than a single host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        OriginalFileName: BrowserCore.exe
+      filter_realbrowsercore:
+        Image|endswith: \BrowserCore.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not 1 of filter_*) and _pb_scope
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance, or other credential access — may reveal the stages that preceded this event and help reconstruct the timeline that led to the renamed-binary execution.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

@@ -1,0 +1,401 @@
+name: Suspicious Kernel Dump Using Dtrace
+id: 039784b0-dd55-442d-808f-f2985277aa33
+description: |
+  Detects dtrace.exe being used to produce a live kernel dump on Windows. The rule fires when
+  the command line either contains lkd(0) on a dtrace.exe execution, or combines syscall:::return
+  with lkd( regardless of binary name. A live kernel dump exposes the same memory surface as a
+  forced crash dump, including LSASS credential structures and per-process kernel data, so this is
+  best treated as a credential-access primitive even though the rule is tagged as discovery.
+  DTrace on Windows is an Insider/test-build feature that is rare on production hosts; legitimate
+  use is largely confined to engineering lab machines. Determine which command structure fired, who
+  ran it, whether the host is a sanctioned DTrace test system, and whether a dump file or
+  follow-on credential activity resulted.
+type: detection
+detection_id: 7124aebe-4cd7-4ccb-8df0-6d6b93c96795
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the command line match what this rule detects — either dtrace.exe with lkd(0), or a command combining syscall:::return with lkd(?
+  context: >-
+    The rule fires on either of two branches, so confirm which one matched. One branch is dtrace.exe whose command
+    line contains lkd(0); the other is any command line containing both syscall:::return and lkd( regardless of the
+    binary name. Note which branch fired: the second branch can match obfuscated or renamed invocations and is the
+    load-bearing signal when the image is not dtrace.exe.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Is this user and host expected to run dtrace.exe and capture kernel dumps?
+  context: >-
+    DTrace on Windows is a test/Insider-build feature whose installer temporarily disables PatchGuard, Secure Boot,
+    and BitLocker, so legitimate use is concentrated on engineering lab machines and sanctioned test systems. A
+    production server or a standard user account producing a kernel dump is far less likely to be routine than the
+    same activity on a known DTrace test host run by a kernel engineer.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What exactly did this dtrace invocation do? Decode the full command line and identify the probe and the dump action.
+  context: >-
+    The full command line reveals the operation. Identify the provider/probe clause (syscall:::return drives a probe
+    on every syscall return), the dump action (lkd(0) requests a live kernel dump, often paired with exit(0) to
+    terminate after a single capture), and any output redirection or script file (-s) that names where the dump or
+    trace lands. Sequential dtrace.exe runs on this host within the window may together form one logical
+    capture-and-exfiltrate operation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What process spawned this dtrace execution, and is that parent chain expected?
+  context: >-
+    The parent process shows how the capture was launched. An interactive shell under explorer.exe spawned by a
+    logged-in engineer on a test host is different from dtrace.exe launched by a script interpreter, a remote
+    execution service (wmiprvse.exe, wsmprovhost.exe), or a download cradle, which point to hands-on-keyboard or
+    automated post-compromise use.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What process spawned the discovery activity, and is that parent normal for system enumeration on this host?
+  context: >-
+    Discovery and introspection commands run by an interactive administrator typically descend from explorer.exe via
+    cmd.exe or powershell.exe. The same activity descending from Office applications, script interpreters
+    (wscript.exe, cscript.exe, mshta.exe), wmiprvse.exe, or wsmprovhost.exe indicates remote or macro-driven
+    enumeration rather than local troubleshooting.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+- question: Did this host write a large kernel-dump or .dmp file around the time of the alert?
+  context: >-
+    A live kernel dump lands on disk as a sizable .dmp or crash-dump file. Correlating dtrace.exe execution with a
+    new dump file confirms the primitive actually produced output an operator could carry off and mine for LSASS
+    credential material and per-process kernel data. Absence of a dump file may mean the capture failed, was
+    redirected, or that file telemetry is not collected for this path.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_dump:
+        TargetFilename|endswith:
+          - '.dmp'
+          - '.dump'
+      condition: selection and selection_dump
+    fields:
+      - TargetFilename
+      - Image
+      - ProcessId
+- question: What child processes did this dtrace execution spawn afterward?
+  context: >-
+    Processes spawned by the capture tool reveal its actual impact. A self-contained kernel dump may spawn nothing,
+    but follow-on cmd.exe, powershell.exe, or transfer utilities point to scripting around the capture — for
+    example moving or parsing the resulting dump to extract credentials.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Did other reconnaissance commands run on this host around the same time?
+  context: >-
+    A single introspection command may be legitimate troubleshooting, but multiple reconnaissance commands in rapid
+    succession is a signature of post-compromise enumeration. An operator who reached the point of dumping kernel
+    memory has often already enumerated the host with whoami, systeminfo, net, and tasklist to understand their
+    context.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_recon:
+        Image|endswith:
+          - '\whoami.exe'
+          - '\systeminfo.exe'
+          - '\ipconfig.exe'
+          - '\net.exe'
+          - '\net1.exe'
+          - '\nltest.exe'
+          - '\dsquery.exe'
+          - '\nbtstat.exe'
+          - '\arp.exe'
+          - '\netstat.exe'
+          - '\tasklist.exe'
+          - '\qprocess.exe'
+          - '\query.exe'
+          - '\quser.exe'
+          - '\hostname.exe'
+          - '\nslookup.exe'
+          - '\adfind.exe'
+          - '\csvde.exe'
+          - '\ldifde.exe'
+          - '\dnscmd.exe'
+          - '\cmdkey.exe'
+          - '\setspn.exe'
+      condition: selection and selection_recon
+    fields:
+      - Image
+      - User
+- question: Is this user expected to run kernel-level introspection or administrative discovery commands?
+  context: >-
+    Kernel engineers and a narrow set of IT staff legitimately run DTrace and low-level introspection tooling.
+    Standard users and most service accounts have no reason to load kernel trace extensions or capture kernel
+    dumps. The user's role and typical toolset determine whether this is sanctioned testing or anomalous activity.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - User
+- question: Does this host normally run dtrace.exe?
+  context: >-
+    A binary that has never been seen on a host is more suspicious than one that runs regularly. DTrace on Windows
+    is an install-on-demand test feature, so zero or very low historical counts on a production host indicate
+    first-time installation and use rather than routine engineering activity.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: When this host has previously fired the rule's pattern, what parents and users normally drove that activity, and does the current alert fit?
+  context: >-
+    Even a sanctioned DTrace test host has a normal launch profile. The query mirrors the rule's two-branch selection
+    scoped to this host, so the resulting parent/user distribution reflects how the rule's specific kernel-dump
+    pattern has historically run here, not generic binary usage. A new parent process, an unexpected user account,
+    or a first-ever appearance of this pattern is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_plain:
+        Image|endswith: \dtrace.exe
+        CommandLine|contains: lkd(0)
+      selection_obfuscated:
+        CommandLine|contains|all:
+        - syscall:::return
+        - lkd(
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (1 of selection*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_plain:
+        Image|endswith: \dtrace.exe
+        CommandLine|contains: lkd(0)
+      selection_obfuscated:
+        CommandLine|contains|all:
+        - syscall:::return
+        - lkd(
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (1 of selection*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_plain:
+        Image|endswith: \dtrace.exe
+        CommandLine|contains: lkd(0)
+      selection_obfuscated:
+        CommandLine|contains|all:
+        - syscall:::return
+        - lkd(
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (1 of selection*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the user's activity across all hosts reveals whether the kernel-dump activity is isolated or part of
+    broader hands-on-keyboard movement. If the same user triggered similar low-level or credential-access activity
+    on multiple endpoints, the scope of the incident is larger than a single host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_plain:
+        Image|endswith: \dtrace.exe
+        CommandLine|contains: lkd(0)
+      selection_obfuscated:
+        CommandLine|contains|all:
+        - syscall:::return
+        - lkd(
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (1 of selection*) and _pb_scope
+    fields:
+    - host.name
+- question: Have other hosts fired the rule's kernel-dump pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: >-
+    The query mirrors the rule's two-branch selection with no host scope, so the result is a fleet-wide count of the
+    kernel-dump firing pattern rather than generic dtrace.exe usage. Many hosts firing the same pattern points to
+    scripted deployment or a misconfigured test rollout; one host or a small unrelated set points to manual operator
+    activity. Use the host distribution to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_plain:
+        Image|endswith: \dtrace.exe
+        CommandLine|contains: lkd(0)
+      selection_obfuscated:
+        CommandLine|contains|all:
+        - syscall:::return
+        - lkd(
+      condition: 1 of selection*
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance, or
+    credential access — may reveal the attack stages that preceded a kernel-memory capture and help reconstruct the
+    full timeline leading up to it.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

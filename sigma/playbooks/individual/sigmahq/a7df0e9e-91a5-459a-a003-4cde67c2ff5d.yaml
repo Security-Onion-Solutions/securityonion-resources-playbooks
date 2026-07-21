@@ -1,0 +1,402 @@
+name: Potentially Suspicious Command Executed Via Run Dialog Box - Registry
+id: 2f648490-4b41-4967-ad01-9028f6bd4427
+description: |
+  Detects a write to the RunMRU registry key (Software\Microsoft\Windows\CurrentVersion\Explorer\RunMRU),
+  which records commands typed into the Windows Run dialog (Win+R), where the recorded command data is
+  EITHER a PowerShell command carrying suspicious keywords (encoded-command flags such as -e/-enc, iex,
+  Invoke-, http, ftp, or a hidden window) OR a wmic command carrying suspicious keywords (shadowcopy,
+  process call create). The pattern is abused by social-engineering lures that instruct a user to open the
+  Run dialog and paste a copied command, which then downloads and executes a payload. Because RunMRU only
+  records that a command was typed, the investigation should confirm which branch fired, decode the pasted
+  command, and determine whether the interpreter actually executed and what it did next - network download,
+  child-process spawning, or persistence.
+type: detection
+detection_id: a7df0e9e-91a5-459a-a003-4cde67c2ff5d
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-10
+questions:
+- question: Does the RunMRU registry write record a pasted PowerShell or wmic command matching what this rule detects?
+  context: >-
+    Before investing investigation time, confirm the alert is a true positive. The rule fires when a value
+    under the RunMRU key is written AND the recorded command data is EITHER a PowerShell command that also
+    carries a suspicious keyword (an encoded-command flag such as -e/-ec/-enc, iex, Invoke-, http, ftp, or a
+    hidden window) OR a wmic command that also carries a suspicious keyword (shadowcopy, process call create).
+    Review the exact TargetObject and Details on the triggering event and note which branch fired: the
+    PowerShell branch makes the encoded-command, script-block, module-load, and network questions
+    load-bearing, while the wmic branch shifts weight to the shadow-copy or remote-process-creation behavior.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this user and host expected to run commands like this through the Run dialog?
+  context: >-
+    Legitimate use of the Run dialog is common for administrators and power users, so knowing whether the
+    account and host function are consistent with pasting an interpreter command is often the fastest way to
+    separate routine activity from a paste-and-run lure. A user with no scripting role pasting a PowerShell or
+    wmic one-liner is a stronger signal than the same command from an engineer's workstation. User attribution
+    is present on roughly 94% of endpoint registry events; when it is a machine account or missing, pivot on
+    the writing process instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: What does the RunMRU key record, and why is a pasted interpreter command here worth scrutiny?
+  context: >-
+    The RunMRU key stores the history of commands typed into the Run dialog, with lettered values (a, b, c, ...)
+    and an MRUList value recording most-recently-used order. It is a normal user-activity artifact, so its
+    presence alone is not malicious; the signal is the CONTENT of the recorded command. A PowerShell download
+    cradle or a wmic shadow-copy/remote-execution string in this key is the fingerprint of a command that was
+    pasted rather than typed by hand, which is how paste-and-run lures deliver their first stage. Confirm the
+    exact key and value data to establish this is Run-dialog abuse rather than a benign command history entry.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: What command was pasted into the Run dialog, and what does it do?
+  context: >-
+    The Details field holds the exact command that was typed or pasted. Decode it: base64 or otherwise encoded
+    PowerShell (-e/-enc) should be decoded to reveal the real payload; plain-text cradles (iex, Invoke-WebRequest,
+    Start-BitsTransfer, Net.WebClient) reveal a source URL and what gets fetched and executed; a hidden window
+    flag indicates the command was meant to run without the user seeing it. For the wmic branch, decode whether
+    the command creates a remote process (process call create) or interacts with shadow copies. Any URL or file
+    path that appears becomes a lead for the download-and-execute chain.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- question: When the pasted PowerShell ran, was its command line encoded or obfuscated, and what did it decode to?
+  context: >-
+    The RunMRU value records what was typed, but the interpreter's own process record is ground truth for what
+    actually executed. If the pasted command used -EncodedCommand (-e/-ec/-en/-enc), decode the base64 to reveal
+    the script - commonly a download cradle that fetches a second stage with Invoke-WebRequest or Start-BitsTransfer
+    and runs it with iex. Comparing the decoded execution against the pasted Details confirms the Run-dialog command
+    actually launched and exposes any staging the recorded string obscured.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+        CommandLine|contains:
+          - ' -e '
+          - ' -ec '
+          - ' -en '
+          - ' -enc '
+          - ' -enco'
+          - 'iex'
+          - 'Invoke-'
+          - 'http'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did the pasted command actually execute - did PowerShell, pwsh, or wmic spawn on this host after the write?
+  context: >-
+    The Run dialog executes the pasted command immediately, so a matching interpreter process should appear on the
+    host within a short window of the RunMRU write. Confirming that powershell.exe, pwsh.exe, or wmic.exe ran (and
+    reading its full command line and parent) is what distinguishes a command that was merely typed from one that
+    executed and began the download-and-execute chain. Absence of a matching process suggests the command was
+    recorded but not run, or ran under a name not covered here.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+          - '\wmic.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- question: Which process wrote the RunMRU value, and was it explorer.exe as an interactive Run-dialog use implies?
+  context: >-
+    A genuine Run-dialog command is written to RunMRU by explorer.exe, which hosts the dialog. Pivoting by
+    ProcessGuid to the writing process's own record reveals its Image and parent: explorer.exe is consistent with
+    an interactive paste, whereas a script host such as wscript.exe, mshta.exe, or an unsigned binary writing
+    RunMRU directly indicates the history was populated programmatically to stage or disguise the command. The
+    parent chain distinguishes user-driven paste-and-run from automated tooling.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- question: Did PowerShell script block logging capture the deobfuscated content of the pasted command?
+  context: >-
+    Script block logging (Event ID 4104) records the deobfuscated script PowerShell actually executed, even when
+    the pasted command was encoded or built from concatenated strings. This is the most reliable view of the true
+    payload behind an -EncodedCommand one-liner and will show the download cradle and any in-memory execution. If
+    PowerShell operational logs are not ingested in this environment, treat zero results as a visibility gap rather
+    than evidence nothing ran, and fall back to decoding the recorded RunMRU command directly.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Were PowerShell security controls bypassed or weakened around the time of this execution?
+  context: >-
+    Paste-and-run cradles frequently disable or sidestep PowerShell protections so the second stage runs without
+    friction. Common markers are an execution-policy bypass (-ExecutionPolicy Bypass, -ep bypass), AMSI tampering
+    (AmsiUtils, amsiInitFailed), real-time protection changes (Set-MpPreference, DisableRealtimeMonitoring), or a
+    downgrade to PowerShell v2 to escape logging. Finding these near the RunMRU write strengthens the case that the
+    pasted command was a malicious first stage rather than a benign one-liner.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: Did the PowerShell process load unusual or unsigned modules indicating in-memory or side-loaded execution?
+  context: >-
+    The PowerShell branch of this technique often runs a payload in memory or drops a legitimate signed binary
+    alongside a malicious helper DLL that is side-loaded when the binary executes. Reviewing the modules loaded by
+    powershell.exe or pwsh.exe on this host - focusing on unsigned or invalid-signature DLLs and modules loaded from
+    user-writable directories such as AppData or Temp - surfaces both .NET-automation hosting and side-loading. Rare
+    or never-before-seen assemblies tied to the pasted command are the signal here.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+      - SignatureStatus
+- question: Did the executed interpreter make external network connections consistent with a download cradle or C2?
+  context: >-
+    A pasted download cradle reaches out to an external host to fetch its second stage, so egress connections from
+    powershell.exe or pwsh.exe shortly after the RunMRU write point directly at the payload source. Reviewing the
+    external destinations the interpreter contacted - excluding internal ranges - reveals the download or
+    command-and-control endpoint and gives an indicator to pivot on across the environment. No external connection
+    where a cradle was pasted may mean the fetch was blocked or the command did not run.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+      filter_internal:
+        DestinationIp|cidr:
+          - '10.0.0.0/8'
+          - '172.16.0.0/12'
+          - '192.168.0.0/16'
+          - '127.0.0.0/8'
+      condition: selection and not filter_internal
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Initiated
+- question: What other registry modifications were made on this host in the same window?
+  context: >-
+    A pasted command that establishes a foothold often writes additional registry values in the same session - a
+    Run or RunOnce key for persistence, or policy edits that weaken security tooling. Clustering the registry writes
+    on this host around the alert reveals whether the Run-dialog command was a one-off or part of a broader set of
+    configuration changes, and which process made them. The RunMRU write itself appears in the results; the signal
+    is what else was modified and by which process.
+  range: +/-30m
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - User
+- question: Has a similar interpreter command been recorded in this host's Run-dialog history before?
+  context: >-
+    RunMRU changes routinely as users run everyday commands, so the frequency of key modifications is not itself a
+    signal. What matters is the Details value: compare the historical Run-dialog commands on this host to see whether
+    a PowerShell or wmic one-liner of this kind was ever run before or whether this is the first time such a command
+    appears. A history of only benign entries (application names, file paths) makes a pasted cradle stand out as new.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - Details
+      - Image
+- question: Was the same pasted command recorded in the Run-dialog history of other hosts?
+  context: >-
+    The RunMRU key path is identical on every host, so this returns Run-dialog usage across the environment; the
+    signal is whether the SAME suspicious command data appears on multiple hosts. A lure delivered broadly - a fake
+    verification page or a mass phishing message - produces the same pasted one-liner on several machines within a
+    short span, while a single affected host points to targeted or opportunistic activity. Compare the Details values
+    across hosts to separate a widespread campaign from an isolated event.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - Details
+      - Image
+- question: What other process activity occurred on this host around the time of the alert?
+  context: >-
+    A paste-and-run command rarely executes in isolation. Aggregating process activity in a tight window around the
+    RunMRU write surfaces what led up to it and what ran immediately after - the spawned interpreter, any binaries it
+    dropped and launched, and follow-on tooling. Novel parent-child pairs stand out at low counts against high-count
+    routine telemetry, which is what points to the payload chain that followed the pasted command.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host - reconnaissance, credential access, or execution of scripting tools - may
+    reveal the stages that preceded the Run-dialog command and help reconstruct the timeline. A paste-and-run lure is
+    typically an initial-access step, so prior or immediately following alerts help place this event within a larger
+    sequence and gauge how far the activity progressed.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

@@ -1,0 +1,412 @@
+name: Powershell Executed From Headless ConHost Process
+id: 307d2f00-03d9-4c99-825c-e2acfb565663
+description: |
+  Detects a conhost.exe process (matched by image name or OriginalFileName CONHOST.EXE) whose command line
+  contains both --headless and powershell. The --headless flag suppresses the console window so the PowerShell
+  session runs without any visible UI, which combines hidden-window execution with command-and-scripting-interpreter
+  abuse. Legitimate use is rare in interactive environments; the pattern is associated with loaders that read an
+  obfuscated payload from disk and pass it to PowerShell for in-memory execution. The investigation should decode
+  the full command line, determine what the launched PowerShell did, identify the parent that invoked conhost,
+  and establish whether this user, host, and launch mechanism are expected.
+type: detection
+detection_id: 056c7317-9a09-4bd4-9067-d051312752ea
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-04
+questions:
+- question: Does the conhost.exe command line contain both --headless and powershell as the rule detects?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the exact command
+    line and process details. The rule fires when the process is conhost.exe (by image name or OriginalFileName
+    CONHOST.EXE) AND the command line contains both --headless and powershell, so verify both the binary identity
+    and that the command line carries both tokens.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to launch headless PowerShell sessions through conhost.exe?
+  context: Legitimate administrative or developer activity can trigger this detection, but a headless PowerShell
+    session through conhost is uncommon in interactive use. Knowing whether the user role and host function are
+    consistent with this behavior is often the fastest path to distinguishing a true positive from routine operations.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What is the full conhost.exe command line, and what does the PowerShell portion after --headless actually do?
+  context: The full command line reveals the specific action taken. Decode any flags, encoded or character-arithmetic
+    obfuscation, file paths, and URLs that follow --headless. Loaders using this pattern frequently invoke an
+    obfuscated form of Invoke-Expression to read a payload from a .log or other staging file under a user-writable
+    directory and execute it in memory, so identify the staged file path and the cmdlet being reconstructed.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|contains|all:
+          - '--headless'
+          - 'powershell'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Was the launched command encoded or obfuscated? What does it decode to?
+  context: Attackers frequently hide intent using character-arithmetic reconstruction of IEX/Invoke-Expression,
+    base64 with the -EncodedCommand parameter, string concatenation, or backtick escaping. Decoding reveals the
+    actual payload — download cradles, reverse shells, or in-memory execution of .NET assemblies. For this pattern,
+    look for a reconstructed iex reading a staged file from a user-writable path and executing its contents.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What modules did conhost.exe or the spawned PowerShell load around the time of the alert?
+  context: PowerShell can be hosted in-memory through .NET automation rather than a visible powershell.exe process,
+    and the loaded-module view shows which assemblies were pulled in. Loads of System.Management.Automation,
+    amsi.dll, or unusual .NET assemblies tied to the alerting host help confirm that a PowerShell runtime was
+    actually instantiated and whether the load set looks like routine tooling or an in-memory cradle.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|contains:
+          - '\System.Management.Automation'
+          - '\amsi.dll'
+          - '\clr.dll'
+          - '\clrjit.dll'
+      condition: selection
+    fields:
+      - Image
+      - ImageLoaded
+      - User
+- question: Did PowerShell script block logging capture the deobfuscated script content?
+  context: Script block logging (Event ID 4104) records the deobfuscated script content that PowerShell actually
+    executed, even when the command line is obfuscated through character arithmetic or encoding. This provides
+    ground truth about what ran. If PowerShell operational logs are not ingested in this environment, treat zero
+    results as a visibility gap rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Were PowerShell security controls bypassed or weakened on this host before this execution?
+  context: Loaders commonly disable or bypass PowerShell protections before running a payload — AMSI bypass
+    (patching amsi.dll in memory), execution policy changes (Set-ExecutionPolicy or -ep bypass), and PowerShell
+    downgrade to v2 which lacks logging. Finding these precursor events on the host strengthens the case for
+    malicious activity.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: What process spawned this conhost.exe, and is that parent chain expected?
+  context: The parent process reveals how the headless PowerShell session was invoked. Routine conhost activity
+    is launched by interactive console hosts or known automation; parents such as wscript.exe, mshta.exe, a
+    scheduled-task host, or an Office application point toward script-driven or persistence-driven invocation.
+    Walk up the tree to see what spawned the parent and what else it spawned.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Were registry values written on this host that hide artifacts or flag the host as compromised around this time?
+  context: Hidden-window execution often pairs with registry edits that conceal artifacts or mark the host. Loaders
+    in this family drop a registry breadcrumb under a user-writable hive (for example a value written beneath
+    HKCU\Software\Microsoft) to flag the host as infected, and some hidden-window tradecraft pushes window
+    positions off screen via registry. The query scopes to registry writes made by script
+    hosts and living-off-the-land binaries on this host in the surrounding window; review the
+    returned values for keys that do not match known software.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+          - '\cmd.exe'
+          - '\wscript.exe'
+          - '\cscript.exe'
+          - '\mshta.exe'
+          - '\rundll32.exe'
+          - '\conhost.exe'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- question: What child processes did this conhost.exe or its PowerShell session spawn afterward?
+  context: The processes spawned after the headless session reveal its actual impact. This family commonly chains
+    into scheduled-task creation (schtasks.exe), discovery commands (net.exe localgroup), firewall changes
+    (netsh.exe), or additional download steps. Unexpected children are the actions the loader was setting up.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Does this host normally run conhost.exe with the headless PowerShell pattern?
+  context: A firing pattern that has never been seen on a host is more suspicious than one that runs regularly.
+    The aggregation shows how often this host has produced the headless-conhost-PowerShell pattern over the
+    trailing window; zero or very low counts indicate first-time or rare execution.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|contains|all:
+          - '--headless'
+          - 'powershell'
+      condition: selection
+    fields:
+      - User
+- question: When this host has previously fired the rule's pattern, what parents and users normally drive it, and
+    does the current alert fit that pattern?
+  context: Even common tools can be abused. The query mirrors the rule's selection structure scoped to this host —
+    the resulting parent/user distribution reflects how the rule's specific firing pattern has historically run
+    here. A new parent process, an unexpected user account, or an unusual command-line structure is the anomaly worth
+    chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \conhost.exe
+      - OriginalFileName: CONHOST.EXE
+      selection_cli:
+        CommandLine|contains|all:
+        - --headless
+        - powershell
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \conhost.exe
+      - OriginalFileName: CONHOST.EXE
+      selection_cli:
+        CommandLine|contains|all:
+        - --headless
+        - powershell
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \conhost.exe
+      - OriginalFileName: CONHOST.EXE
+      selection_cli:
+        CommandLine|contains|all:
+        - --headless
+        - powershell
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple
+    endpoints. If the same user triggered similar activity on several hosts, the scope of the activity may be
+    larger than the single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \conhost.exe
+      - OriginalFileName: CONHOST.EXE
+      selection_cli:
+        CommandLine|contains|all:
+        - --headless
+        - powershell
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Have other hosts fired the rule's pattern in the past week, and does the cross-host distribution look
+    like consistent automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count
+    of the firing pattern rather than generic conhost usage. Many hosts firing the same pattern points to scripted
+    deployment or vendor automation; one host or a small unrelated set points to manual operator activity. Use the
+    host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \conhost.exe
+      - OriginalFileName: CONHOST.EXE
+      selection_cli:
+        CommandLine|contains|all:
+        - --headless
+        - powershell
+      condition: all of selection_*
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering,
+    reconnaissance, or credential access — may reveal the stages that preceded this event and help reconstruct
+    the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

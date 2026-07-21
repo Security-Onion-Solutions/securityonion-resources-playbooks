@@ -1,0 +1,414 @@
+name: Suspicious Service Path Modification
+id: e1ce7115-0f5a-42e4-a642-9a8139462e16
+description: |
+  Detects sc.exe being used with config and binPath to point an existing or new Windows service at a suspicious command interpreter or a user-writable path (powershell, cmd, mshta, wscript, cscript, rundll32, svchost, dllhost, or paths such as C:\Users\Public, Downloads, Desktop, the Startup folder, C:\Windows\TEMP, or AppData\Local\Temp). Reconfiguring a service binary path is a persistence and privilege-escalation technique: the chosen binary runs under the service's account (often LocalSystem) at the configured start type, surviving reboots. Legitimate administrators do change service paths during software deployment, so the investigation should establish which service was altered, what binary it now executes, whether that binary is signed and expected, and whether the change was authorized.
+type: detection
+detection_id: 138d3531-8793-4f50-a2cd-f291b2863d78
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-04
+questions:
+- question: Does the command line show sc.exe modifying a service binary path to a suspicious command or location?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the exact command line. Verify it contains sc with config and binPath, and that the binPath value points at a command interpreter or a user-writable directory rather than a normal service executable under System32 or Program Files.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Is this user and host expected to reconfigure Windows service binary paths?
+  context: Legitimate service-path changes are usually performed by administrators or deployment tooling on servers and managed endpoints. Knowing whether the user role and host function are consistent with service reconfiguration is often the fastest path to distinguishing routine administration from unauthorized persistence.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What service was created or modified, and what binary does it execute?
+  context: The sc.exe command line reveals the service name and binary path. Attackers reconfigure services to execute malicious binaries, often placed in world-writable directories such as C:\Users\Public or C:\Windows\TEMP, or masquerading as legitimate services. The configured binary path is the persistence payload and should be analyzed.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: system
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 7045
+      condition: selection
+    fields:
+      - ServiceName
+      - ImagePath
+      - StartType
+      - AccountName
+- question: What is the content of the binary or script that the service binary path now references?
+  context: The binPath value frequently chains an interpreter to a script or executable. Read and analyze that target's actual content for base64 encoding, obfuscated strings, embedded URLs or IP addresses, and known malware string patterns. A reconfigured service that loads a small script or relocated DLL is the persistence payload, distinct from a reputation lookup.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What is the hash of the reconfigured service's binary, and has it run from a non-standard path?
+  context: A binary's hash is recorded when it runs, not when sc.exe rewrites the service path, and the binPath value is not retained as a queryable field. The most direct check is manual -- read the target path from the service-configuration question and the alert command line, retrieve that file from disk, and submit its hash to VirusTotal, Hybrid Analysis, or internal threat intel. As corroboration, this query surfaces processes the Service Control Manager (services.exe) launched from outside the standard system and Program Files directories; a service binary running from Temp, Public, or a user profile is the suspicious reconfiguration, and its hash is read here. The service may not start until its next restart or a reboot, so an empty result does not mean it is benign. Where the binPath wraps a LOLBin (cmd.exe, powershell.exe), it runs from System32 and is filtered out here as unremarkable -- pivot to the script or payload it launches.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: '\services.exe'
+      filter_standard:
+        Image|contains:
+          - ':\Windows\System32\'
+          - ':\Windows\SysWOW64\'
+          - ':\Program Files\'
+          - ':\Program Files (x86)\'
+      condition: selection and not filter_standard
+    fields:
+      - Image
+      - Hashes
+- question: Was the service registry key under HKLM\System\CurrentControlSet\Services modified to point at this binary path?
+  context: Service reconfiguration writes the new binary path into the service's registry key (ImagePath or ServiceDll under HKLM\System\CurrentControlSet\Services). Reviewing the registry write confirms which service definition was changed and captures cases where the path was altered directly rather than through the sc.exe command line, including hijacks of an existing canonical service.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains: '\System\CurrentControlSet\Services\'
+      filter_value:
+        TargetObject|endswith:
+          - '\ImagePath'
+          - '\ServiceDll'
+      condition: selection and filter_value
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- question: Does the service control manager record a service installation or change event for this service?
+  context: The service control manager logs an installation event when a service is created, recording the service name, the image path, the start type, and the account the service runs under. This structured record corroborates the command-line activity and reveals the configured account, which determines the privilege the persistence runs with.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4697
+      condition: selection
+    fields:
+      - ServiceName
+      - ServiceFileName
+      - ServiceStartType
+      - ServiceAccount
+- question: Does the service binary exist on disk, and is it a known legitimate file or suspicious?
+  context: The binary path from the command line should be verified on disk. Legitimate services run from System32 or Program Files. Binaries in user-writable directories, with random names, or with hashes matching known malware are high-confidence indicators of malicious persistence.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: Is the reconfigured service currently running, and what account is it using?
+  context: A reconfigured service may not have started yet (demand start) or may have been stopped after detection. Checking the current service status reveals whether the persistence is active. Services running as LocalSystem have full system privileges; services running as a specific user account indicate the attacker's access level.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What process spawned sc.exe, and is that parent chain expected?
+  context: The parent process reveals how the service reconfiguration was invoked. Legitimate usage often has predictable parents such as explorer.exe for interactive administration or a deployment agent. Unusual parents like mshta.exe, wscript.exe, cmd.exe spawned from an Office application, or a script host may indicate exploitation or a malicious macro driving the change.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \sc.exe
+        CommandLine|contains|all:
+        - config
+        - binPath
+        CommandLine|contains:
+        - powershell
+        - 'cmd '
+        - mshta
+        - wscript
+        - cscript
+        - rundll32
+        - svchost
+        - dllhost
+        - cmd.exe /c
+        - cmd.exe /k
+        - cmd.exe /r
+        - cmd /c
+        - cmd /k
+        - cmd /r
+        - C:\Users\Public
+        - \Downloads\
+        - \Desktop\
+        - \Microsoft\Windows\Start Menu\Programs\Startup\
+        - C:\Windows\TEMP\
+        - \AppData\Local\Temp
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \sc.exe
+        CommandLine|contains|all:
+        - config
+        - binPath
+        CommandLine|contains:
+        - powershell
+        - 'cmd '
+        - mshta
+        - wscript
+        - cscript
+        - rundll32
+        - svchost
+        - dllhost
+        - cmd.exe /c
+        - cmd.exe /k
+        - cmd.exe /r
+        - cmd /c
+        - cmd /k
+        - cmd /r
+        - C:\Users\Public
+        - \Downloads\
+        - \Desktop\
+        - \Microsoft\Windows\Start Menu\Programs\Startup\
+        - C:\Windows\TEMP\
+        - \AppData\Local\Temp
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the same user triggered similar service changes on multiple hosts, the scope of the persistence operation may be larger than a single machine.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \sc.exe
+        CommandLine|contains|all:
+        - config
+        - binPath
+        CommandLine|contains:
+        - powershell
+        - 'cmd '
+        - mshta
+        - wscript
+        - cscript
+        - rundll32
+        - svchost
+        - dllhost
+        - cmd.exe /c
+        - cmd.exe /k
+        - cmd.exe /r
+        - cmd /c
+        - cmd /k
+        - cmd /r
+        - C:\Users\Public
+        - \Downloads\
+        - \Desktop\
+        - \Microsoft\Windows\Start Menu\Programs\Startup\
+        - C:\Windows\TEMP\
+        - \AppData\Local\Temp
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Was sc.exe executed from its expected System32 path?
+  context: sc.exe executed from a non-standard path outside System32 or SysWOW64 may indicate the binary was copied or renamed to evade path-based allowlists. A copy of sc.exe running from a user's temp directory is more suspicious than the one in System32.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- question: How often has this host fired the service-path modification pattern over the past 90 days, and what command-line structures are typical?
+  context: A service-reconfiguration pattern with no prior history on a host is more suspicious than one used regularly under stable parents. The query mirrors the rule's selection structure scoped to this host, so the resulting count reflects the rule's specific firing pattern rather than generic sc.exe usage. The command-line projection lets the analyst compare typical invocation patterns against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \sc.exe
+        CommandLine|contains|all:
+        - config
+        - binPath
+        CommandLine|contains:
+        - powershell
+        - 'cmd '
+        - mshta
+        - wscript
+        - cscript
+        - rundll32
+        - svchost
+        - dllhost
+        - cmd.exe /c
+        - cmd.exe /k
+        - cmd.exe /r
+        - cmd /c
+        - cmd /k
+        - cmd /r
+        - C:\Users\Public
+        - \Downloads\
+        - \Desktop\
+        - \Microsoft\Windows\Start Menu\Programs\Startup\
+        - C:\Windows\TEMP\
+        - \AppData\Local\Temp
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - CommandLine
+- question: Were any other persist-and-tamper LOLBins used on this host recently?
+  context: Operators who use one living-off-the-land binary often use several. After reconfiguring a service for persistence, the same operator may also touch scheduled tasks, registry autoruns, boot configuration, or log clearing. Finding multiple persistence and tampering LOLBins in the same window strengthens the case for malicious activity.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\reg.exe'
+          - '\netsh.exe'
+          - '\wevtutil.exe'
+          - '\bcdedit.exe'
+          - '\vssadmin.exe'
+          - '\diskshadow.exe'
+          - '\dnscmd.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine

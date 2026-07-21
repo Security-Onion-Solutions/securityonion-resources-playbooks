@@ -1,0 +1,382 @@
+name: UAC Bypass Via Wsreset
+id: 740c98ea-ba79-40bc-8e31-730934ae8c18
+description: |
+  Detects a registry write that sets the default command under the per-user Classes key
+  HKCU\Software\Classes\AppX82a6gwre4fdg3bt635tn5ctqjf8msdd2\Shell\open\command (a TargetObject
+  ending in \AppX82a6gwre4fdg3bt635tn5ctqjf8msdd2\Shell\open\command). Auto-elevating wsreset.exe
+  (the Windows Store reset utility) reads that value on startup and executes it as a high-integrity
+  process with no User Account Control consent prompt. This follows the general auto-elevate abuse
+  pattern: a legitimate, Microsoft-signed, auto-elevating binary reads attacker-controlled data from a
+  registry key it trusts and runs it elevated, so the actor never launches a high-integrity process
+  directly. Legitimate changes to this key are rare; investigate what command was written, which
+  process wrote it and what launched that process, whether wsreset.exe subsequently spawned a
+  high-integrity child, what that child did, and whether the value was reverted afterward.
+type: detection
+detection_id: 6ea3bf32-9680-422d-9f50-e90716b12a66
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-10
+questions:
+- question: Does the alerting registry write set the default command of the wsreset AppX shell-open key?
+  context: >-
+    Before investing investigation time, confirm the alert is a true positive. The rule fires when a
+    value whose path ends in \AppX82a6gwre4fdg3bt635tn5ctqjf8msdd2\Shell\open\command is written. That
+    key is the command wsreset.exe reads and runs at high integrity, so on a clean host it is effectively
+    never touched. Review the exact TargetObject and Details on the triggering event to confirm a command
+    was planted in this key rather than an unrelated Classes edit.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this user and host expected to modify this per-user Classes shell-open command key?
+  context: >-
+    The AppX...\Shell\open\command class default should effectively never change through normal use. A
+    medium-integrity user account writing this per-user Classes key is the preparatory move of the User
+    Account Control bypass, so knowing whether the writing account and host function match any sanctioned
+    change or tooling is the fastest way to separate testing or red-team activity from a live bypass. User
+    attribution is present on roughly 94% of endpoint registry events; when it is a machine account or
+    missing, pivot on the writing process instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Which value was written to this AppX key, and why is this key a UAC-bypass location?
+  context: >-
+    The key HKCU\Software\Classes\AppX82a6gwre4fdg3bt635tn5ctqjf8msdd2\Shell\open\command holds the
+    command that auto-elevating wsreset.exe runs on startup. Because wsreset.exe reads this per-user
+    class value and executes it at high integrity without a consent prompt, a value placed here by a
+    medium-integrity user is inherited and run elevated. Confirming the exact path and writing process
+    establishes this as the wsreset hijack location rather than an unrelated Classes edit, and sets up
+    decoding the planted command. The auto-elevating binary abused here is wsreset.exe specifically;
+    the same registry-command pattern is used against other auto-elevating binaries such as fodhelper.exe,
+    eventvwr.exe, sdclt.exe, and computerdefaults.exe.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: What command or payload was written to the AppX shell-open command value?
+  context: >-
+    The Details field holds the command wsreset.exe will run at high integrity. Decode it: the planted
+    value is commonly powershell.exe or cmd.exe with an inline or encoded payload, or a path to a dropped
+    binary. If it references a file path, that path becomes a lead for confirming a payload on disk; if it
+    is an inline interpreter command, the operation is fileless. Details is present on roughly 79% of
+    registry modifications and should be populated for this string value.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- question: What process wrote this value, and what launched that process?
+  context: >-
+    The registry event carries no command line, so pivot by ProcessGuid to the writing process to read
+    its Image, full command, and parent. A reg.exe, powershell.exe, or cmd.exe write launched from an
+    Office application, a browser, a script host such as wscript.exe or mshta.exe, or an unsigned binary
+    points to the bypass being staged programmatically rather than a deliberate administrator edit. The
+    parent chain distinguishes a scripted hijack from an interactive console action; an unexpected
+    parent-child lineage separates a staged bypass from routine administrator use.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: Did the process that wrote this value go on to launch wsreset.exe or other child processes?
+  context: >-
+    The bypass completes when auto-elevating wsreset.exe is run after the key is planted, and the same
+    process or its controlling script frequently launches it moments later. Listing the child processes
+    of the writing process reveals whether wsreset.exe was started as part of the same operation and what
+    else that process spawned. wsreset.exe appearing here shortly after the write ties the registry edit
+    to the elevation attempt.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: After this write, did wsreset.exe spawn a child process on this host?
+  context: >-
+    On a clean host wsreset.exe resets the Store cache and does not spawn arbitrary child processes. When
+    the AppX shell-open command is hijacked, wsreset.exe instead reads the planted value and launches it
+    at high integrity, so any child process of wsreset.exe is the bypass firing. The query lists children
+    of wsreset.exe on this host after the write; powershell.exe, cmd.exe, or an arbitrary binary here
+    confirms high-integrity code execution. The time gap between the registry write and the child launch
+    indicates whether the elevation was triggered immediately as part of one operation.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: '\wsreset.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - User
+- question: What action was performed with elevated privileges after the bypass?
+  context: >-
+    UAC bypass is a means to an end: attackers elevate to install persistence, dump credentials, tamper
+    with security tools, or reach protected resources. Examining processes running at High or System
+    integrity on this host shortly after the write reveals the objective. The planted wsreset child runs
+    at high integrity, so the elevated actions that follow it - credential dumping, persistence
+    installation, or defense tampering - are what determine impact.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        IntegrityLevel:
+          - 'High'
+          - 'System'
+          - 'S-1-16-16384'
+          - 'S-1-16-12288'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - IntegrityLevel
+- question: After this write, was the AppX shell-open value restored to its default or changed again?
+  context: >-
+    Registry key or value deletions are not observable in this telemetry, so durability is judged from the
+    key's re-modification history rather than from a delete event. Cleanup is common immediately after the
+    elevated child launches: a later write that clears or restores the value indicates the hijack was
+    reverted to hide it, while the value remaining a planted command leaves the key primed to run again
+    the next time wsreset.exe is executed. Compare the Details values written over the following window.
+  range: +24h
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - Details
+      - Image
+- question: Has this AppX shell-open command value been modified before on this host?
+  context: >-
+    This class default should change rarely and only through deliberate action, so a history with no
+    prior writes makes this a first-time change and raises its weight. A history of periodic writes to
+    the same value would instead point to a management process or a repeatedly run tool. Compare the
+    historical Details values to see whether a command was set here before or whether this is new.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - Details
+      - Image
+- question: Was this same AppX key modified on other hosts in the environment?
+  context: >-
+    The same write across many hosts suggests a broad tool run or a mis-scoped deployment; the same write
+    confined to one host suggests a targeted bypass. Compare the Details values across hosts to see
+    whether they all plant the same command and whether the writing process is consistent, which
+    separates a single hands-on operation from repeated use of the same technique across the environment.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+      - Details
+- question: What other registry modifications were made on this host in the same window?
+  context: >-
+    An actor who stages a UAC bypass often makes other configuration changes in the same session -
+    additional Classes hijacks for other auto-elevating binaries, Defender or firewall policy edits, or
+    persistence keys. Clustering the registry writes on this host in a short window around the alert
+    reveals the full scope of changes and which process made them. The triggering key appears in the
+    results; the signal is what else was modified and by which process.
+  range: +/-30m
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - User
+- question: Were other auto-elevating shell-open command keys manipulated on this host?
+  context: >-
+    Attackers who attempt one UAC bypass often try several auto-elevate variants until one succeeds,
+    writing a command into the Classes shell-open key an auto-elevating binary reads. Finding
+    command-line writes to the fodhelper/computerdefaults ms-settings key, the eventvwr mscfile key, the
+    sdclt Folder key, or this wsreset AppX key from reg.exe, powershell.exe, or cmd.exe shows whether
+    multiple bypass methods were staged rather than a single edit.
+  range: -15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\reg.exe'
+          - '\powershell.exe'
+          - '\cmd.exe'
+        CommandLine|contains:
+          - 'ms-settings'
+          - 'mscfile'
+          - 'Classes\Folder'
+          - 'AppX82a6gwre4fdg3bt635tn5ctqjf8msdd2'
+          - 'Shell\open\command'
+          - 'DelegateExecute'
+      condition: selection
+    fields:
+      - CommandLine
+      - Image
+- question: Were other privilege escalation techniques attempted on this host?
+  context: >-
+    Attackers who attempt one UAC bypass often try multiple methods, especially if the OS version or
+    configuration blocks certain techniques. Other privilege-escalation or bypass detections on this host
+    from the same user or process point to deliberate escalation activity rather than a false positive,
+    and defense-tampering or credential-access alerts near the bypass help establish the objective.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - rule.name
+      - rule.uuid
+      - event.severity_label
+- question: What other process activity occurred on this host around the time of the alert?
+  context: >-
+    A UAC bypass rarely happens in isolation. Aggregating process activity in a tight window around the
+    alert surfaces what led up to the registry write and what ran immediately after it. Novel
+    parent-child pairs stand out at low counts against high-count routine telemetry, which is what points
+    to the tool that staged the hijack and any high-integrity actions taken once elevation succeeded.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host - reconnaissance, execution of scripting tools, or defense
+    tampering - may reveal the stages that preceded this change and help reconstruct the timeline. A UAC
+    bypass is typically a means to run privileged follow-on actions, so prior alerts help place this
+    registry write within a larger sequence.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

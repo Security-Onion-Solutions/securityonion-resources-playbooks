@@ -1,0 +1,481 @@
+name: Potential QBot Activity
+id: a24de115-d73e-4ec0-804d-e47a1e8ee97f
+description: |
+  Detects process executions matching patterns previously used by QBot. The rule fires when any
+  one of three independent branches matches: either WinRAR.exe spawns wscript.exe, or a command
+  line contains the sequence ' /c ping.exe -n 6 127.0.0.1 & type ', or a command line references
+  regsvr32.exe together with C:\ProgramData and a .tmp file. These correspond to an archive-
+  delivered script stage, a timed local delay followed by a file write, and registration of a
+  module dropped into a world-writable directory; the loader family behind them typically stages
+  a DLL with a non-standard extension and executes it through a signed registration utility.
+  Investigation should determine which branch fired, decode what the command line actually did,
+  establish whether a .tmp module was written to and loaded from C:\ProgramData, and trace the
+  execution chain back to the archive or document the user opened.
+type: detection
+detection_id: 4fcac6eb-0287-4090-8eea-2602e4c20040
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-16
+questions:
+- question: Which of the rule's three branches does this event match, and does the command line confirm it?
+  context: >-
+    This rule fires on any single branch, so confirm which one applied: either WinRAR.exe spawned
+    wscript.exe, or the command line carried the sequence ' /c ping.exe -n 6 127.0.0.1 & type ',
+    or the command line referenced regsvr32.exe together with C:\ProgramData and a .tmp file. Note
+    which branch fired, because it steers the rest of the work — the parent-child branch points at
+    the archive that was opened and its extracted script, while the two command-line branches point
+    at a staged .tmp module and the process that registers it.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+  answer_sources:
+  - alert
+  - process_creation
+- question: Is this user and host expected to run scripts extracted from archives, or to register modules out of C:\ProgramData?
+  context: >-
+    Extracting an archive and running a script from it is ordinary user behavior on some hosts and
+    unheard of on others; registering a module from C:\ProgramData is rare for interactive users but
+    is done by some installers and management agents. Knowing the user's role and the host's function
+    is the fastest way to separate a routine workflow from a delivery chain the user was tricked into
+    starting.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: Is this parent expected to spawn this child, and what started the parent?
+  context: >-
+    The parent's own command line names what it was working on — for an archive utility, the archive
+    path it had open; for a command interpreter, the script or batch content it was running. Tracing
+    the grandparent shows whether the chain began with a user double-clicking an attachment or with
+    an already-running automated process.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+  answer_sources:
+  - process_creation
+- question: What other child processes did the same parent spawn?
+  context: >-
+    A delivery chain rarely produces a single child. The same parent may have extracted and launched
+    a script, then spawned a command interpreter, a registration utility, or a copy operation into
+    C:\ProgramData. Listing every child of the exact parent instance shows the full set of stages
+    started from one action.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Are the files this execution touched still on disk for analysis?
+  context: >-
+    All three branches reference files — an extracted script, the target of a type redirection, or a
+    .tmp module under C:\ProgramData. Correlating file writes to the alerting process and its direct
+    children shows what was created and whether it is still available for hashing, string review, or
+    detonation.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+  answer_sources:
+  - file_event
+  - manual_review
+- question: What did the alerting command line actually do once its arguments and file operations are decoded?
+  context: >-
+    Read every argument in order. The ping-and-type sequence uses a loopback ping purely as a timer
+    before redirecting file content, so identify the source and destination of the redirection. A
+    regsvr32.exe reference names the module being registered and the path it was staged at. This
+    query returns every execution on the host in the window that matches any of the rule's branches,
+    which is what reveals a multi-step operation rather than one isolated command.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_branch1:
+        ParentImage|endswith: \WinRAR.exe
+        Image|endswith: \wscript.exe
+      selection_branch2:
+        CommandLine|contains: ' /c ping.exe -n 6 127.0.0.1 & type '
+      selection_branch3:
+        CommandLine|contains|all:
+        - regsvr32.exe
+        - C:\ProgramData
+        - .tmp
+      condition: selection_host and 1 of selection_branch*
+    fields:
+      - CommandLine
+      - CurrentDirectory
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: Is the script or command payload encoded or obfuscated, and what does the reconstructed content do?
+  context: >-
+    VB script stages commonly hide their payload behind Chr() chains, string concatenation, or
+    base64, and command lines hide it behind environment-variable substitution and caret escaping.
+    Reconstruct the string from the alerting command line and iterate until the content is readable;
+    what emerges is usually a download cradle, a file copy into a world-writable directory, or a
+    registration call for a staged module.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: What .tmp files were written under C:\ProgramData around the alert, and what is in them?
+  context: >-
+    C:\ProgramData is world-writable and needs no elevation, which makes it a common staging
+    directory; a .tmp extension on a file that is later registered means the extension is cosmetic
+    and the content is a module. Retrieve the file and check it for PE headers, exported entry
+    points, embedded URLs, and packer artifacts rather than trusting the extension.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains: \ProgramData\
+        TargetFilename|endswith: .tmp
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+  answer_sources:
+  - file_event
+  - manual_review
+  - safe_environment
+  - external_threat_intel
+- question: If the staged module has executed, what is its hash and does it have known threat-intel detections?
+  context: >-
+    A file write carries no hash; the hash is recorded when the content runs. This query catches both
+    execution paths — the staged file running directly, and a signed utility running with the
+    C:\ProgramData path and .tmp name on its command line. On the second path the hash returned is the
+    utility's own, not the module's, so retrieve the module from its on-disk path and hash it there
+    before submitting it to reputation services.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_direct:
+        Image|endswith: .tmp
+      selection_interpreter:
+        CommandLine|contains|all:
+        - C:\ProgramData
+        - .tmp
+      condition: selection and 1 of selection_*
+    fields:
+      - Image
+      - CommandLine
+      - Hashes
+  answer_sources:
+  - process_creation
+  - external_threat_intel
+- question: Did this host load scripting-engine modules or a module out of C:\ProgramData around the alert?
+  context: >-
+    A VB script stage pulls in the scripting engine and its runtime — vbscript.dll, scrrun.dll,
+    jscript.dll, wshom.ocx — and a registered .tmp file appears as a module load from a
+    world-writable path. The load event carries the module's signature status and hash directly, so
+    an unsigned module loading out of C:\ProgramData can be identified and hashed without waiting for
+    a separate execution event.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_mod_engine:
+        ImageLoaded|endswith:
+        - \vbscript.dll
+        - \scrrun.dll
+        - \jscript.dll
+        - \wshom.ocx
+      selection_mod_dropped:
+        ImageLoaded|contains: \ProgramData\
+      condition: selection_host and 1 of selection_mod_*
+    fields:
+      - ImageLoaded
+      - Image
+      - Signed
+      - Signature
+      - Hashes
+  answer_sources:
+  - process_creation
+  - edr_console
+- question: Did the script host or module-registration utility on this host make outbound connections around the alert?
+  context: >-
+    The only address in the rule's command lines is the loopback address, used as a delay timer
+    rather than a destination, so real egress has to be looked for on the processes involved. Script
+    hosts and registration utilities reaching external addresses are the stage worth chasing — check
+    resolution history, registration age, and reputation for anything they contacted, and treat
+    direct-to-IP connections with no preceding lookup as its own finding.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+        - \wscript.exe
+        - \cscript.exe
+        - \regsvr32.exe
+        - \rundll32.exe
+      condition: all of selection_*
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationPort
+      - Initiated
+  answer_sources:
+  - network_connection
+  - external_threat_intel
+  - manual_review
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: >-
+    The query mirrors the rule's selection structure scoped to this user, so the result is the user's
+    90-day history of these specific branches firing rather than generic use of a script host. A user
+    who has never produced the pattern is a different finding from a developer or packager whose
+    normal work involves archives and registration utilities; weigh the count against what the role
+    actually requires.
+  range: -90d
+  always_include: true
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection1:
+        ParentImage|endswith: \WinRAR.exe
+        Image|endswith: \wscript.exe
+      selection2:
+        CommandLine|contains: ' /c ping.exe -n 6 127.0.0.1 & type '
+      selection3:
+        CommandLine|contains|all:
+        - regsvr32.exe
+        - C:\ProgramData
+        - .tmp
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (1 of selection*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+- question: Has this parent process historically driven the rule's pattern here or across the environment, or is the parent new for this activity?
+  context: >-
+    When the alert fires under a service account or computer account, user identity attributes
+    nothing and the launch mechanism is the meaningful pivot. This query mirrors the rule's selection
+    structure scoped to the alerting parent, giving the 90-day history of that parent driving these
+    branches. A parent already responsible for thousands of prior events is packaging or management
+    automation; a parent new to this pattern is the deviation to chase.
+  range: -90d
+  always_include: true
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection1:
+        ParentImage|endswith: \WinRAR.exe
+        Image|endswith: \wscript.exe
+      selection2:
+        CommandLine|contains: ' /c ping.exe -n 6 127.0.0.1 & type '
+      selection3:
+        CommandLine|contains|all:
+        - regsvr32.exe
+        - C:\ProgramData
+        - .tmp
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (1 of selection*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- question: What else did this user do across the network around this time?
+  context: >-
+    A delivery chain that reached one user often reached the same user on another host, or reached
+    several users in the same wave. Aggregating the user's activity by host and binary in the alert
+    window shows whether the work is confined to this host. If the alert fired under a service or
+    computer account this view returns routine agent activity and the parent-anchored fleet view is
+    the meaningful one.
+  range: +/-1h
+  always_include: true
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+- question: Did this same parent-driven pattern fire on other hosts in the same window, or is the activity isolated to this host?
+  context: >-
+    This query mirrors the rule's selection structure scoped to the alerting parent process,
+    fleet-wide, in the alert window. Several hosts producing the pattern at once points at pushed or
+    scheduled automation, or at a delivery wave that landed in multiple mailboxes; a single host
+    points at a host-local trigger such as one archive that one person opened.
+  range: +/-1h
+  always_include: true
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection1:
+        ParentImage|endswith: \WinRAR.exe
+        Image|endswith: \wscript.exe
+      selection2:
+        CommandLine|contains: ' /c ping.exe -n 6 127.0.0.1 & type '
+      selection3:
+        CommandLine|contains|all:
+        - regsvr32.exe
+        - C:\ProgramData
+        - .tmp
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (1 of selection*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- question: What other process activity occurred on this host around the time of the alert?
+  context: >-
+    Aggregating every parent-child pair on the host in the alert window collapses repetitive agent
+    and OS activity into high-count rows and leaves novel pairs standing out at low counts — that is
+    what to scan for. Also note when this ran: script execution outside the user's working hours or
+    outside a maintenance window carries different weight than the same activity mid-morning on a
+    workstation.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+  answer_sources:
+  - process_creation
+  - file_event
+  - registry_event
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections reconstruct what preceded this execution — mail or browser activity that
+    delivered an archive, an extraction, or an earlier script stage. A loader chain typically
+    produces several low-severity detections before the one that fired here, and reading them in
+    order establishes the entry point.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+  answer_sources:
+  - alert

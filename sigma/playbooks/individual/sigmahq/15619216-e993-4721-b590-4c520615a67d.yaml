@@ -1,0 +1,427 @@
+name: Potential Meterpreter/CobaltStrike Activity
+id: b5fb8543-db56-4940-aad3-bf1778fa3898
+description: |
+  Detects the named-pipe token-impersonation pattern used by the Meterpreter and
+  Cobalt Strike getsystem primitive, where the Service Control Manager (services.exe)
+  starts a child process that either runs a command interpreter with a /c echo command
+  writing to a named pipe, or runs rundll32 against a payload DLL with the ,a /p:
+  ordinal-and-pipe arguments. The rule fires when services.exe is the parent AND
+  EITHER the command-interpreter named-pipe branch OR the rundll32 payload-DLL branch
+  matches, AND the MpCmdRun (Defender) command is not present. Both branches set up a
+  SYSTEM-owned service whose token the operator then duplicates and impersonates to
+  spawn a process running as SYSTEM. The investigation should confirm which branch
+  fired, decode the named-pipe or DLL ordinal it sets up, and determine whether a
+  SYSTEM-context child process followed from the stolen token.
+type: detection
+detection_id: 15619216-e993-4721-b590-4c520615a67d
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-04
+questions:
+- question: Does the alert match the rule — services.exe spawning either a command interpreter that echoes to a named pipe, or rundll32 against a payload DLL with the ,a ordinal and /p pipe arguments?
+  context: The rule fires on one of two branches under a services.exe parent, and which one
+    fired changes the rest of the investigation. The first branch is cmd or %COMSPEC%
+    running /c echo into a \pipe\ path — the named-pipe the operator's code connects to in
+    order to impersonate the service token. The second branch is rundll32 loading a payload
+    DLL by ordinal with a ,a ordinal and /p pipe argument. Confirm the parent is services.exe and note which
+    branch's CommandLine matched, because the named-pipe name or the DLL path is the
+    load-bearing artifact for the follow-on questions.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - CommandLine
+- question: Is this user and host expected to run service-launched command interpreters or rundll32 payloads of this kind?
+  context: A service legitimately launching a helper command is routine on some hosts, but a
+    services.exe child that echoes to a named pipe or loads a DLL by ordinal is not a normal
+    service-start pattern. Knowing whether the host runs custom services and whether the
+    account is a service principal or an interactive user is often the fastest way to
+    separate a true positive from sanctioned service automation.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What named pipe or payload DLL does this command set up? Decode the full command line.
+  context: The full command line carries the load-bearing artifact. For the command-interpreter
+    branch, the \pipe\ path names the pipe the operator's beacon connects to so it can
+    impersonate the service's SYSTEM token; decode the echoed content and the exact pipe name.
+    For the rundll32 branch, the DLL path and the ,a ordinal plus the /p pipe argument identify the
+    payload and the pipe it serves. This query scopes to service-launched named-pipe and
+    rundll32-ordinal command lines on this host so multi-step setup is visible, rather than
+    every cmd or rundll32 execution.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_pipe:
+        CommandLine|contains|all:
+          - echo
+          - \pipe\
+      selection_rundll:
+        CommandLine|contains|all:
+          - rundll32
+          - .dll,a
+          - '/p:'
+      condition: selection_host and (selection_pipe or selection_rundll)
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Is services.exe expected to spawn this child, and which service definition launched it?
+  context: The services.exe parent is the core signal — the Service Control Manager only
+    launches what a service definition tells it to, so a service that runs a command
+    interpreter echoing to a pipe, or rundll32 by ordinal, points to a service whose ImagePath
+    or FailureCommand was set to the operator's payload. Trace the parent to confirm it is the
+    real services.exe and review what spawned it, then correlate against which service entry
+    holds this command line.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What other child processes did this services.exe instance spawn around the same time?
+  context: If the impersonation setup ran under a service start, the same services.exe instance
+    may have launched additional children — the payload itself, a follow-on SYSTEM process, or
+    cleanup commands. Multiple unusual children from the same parent instance points to
+    deliberate orchestration of the token-theft chain rather than a single isolated service
+    start.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Did this specific service-launched process, or a process it spawned, write a file to disk that ties an artifact directly to this token-theft chain?
+  context: Named-pipe impersonation steals the SYSTEM token by opening a handle into the
+    connecting service process and duplicating its token. That handle-open and duplication is
+    not observable in this environment — there is no process-access telemetry available, so a
+    zero result never means the token theft did not happen. What can be tied to this specific
+    process lineage is a written file — the rundll32 branch's payload DLL, or staging or cleanup
+    artifacts the operator drops once SYSTEM is obtained. Scoping to this process and its
+    children (rather than the broader host-wide file search elsewhere in this playbook) confirms
+    whether an artifact came from this exact chain rather than unrelated host activity.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Was a SYSTEM logon with special privileges assigned on this host around the time of the alert?
+  context: After duplicating the service token, the operator uses it to create a new process
+    running as SYSTEM. That elevated context produces a logon for which special privileges
+    (SeDebugPrivilege, SeImpersonatePrivilege, SeTcbPrivilege and similar) are assigned.
+    A special-privileges-assigned event for a SYSTEM logon in the same window, correlated with
+    the service-launched child, marks the moment the stolen token was used. If security event
+    collection is not in place on this host, treat zero results as a visibility gap rather than
+    evidence nothing happened.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        EventID: 4672
+      condition: selection
+    fields:
+      - SubjectUserName
+      - SubjectLogonId
+      - PrivilegeList
+- question: Did a new process start as SYSTEM with a parent-child user or integrity mismatch shortly after the service-launched command?
+  context: The end state of the getsystem chain is a process created with the stolen token —
+    its security context (SID, logon session, integrity level) differs from its parent's. A
+    child running at System integrity whose parent ran at a lower integrity, or whose user
+    does not match its parent's, is the parent-child lineage anomaly the technique produces.
+    Look at processes that started in the minutes after the service-launched command and
+    compare their integrity and user against the launching chain.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        IntegrityLevel:
+          - 'System'
+          - 'S-1-16-16384'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - User
+- question: Is this activity part of an authorized penetration test or red team engagement?
+  context: The getsystem named-pipe impersonation primitive is built into offensive frameworks
+    and is used in authorized security assessments. Before investing investigation time, check
+    whether a pentest or red team exercise is currently active on this host or network segment.
+    An authorized engagement with matching tooling and timing resolves the alert without
+    further analysis.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Which getsystem variant fired — the named-pipe command-interpreter branch or the rundll32 payload-DLL branch?
+  context: The two branches reflect different impersonation setups. The command-interpreter
+    branch echoes into a named pipe that a beacon connects to in order to impersonate the
+    service token; the rundll32 branch loads a payload DLL by ordinal that serves the pipe
+    from within the service process. Identifying which branch ran, and the exact pipe name or
+    DLL, determines how the token was stolen and what artifacts to hunt for next.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Are named-pipe or payload-DLL artifacts of this impersonation primitive present on the host?
+  context: The named-pipe impersonation setup leaves characteristic artifacts — pipe names
+    matching the operator's framework convention, and on the rundll32 branch a payload DLL
+    written to disk before it is loaded. Checking for files created by the service-launched
+    process, or follow-on dumps and tooling, confirms execution and reveals the scope of
+    activity even after the original process has exited.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith:
+          - '.dll'
+          - '.tmp'
+          - '.dmp'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+        ParentImage|endswith: \services.exe
+      selection_technique_1:
+        CommandLine|contains|all:
+        - /c
+        - echo
+        - \pipe\
+        CommandLine|contains:
+        - cmd
+        - '%COMSPEC%'
+      selection_technique_2:
+        CommandLine|contains|all:
+        - rundll32
+        - .dll,a
+        - '/p:'
+      filter_defender:
+        CommandLine|contains: MpCmdRun
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection_img and 1 of selection_technique_* and not 1 of filter_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+        ParentImage|endswith: \services.exe
+      selection_technique_1:
+        CommandLine|contains|all:
+        - /c
+        - echo
+        - \pipe\
+        CommandLine|contains:
+        - cmd
+        - '%COMSPEC%'
+      selection_technique_2:
+        CommandLine|contains|all:
+        - rundll32
+        - .dll,a
+        - '/p:'
+      filter_defender:
+        CommandLine|contains: MpCmdRun
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection_img and 1 of selection_technique_* and not 1 of filter_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the environment around this time?
+  context: Tracking the account's activity across all hosts in the surrounding window reveals
+    lateral movement or coordinated activity on multiple endpoints. If the same account
+    triggered similar service-context or privilege-escalation activity elsewhere, the scope is
+    larger than this one host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+        ParentImage|endswith: \services.exe
+      selection_technique_1:
+        CommandLine|contains|all:
+        - /c
+        - echo
+        - \pipe\
+        CommandLine|contains:
+        - cmd
+        - '%COMSPEC%'
+      selection_technique_2:
+        CommandLine|contains|all:
+        - rundll32
+        - .dll,a
+        - '/p:'
+      filter_defender:
+        CommandLine|contains: MpCmdRun
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection_img and 1 of selection_technique_* and not 1 of filter_*) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Surveying activity around the alert reveals what
+    led to the impersonation setup and what followed — reconnaissance, credential access, or
+    persistence staged through the stolen SYSTEM token. Aggregating by process and parent
+    collapses repetitive agent telemetry into high-count rows while novel parent-child pairs
+    stand out at low counts.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Gaining SYSTEM through token impersonation is usually a mid-chain step. Earlier
+    detections on the same host — service installation, credential access, or defense tampering
+    — may reveal how the operator reached the point of stealing the service token and help
+    reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

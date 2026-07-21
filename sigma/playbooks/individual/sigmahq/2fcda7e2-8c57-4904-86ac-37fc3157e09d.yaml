@@ -1,0 +1,362 @@
+name: Sensitive File Dump Via Print.EXE
+id: e4f87b9b-8474-4af3-8308-a63210e83cad
+description: |
+  Detects abuse of the signed Windows utility print.exe to copy sensitive credential
+  stores -- the SAM, SECURITY, or SYSTEM registry hives from the config directory, or
+  the domain controller's ntds.dit -- to an attacker-chosen destination for offline
+  hash extraction. The rule fires when print.exe (by image name or original filename)
+  runs with the /D switch and a command line referencing one of those sensitive paths.
+  Legitimate use of print.exe to send these specific files to a printer is implausible,
+  so a true positive points at hands-on credential theft; the investigation should
+  determine which store was targeted, where the copy landed, which accounts are exposed,
+  and whether lateral movement followed.
+type: detection
+detection_id: 2fcda7e2-8c57-4904-86ac-37fc3157e09d
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- question: Does the command line show print.exe copying a sensitive credential store with the /D switch?
+  context: Confirm the alert is a true positive by reviewing the exact command line and process
+    details. The rule fires only when print.exe (or a binary whose original filename is Print.EXE)
+    runs with /D and a path referencing \config\SAM, \config\SECURITY, \config\SYSTEM, or
+    \windows\ntds\ntds.dit. Note which target appears -- a registry hive points at local SAM-based
+    theft, ntds.dit points at domain-wide credential extraction.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to copy registry hives or ntds.dit?
+  context: Copying the SAM/SYSTEM/SECURITY hives or ntds.dit is not a routine task for ordinary
+    users or workstations. On a domain controller a backup process may touch ntds.dit, but never
+    through print.exe. Knowing whether the account and host function fit any legitimate workflow
+    is the fastest way to separate a true positive from an anomaly.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Which credential store was targeted, and was the copy operation completed?
+  context: The path in the command line identifies the store -- the SAM hive alone yields local
+    account hashes, but SAM plus SYSTEM (and ideally SECURITY) is what enables offline hash
+    extraction, while ntds.dit yields every domain account. Read the full command to confirm the
+    source path and capture the destination the copy was written to.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Where did the copied credential store land on disk?
+  context: The /D destination in the command line names where the hive or ntds.dit copy was
+    written. Pull file-creation events on this host for that destination path to confirm the file
+    landed and to see whether it was subsequently staged, archived, or moved. Dump files commonly
+    appear under user-writable locations such as the public profile or a temp directory.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - User
+      - EventType
+- question: What process spawned print.exe and is that parent chain expected?
+  context: The parent reveals how print.exe was invoked. A console shell, a script host (wscript,
+    cscript, mshta), a remote-execution service, or an exploited application server spawning
+    print.exe with these arguments points at hands-on operator activity rather than any legitimate
+    workflow. Walk the parent's own parent if the immediate parent is itself a shell or service host.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What other credential-dumping commands ran on this host around the same time?
+  context: A print.exe hive copy is rarely a standalone action. Operators commonly pair it with
+    reg save of the SAM and SYSTEM hives, shadow-copy creation for ntds.dit access, ntdsutil,
+    reconnaissance commands, or archiving of the dumped files. Surfacing nearby command lines that
+    reference credential stores or staging shows whether this is one step in a broader collection.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_cred:
+        CommandLine|contains:
+          - 'reg save'
+          - 'reg.exe save'
+          - '\config\SAM'
+          - '\config\SECURITY'
+          - '\config\SYSTEM'
+          - 'ntds.dit'
+          - 'ntdsutil'
+          - 'vssadmin'
+          - 'shadowcopy'
+          - 'HarddiskVolumeShadowCopy'
+      condition: selection_host and selection_cred
+    fields:
+      - CommandLine
+      - Image
+      - User
+- question: What child processes did print.exe spawn afterward?
+  context: print.exe performing a file copy should not spawn children. Any subsequent process under
+    it -- a compressor, an exfiltration tool, a shell, or a hash-extraction utility -- indicates the
+    copy was part of a larger operation and identifies the next stage to investigate.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Which accounts may be compromised, and do any have elevated privileges?
+  context: The severity depends on what the targeted store holds. A SAM copy exposes local accounts
+    on this host; a SECURITY hive copy can expose cached domain credentials and LSA secrets; ntds.dit
+    exposes every domain account including domain admins and the krbtgt account. Cross-reference the
+    exposed accounts against directory group memberships to scope escalation and remediation.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Were outbound remote-access connections (RDP, SMB, WinRM, SSH) initiated from this host after
+    this event?
+  context: Credential theft is typically followed by lateral movement. The query returns outbound connections
+    from this host to remote-access ports -- 3389 (RDP), 445 (SMB/PsExec), 5985/5986 (WinRM), 22 (SSH)
+    -- in the hours after the event; the originating Image and User show what drove each connection. Two
+    limits to keep in mind -- credentials exfiltrated and replayed from another machine will not appear
+    here (check security 4624 logons on suspected targets for this account and any accounts with sessions
+    on this host), and the query requires Sysmon network telemetry (EID 3); if that is not collected from
+    this host, treat zero rows as a visibility gap, not as evidence no movement occurred.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
+- question: When this host previously matched this print.exe credential-dump pattern, what parents and users drove it, and does the current alert fit?
+  context: The query mirrors the rule's selection scoped to this host, so the resulting parent/user
+    distribution reflects how this specific firing pattern has run here before -- which for a
+    credential-dump rule is almost always zero. A new parent, an unexpected account, or any prior
+    history at all is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \print.exe
+      - OriginalFileName: Print.EXE
+      selection_cli:
+        CommandLine|contains|windash: /D
+        CommandLine|contains:
+        - \config\SAM
+        - \config\SECURITY
+        - \config\SYSTEM
+        - \windows\ntds\ntds.dit
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \print.exe
+      - OriginalFileName: Print.EXE
+      selection_cli:
+        CommandLine|contains|windash: /D
+        CommandLine|contains:
+        - \config\SAM
+        - \config\SECURITY
+        - \config\SYSTEM
+        - \windows\ntds\ntds.dit
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \print.exe
+      - OriginalFileName: Print.EXE
+      selection_cli:
+        CommandLine|contains|windash: /D
+        CommandLine|contains:
+        - \config\SAM
+        - \config\SECURITY
+        - \config\SYSTEM
+        - \windows\ntds\ntds.dit
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or staging on
+    multiple endpoints. If the same account performed credential access or copied files on more than
+    one host in this window, the scope of compromise is larger than the alerting host alone.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \print.exe
+      - OriginalFileName: Print.EXE
+      selection_cli:
+        CommandLine|contains|windash: /D
+        CommandLine|contains:
+        - \config\SAM
+        - \config\SECURITY
+        - \config\SYSTEM
+        - \windows\ntds\ntds.dit
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Credential dumping rarely happens in isolation. Earlier detections on the same host --
+    exploitation of an application server, defense tampering, reconnaissance, or privilege escalation
+    -- may reveal the stages that preceded the copy and help reconstruct how the operator reached the
+    point of harvesting credential stores.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

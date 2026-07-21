@@ -1,0 +1,450 @@
+name: DumpMinitool Execution
+id: 04c09aab-07fc-4541-9431-57e01835c9af
+description: |
+  Detects execution of DumpMinitool.exe (or its .x86 / .arm64 variants) with a dump-type
+  argument of Full, Mini, or WithHeap. DumpMinitool is a Microsoft-signed binary shipped
+  with Visual Studio that wraps the MiniDumpWriteDump API; it can capture full process
+  memory, including LSASS, and is frequently allowlisted because it is a signed developer
+  tool. The rule fires only when both selections match: the binary identity (Image name
+  or OriginalFileName) AND a dump-type token in the command line. Legitimate use is
+  confined to developer and build hosts capturing crash dumps; on other hosts, or against
+  a high-value process such as lsass.exe, the same invocation is a credential-dumping
+  LOLBIN. Investigation should establish the dump target, the resulting dump file, the
+  parent that launched it, and whether the host normally runs this tool.
+type: detection
+detection_id: dee0a7a3-f200-4112-a99b-952196d81e42
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- question: Does the command line and binary identity match what this rule detects?
+  context: >-
+    Confirm the alert is a true positive before investigating further. The rule fires
+    only when the process is DumpMinitool (by Image name or OriginalFileName, including
+    the .x86 and .arm64 variants) AND the command line contains a dump-type token (Full,
+    Mini, or WithHeap). Note that the binary parses its arguments by position, not by
+    flag name, so the dump-type token may sit alongside disguised or meaningless flag
+    names. Read the full command line to identify the output dump path and the target
+    process id passed to it.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to capture process memory dumps with a Visual Studio tool?
+  context: >-
+    Legitimate DumpMinitool use is largely confined to developer workstations and build
+    hosts capturing crash dumps. Knowing whether the host has a development role and
+    whether the user routinely performs debugging or dump-collection work is often the
+    fastest way to separate routine activity from credential-dumping abuse on a server or
+    end-user endpoint.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What is the actual identity of this binary based on its metadata and hash?
+  context: >-
+    DumpMinitool is Microsoft-signed and ships under the Visual Studio install tree
+    (typically under \Microsoft Visual Studio\<version>\<edition>\Common7\IDE\Extensions).
+    Compare the Image path on disk against OriginalFileName in the PE metadata and confirm
+    the signing chain. A binary named DumpMinitool whose OriginalFileName matches but
+    which runs from a user-writable or non-Visual-Studio location is the relocation
+    pattern worth chasing; submit the hash for reputation lookup to confirm it is the
+    genuine signed tool rather than a repackaged or trojanized copy.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Hashes
+- question: How did this binary arrive on the host, and was it copied outside the Visual Studio install tree?
+  context: >-
+    Trace the file-creation event for the binary by basename over a long window. If the
+    file landed under the normal Visual Studio extensions path, it is most likely a
+    standard install; if it was dropped into Downloads, Temp, ProgramData, Public, or
+    another user-writable location, it was relocated to evade path-based allowlisting. The
+    creating process shown in the file event reveals the delivery mechanism: an installer,
+    a browser or download tool, an archive extractor, or a copy by a remote admin tool.
+  range: -30d
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains|expand: '%file_name%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: What process was targeted for the memory dump, and was it LSASS?
+  context: >-
+    DumpMinitool takes a target process id as a positional argument and writes a memory
+    dump of that process. Resolve the process id passed on the command line to the image
+    it referred to at execution time. A dump of lsass.exe (or lsaiso, vault, or other
+    credential-bearing processes) is credential-theft-grade, and the Full dump-type
+    captures complete memory and tokens. Identify which process was dumped to determine
+    which credentials may be exposed.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did this process, or a child of it, write a minidump file to disk that would confirm MiniDumpWriteDump captured a target process?
+  context: >-
+    DumpMinitool's memory capture is implemented by opening a handle to the target process
+    and calling MiniDumpWriteDump; that handle-open is not visible in this environment's
+    telemetry, so there is no way to directly confirm the access to lsass.exe or another
+    target from the handle side. The write side is the only observable trace: a successful
+    capture produces a dump file at the path supplied on the command line. Review file-write
+    activity from the alerting process and any children for a dump artifact, and treat an
+    empty result as a coverage gap on the handle-access step, not as proof no memory was
+    captured.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What process spawned this tool and is that parent chain expected?
+  context: >-
+    The parent process reveals how the dump tool was invoked. On a developer host the
+    parent is typically a Visual Studio process, a build agent, or an interactive shell
+    started by the developer. An unexpected parent such as a script host, an Office
+    application, a remote-access service, or a web server points to operator-driven abuse
+    rather than legitimate debugging.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What did this binary do after execution, and is the same binary present on other hosts?
+  context: >-
+    Examine the child processes spawned by the dump tool to see whether the dump was
+    followed by compression, staging, or exfiltration of the resulting file. The same
+    binary in the same non-standard location appearing on multiple hosts suggests
+    deliberate distribution rather than an isolated developer machine; correlate by
+    binary identity across hosts to gauge scope.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Which accounts may be compromised, and do any have elevated privileges?
+  context: >-
+    A full LSASS dump can expose every credential cached in memory on the host, including
+    interactive logons, service accounts, and any domain or admin sessions present at dump
+    time. Cross-reference the accounts that had active sessions on this host with directory
+    group memberships. Domain admin, enterprise admin, or broad service-account exposure
+    requires incident escalation and credential rotation; a single standard-user session
+    may need only monitoring.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Were outbound remote-access connections (RDP, SMB, WinRM, SSH) initiated from this host after
+    this event?
+  context: Credential theft is typically followed by lateral movement. The query returns outbound connections
+    from this host to remote-access ports -- 3389 (RDP), 445 (SMB/PsExec), 5985/5986 (WinRM), 22 (SSH)
+    -- in the hours after the event; the originating Image and User show what drove each connection. Two
+    limits to keep in mind -- credentials exfiltrated and replayed from another machine will not appear
+    here (check security 4624 logons on suspected targets for this account and any accounts with sessions
+    on this host), and the query requires Sysmon network telemetry (EID 3); if that is not collected from
+    this host, treat zero rows as a visibility gap, not as evidence no movement occurred.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \DumpMinitool.exe
+        - \DumpMinitool.x86.exe
+        - \DumpMinitool.arm64.exe
+      - OriginalFileName:
+        - DumpMinitool.exe
+        - DumpMinitool.x86.exe
+        - DumpMinitool.arm64.exe
+      selection_cli:
+        CommandLine|contains:
+        - ' Full'
+        - ' Mini'
+        - ' WithHeap'
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \DumpMinitool.exe
+        - \DumpMinitool.x86.exe
+        - \DumpMinitool.arm64.exe
+      - OriginalFileName:
+        - DumpMinitool.exe
+        - DumpMinitool.x86.exe
+        - DumpMinitool.arm64.exe
+      selection_cli:
+        CommandLine|contains:
+        - ' Full'
+        - ' Mini'
+        - ' WithHeap'
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the user's activity across all hosts reveals whether the dump is an isolated
+    action or part of broader hands-on activity such as lateral movement or staging. If
+    the same user triggered similar activity on multiple hosts in the surrounding window,
+    the scope of compromise may be larger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \DumpMinitool.exe
+        - \DumpMinitool.x86.exe
+        - \DumpMinitool.arm64.exe
+      - OriginalFileName:
+        - DumpMinitool.exe
+        - DumpMinitool.x86.exe
+        - DumpMinitool.arm64.exe
+      selection_cli:
+        CommandLine|contains:
+        - ' Full'
+        - ' Mini'
+        - ' WithHeap'
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: When this host has previously fired the rule's pattern, what parents and users normally drive that activity, and does the current alert fit?
+  context: >-
+    Even on a host where DumpMinitool runs legitimately, the parent and user distribution
+    for the rule's specific firing pattern shows how it normally runs here. The query
+    mirrors the rule's selection scoped to this host, so the result reflects the dump-tool
+    pattern rather than generic binary usage. A new parent process, an unexpected user
+    account, or an unusual command-line structure is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \DumpMinitool.exe
+        - \DumpMinitool.x86.exe
+        - \DumpMinitool.arm64.exe
+      - OriginalFileName:
+        - DumpMinitool.exe
+        - DumpMinitool.x86.exe
+        - DumpMinitool.arm64.exe
+      selection_cli:
+        CommandLine|contains:
+        - ' Full'
+        - ' Mini'
+        - ' WithHeap'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Have other hosts fired the rule's pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: >-
+    The query mirrors the rule's selection structure with no host scope, so the result is
+    a fleet-wide count of the dump-tool firing pattern rather than generic usage of the
+    binary. Many hosts firing the same pattern points to scripted deployment or build
+    automation, while one host or a small unrelated set points to manual operator activity.
+    Use the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \DumpMinitool.exe
+        - \DumpMinitool.x86.exe
+        - \DumpMinitool.arm64.exe
+      - OriginalFileName:
+        - DumpMinitool.exe
+        - DumpMinitool.x86.exe
+        - DumpMinitool.arm64.exe
+      selection_cli:
+        CommandLine|contains:
+        - ' Full'
+        - ' Mini'
+        - ' WithHeap'
+      condition: all of selection_*
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    A credential dump is rarely the first action in an intrusion. Earlier detections on
+    the same host — defense tampering, reconnaissance, privilege escalation, or initial
+    access — may reveal the stages that preceded reaching for LSASS and help reconstruct
+    the full timeline. A clean prior-alert history shifts the disposition toward
+    legitimate developer or support activity.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

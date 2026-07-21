@@ -1,0 +1,524 @@
+name: Suspicious Eventlog Clear
+id: d6125d82-ed49-485d-8083-363df0afd8f2
+description: |
+  Detects PowerShell script blocks that clear or remove Windows event logs — either through
+  the built-in log-management cmdlets (Clear-EventLog, Remove-EventLog, Limit-EventLog,
+  Clear-WinEvent) or through the .NET log APIs (Eventing.Reader.EventLogSession with ClearLog,
+  or Diagnostics.EventLog with Clear). Clearing event logs destroys the recorded history of
+  activity on the host and is a common indicator-removal step (T1685.005) performed to cover
+  earlier intrusion activity, though installers and cleanup scripts occasionally clear logs
+  legitimately. The investigation should establish which logs were targeted, whether the clear
+  actually happened, what the complete script does, and what activity on this host the
+  clearing may have been intended to hide.
+type: detection
+detection_id: 0f017df3-8f5a-414f-ad6b-24aff1128278
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-17
+questions:
+- question: Does the full script block contain the log-clearing cmdlets or .NET log-clearing calls this rule detects?
+  context: >-
+    The rule fires on any one of three branches — either a log-management cmdlet
+    (Clear-EventLog, Remove-EventLog, Limit-EventLog, Clear-WinEvent), or the .NET
+    Eventing.Reader.EventLogSession API together with ClearLog, or the Diagnostics.EventLog
+    class together with Clear. Note which branch matched — the cmdlet branch is an explicit
+    clear, while the .NET branches are how PowerShell 7 scripts and custom tooling clear logs
+    without the cmdlets. Long scripts are split across multiple events, so judge the match on
+    the complete reassembled block, not just the alerting fragment.
+  range: +/-5m
+  answer_sources:
+  - alert
+  - ps_script
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - ScriptBlockText
+- question: Is this user and host expected to run event-log maintenance from PowerShell?
+  context: >-
+    Clearing an event log requires administrative rights, so the acting account is elevated by
+    definition — the question is whether that elevation and this activity fit the account's
+    role. Installers and cleanup scripts are the known benign sources for this detection; a
+    SYSTEM or service account usually means deployment tooling, judged by the host's role and
+    the script's on-disk path. An interactive user clearing logs by hand is far less common
+    and worth confirming directly with the user or their team.
+  range: +/-5m
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - host.name
+      - user.name
+      - Path
+- question: What does the complete script do around the log-clearing call, and is any of its content still obfuscated?
+  context: >-
+    Script-block content is logged after PowerShell unwraps encoded-command wrappers, so
+    base64 payloads arrive already decoded — only string-level obfuscation (concatenation,
+    format operators, backticks) still needs manual work. Read the LogName arguments or
+    ClearLog parameters to see which logs are wiped and whether the script loops over every
+    log for a mass clear, then examine what the rest of the script does — download cradles,
+    credential access, service tampering, or file deletion surrounding the clear reveal what
+    the clearing supports.
+  range: +/-5m
+  answer_sources:
+  - ps_script
+  - manual_review
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - powershell.sequence
+      - powershell.total
+      - ScriptBlockText
+- question: Which event logs did the clearing command target?
+  context: >-
+    The LogName argument or ClearLog parameter names the target — clearing Security destroys
+    sign-in and privilege-use history, System hides service and driver changes, and custom
+    channels can hide application-specific evidence. This query surfaces the launching
+    PowerShell command line only when the clearing text was passed at invocation; a clear run
+    from a script file or an interactive session will not appear in process telemetry, so
+    treat the script-block content as the authoritative record of the targeted logs.
+  range: +/-24h
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        User|expand: '%User%'
+      selection_content:
+        CommandLine|contains:
+          - 'Clear-EventLog'
+          - 'Remove-EventLog'
+          - 'Limit-EventLog'
+          - 'Clear-WinEvent'
+          - 'Eventing.Reader.EventLogSession'
+          - 'ClearLog'
+          - 'Diagnostics.EventLog'
+      condition: selection and selection_content
+    fields:
+    - CommandLine
+- question: Does the alerting script exist on disk, and what created it?
+  context: >-
+    When the script block ran from a file, its path is recorded on the alert. A script in a
+    user-writable or staging location (Temp, AppData, ProgramData, Downloads) implies a
+    delivery step that wrote it — find the file-creation event to identify the process and
+    account that staged it. In-memory or interactive execution records no path at all, which
+    for a log-clearing block is itself worth noting, since fileless execution is a deliberate
+    evasion choice.
+  range: +/-24h
+  answer_sources:
+  - file_event
+  - manual_review
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - EventType
+      - TargetFilename
+      - Image
+      - User
+- question: Did the Security event log actually get cleared?
+  context: >-
+    Clearing the Security log writes event 1102 as the first entry of the fresh log, naming
+    the account that performed the clear — correlate its timestamp with the script block to
+    confirm the clear executed and succeeded. Events already shipped off-host before the clear
+    survive it, so history from before the wipe remains searchable centrally. Zero results
+    mean the clear failed, targeted logs other than Security, or the Security channel is not
+    collected from this host — the script content and file-deletion checks cover the
+    non-Security cases.
+  range: +/-1h
+  answer_sources:
+  - manual_review
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 1102
+      condition: selection
+    fields:
+      - EventID
+      - SubjectUserName
+- question: Were event log files deleted directly on this host?
+  context: >-
+    Deleting or replacing the .evtx files under the winevt Logs directory destroys log history
+    without running any clearing command, and operators who clear logs through an API often
+    remove files as a parallel step. File-deletion telemetry names the deleting process and
+    account — a deletion near the alert extends the indicator-removal picture beyond the
+    PowerShell call itself.
+  range: +/-24h
+  answer_sources:
+  - file_event
+  query: |
+    aggregation: false
+    logsource:
+      category: file_delete
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith: '.evtx'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - User
+- question: Were PowerShell security controls bypassed or weakened before this execution?
+  context: >-
+    Attackers often disable script scanning or logging before running a payload — AMSI
+    bypasses, execution-policy bypass flags, Defender preference changes, or a downgrade to
+    PowerShell version 2, which lacks script-block logging entirely. Any of these shortly
+    before a log-clearing block strengthens the anti-forensics reading, and a downgrade
+    attempt matters doubly here because it would blind the very channel this alert came from.
+  range: -1h
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: Were other defense tampering actions performed on this host?
+  context: >-
+    Log clearing rarely travels alone — wevtutil clears, shadow-copy deletion, recovery and
+    firewall changes, service stops, and antivirus tampering are commonly stacked in a single
+    cleanup pass. Multiple tampering commands from the same account in a short window show the
+    span of controls being degraded, and the per-tool counts here separate a one-off
+    administrative action from a systematic sweep. Judge matches against the security services
+    and admin tooling expected for this host's role.
+  range: +/-1h
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_tamper:
+        Image|endswith:
+          - '\wevtutil.exe'
+          - '\vssadmin.exe'
+          - '\bcdedit.exe'
+          - '\wbadmin.exe'
+          - '\netsh.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\powershell.exe'
+        CommandLine|contains:
+          - 'cl '
+          - 'clear-log'
+          - 'delete shadows'
+          - 'recoveryenabled'
+          - 'DisableRealtimeMonitoring'
+          - 'advfirewall'
+          - 'stop'
+          - 'delete'
+      condition: selection and selection_tamper
+    fields:
+      - Image
+      - User
+- question: What activity occurred on this host after the event logs were cleared?
+  context: >-
+    Attackers clear logs either to erase what already happened or to hide what comes next.
+    This survey of process activity in the hour after the clear shows what the host did once
+    its history was wiped — look for novel binaries, staging paths, and tooling that would
+    normally have been recorded into the now-cleared channels. The correlation window is
+    tunable; widen it if the host stays quiet.
+  range: +1h
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - User
+- question: What other PowerShell script activity occurred on this host around the alert?
+  context: >-
+    Attacker PowerShell rarely runs as a single block — reconnaissance, staging, and follow-on
+    tooling produce a cluster of script blocks in a short window, and the surrounding blocks
+    often carry the plaintext of what the clearing was covering for. On a default-configured
+    host only content matching Microsoft's suspicious-strings list is logged, so this window
+    may show a fragment of the session rather than all of it — the logging-coverage question
+    calibrates how complete this picture is.
+  range: +/-1h
+  answer_sources:
+  - ps_script
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - user.name
+      - log.level
+      - ScriptBlockText
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Log clearing is a cleanup step — the detections that fired before it are the best
+    surviving pointer to what was being cleaned up. Earlier alerts for credential access,
+    reconnaissance, defense tampering, or execution on this host reconstruct the timeline the
+    cleared logs no longer document, and they survive the clear because they were shipped
+    off-host when they fired.
+  range: -6h
+  answer_sources:
+  - alert
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Is event logging on this host currently intact, or is clearing still occurring?
+  context: >-
+    Confirm through the endpoint console or direct host inspection that the Event Log service
+    is running and the cleared channels are receiving fresh events — a channel that stays
+    empty means the host is still operating without an audit trail. The query lists this
+    user's PowerShell invocations on the host over the following day so that repeated clearing
+    or remediation commands stand out.
+  range: +24h
+  answer_sources:
+  - edr_console
+  - manual_review
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        User|expand: '%User%'
+        Image|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+      condition: selection
+    fields:
+    - CommandLine
+- question: Is full script block logging enabled on this host, or is only suspicious-content logging active?
+  context: >-
+    PowerShell logs script blocks at verbose level when the Script Block Logging policy is
+    enabled, and only Microsoft's automatically-flagged suspicious blocks (at warning level)
+    when it is not. On a warning-only host this alert shows a fragment of the host's
+    PowerShell activity, not all of it — surrounding benign-looking blocks may simply not have
+    been logged. The level distribution tells you how complete your view is, which calibrates
+    every other script-content question in this investigation.
+  range: -7d
+  answer_sources:
+  - ps_script
+  query: |
+    aggregation: true
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - log.level
+- always_include: true
+  question: Has this user produced log-clearing PowerShell content before, and does that history fit their role?
+  context: >-
+    The query mirrors the rule's own selection scoped to this user — the result is their
+    90-day history of producing this specific log-clearing content, aggregated by host, not
+    generic PowerShell use. An operations engineer who resets lab-machine logs monthly reads
+    differently from an account that has never produced this content before; weigh the count
+    against role and typical tooling, and remember that hosts logging only flagged content
+    contribute only the suspicious subset of their history.
+  range: -90d
+  answer_sources:
+  - ps_script
+  - organizational_knowledge
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: ps_script
+      definition: 'Requirements: Script Block Logging must be enabled'
+    detection:
+      selection:
+      - ScriptBlockText|contains:
+        - 'Clear-EventLog '
+        - 'Remove-EventLog '
+        - 'Limit-EventLog '
+        - 'Clear-WinEvent '
+      - ScriptBlockText|contains|all:
+        - Eventing.Reader.EventLogSession
+        - ClearLog
+      - ScriptBlockText|contains|all:
+        - Diagnostics.EventLog
+        - Clear
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: Which hosts have produced this log-clearing script content in the past 90 days, and is the alerting host among them?
+  context: >-
+    When the alert fires under a service principal, the account name attributes nothing, and
+    these channel events carry no process identity to pivot on — the meaningful pivot is the
+    content itself. Routine appearance across many hosts is deployment tooling or vendor
+    automation; content that has never appeared before, or only on this host, is the deviation
+    worth chasing. Only hosts shipping this channel — and, for non-flagged content, with full
+    script-block logging enabled — can appear, so absence elsewhere is weak evidence.
+  range: -90d
+  answer_sources:
+  - ps_script
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: ps_script
+      definition: 'Requirements: Script Block Logging must be enabled'
+    detection:
+      selection:
+      - ScriptBlockText|contains:
+        - 'Clear-EventLog '
+        - 'Remove-EventLog '
+        - 'Limit-EventLog '
+        - 'Clear-WinEvent '
+      - ScriptBlockText|contains|all:
+        - Eventing.Reader.EventLogSession
+        - ClearLog
+      - ScriptBlockText|contains|all:
+        - Diagnostics.EventLog
+        - Clear
+      condition: selection
+    fields:
+    - host.name
+- always_include: true
+  question: What else did this user do across the network around this time?
+  context: >-
+    A user-wide view across hosts in the alert window reveals whether this account was active
+    on multiple endpoints — clearing logs on several machines in one pass is how cleanup after
+    lateral movement looks. When the alert fired under SYSTEM or another service principal,
+    this pivot returns agent-telemetry noise; the fleet-wide script-content question carries
+    the meaningful answer in that case.
+  range: +/-1h
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- always_include: true
+  question: Did this log-clearing script content fire on other hosts in the same window?
+  context: >-
+    This is a fleet-wide match of the rule's own selection in the alert window, aggregated by
+    host. Several hosts producing the same clearing content within the hour points to pushed
+    automation or an orchestrated cleanup across machines; a single host points to a
+    host-local trigger. Coverage is policy-gated per host, so hosts not shipping this channel
+    cannot appear regardless of what ran on them.
+  range: +/-1h
+  answer_sources:
+  - ps_script
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: ps_script
+      definition: 'Requirements: Script Block Logging must be enabled'
+    detection:
+      selection:
+      - ScriptBlockText|contains:
+        - 'Clear-EventLog '
+        - 'Remove-EventLog '
+        - 'Limit-EventLog '
+        - 'Clear-WinEvent '
+      - ScriptBlockText|contains|all:
+        - Eventing.Reader.EventLogSession
+        - ClearLog
+      - ScriptBlockText|contains|all:
+        - Diagnostics.EventLog
+        - Clear
+      condition: selection
+    fields:
+    - host.name

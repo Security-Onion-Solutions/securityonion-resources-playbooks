@@ -1,0 +1,390 @@
+name: Uncommon Outbound Kerberos Connection
+id: 5814f37a-5349-4282-bada-d62c06dce345
+description: |
+  Detects an outbound network connection to port 88 (Kerberos) that was initiated by a process other than lsass.exe, common web browsers, or Tomcat. Windows normally routes Kerberos authentication through lsass.exe, so a direct connection to the key distribution center from another process is characteristic of tooling that implements the Kerberos protocol itself -- ticket requests, roasting, forging, or pass-the-ticket -- rather than the operating-system authentication stack.
+  Legitimate causes exist (some Java or line-of-business clients speak Kerberos directly and must be baselined), but an unexpected initiator making raw KDC connections is a strong lead for credential access or the setup of lateral movement via delegation abuse. Investigate the initiating process identity, whether the destination is a legitimate domain controller, and correlate with Kerberos ticket-request events to determine whether this is red-team tooling or a benign application with its own Kerberos client.
+type: detection
+detection_id: e54979bd-c5f9-4d6c-967b-a04b19ac4c74
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-10
+questions:
+- question: Do the destination and port match the rule's Kerberos criteria, and which process initiated the outbound connection?
+  context: >-
+    Confirm the alert by reviewing the destination IP, that the port is 88 (Kerberos), and that the direction is outbound
+    (Initiated maps to egress). Windows routes Kerberos authentication through lsass.exe, so an initiator that is not lsass.exe
+    (and not the browsers or Tomcat the rule excludes) is the anomaly. Note that endpoint network events carry the initiating
+    process while purely network-level telemetry does not; if the process fields are empty, this connection was observed
+    without host-agent context and the process must be recovered by correlating the source host and timestamp.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationIp|expand: '%dst_ip%'
+      condition: selection
+    fields:
+      - DestinationPort
+      - Initiated
+- question: Is this user and host expected to authenticate to the KDC through a non-lsass process?
+  context: >-
+    A domain controller / workstation whose applications legitimately speak Kerberos directly (some Java stacks, certain
+    backup or database clients) will trip this rule as routine. Knowing whether the user role and host function fit
+    direct-to-KDC Kerberos is often the fastest way to separate a baselined line-of-business client from operator tooling.
+    The query redisplays the triggering process context; on network-only telemetry the process fields may be empty.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Is the Kerberos destination a legitimate domain controller, or an unexpected host?
+  context: >-
+    Kerberos traffic should terminate on a domain controller acting as the KDC. A port-88 connection to a host that is not
+    a domain controller -- a workstation, a server outside the DC set, or an external address -- points to a rogue or
+    attacker-staged KDC or to tunnelled traffic. destination.domain is sparsely populated on network events because name
+    resolution is a separate lookup, so anchor on the destination IP and pivot through the host's DNS queries to recover the
+    name, then compare the IP against the known domain-controller inventory.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationIp|expand: '%dst_ip%'
+      condition: selection
+    fields:
+      - DestinationHostname
+      - DestinationPort
+- question: What Kerberos tickets or service principals did the initiating process request?
+  context: >-
+    Direct KDC tooling requests specific ticket material -- a TGT via asktgt, service tickets for targeted SPNs via
+    kerberoast or asktgs, or S4U delegation tickets. The initiating process command line, recovered by pivoting from the
+    connection to its process-creation event, often reveals the verb and target (a TGT request, a mass SPN harvest, or an
+    impersonation against a specific service). Renamed tooling may hide the verb; in that case the ticket-request events
+    on the KDC are the fallback source.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What is the initiating process -- a known-good signed binary, or an unknown or renamed executable?
+  context: >-
+    The rule allowlists lsass.exe, browsers, and Tomcat; every other initiator is unmodelled. Recover the process image
+    path, its original file name (which survives renaming), its hashes for reputation lookup, and the command line. A .NET
+    or native binary living in a user-writable path, an original file name that does not match the on-disk name, or a hash
+    with no reputation are all consistent with dropped credential-access tooling rather than a baselined Kerberos client.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Hashes
+      - CommandLine
+- question: What modules did the initiating process load, and do they indicate a hosted .NET assembly or a raw Kerberos client?
+  context: >-
+    Tools that talk to the KDC directly commonly run as .NET assemblies (loading the CLR modules clr.dll, mscoree.dll,
+    mscorlib) or link the Windows security provider (secur32.dll, sspicli.dll) to build Kerberos messages themselves. An
+    otherwise unremarkable process that pulls in the .NET runtime immediately before opening a port-88 connection fits the
+    execute-assembly pattern. Loaded modules carry a signature on the load event, so unsigned or unusually signed modules
+    stand out.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+      - SignatureStatus
+- question: What Kerberos ticket-request events for this account accompanied the connection, and what encryption type was used?
+  context: >-
+    A direct KDC connection should coincide with a TGT request (4768) or service-ticket request (4769) for the same account.
+    Service tickets issued with RC4 (encryption type 0x17) when the environment supports AES are the classic kerberoasting
+    and forged-ticket downgrade signal, and a burst of 4769 requests for many SPNs in quick succession indicates automated
+    SPN harvesting. Correlate the ticket events by the requesting account and the client address within a few minutes of
+    the connection; if Security ticket auditing is not collected, treat an empty result as a visibility gap.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        EventID:
+          - 4768
+          - 4769
+        TargetUserName|expand: '%User%'
+      condition: selection
+    fields:
+      - ServiceName
+      - TicketEncryptionType
+      - IpAddress
+      - EventID
+- question: What process spawned the initiating process, and is that parent chain expected?
+  context: >-
+    The parent process reveals how the Kerberos client was launched. A baselined line-of-business client is normally started
+    by services.exe or a known launcher, while tooling is often spawned by a shell, a remote-execution service, an Office
+    application, or a scripting host. Recover the parent and, if it is itself unusual, walk one more level up its own parent
+    lineage.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - Image
+      - CommandLine
+- question: Does this host normally connect to this destination on the Kerberos port?
+  context: >-
+    First-time or rare connections to a destination are more suspicious than routine communication. If this host has a long
+    history of port-88 traffic to this same domain controller the connection is likely a baselined client; zero or very low
+    historical counts to this destination point to newly introduced tooling or a rogue KDC. The port breakdown shows whether
+    the host talks to this destination for other services or only for Kerberos.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationIp|expand: '%dst_ip%'
+      condition: selection
+    fields:
+      - DestinationPort
+      - Image
+- question: When this host has previously matched the rule's pattern, what processes and users drove it, and does the current alert fit?
+  context: >-
+    The query mirrors the rule's selection structure scoped to this host, so the resulting program/user distribution reflects
+    how this specific direct-to-KDC pattern (not generic port-88 traffic) has historically run here. A recurring, known
+    application initiating the same connections is a baseline candidate; a new initiating process or an unexpected user
+    account is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        DestinationPort: 88
+        Initiated: 'true'
+      filter_main_lsass:
+        Image: C:\Windows\System32\lsass.exe
+      filter_optional_chrome:
+        Image:
+        - C:\Program Files (x86)\Google\Chrome\Application\chrome.exe
+        - C:\Program Files\Google\Chrome\Application\chrome.exe
+      filter_optional_firefox:
+        Image:
+        - C:\Program Files (x86)\Mozilla Firefox\firefox.exe
+        - C:\Program Files\Mozilla Firefox\firefox.exe
+      filter_optional_tomcat:
+        Image|endswith: \tomcat\bin\tomcat8.exe
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection and not 1 of filter_main_* and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - Image
+    - User
+- question: Which accounts may be compromised, and do any have elevated privileges?
+  context: >-
+    The severity of Kerberos ticket abuse depends on the accounts involved. A TGT or service ticket for a Domain Admin,
+    Enterprise Admin, krbtgt, or a broadly privileged service account requires incident escalation; a standard user account
+    may only need monitoring. Cross-reference the requesting user and any targeted service accounts against directory group
+    memberships.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Were outbound remote-access connections (RDP, SMB, WinRM, SSH) initiated from this host after this event?
+  context: >-
+    Kerberos ticket acquisition is typically followed by lateral movement using the obtained tickets. The query returns
+    outbound connections from this host to remote-access ports -- 3389 (RDP), 445 (SMB), 5985/5986 (WinRM), 22 (SSH) -- in
+    the hours after the event, with the originating image and user for each. Tickets replayed from a different machine will
+    not appear here, so also review logon activity on suspected targets for this account; if outbound network events are not
+    collected from this host, treat zero rows as a visibility gap rather than as evidence no movement occurred.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
+- question: Has this user account run remote-execution tooling against other hosts in the environment?
+  context: >-
+    Stolen or forged tickets let an account move to many systems. If the same user is also
+    invoking remote-execution tools (psexec, mstsc, ssh, plink, wmic) across multiple hosts
+    within a short window, the scope of compromise is larger than a single alert. Grouping by
+    host and binary shows how many systems the account has touched with movement tooling. If
+    this alert fired under SYSTEM, LOCAL SERVICE, NETWORK SERVICE, or a machine account (name
+    ending in $), this query intentionally returns nothing — a user pivot on a service principal
+    matches every host's background automation, not an actor; assess movement through the host-
+    and program-scoped questions instead.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      selection_lateral:
+        Image|endswith:
+        - \psexec.exe
+        - \psexec64.exe
+        - \mstsc.exe
+        - \ssh.exe
+        - \plink.exe
+        - \wmic.exe
+      filter_svcprin_builtin:
+        User:
+        - SYSTEM
+        - LOCAL SERVICE
+        - NETWORK SERVICE
+      filter_svcprin_machine:
+        User|endswith: $
+      condition: (selection and selection_lateral) and not 1 of filter_svcprin_*
+    fields:
+    - host.name
+    - Image
+- question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Alerts rarely occur in isolation. Activity around the connection reveals what led to it and what followed -- credential
+    tooling being dropped or run, reconnaissance, or persistence being installed. Aggregating by process and parent collapses
+    routine agent noise into high-count rows while novel parent-child pairs stand out at low counts.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host -- defense tampering, reconnaissance, or credential access -- may reveal the attack
+    stages that preceded the Kerberos activity and help reconstruct the timeline. Credential access followed by lateral
+    movement is a common ordering, and a preceding tooling-execution or LSASS-access alert would corroborate that this
+    connection is operator activity.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Have other hosts matched the rule's pattern in the past week, and does the distribution look like automation or one-off activity?
+  context: >-
+    The query mirrors the rule's selection structure with no host scope, giving a fleet-wide count of this direct-to-KDC
+    pattern rather than generic port-88 usage. Many hosts firing the same pattern points to a shared application or scripted
+    deployment worth baselining; one host or a small unrelated set points to targeted operator activity. Use the host spread
+    to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        DestinationPort: 88
+        Initiated: 'true'
+      filter_main_lsass:
+        Image: C:\Windows\System32\lsass.exe
+      filter_optional_chrome:
+        Image:
+        - C:\Program Files (x86)\Google\Chrome\Application\chrome.exe
+        - C:\Program Files\Google\Chrome\Application\chrome.exe
+      filter_optional_firefox:
+        Image:
+        - C:\Program Files (x86)\Mozilla Firefox\firefox.exe
+        - C:\Program Files\Mozilla Firefox\firefox.exe
+      filter_optional_tomcat:
+        Image|endswith: \tomcat\bin\tomcat8.exe
+      condition: selection and not 1 of filter_main_* and not 1 of filter_optional_*
+    fields:
+    - host.name

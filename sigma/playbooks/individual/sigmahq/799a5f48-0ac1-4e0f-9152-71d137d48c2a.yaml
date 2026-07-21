@@ -1,0 +1,310 @@
+name: Abusable DLL Potential Sideloading From Suspicious Location
+id: 2a6af4cb-1885-48ed-a766-9ad0e5b111b6
+description: |
+  Flags a process loading one of a set of frequently-abused DLLs (coreclr.dll, facesdk.dll, HPCustPartUI.dll,
+  libcef.dll, ZIPDLL.dll) from a location where that DLL is not normally found. The rule fires when the loaded
+  module name matches the abused-DLL list AND its path falls in EITHER a transient or world-writable directory
+  (Perflogs, Users\Public, Temporary Internet, Windows\Temp) OR a user-profile subfolder that combines a Users
+  path with Favorites, Favourites, Contacts, or Pictures. This pattern is characteristic of DLL sideloading, where
+  a legitimate signed executable is placed next to a malicious DLL carrying a trusted name so the DLL loads through
+  normal search order; legitimate software rarely loads these DLLs from user-writable staging directories.
+  Determine which application loaded the DLL, whether that binary is a genuine relocated copy or a masquerade, and
+  whether the module itself is signed and reputable.
+type: detection
+detection_id: 799a5f48-0ac1-4e0f-9152-71d137d48c2a
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-09
+questions:
+- question: Does the loaded module match what this rule detects — path, signature, and loading process?
+  context: >-
+    Confirm the alert is a true positive by reviewing the exact module path (ImageLoaded), its code-signature
+    status, and the process that loaded it against the rule's criteria. The rule fires when a known-abused DLL name
+    loads from EITHER a transient or world-writable directory (Perflogs, Users\Public, Temporary Internet,
+    Windows\Temp) OR a user-profile subfolder that pairs a Users path with Favorites, Favourites, Contacts, or
+    Pictures. Note which branch fired: a load from a user-profile subfolder narrows the investigation toward that
+    account, while a load from a shared world-writable path suggests staging usable by any process. DLL loads carry
+    a hash and signing status on the load event itself.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|endswith|expand: '%ImageLoaded%'
+      condition: selection
+    fields:
+      - ImageLoaded
+- question: Is this user and host expected to load third-party DLLs from user-writable directories?
+  context: >-
+    Legitimate administrative or developer activity can trigger this detection — some installers, portable apps, and
+    build tools stage and load DLLs from profile or temporary directories. Knowing whether the user role and host
+    function are consistent with running applications out of Public, Temp, or a profile subfolder is often the
+    fastest way to separate a routine load from a sideload.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Is the sideloaded DLL, and any other files this process wrote, still on disk for analysis?
+  context: >-
+    The loaded module and any companion payloads are the primary artifacts for deeper analysis — hash lookups,
+    sandbox submission, or content review. Checking whether the process wrote additional files, and whether they
+    persist, determines what can still be collected before cleanup. The DLL path itself is known from the alert;
+    this surfaces related writes by the loading process and its direct children.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What DLLs and other modules did this process load, and are any from non-canonical paths, unsigned, or from user-writable directories?
+  context: >-
+    The full set of modules a process loads tells the operator's story when the loading binary looks benign. Look
+    for DLLs from Public, Temp, Perflogs, or a profile subfolder alongside the flagged module — a common
+    side-loading pattern; unsigned modules where signed ones are expected; system DLL names loaded from non-system
+    paths (search-order hijacking); and modules the loading process does not normally pull in. Enumerating every
+    module loaded in the same window shows whether one abused DLL was an isolated event or part of a staged set.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+      - SignatureStatus
+      - Hashes
+- question: For the flagged module, what is its signing status, hash, and threat-intel reputation?
+  context: >-
+    Module reputation separates a routine third-party DLL from a sideloaded malicious one. A genuinely signed DLL
+    loaded from an unexpected location may still be legitimate (some installers stage signed DLLs); an unsigned DLL
+    carrying a trusted-looking filename with no valid signature is a masquerading indicator. The Hashes field on the
+    load event supports a threat-intelligence lookup directly, with no execution pivot needed. Signature statuses to
+    watch are Unsigned, Expired, Distrusted, and Invalid (tampered).
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Hashes
+      - Signed
+      - Signature
+      - SignatureStatus
+- question: What was the loading process doing at the time — decode its command line and working directory.
+  context: >-
+    An image_load event has no command line of its own, so pivot to the loading process to see how it was invoked.
+    The command line and current directory reveal whether the binary was launched from the same suspicious folder
+    as the DLL, handed arguments that point at a payload, or run headless as part of an automated chain. This scope
+    covers all executions of that binary on the host in the window, which for multi-step tooling can span several
+    sequential invocations that form one logical operation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What process spawned the loading process, and is that parent chain expected?
+  context: >-
+    The parent process shows how the loader was invoked. Legitimate usage often has predictable parents (explorer.exe
+    for user actions, services.exe for services, an installer or updater for staged applications). Parents such as
+    an Office application, a script host (wscript.exe, mshta.exe), or an archive utility can indicate the sideload
+    was delivered through a document or a dropped kit. If the parent linkage is not populated on the load event,
+    resolve it from the loading process record instead.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - Image
+      - CommandLine
+- question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Sideloading rarely occurs in isolation. Examining activity in the minutes around the load reveals what dropped
+    or launched the loader, what ran afterward, and whether the event is one step in a larger sequence. Aggregating
+    process activity by parent and child collapses repetitive agent noise into high-count rows while novel
+    parent-child pairs stand out at low counts — reconnaissance, staging, or follow-on execution.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Has this DLL been loaded on this host before, and under which processes?
+  context: >-
+    A first-time module load on a host is a stronger anomaly than a recurring one. If the same DLL has been loaded
+    by the same process binary repeatedly over the prior 90 days, this load is probably routine. If this is the
+    first occurrence, or the DLL has historically been loaded only by entirely different processes, the current load
+    is anomalous and consistent with newly staged sideloading.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|endswith|expand: '%ImageLoaded%'
+      condition: selection
+    fields:
+      - Image
+- question: Is this DLL being loaded on other hosts in the environment, and by which processes?
+  context: >-
+    Cross-host correlation surfaces how far the activity reaches. The same abused DLL loading on one host may be a
+    localized incident; the same name loading across many hosts from user-writable paths points to shared tooling or
+    distributed staging. Pay attention to the variety of loading processes: a single expected application is benign,
+    while the same DLL loaded by several unrelated binaries suggests the sideload pattern is spreading.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        ImageLoaded|endswith|expand: '%dll_basename%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Does this host normally run the loading process?
+  context: >-
+    A loader binary that has never been seen on a host is more notable than one that runs regularly. Zero or very
+    low historical counts indicate first-time or rare execution, which for a relocated or renamed executable running
+    from a writable directory is consistent with freshly deployed sideloading. Grouping by user shows whether the
+    binary is tied to a specific account.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host — defense tampering, reconnaissance, credential access, or a suspicious file
+    write — may reveal the stages that preceded the load and help reconstruct the timeline. Sideloading is typically
+    a mid-chain step: something dropped the loader and the DLL first, and something usually runs after the payload
+    initializes.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Which of the known-abused DLL names loaded, and from which flagged directory?
+  context: >-
+    The rule pairs a fixed list of frequently-sideloaded DLL names (coreclr.dll, facesdk.dll, HPCustPartUI.dll,
+    libcef.dll, ZIPDLL.dll) with a set of transient, world-writable, or user-profile directories. Identifying the
+    exact name and path that matched tells you which legitimate application the loader is imitating — .NET runtime
+    hosts for coreclr.dll, Chromium-based apps for libcef.dll, archive utilities for ZIPDLL.dll — and whether that
+    application would plausibly run from that directory on this host. A mismatch between the DLL's usual home and its
+    observed path is the core of the sideload assessment.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Image
+- question: Is the process that loaded this DLL the legitimate application that ships it, or a renamed or relocated copy?
+  context: >-
+    Sideloading works by placing a malicious DLL with a trusted name next to a legitimate, often signed executable
+    in a writable directory; the executable loads the attacker DLL through normal search order. Compare the loading
+    process image name and its path against where that binary legitimately belongs. A signed vendor binary running
+    from Public, Temp, or a profile subfolder rather than Program Files, loading a same-named DLL from beside it, is
+    the classic setup. Read the loading process record for its full path, command line, and working directory.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - CurrentDirectory

@@ -1,0 +1,347 @@
+name: Explorer NOUACCHECK Flag
+id: 72089c23-2a73-4cf9-a656-98b9d9af6afc
+description: |
+  Detects explorer.exe launched with the /NOUACCHECK flag, which tells Explorer to run every child process it spawns
+  without User Account Control consent prompts. The rule fires when an Image ending in \explorer.exe runs with /NOUACCHECK
+  on its command line, excluding the benign Domain Controller logon case where Explorer is started by the scheduled-task
+  svchost service (svchost.exe -k netsvcs -p -s Schedule). Setting /NOUACCHECK requires an already-elevated context, so on a
+  workstation it is a means of laundering an existing high-integrity token into an interactive shell whose children inherit
+  elevation silently. Investigation should confirm the flag is present, identify the elevated process that launched Explorer,
+  and determine what ran at high integrity afterward.
+type: detection
+detection_id: 534f2ef7-e8a2-4433-816d-c91bccde289b
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- question: Does the alerting event show explorer.exe started with the /NOUACCHECK flag on its command line?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule fires when both conditions hold together, an Image ending in \explorer.exe AND a command line containing /NOUACCHECK, with the Domain Controller scheduled-task logon parent excluded. Review the exact Image and command line in the triggering event and confirm the flag is literally present rather than a substring of an unrelated argument.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Is this user and host expected to relaunch Explorer with elevation-bypass flags?
+  context: Setting /NOUACCHECK requires an already-elevated context, so a routine interactive user session does not produce this pattern on its own. Some imaging, deployment, or administrative tooling restarts the shell during privileged setup. Knowing whether the user role and host function involve privileged shell relaunches is often the fastest path to separating a deployment artifact from an operator laundering an elevated token.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What elevated context launched this explorer.exe, and what command line and integrity level did the alerting Explorer carry?
+  context: The /NOUACCHECK launch only matters because Explorer was already running elevated when it was relaunched. Read the full command line of the alerting Explorer and the integrity level it ran at, then look at every explorer.exe started on this host in the surrounding window to see whether a normal interactive shell was killed and replaced with an elevated one. A medium-integrity user shell relaunching as a high-integrity /NOUACCHECK shell is the token-laundering step.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - IntegrityLevel
+      - ParentImage
+      - ParentCommandLine
+- question: What process spawned this explorer.exe, and was that parent already running with elevated privileges?
+  context: The /NOUACCHECK relaunch must come from an already-elevated process, so the parent identity is the pivot. A parent like cmd.exe, powershell.exe, an installer, or an unsigned binary running at high integrity points to an operator who first obtained elevation by another means and is now converting it into a persistent elevated shell. Walk up the tree to see what spawned the parent and how that process became elevated.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+      - IntegrityLevel
+- question: What ran at high or system integrity on this host in the half hour after the Explorer relaunch?
+  context: 'The /NOUACCHECK flag exists so that children of Explorer inherit elevation without consent prompts, so the payoff appears as high-integrity child processes shortly after the relaunch. Examining processes that ran at High or System integrity in the window after the alert reveals the objective: persistence installation, credential dumping, security-tool tampering, or access to protected resources. A relaunch with no elevated follow-on activity is weaker than one immediately followed by privileged action.'
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        IntegrityLevel:
+          - 'High'
+          - 'System'
+          - 'S-1-16-16384'
+          - 'S-1-16-12288'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - IntegrityLevel
+- question: Did the elevated parent or its successors receive special privileges consistent with a high-integrity logon?
+  context: An elevated process backing the /NOUACCHECK relaunch is granted sensitive privileges (SeDebugPrivilege, SeTcbPrivilege, SeBackupPrivilege, and similar) when its token is created. Special-privilege assignment events on this host around the alert time corroborate that a genuinely elevated token was in play rather than a benign substring match on the command line. If special-privilege logging is not collected in this environment, treat zero results as a visibility gap rather than evidence nothing elevated.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4672
+      condition: selection
+    fields:
+      - SubjectUserName
+      - PrivilegeList
+      - ProcessName
+- question: Were registry keys written by command line to set up a separate auto-elevated UAC bypass on this host?
+  context: The /NOUACCHECK flag is one elevation path, but an operator who is escalating often also primes the classic auto-elevated-binary bypasses that write a command into a registry key an elevated process reads. Command-line writes touching ms-settings, mscfile, exefile, Folder shell-open, Environment, or DelegateExecute keys point to a second bypass attempt and reveal the exact payload that would run elevated. Finding these alongside the Explorer relaunch indicates deliberate, repeated escalation rather than a single artifact.
+  range: -15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\reg.exe'
+          - '\powershell.exe'
+          - '\cmd.exe'
+        CommandLine|contains:
+          - 'ms-settings'
+          - 'mscfile'
+          - 'Classes\exefile'
+          - 'Classes\Folder'
+          - 'Environment'
+          - 'Shell\Open\command'
+          - 'DelegateExecute'
+      condition: selection
+    fields:
+      - CommandLine
+      - Image
+- question: Were UAC-related registry values modified on this host shortly before the Explorer relaunch?
+  context: 'Command-line evidence misses registry writes performed in-memory by a loaded module or a tool that does not shell out to reg.exe. Registry modification events targeting known auto-elevation keys, the shell-open command verbs under user-writable Classes hives, or the consent-prompt policy values under the system policies key, capture the bypass setup directly at the registry layer. A write to one of these keys in the minutes before the relaunch ties the elevation to a specific mechanism and payload. If registry modification events are not collected in this environment, treat zero results as a visibility gap.'
+  range: -15m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains:
+          - 'ms-settings\Shell\Open\command'
+          - 'mscfile\shell\open\command'
+          - 'Classes\exefile'
+          - 'Classes\Folder\shell'
+          - '\DelegateExecute'
+          - 'Policies\System\EnableLUA'
+          - 'Policies\System\ConsentPromptBehaviorAdmin'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- question: Did other privilege-escalation or UAC-bypass detections fire on this host around the same time?
+  context: Operators who attempt one elevation path often try several until one succeeds, especially if the host configuration blocks a given technique. Other privilege-escalation or bypass alerts on this host in the surrounding window confirm deliberate escalation activity rather than an isolated false positive, and the sequence of alerts helps reconstruct how elevation was first obtained before the Explorer relaunch.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - rule.name
+      - rule.uuid
+      - event.severity_label
+- question: Does this host normally run explorer.exe with the /NOUACCHECK flag?
+  context: A relaunch of Explorer with elevation-bypass flags is rare on most hosts, so historical frequency is a strong triage signal. Zero or very low counts over the prior 90 days indicate a first-time or unusual occurrence and raise the priority of the elevated follow-on activity; a host that produces this pattern routinely is more likely running deployment or imaging automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: \explorer.exe
+        CommandLine|contains: /NOUACCHECK
+      condition: selection
+    fields:
+      - User
+- question: When this host has previously fired the rule's pattern, what parents and users normally drive that activity, and does the current alert fit that pattern?
+  context: Even on hosts where the pattern appears, the parent and user distribution tells you whether this instance is routine. The query mirrors the rule's selection structure scoped to this host, so the resulting parent and user breakdown reflects how this specific /NOUACCHECK firing pattern has historically run here, not generic Explorer usage. A new parent process, an unexpected user account, or an unusual command structure is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \explorer.exe
+        CommandLine|contains: /NOUACCHECK
+      filter_dc_logon:
+      - ParentCommandLine: C:\Windows\system32\svchost.exe -k netsvcs -p -s Schedule
+      - ParentImage: C:\Windows\System32\svchost.exe
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection and not 1 of filter_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \explorer.exe
+        CommandLine|contains: /NOUACCHECK
+      filter_dc_logon:
+      - ParentCommandLine: C:\Windows\system32\svchost.exe -k netsvcs -p -s Schedule
+      - ParentImage: C:\Windows\System32\svchost.exe
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection and not 1 of filter_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \explorer.exe
+        CommandLine|contains: /NOUACCHECK
+      filter_dc_logon:
+      - ParentCommandLine: C:\Windows\system32\svchost.exe -k netsvcs -p -s Schedule
+      - ParentImage: C:\Windows\System32\svchost.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not 1 of filter_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or privileged action across multiple endpoints. If the same user triggered similar elevation activity on other hosts, the scope of the operation may be larger than this single endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \explorer.exe
+        CommandLine|contains: /NOUACCHECK
+      filter_dc_logon:
+      - ParentCommandLine: C:\Windows\system32\svchost.exe -k netsvcs -p -s Schedule
+      - ParentImage: C:\Windows\System32\svchost.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not 1 of filter_*) and _pb_scope
+    fields:
+    - host.name
+- question: Have other hosts fired the rule's pattern in the past week, and does the cross-host distribution look like consistent automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of the /NOUACCHECK firing pattern, not generic Explorer usage. Many hosts firing the same pattern points to scripted deployment or imaging automation; one host or a small unrelated set points to manual operator activity. Use the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \explorer.exe
+        CommandLine|contains: /NOUACCHECK
+      filter_dc_logon:
+      - ParentCommandLine: C:\Windows\system32\svchost.exe -k netsvcs -p -s Schedule
+      - ParentImage: C:\Windows\System32\svchost.exe
+      condition: selection and not 1 of filter_*
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: 'Alerts rarely happen in isolation. Earlier detections on the same host, defense tampering, reconnaissance, or credential access, may reveal the stages that preceded the elevation and help reconstruct the timeline. Look for patterns: how the parent process first obtained elevation, or tampering and reconnaissance that preceded the relaunch.'
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

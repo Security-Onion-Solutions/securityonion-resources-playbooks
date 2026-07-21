@@ -1,0 +1,382 @@
+name: Driver Added To Disallowed Images In HVCI - Registry
+id: a4be8b41-eff0-4164-b73b-d4f51ea80af7
+description: |
+  Detects modification of the HVCIDisallowedImages registry value under
+  HKLM\SYSTEM\CurrentControlSet\Control\CI. This value holds a list of driver file
+  names that hypervisor-protected code integrity (HVCI) refuses to load after the
+  next reboot. It exists as a mitigation control, but an actor with administrative
+  rights can add the file names of security or EDR kernel drivers to it, silently
+  preventing endpoint protection from starting once the machine restarts. Legitimate
+  writes are rare and typically tied to deliberate code-integrity administration.
+  The investigation should establish which driver names were written, what process
+  and account performed the write, whether other code-integrity or tamper-related
+  changes landed in the same session, and whether a reboot followed that put the
+  block into effect.
+type: detection
+detection_id: 555155a2-03bf-4fe7-af74-d176b3fdbe16
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-09
+questions:
+- question: Does the modified registry value match what this rule detects — a write to HVCIDisallowedImages under the Control\CI key?
+  context: Before investing investigation time, confirm the alert is a true positive.
+    Review the exact registry path (TargetObject) and confirm it falls under
+    \Control\CI\ and names HVCIDisallowedImages, then note the value data and the
+    writing process — the driver file names in the value data drive the rest of the
+    investigation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this user and host expected to modify code-integrity policy under Control\CI?
+  context: Writing to HKLM\SYSTEM\CurrentControlSet\Control\CI requires administrative
+    rights and is not part of routine software behavior — legitimate hits are usually
+    deliberate hardening or testing by platform engineers. User attribution is present
+    on most endpoint registry events; when the account is SYSTEM or a machine account,
+    pivot on the writing process (Image) instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: What exactly was written to this code-integrity value, and why is this location security-relevant?
+  context: HVCIDisallowedImages under Control\CI registers driver file names that
+    hypervisor-enforced code integrity refuses to load at boot. Unlike Run-key
+    persistence the payoff is subtractive — the named drivers, most valuably the
+    kernel drivers of anti-malware and EDR products, simply never start after the
+    next reboot. The write requires HVCI to be enabled and takes effect only after
+    a restart, so the value data and any following reboot together determine impact.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Which driver file names were written to the HVCIDisallowedImages value, and do they belong to security tooling?
+  context: The value data holds the list of driver file names to block and can carry
+    multiple names. Compare each name against the kernel drivers of the
+    endpoint-protection stack deployed on this host — those are the high-value targets
+    for this technique, though the built-in anti-malware minifilter (WdFilter.sys) is
+    not affected by this list. If the Details field is empty (multi-string data is not
+    always captured), read the value directly from the host.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- question: Does the modification persist — has the value been re-modified or extended since the alert?
+  context: Endpoint registry telemetry records value modifications but no key or value
+    deletions, so cleanup by the actor is not directly observable. Judge persistence
+    from the value's re-modification history over the following day and from whether
+    the block took effect after a reboot; repeated writes that add more driver names
+    indicate iterative tampering rather than a one-off configuration change.
+  range: +24h
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- question: What process wrote this registry value, and what parent chain launched it?
+  context: The registry event carries the writing process; its process-creation record
+    shows the full command line and parent. reg.exe or PowerShell under an interactive
+    shell points to hands-on activity, while a signed installer or management-agent
+    service writing the value points to software deployment. Walk up the parent chain
+    if the immediate parent is itself a script host or shell.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What other processes did the writing process spawn afterward?
+  context: A process that tampers with code-integrity configuration often continues
+    with related actions — forcing a restart, disabling other protections, or staging
+    a driver to load once the block is active. Children of the writing process in the
+    following hours reveal that progression.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Were other code-integrity values under Control\CI modified on this host?
+  context: The same key holds other values that weaken enforcement — HvciAuditMode and
+    UMCIAuditMode switch kernel- and user-mode code integrity to audit-only (events are
+    logged but nothing is blocked), and Enabled toggles enforcement outright. An actor
+    neutering driver protection frequently touches more than one of these in the same
+    session, so any sibling write near the alert materially raises confidence.
+  range: +/-24h
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains: '\Control\CI\'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- question: Were other registry modifications made on this host in the same session?
+  context: Actors who tamper with driver enforcement often change several settings
+    together — disabling security-tool policies, adding persistence run keys, or
+    altering boot configuration. Grouping all registry writes in the surrounding
+    window by key path and writing process shows whether this write was part of a
+    wider configuration push. If the host is registry-noisy, narrow to the alerting
+    writing process or to security-relevant hive paths (Run, Services, Policies,
+    Winlogon).
+  range: +/-30m
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - User
+- question: Was a restart initiated on this host after the value was written?
+  context: HVCIDisallowedImages only takes effect at boot, so the actor must restart
+    the machine before the named drivers stop loading. A shutdown /r, Restart-Computer,
+    or similar restart command shortly after the write is the activation step; no
+    restart yet means the block is staged but not live, which changes containment
+    options.
+  range: +24h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_shutdown:
+        Image|endswith: '\shutdown.exe'
+      selection_cmdline:
+        CommandLine|contains:
+          - 'Restart-Computer'
+          - 'shutdown /r'
+          - 'shutdown -r'
+      condition: selection_host and (selection_shutdown or selection_cmdline)
+    fields:
+      - Image
+      - CommandLine
+      - User
+- question: Which kernel drivers loaded on this host after the alert?
+  context: Once the host reboots with the block in place, the named drivers never load.
+    Compare the post-alert driver-load inventory against the file names written to the
+    value — a security driver that loaded on every previous boot and is absent after
+    the restart confirms the block took effect. Signature data also distinguishes
+    established vendor drivers from unsigned or unusual entries loaded in the same
+    window.
+  range: +7d
+  query: |
+    aggregation: true
+    logsource:
+      category: driver_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signature
+- question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Aggregating processes by image and parent
+    collapses repetitive agent telemetry into high-count rows while novel parent-child
+    pairs stand out at low counts — reconnaissance, privilege escalation, or tamper
+    tooling running alongside the registry write provides the immediate context for
+    this event.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — privilege escalation, defense
+    tampering, vulnerable-driver activity — may reveal the stages that preceded this
+    write and help reconstruct the timeline. Code-integrity tampering usually arrives
+    after an actor already holds administrative rights, so the escalation path is
+    often visible in the preceding alerts.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Has the HVCIDisallowedImages value been modified before on this host?
+  context: This value should almost never change on a production system. Zero prior
+    history makes the current write a first-time change worth chasing; repeated
+    historical writes by the same management tooling with identical value data point
+    to a sanctioned configuration mechanism.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - Details
+      - Image
+- question: Does this host normally run the process that performed the write?
+  context: A writing binary that has never executed on this host before is more
+    suspicious than an established administration tool. Zero or very low historical
+    counts indicate first-time or rare execution and shift attention to how the
+    binary arrived on the host.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: When this host has previously fired the rule's pattern, which writing processes and users normally drive it, and does the current alert fit?
+  context: The query mirrors the rule's selection structure scoped to this host, so
+    the result reflects how writes to this code-integrity value (not generic registry
+    activity) have historically occurred here. A new writing process or an unexpected
+    account is the deviation worth chasing; a match to an established management-tool
+    pattern supports a sanctioned change.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        TargetObject|contains|all:
+        - \Control\CI\
+        - \HVCIDisallowedImages
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - Image
+    - User
+- question: Have other hosts fired this rule's pattern in the past week, and does the distribution point to automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the
+    result is a fleet-wide count of writes to this code-integrity value. Many hosts
+    writing the same value in a tight window points to a policy rollout or
+    security-tooling deployment; a single host, or a small unrelated set, points to
+    manual operator activity. Use host distribution and value-data consistency to
+    calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        TargetObject|contains|all:
+        - \Control\CI\
+        - \HVCIDisallowedImages
+      condition: selection
+    fields:
+    - host.name

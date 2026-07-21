@@ -1,0 +1,390 @@
+name: Certificate Exported Via PowerShell
+id: aaee007a-e0e7-4baa-8040-6d5c75b3dea3
+description: |
+  Detects PowerShell command lines containing Export-PfxCertificate or Export-Certificate, the cmdlets used to write a
+  certificate (and, for PFX, its associated private key) out of the local certificate store to a file. Administrators
+  legitimately export certificates during PKI maintenance, backup, and migration, so a single export is not inherently
+  malicious. The same cmdlets are used to steal code-signing, authentication, or machine certificates and their private
+  keys for offline use, certificate-based authentication as the victim, or token forgery; private-key export requires the
+  certificate to be marked exportable. Investigation should confirm which store and certificate were targeted, whether the
+  private key was included, who and what drove the export, and whether the resulting file was staged or moved off-host.
+type: detection
+detection_id: 9e716b33-63b2-46da-86a4-bd3c3b9b5dfb
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the command line contain Export-PfxCertificate or Export-Certificate as this rule detects?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the exact command line.
+    The rule fires when the command line contains either Export-PfxCertificate or Export-Certificate; note which cmdlet ran
+    and the full parameters, since Export-PfxCertificate can carry the private key while Export-Certificate exports only the
+    public certificate.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Is this user and host expected to export certificates from the local store?
+  context: Legitimate certificate exports are normally performed by administrators or PKI automation on a small set of
+    servers. A certificate export from a workstation, a standard user account, or a service-account context that has no PKI
+    role is a stronger indicator of credential theft than the same command on a managed CA or build host.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Which certificate and store were targeted, and was the private key included in the export?
+  context: Different export targets carry different risk. Export-PfxCertificate against Cert:\LocalMachine\My or
+    Cert:\CurrentUser\My pulls the private key (when the certificate is marked exportable), enabling authentication or
+    signing as the victim; Export-Certificate writes only the public certificate. Identify the store path, thumbprint, and
+    output file path from the command line, and note whether a password or -ProtectTo AD principal was set, which determines
+    how the exported file can be reused.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Was the export command encoded or obfuscated, and what does the full invocation decode to?
+  context: Export cmdlets are often staged through a wrapper that enumerates the store and supplies a plaintext password via
+    ConvertTo-SecureString -AsPlainText. Attackers may also wrap the whole sequence in -EncodedCommand, string concatenation,
+    or backtick escaping to hide the store path, thumbprint, and output file. Decode the command line to recover the actual
+    certificate selection, the destination file, and any embedded password.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Which identity does the exported certificate authenticate, and does it carry elevated or signing privilege?
+  context: The severity of a certificate export depends on what the certificate represents. A machine or domain-controller
+    certificate, a code-signing certificate, or an ADFS token-signing certificate enables impersonation, trusted code
+    signing, or federated-token forgery and warrants escalation; a self-signed test certificate may only need monitoring.
+    Cross-reference the exported certificate's subject and EKU with directory and PKI records to determine exposure.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What process spawned this PowerShell instance, and is that parent chain expected?
+  context: The parent process reveals how the export was invoked. PKI maintenance typically runs PowerShell from an
+    interactive admin shell or a known scheduled task. A web server, remote-execution service, or scripting host
+    (w3wp.exe, wsmprovhost.exe, mshta.exe, wscript.exe) spawning the PowerShell that exports a certificate points to a
+    webshell or remote-operator path rather than routine administration.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: When this host has previously run a certificate export, what parents and users normally drove it, and does the
+    current alert fit that pattern?
+  context: Even on hosts where certificate export is routine, the parent process and user driving it are usually stable. The
+    query mirrors the rule's selection scoped to this host, so the resulting parent/user distribution reflects how this
+    specific export pattern has historically run here. A new parent process, an unexpected user account, or a first-ever
+    occurrence is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        CommandLine|contains:
+        - 'Export-PfxCertificate '
+        - 'Export-Certificate '
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Did the process that ran the export also touch private-key material on disk around the same time?
+  context: Certificate export from the store is one path to private keys; operators often pair it with direct access to
+    on-disk key material. Look for the exporting process reading or writing files under the CAPI and CNG key directories
+    (%APPDATA%\Microsoft\Crypto\RSA\ and %APPDATA%\Microsoft\Crypto\Keys\), the personal certificate store path
+    (%APPDATA%\Microsoft\SystemCertificates\My\Certificates\), or files with .pfx, .pem, .pvk, or .der extensions. Such
+    file activity confirms the export was part of broader key collection rather than a one-off public-certificate export.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_keydirs:
+        TargetFilename|contains:
+        - '\Microsoft\Crypto\RSA\'
+        - '\Microsoft\Crypto\Keys\'
+        - '\Microsoft\SystemCertificates\'
+      selection_ext:
+        TargetFilename|endswith:
+        - '.pfx'
+        - '.pem'
+        - '.pvk'
+        - '.der'
+      condition: selection_host and (selection_keydirs or selection_ext)
+    fields:
+      - TargetFilename
+      - Image
+- question: Did the certificate client lifecycle log record an export event for the targeted certificate on this host?
+  context: Beyond process telemetry, Windows records certificate exports in the certificate client lifecycle channel as a
+    distinct event independent of how the export was launched. Correlating a lifecycle export entry with the alert window
+    confirms the export completed and identifies the certificate by thumbprint even if the command line was obfuscated. If
+    this channel is not collected in this environment, treat the absence of an entry as a visibility gap, not as evidence the
+    export failed.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: certificateservicesclient-lifecycle-system
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 1007
+      condition: selection
+    fields:
+      - Subject
+      - UserData
+- question: Did PowerShell script block logging capture the full export script content?
+  context: Windows Event ID 4104 records the deobfuscated script that PowerShell actually executed, even when the command
+    line was encoded. This is the ground-truth source for the certificate selection logic, the output file path, and any
+    inline password, bypassing wrapper obfuscation. If PowerShell operational logs are not ingested in this environment,
+    treat zero results as a visibility gap rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Were PowerShell or endpoint security controls bypassed or weakened before this export?
+  context: Operators often disable or downgrade PowerShell and endpoint protections before staging credential theft. Common
+    precursors include AMSI bypass, execution-policy changes, PowerShell version downgrade to v2, and Defender preference
+    changes. Finding these shortly before the export strengthens the case that the certificate export was hands-on-keyboard
+    activity rather than routine administration.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: Were outbound remote-access connections (RDP, SMB, WinRM, SSH) initiated from this host after
+    this event?
+  context: Credential theft is typically followed by lateral movement. The query returns outbound connections
+    from this host to remote-access ports -- 3389 (RDP), 445 (SMB/PsExec), 5985/5986 (WinRM), 22 (SSH)
+    -- in the hours after the event; the originating Image and User show what drove each connection. Two
+    limits to keep in mind -- credentials exfiltrated and replayed from another machine will not appear
+    here (check security 4624 logons on suspected targets for this account and any accounts with sessions
+    on this host), and the query requires Sysmon network telemetry (EID 3); if that is not collected from
+    this host, treat zero rows as a visibility gap, not as evidence no movement occurred.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        CommandLine|contains:
+        - 'Export-PfxCertificate '
+        - 'Export-Certificate '
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        CommandLine|contains:
+        - 'Export-PfxCertificate '
+        - 'Export-Certificate '
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Have other hosts run a certificate export in the past week, and does the cross-host distribution look like
+    automation or one-off activity?
+  context: The query mirrors the rule's selection with no host scope, so the result is a fleet-wide count of certificate
+    exports. Many hosts running the same export pattern points to scripted PKI maintenance or vendor automation; one host
+    or a small unrelated set points to manual operator activity. Use the host distribution to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        CommandLine|contains:
+        - 'Export-PfxCertificate '
+        - 'Export-Certificate '
+      condition: selection
+    fields:
+    - host.name
+- question: What other tools ran on this host around the same time as the export?
+  context: Certificate theft is usually one stage of a longer operation. Activity surrounding the export may reveal store
+    enumeration, credential dumping, reconnaissance, or data staging that provides broader context. Look for other
+    credential-access tooling, archive utilities, or unexpected interpreters running in the same window.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+- question: What other activity occurred on this host around the time of the alert?
+  context: Examining the broader process activity around the alert reveals the immediate context -- what led up to the
+    certificate export and what followed. Novel parent-child process pairs at low counts are what to scan for; repetitive
+    agent and OS telemetry collapses into high-count rows. Look for store enumeration, credential-dumping tools, or archive
+    utilities running alongside the export.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host -- defense tampering, reconnaissance, or
+    initial-access activity -- may reveal the stages that preceded the certificate export and help reconstruct the full
+    timeline. Credential access following earlier defense tampering or remote execution is a meaningful sequence.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

@@ -1,0 +1,342 @@
+name: Setup16.EXE Execution With Custom .Lst File
+id: 95f99dd2-6b22-4b7d-acd1-ee03c261a605
+description: |
+  Detects setup16.exe (a legacy InstallShield-era Windows setup binary in SysWOW64) running with a ' -m ' argument that points it at a custom .lst response file, while the child it spawns does NOT come from the legitimate C:\~MSSETUP.T\ extraction path. A .lst file can carry a RunCmd-style stanza that names an arbitrary program for setup16 to execute, so the real command never appears on setup16's own command line — making this a proxy-execution vector that defeats naive command-line monitoring. On modern systems setup16 is essentially never used legitimately, so the investigation should determine which child command setup16 launched, where the .lst file came from, and whether the activity ties to authorized maintenance or to an operator using a living-off-the-land binary.
+type: detection
+detection_id: 99c8be4f-3087-4f9f-9c24-8c7e257b442e
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Did setup16.exe run with a ' -m ' argument pointing at a custom .lst file, and is the spawned child outside the C:\~MSSETUP.T\ extraction path?
+  context: Confirm the alert is a true positive before investing time. The rule fires when the parent is setup16.exe in SysWOW64, its command line contains ' -m ' (the marker for a response/answer .lst file), AND the child it spawned does not start in C:\~MSSETUP.T\ — the normal install-extraction directory. Review the parent command line and the child image path together; a child running from a user-writable or unexpected location is the load-bearing part of the match.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+- question: Is this user and host expected to run the legacy setup16.exe installer utility?
+  context: On modern Windows, setup16.exe is practically never invoked, so legitimate use is rare and usually tied to ancient InstallShield-based installers. Knowing whether this host's function (e.g., a software-packaging or legacy-app workstation) and this user's role make setup16 plausible is often the fastest way to separate a true positive from an obscure but authorized install.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What was setup16.exe's full command line, and which .lst response file did the ' -m ' argument point at?
+  context: The parent's command line names the .lst file that drives setup16's actions. Decode the full argument string to recover the path to the .lst (often under %TEMP%, %APPDATA%, or %PUBLIC% if attacker-supplied) so it can be retrieved and inspected for the RunCmd-style stanza that specifies the embedded program. The actual executed command lives inside that file, not on the command line.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- question: What child process did setup16.exe spawn, and what is that child's full command line?
+  context: Because the real instruction is hidden in the .lst file, the spawned child process is the clearest evidence of what setup16 actually executed. Inspect the child image and its arguments — script interpreters (powershell.exe, cmd.exe, wscript.exe), rundll32, or any non-Microsoft binary launched this way is the operational payload of the proxy execution. The child running from outside C:\~MSSETUP.T\ is what the rule keyed on.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - CurrentDirectory
+- question: Where did the .lst file come from — was it written to a user-writable directory shortly before setup16 ran?
+  context: A response file dropped to %TEMP%, %APPDATA%, %PUBLIC%, or C:\ProgramData and then handed to setup16 indicates attacker staging rather than a vendor install (which would extract to C:\~MSSETUP.T\). Look for a recent file write of a .lst (or the binary it references) to a user-writable path on this host, and correlate its write time to the setup16 execution.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_lst:
+        TargetFilename|endswith: '.lst'
+      condition: selection and selection_lst
+    fields:
+      - TargetFilename
+      - Image
+      - User
+- question: What modules did the setup16-spawned child load, and were any loaded from user-writable or non-system paths?
+  context: The proxy-executed child may side-load a DLL or load a module from an unusual location, which is the hijacked execution flow this technique describes. Modules loaded from %TEMP%, %APPDATA%, the install staging directory, or other user-writable paths — rather than System32/SysWOW64 — point to an attacker-supplied component rather than a normal install. If image_load events are not collected in this environment, treat zero results as a visibility gap.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_path:
+        ImageLoaded|contains:
+          - '\Users\'
+          - '\Temp\'
+          - '\AppData\'
+          - '\ProgramData\'
+          - '\Public\'
+      condition: selection and selection_path
+    fields:
+      - Image
+      - ImageLoaded
+      - User
+- question: Does the .lst file or the executed binary carry a Mark-of-the-Web Zone.Identifier stream indicating it was downloaded?
+  context: A Zone.Identifier alternate data stream on the response file or the binary it references shows the artifact
+    arrived from outside the host — a browser download, email attachment, or remote copy — rather than being placed by
+    a trusted installer. Files staged for living-off-the-land execution frequently retain this download mark. Elastic
+    Defend records the Zone.Identifier write as an ordinary file-creation event on the carrier file, with the stream
+    name in the path, so this is a wide host-scoped window rather than a narrow one — MOTW writes are comparatively
+    sparse. If no matching write appears, treat that as a visibility gap rather than evidence the artifact was placed
+    locally.
+  range: -30d
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_motw:
+        TargetFilename|contains: ':Zone.Identifier'
+      condition: selection and selection_motw
+    fields:
+      - TargetFilename
+      - Image
+      - User
+- question: Has setup16.exe ever spawned this child binary on this host before?
+  context: setup16 spawning a child from outside the install-extraction path is, by itself, unusual on a modern system. A historical count of zero or near-zero for this specific setup16-to-child pairing on the host confirms a novel spawning relationship; a non-trivial prior history would point toward a recurring legacy-install process worth confirming with the owning team.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What other child processes did setup16.exe spawn on this host?
+  context: A single .lst-driven invocation can chain multiple commands. Enumerating every child of setup16 on this host reveals whether the proxy execution launched additional tools — reconnaissance, credential access, or further staging — beyond the one that tripped the alert, exposing the full scope of activity routed through this binary.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: What other activity occurred around the setup16.exe execution on this host?
+  context: Beyond child processes, the surrounding window may contain the file write that staged the .lst, network connections that fetched a payload, or follow-on tooling. Pulling host activity tightly around the setup16 execution helps reconstruct how the .lst arrived and what the embedded command went on to do.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Is the setup16.exe parent spawning this child binary on other hosts in the environment?
+  context: The same setup16-driven spawning pattern appearing on multiple hosts suggests a pushed or staged operation rather than a one-off, since legitimate use of this legacy binary is rare and isolated. A fleet-wide view calibrates severity and identifies the scope of any compromise.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+      - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage: C:\Windows\SysWOW64\setup16.exe
+        ParentCommandLine|contains: ' -m '
+      filter_optional_valid_path:
+        Image|startswith: C:\~MSSETUP.T\
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage: C:\Windows\SysWOW64\setup16.exe
+        ParentCommandLine|contains: ' -m '
+      filter_optional_valid_path:
+        Image|startswith: C:\~MSSETUP.T\
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around the time of this alert?
+  context: Tracking the user's activity across all hosts in the surrounding window reveals lateral movement or activity spanning multiple endpoints. If the same user drove similar living-off-the-land execution elsewhere, the scope of compromise is larger than this single host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage: C:\Windows\SysWOW64\setup16.exe
+        ParentCommandLine|contains: ' -m '
+      filter_optional_valid_path:
+        Image|startswith: C:\~MSSETUP.T\
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining what ran before and after on this host reveals the immediate context — what staged the .lst, what the embedded command did next, and whether this is part of a larger sequence such as reconnaissance, privilege escalation, or persistence.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — defense tampering, reconnaissance, credential access, or staging activity — may reveal the attack stages that preceded the setup16 proxy execution and help reconstruct the full timeline leading up to it.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Were other process-based persistence mechanisms installed on this host around the same time?
+  context: Proxy execution via a legacy installer can be a foothold step, and attackers rarely rely on a single persistence mechanism. Surfacing scheduled tasks, services, registry, BITS, or WMIC activity in the surrounding window shows whether the embedded command went on to install backup persistence — intentional stacking rather than an isolated install.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine

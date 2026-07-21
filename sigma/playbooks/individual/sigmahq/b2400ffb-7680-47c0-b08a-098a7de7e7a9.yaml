@@ -1,0 +1,443 @@
+name: Pingback Backdoor Activity
+id: 085f2cfd-0c64-4090-bba4-3989a9ec2957
+description: |
+  Detects a process spawned by updata.exe whose command line carries "config", "msdtc", "start" and "auto"
+  together — the parameter combination used to set the Windows Distributed Transaction Coordinator (msdtc)
+  service to start automatically. Setting msdtc to auto-start is the persistence half of a DLL search-order
+  hijack (T1574.001) — the service binary itself is signed and legitimate, and the planted library it
+  side-loads from its search path (oci.dll, in the Pingback family) is what actually executes, at every boot.
+  The alerting command is therefore the installer's footprint, not the payload. The investigation should
+  establish what wrote a DLL into the service's search path, which modules msdtc.exe subsequently loaded and
+  whether they are signed, whether the service start value in the registry was in fact changed, and what
+  updata.exe is and how it arrived on the host.
+type: detection
+detection_id: b2400ffb-7680-47c0-b08a-098a7de7e7a9
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-16
+questions:
+- question: Does the alerting command line contain config, msdtc, start and auto together, and is its parent updata.exe?
+  context: >-
+    The rule fires only when all four command-line tokens are present at once and the parent process name ends in
+    updata.exe. Read the full command line and the parent path from the event before spending time on the rest of
+    the investigation, and note which utility actually ran the configuration (sc.exe, powershell.exe or another
+    service-control wrapper) — the rule constrains the arguments, not the child binary.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - CommandLine
+- question: Is this user and host expected to reconfigure the msdtc service start type?
+  context: >-
+    Changing a Windows service to automatic start is a routine administrative action on some servers and a
+    non-event on most workstations. Establish whether this host runs distributed-transaction workloads at all and
+    whether the account is one that performs service configuration, before weighing the parent process.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What is updata.exe, and what started it?
+  context: >-
+    The parent-child relationship is the core signal here — a binary named updata.exe reconfiguring a system
+    service is what separates this from routine administration. Retrieve the parent's own creation event to see
+    its full path, its command line and its grandparent, which shows whether it arrived through an installer, a
+    browser download, a script interpreter or an existing service.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What other child processes did the same updata.exe instance spawn?
+  context: >-
+    An installer that configures service persistence usually performs other steps in the same window — copying a
+    library into place, stopping and restarting the service, deleting its own dropper. The siblings of the
+    alerting process show the rest of that sequence and often name the file that was planted.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Does any administrator or software-deployment owner recall this msdtc reconfiguration?
+  context: >-
+    A binary named like an updater is exactly what a legitimate deployment agent looks like, so confirm with the
+    team that owns software distribution on this host whether a package was pushed at this time and whether it is
+    expected to touch service start types. If nobody recalls it, ask what product updata.exe belongs to and how it
+    was installed.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What exactly was changed about the msdtc service, and were other service settings touched in the same window?
+  context: >-
+    Service reconfiguration frequently spans several sequential commands that form one logical operation — set the
+    start type, change the binary path or account, then start the service. Reading every msdtc-referencing command
+    on the host around the alert shows the whole operation rather than the single invocation that matched the rule.
+    Pay attention to any command that also stops or restarts the service, since a restart is what forces the
+    library reload.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains: msdtc
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - CurrentDirectory
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: Was the msdtc service start value actually written in the registry, and what value was set?
+  context: >-
+    The command line states an intent; the registry write is the effect. Service start types live under the
+    service's key in the control set, where a Start value of 2 means automatic and 3 means manual. Confirming the
+    write and its value separates a command that succeeded from one that failed or was blocked, and any change to
+    ImagePath or the service account in the same window is a second execution-flow modification worth reading.
+    Compare what is there now against the expected baseline for msdtc on a comparable host.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains: \Services\MSDTC
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+  answer_sources:
+  - manual_review
+- question: Was a DLL written into a Windows system directory on this host around the alert, and what wrote it?
+  context: >-
+    Search-order hijacking needs a library sitting somewhere the trusted service will look — most often the Windows
+    system directory itself, where the planted file inherits the directory's apparent legitimacy. Correlate the
+    write time against the service reconfiguration and the parent's execution window; a DLL created minutes before
+    the start type was changed, by a non-installer process, is the concrete evidence thread. File writes carry no
+    hash, so take the path and pivot to the module-load and later execution events for identity.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith: .dll
+      selection_paths:
+        TargetFilename|contains:
+          - \Windows\System32\
+          - \Windows\SysWOW64\
+      condition: selection and selection_paths
+    fields:
+      - TargetFilename
+      - Image
+      - ProcessGuid
+  answer_sources:
+  - file_event
+- question: Which libraries has msdtc.exe loaded on this host, and are any unsigned or loaded from outside the system directory?
+  context: >-
+    This is the question the rest of the chain exists to set up — the service binary is signed and expected, so the
+    planted library is the only place the payload is visible. Module-load events carry the loaded path, signature
+    status, signer and hash, so an unsigned or invalidly-signed module, or one loaded from a directory other than
+    the known-safe system paths, identifies the hijack directly. Check the module hashes against a known-good
+    baseline for this service; a familiar filename such as oci.dll with an unfamiliar hash is substitution rather
+    than a phantom insertion. Development and vendor tooling legitimately loads modules from non-standard
+    directories, but msdtc.exe is not such a process.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: \msdtc.exe
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+      - SignatureStatus
+      - Hashes
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: Did msdtc.exe make outbound network connections on this host after the service was reconfigured?
+  context: >-
+    A service that only coordinates local transactions has a narrow and predictable network profile, so egress from
+    msdtc.exe to an external address is a deviation worth chasing. Note a real visibility limit before reading the
+    result — a covert channel built on ICMP echo traffic opens no port and creates no socket, so it does not appear
+    as a connection event and will not be listed by local connection tools. Zero results here therefore mean the
+    channel is not observable in this telemetry, not that no communication occurred; confirming an ICMP-based
+    channel needs packet-level capture or endpoint tooling that records raw sockets.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: \msdtc.exe
+      condition: selection
+    fields:
+      - DestinationIp
+      - Initiated
+  answer_sources:
+  - network_connection
+  - edr_console
+- question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Aggregating every process launch on the host by binary and parent collapses routine agent telemetry into a few
+    high-count rows and leaves novel parent-child pairs standing out at low counts. Look for the delivery step that
+    preceded updata.exe and for any hands-on-keyboard tooling that followed the service change.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Persistence is rarely the first stage on a host. Earlier detections covering delivery, execution of a dropper,
+    or defense tampering help reconstruct how updata.exe came to run and whether the service change is the tail of a
+    longer sequence.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+  answer_sources:
+  - alert
+- always_include: true
+  question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: >-
+    The query mirrors the rule's selection scoped to this account, so the result is the account's 90-day history of
+    updata.exe driving msdtc auto-start configuration — not generic service administration. An account that has
+    never produced this pattern is the deviation to chase; one that produces it on a schedule points at a deployment
+    role. Weigh the count against what this account is supposed to do.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        ParentImage|endswith: \updata.exe
+        CommandLine|contains|all:
+        - config
+        - msdtc
+        - start
+        - auto
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+- always_include: true
+  question: Has updata.exe driven this msdtc configuration pattern before, on this host or elsewhere?
+  context: >-
+    When the alert fires under a service principal, account identity attributes nothing and the launch mechanism is
+    the meaningful pivot. This query mirrors the rule's selection scoped to the alerting parent, giving the 90-day
+    history of updata.exe producing this exact pattern, grouped by host. A parent that already accounts for
+    thousands of prior events is vendor or platform automation; a first appearance is the deviation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        ParentImage|endswith: \updata.exe
+        CommandLine|contains|all:
+        - config
+        - msdtc
+        - start
+        - auto
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- always_include: true
+  question: What else did this user do across the environment around this time?
+  context: >-
+    Tracking the account's activity across all hosts in the alert window shows whether the same identity was active
+    elsewhere, which distinguishes a host-local install from movement across endpoints. If the alert fired under
+    SYSTEM or a machine account this view fills with agent telemetry and the parent-scoped view is the one that
+    answers the question.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+- always_include: true
+  question: Did the same parent-driven msdtc configuration fire on other hosts in the same window?
+  context: >-
+    Under a service principal, account-wide activity returns agent noise, so the useful pivot is whether the same
+    launch mechanism produced this pattern elsewhere at the same time. The query mirrors the rule's selection scoped
+    to the alerting parent, fleet-wide, in the alert window. Several hosts at once points to pushed or scheduled
+    automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        ParentImage|endswith: \updata.exe
+        CommandLine|contains|all:
+        - config
+        - msdtc
+        - start
+        - auto
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- question: Has this host reconfigured the msdtc service at any point in the last 90 days?
+  context: >-
+    Historical frequency of msdtc-referencing commands on this host separates a service that is actively managed
+    from one that has never been touched. Zero prior occurrences make the alerting change a first-time event; a
+    steady history under a deployment account and a consistent utility describes routine management, and the parent
+    binary is then the remaining discriminator.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains: msdtc
+      condition: selection
+    fields:
+      - Image
+      - User
+  answer_sources:
+  - process_creation
+- question: Were other process-based persistence mechanisms installed on this host?
+  context: >-
+    Service auto-start is one foothold, and installers that set one commonly set backups using different techniques
+    — scheduled tasks, registry Run keys, BITS jobs or WMI subscriptions. Several persistence installations inside
+    the same window describe intentional stacking rather than an isolated administrative change. The alerting
+    command itself may appear in these results; the interesting rows are the ones that do not reference msdtc.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation

@@ -1,0 +1,334 @@
+name: Nslookup PowerShell Download Cradle - ProcessCreation
+id: 6d3465cf-84ed-4dcd-a965-007c65fbaa71
+description: |
+  Detects PowerShell (powershell.exe or pwsh.exe) spawning nslookup.exe with a TXT-record query flag
+  (-q=txt or -querytype=txt). This is a download cradle that stages a payload in a DNS TXT record and
+  pulls it down with nslookup, avoiding the more heavily monitored web-download cmdlets. The rule fires
+  when all of: the child is nslookup.exe AND the parent is a PowerShell host AND the command line carries
+  a TXT query flag. Legitimate use is rare — administrators occasionally query TXT records by hand, but
+  almost never from a PowerShell parent in this exact pattern. The investigation should determine what
+  PowerShell ran, what domain was queried, what the TXT response contained, and whether the returned text
+  was executed.
+type: detection
+detection_id: 1b3b01c7-84e9-4072-86e5-fc285a41ff23
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- question: Does the alerting event show nslookup.exe launched by powershell.exe or pwsh.exe with a TXT query flag (-q=txt or -querytype=txt)?
+  context: Confirm the alert is a true positive by reviewing the exact command line, the child Image, and the parent process against the rule's criteria. All three must hold together — nslookup as the child, a PowerShell host as the parent, and a TXT-record query flag on the command line.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to query DNS TXT records via nslookup from PowerShell?
+  context: Interactive DNS troubleshooting from a script host is unusual outside of specific administrative or development workflows. Knowing whether this user role and host function routinely produce this pattern is often the fastest path to separating a true positive from a benign one-off.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Is the PowerShell parent expected to spawn nslookup, and what started PowerShell itself?
+  context: The PowerShell-spawns-nslookup relationship is the core signal here. Tracing PowerShell's own origin reveals whether the chain is legitimate (a user running a script interactively) or suspicious (PowerShell launched by Office, a browser, a script host, or an unsigned binary). The parent command line shows what PowerShell was instructed to do.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What other child processes did this same PowerShell instance spawn?
+  context: A download cradle rarely ends at the download. If this PowerShell instance also spawned the payload, a shell, or follow-on tooling, those siblings reveal the full scope of activity from one parent. Multiple suspicious children from the same PowerShell process points to orchestration rather than a stray DNS lookup.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: What exactly did nslookup do? Read the full command line, including the queried domain and record type.
+  context: The full nslookup command line names the domain whose TXT record is being read and any server argument. Identify the queried domain and check its reputation — a download cradle points nslookup at attacker-controlled infrastructure. Scoping to all nslookup executions on the host in the window catches related queries that form one logical operation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What does the PowerShell parent command line decode to, and what does it do with the nslookup output?
+  context: The parent PowerShell command is where the cradle logic lives. It may wrap nslookup in a subexpression and index into the result to extract the payload from the TXT record, and it may be base64-encoded, concatenated, or backtick-escaped to hide that. Decode the parent command and identify what it does with the returned text — whether it executes it in memory, writes it to disk, or passes it onward.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did PowerShell script block logging capture the full script content around this event?
+  context: Script block logging records the deobfuscated script content PowerShell actually executed, even when the command line is encoded or concatenated. This is ground truth for what the cradle did with the TXT-record response. If PowerShell operational logs are not ingested in this environment, treat zero results as a visibility gap rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Were PowerShell security controls bypassed or weakened on this host before this execution?
+  context: Operators frequently disable or downgrade PowerShell protections before running a payload — AMSI bypass, execution-policy bypass, or a downgrade to v2 (which lacks logging). Finding these precursor events in the hour before the cradle ran strengthens the case that the activity is malicious.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: Does PowerShell normally spawn nslookup on this host?
+  context: Most PowerShell-to-nslookup pairings are rare or absent on a given host. A zero or very low historical count for this specific parent-child combination marks a novel spawning relationship worth chasing; a steady prior count points to an established administrative or monitoring workflow.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Does this host normally run nslookup at all?
+  context: nslookup that has rarely or never run on a host is more suspicious than one that runs regularly as part of monitoring or troubleshooting. A zero or very low 90-day count indicates first-time or rare use of the binary on this host, independent of which parent launched it.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|contains: \nslookup.exe
+      - OriginalFileName: \nslookup.exe
+      selection_cmd:
+        ParentImage|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        CommandLine|contains:
+        - ' -q=txt '
+        - ' -querytype=txt '
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|contains: \nslookup.exe
+      - OriginalFileName: \nslookup.exe
+      selection_cmd:
+        ParentImage|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        CommandLine|contains:
+        - ' -q=txt '
+        - ' -querytype=txt '
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the environment around this time?
+  context: Tracking the user's activity across all hosts in the surrounding window reveals whether this is an isolated lookup or part of broader hands-on activity. The same user driving similar activity on multiple hosts widens the apparent scope.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|contains: \nslookup.exe
+      - OriginalFileName: \nslookup.exe
+      selection_cmd:
+        ParentImage|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        CommandLine|contains:
+        - ' -q=txt '
+        - ' -querytype=txt '
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Is this PowerShell-spawns-nslookup pattern occurring on other hosts in the environment?
+  context: The same parent-child pairing appearing on multiple hosts may indicate a coordinated rollout, a phishing wave, or lateral movement; a single occurrence is more likely targeted. An environment-wide comparison helps calibrate the scope of the activity.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+      - CommandLine
+- question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the event reveals the immediate context: what led to it, what happened after, and whether it is part of a larger sequence. Watch for reconnaissance, credential access, or persistence near the alert time.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — defense tampering, reconnaissance, credential access — may reveal the stages that preceded this event and help reconstruct the timeline leading to the download cradle.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

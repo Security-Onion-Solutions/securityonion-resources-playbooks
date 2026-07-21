@@ -1,0 +1,395 @@
+name: Potential PendingFileRenameOperations Tampering
+id: 6ae15e64-9f23-4856-96fc-3555491e5c71
+description: |
+  Detects a process writing the PendingFileRenameOperations value under HKLM\SYSTEM\CurrentControlSet\Control\Session Manager, which queues file rename or delete operations to run at the next reboot before the target files are locked. The rule fires when the value is written AND EITHER the writing process runs from \Users\Public\ OR the writing process is reg.exe or regedit.exe. Windows and legitimate installers/updaters set this value routinely to replace in-use files after a restart, so the investigation centers on the queued source-to-destination paths in the value data, the identity and origin of the writing process, and whether a protected file (an endpoint agent binary, a system DLL) is being staged for replacement or deletion at reboot.
+type: detection
+detection_id: 4eec988f-7bf0-49f1-8675-1e6a510b3a2a
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-03
+questions:
+- question: Does the writing process and value data match what this rule detects?
+  context: >-
+    Confirm the alert is a true positive before investing time. The rule fires when the PendingFileRenameOperations
+    value under Session Manager is written AND the writing process either runs from \Users\Public\ or is reg.exe or
+    regedit.exe. Note which branch fired: a reg.exe/regedit.exe writer points at a command-line or scripted registry
+    edit, while a \Users\Public\ writer points at an unknown binary running from a world-writable path. Review the exact
+    key path (TargetObject), the queued rename pairs (Details), and the writing process (Image) against those criteria.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - Image
+      - TargetObject
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this user and host expected to queue file rename or delete operations at reboot?
+  context: >-
+    Legitimate installers, patch tooling, and administrators set this value routinely to replace in-use files after a
+    restart, so knowing whether the account and host normally perform software installs or maintenance is often the
+    fastest way to separate routine servicing from tampering. User attribution is present on most endpoint registry
+    events; when it is a machine account or SYSTEM, pivot on the writing process instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: What is the actual identity of the writing process based on its metadata and hash?
+  context: >-
+    Pivoting from the registry write to the writing process's creation event recovers its on-disk path, embedded
+    OriginalFileName, and hash. A binary running from \Users\Public\ whose OriginalFileName does not match its filename,
+    or a file named reg.exe that is not the Microsoft-signed system utility, reveals a renamed or masqueraded tool. The
+    hash enables a reputation lookup to distinguish a known-good utility from a novel or known-malicious sample. This is
+    most load-bearing when the \Users\Public\ path branch fired.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Hashes
+- question: What file rename or delete pairs are queued in the value data, and what gets replaced at reboot?
+  context: >-
+    PendingFileRenameOperations is a REG_MULTI_SZ multistring of source-to-destination path pairs; the file named first
+    is renamed to the second at next boot, and a pair whose destination is empty deletes the source. Decode each pair in
+    the Details field and identify what is being replaced or removed: a system DLL, an endpoint agent binary, or a
+    protected file swapped for an attacker payload is the pattern to chase. Details is present on roughly four in five
+    registry modifications; a large multistring blob may be absent, in which case read the queued pairs from the alert
+    event directly.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- question: Is Session Manager\PendingFileRenameOperations a known persistence or evasion location, and what was written?
+  context: >-
+    The Session Manager rename queue applies changes at the earliest point of boot, before files are locked and before
+    most security tooling loads, which makes it a reliable location for replacing or deleting protected files as part of
+    defense evasion or reboot-applied persistence. Confirm the exact value data and the writing process, and judge whether
+    the queued operation is consistent with a software update versus a swap of a security-relevant file.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: What command did the writing process run to set this value?
+  context: >-
+    The registry event names the writing process but not its arguments. Pivoting to the process creation event by
+    ProcessGuid recovers the full command line and working directory, showing whether the value was set through a direct
+    reg.exe add against the Session Manager key, a scripted edit, or a compiled binary running from a user-writable path.
+    Unusual argument structure for a LOLBAS-class utility is part of what separates tampering from a routine servicing
+    write.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Does this modification persist, or was the value re-written afterward?
+  context: >-
+    Endpoint telemetry emits no registry key or value deletion events, so attacker cleanup of the queued rename is not
+    directly observable. Judge whether the operation stuck by reviewing the value's re-modification history over the
+    window after the alert and by checking whether the staged replacement executed at the next boot. A value that is
+    written and then overwritten with a benign entry, or removed, may reflect either normal servicing completion or an
+    effort to hide the staged operation.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- question: Has this key been modified before on this host, and by what?
+  context: >-
+    Installers and patch tooling set this value periodically, so a history of modifications from update processes is
+    expected on a maintained host. Compare the historical writing processes and value data against the current alert: a
+    key touched only by known servicing binaries that is now written by reg.exe from a script or by a binary in
+    \Users\Public\ is the deviation worth chasing. Zero history for a routinely-serviced host can also indicate a
+    visibility gap rather than genuine novelty.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - Details
+      - Image
+- question: Were other registry modifications made on this host in the same session?
+  context: >-
+    A rename-on-reboot operation is often one step among several. Staging a file swap alongside disabling a security
+    control, adding a Run key, or altering a service configuration within the same short window points to a hands-on
+    session or an installer-style implant rather than an isolated servicing write. The triggering key appears in the
+    results; the signal is what else changed around it.
+  range: +/-30m
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - User
+- question: What did the writing process do after it queued the rename operations?
+  context: >-
+    The child processes, file operations, and follow-on activity of the writing process reveal its actual objective.
+    A binary that queues a file swap and then spawns command interpreters, drops additional files, or launches
+    reconnaissance utilities is operating beyond a single registry edit. Reviewing what the same process did next
+    distinguishes a one-shot servicing action from an active operation.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Were other persistence or tamper LOLBins used on this host recently?
+  context: >-
+    A rename-on-reboot swap frequently accompanies other living-off-the-land actions for the same goal, such as service
+    edits, scheduled tasks, or boot-configuration changes. Finding several such utilities running in the same timeframe
+    strengthens the case that the registry write is part of deliberate tampering rather than routine maintenance.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\certutil.exe'
+          - '\bitsadmin.exe'
+          - '\curl.exe'
+          - '\rundll32.exe'
+          - '\regsvr32.exe'
+          - '\mshta.exe'
+          - '\msbuild.exe'
+          - '\cmstp.exe'
+          - '\msiexec.exe'
+          - '\wmic.exe'
+          - '\forfiles.exe'
+          - '\pcalua.exe'
+          - '\presentationhost.exe'
+          - '\control.exe'
+          - '\hh.exe'
+          - '\ie4uinit.exe'
+          - '\infdefaultinstall.exe'
+          - '\installutil.exe'
+          - '\msdt.exe'
+          - '\mavinject.exe'
+          - '\diskshadow.exe'
+          - '\dnscmd.exe'
+          - '\esentutl.exe'
+          - '\expand.exe'
+          - '\extrac32.exe'
+          - '\makecab.exe'
+          - '\replace.exe'
+          - '\xwizard.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- question: How often has this host fired this rename-tampering pattern over the past 90 days?
+  context: >-
+    A firing pattern with no prior history on a host is more notable than one that recurs under stable servicing
+    processes. The query mirrors the rule's selection scoped to this host, so the count reflects the rule's specific
+    pattern rather than generic registry activity. Registry events carry no command line, so that projection is typically
+    empty here; use the count itself to gauge how routine this pattern is on the host.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection_main:
+        TargetObject|contains: \CurrentControlSet\Control\Session Manager\PendingFileRenameOperations
+      selection_susp_paths:
+        Image|contains: \Users\Public\
+      selection_susp_images:
+        Image|endswith:
+        - \reg.exe
+        - \regedit.exe
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection_main and 1 of selection_susp_*) and _pb_scope
+    fields:
+    - CommandLine
+- question: Were other process-based persistence mechanisms installed on this host?
+  context: >-
+    Attackers rarely rely on a single foothold. After staging a reboot-applied change, they commonly add backup
+    mechanisms through scheduled tasks, services, registry Run keys, BITS jobs, or WMI subscriptions. Multiple
+    persistence installations in the same timeframe point to intentional stacking rather than an isolated servicing
+    action.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- question: Were files dropped to persistence locations on this host?
+  context: >-
+    File-based persistence bypasses command-line detection entirely. Dropping an executable or script into a Startup
+    folder or a path referenced by a registry Run key achieves persistence without invoking schtasks, sc, or reg. File
+    event monitoring captures these drops even when standard persistence tooling is avoided, and pairs with the
+    reboot-applied file swap to show the full staging picture.
+    Run-key persistence itself is a registry write, not a file drop, so it does not appear in file telemetry; this query covers Startup folders and scheduled-task definition files, and Run-key writes surface in registry questions instead.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist_paths:
+        TargetFilename|contains:
+          - '\Start Menu\Programs\Startup\'
+          - '\Windows\System32\Tasks\'
+          - '\Windows\Tasks\'
+      condition: selection and selection_persist_paths
+    fields:
+      - TargetFilename
+      - Image
+- question: Have other hosts fired this rename-tampering pattern in the past week?
+  context: >-
+    The query mirrors the rule's selection with no host scope, giving a fleet-wide count of the pattern rather than
+    generic registry activity. Many hosts writing the same pattern points to scripted deployment or vendor servicing
+    automation; one host or a small unrelated set points to targeted operator activity. Use the host distribution to
+    calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection_main:
+        TargetObject|contains: \CurrentControlSet\Control\Session Manager\PendingFileRenameOperations
+      selection_susp_paths:
+        Image|contains: \Users\Public\
+      selection_susp_images:
+        Image|endswith:
+        - \reg.exe
+        - \regedit.exe
+      condition: selection_main and 1 of selection_susp_*
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Alerts rarely happen in isolation. Earlier detections on the same host, such as defense tampering, credential
+    access, or reconnaissance, may reveal the stages that preceded the reboot-applied change and help reconstruct the
+    timeline leading to it.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

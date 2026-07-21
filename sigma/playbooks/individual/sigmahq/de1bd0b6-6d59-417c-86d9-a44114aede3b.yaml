@@ -1,0 +1,450 @@
+name: PaperCut MF/NG Exploitation Related Indicators
+id: d7ea956e-e880-4229-9a44-bde89a261b86
+description: |
+  Detects command lines associated with exploitation of PaperCut MF/NG print-management servers. The rule fires when a
+  command line either carries the full download pattern (a `/c` shell invocation running powershell with `-nop -w hidden`
+  and `Invoke-WebRequest` writing `setup.msi` via `-OutFile`) or carries the full install pattern (`msiexec` with `/i`,
+  `setup.msi`, `/qn` and the `IntegratorLogin=fimaribahundq` parameter); each branch requires all of its own terms
+  together, and either branch alone is enough to alert. Unauthenticated flaws in the PaperCut application server permit
+  script injection into printer templates, giving code execution as SYSTEM under the server process, which is then used to
+  fetch and silently install a remote-management agent as a persistent access channel. Determine which branch fired,
+  recover the staging URL or installer parameters from the command line, confirm the parent lineage back to the print
+  server application, and establish whether the MSI was actually installed and what it ran afterward.
+type: detection
+detection_id: de1bd0b6-6d59-417c-86d9-a44114aede3b
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-17
+questions:
+- question: >-
+    Does the command line match either the hidden-PowerShell download of setup.msi or the silent msiexec install with the
+    IntegratorLogin parameter?
+  context: >-
+    The rule fires on either of two complete patterns, and each branch requires all of its own terms together. The download
+    branch needs a `/c` shell invocation, powershell, `-nop -w hidden`, `Invoke-WebRequest`, `setup.msi` and `-OutFile` in
+    one command line. The install branch needs `msiexec `, `/i `, `setup.msi `, `/qn ` and `IntegratorLogin=fimaribahundq`.
+    Note which branch fired - the download branch means staging was attempted and the URL is recoverable from the command
+    line, while the install branch means the payload reached execution and the follow-on install and agent questions carry
+    the most weight.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - alert
+  - process_creation
+- question: Is this host a print-management server, and is this user expected to install software from the command line?
+  context: >-
+    Exploitation of the print server runs code under the server application's own service identity, so the alert commonly
+    fires as SYSTEM on a server whose function is printing rather than software distribution. A print server silently
+    installing an MSI it downloaded seconds earlier is not routine administration; a packaging or deployment host running
+    scripted installs may be.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: What did the command line actually do - which URL was fetched, or which installer and parameters were passed to msiexec?
+  context: >-
+    Read every argument. On the download branch, the `Invoke-WebRequest` argument carries the staging URL and the `-OutFile`
+    argument carries the local write path, both of which become pivot points for network and file follow-up. On the install
+    branch, the `/qn` flag means the install ran with no user interaction and the IntegratorLogin and CompanyId parameters
+    identify the remote-management tenant the agent was enrolled into. The working directory shows where setup.msi landed.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: What process spawned this command, and is that parent chain expected?
+  context: >-
+    The parent is the decisive piece of context for this pattern. Code execution through injected printer-template scripts
+    surfaces as the print server application process spawning a command interpreter, which is not something the print
+    service does in normal operation. A parent such as an interactive shell, a deployment agent, or a packaging tool points
+    toward administrative activity instead.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Did the print server application process spawn any command interpreters or scripting hosts on this host?
+  context: >-
+    Script injection into a printer template executes inside the server's Java runtime and inherits its privileges, so the
+    resulting processes appear as children of pc-app.exe. Any cmd.exe, powershell.exe, wscript.exe or msiexec.exe under that
+    parent is worth reading in full, including invocations that did not match the alerting patterns - a later exploit variant
+    changed the command wording while keeping the same lineage.
+  range: -24h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: '\pc-app.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - User
+  answer_sources:
+  - process_creation
+- question: What child processes did the alerting command spawn?
+  context: >-
+    The children reveal what the command achieved. On the download branch, expect a powershell.exe child performing the
+    fetch and, if staging succeeded, a later shell that installs the retrieved MSI. On the install branch, msiexec children
+    show what the package unpacked and started. Absence of children on the download branch suggests the fetch failed or was
+    blocked.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: What did MSI installer activity start on this host after the alert, and does a remote-management agent now run here?
+  context: >-
+    A silent install of a legitimately signed remote-management package is the access channel this exploitation pattern
+    establishes, and it survives reboot as a service. Processes launched by msiexec.exe after the alert show what the
+    package registered and started. A remote-management or remote-support agent that no asset record accounts for on a print
+    server should be treated as attacker-controlled until the install is traced to a change record.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: '\msiexec.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - User
+  answer_sources:
+  - process_creation
+  - asset_inventory
+  - organizational_knowledge
+- question: Does this host normally run silent MSI installs from the command line?
+  context: >-
+    Unattended `msiexec /i ... /qn` invocations are routine on hosts covered by software distribution and rare on
+    single-purpose application servers. A ninety-day history with no prior silent installs, or installs only from a
+    deployment account, makes the alerting invocation the outlier. The user breakdown shows whether such installs normally
+    come from a deployment identity rather than the application's service identity.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains|all:
+        - 'msiexec '
+        - '/i '
+        - '/qn '
+      condition: selection
+    fields:
+      - User
+  answer_sources:
+  - process_creation
+- question: >-
+    When this host has previously fired either branch of this rule's pattern, what parents and users drove that activity,
+    and does the current alert fit?
+  context: >-
+    The query mirrors the rule's selection structure scoped to this host, so the parent and user distribution reflects how
+    these specific command patterns have run here before. For a rule this narrow - a fixed installer name and a fixed
+    integrator parameter - a non-zero history is itself notable and points to earlier exploitation attempts rather than a
+    tuning problem.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_1:
+        CommandLine|contains|all:
+        - ' /c '
+        - powershell
+        - -nop -w hidden
+        - Invoke-WebRequest
+        - setup.msi
+        - -OutFile
+      selection_2:
+        CommandLine|contains|all:
+        - 'msiexec '
+        - '/i '
+        - 'setup.msi '
+        - '/qn '
+        - IntegratorLogin=fimaribahundq
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+  answer_sources:
+  - process_creation
+- question: >-
+    Have other hosts fired either branch of this rule's pattern in the past week, and how are those hosts distributed?
+  context: >-
+    The query mirrors the rule's selection structure with no host scope, giving a fleet-wide count of these command
+    patterns. Several print servers matching within a short window points to mass scanning of internet-reachable instances
+    rather than a single targeted host, which widens the containment and patching task to every server running the
+    vulnerable application versions.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_1:
+        CommandLine|contains|all:
+        - ' /c '
+        - powershell
+        - -nop -w hidden
+        - Invoke-WebRequest
+        - setup.msi
+        - -OutFile
+      selection_2:
+        CommandLine|contains|all:
+        - 'msiexec '
+        - '/i '
+        - 'setup.msi '
+        - '/qn '
+        - IntegratorLogin=fimaribahundq
+      condition: 1 of selection_*
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- question: Has this user previously produced either branch of the rule's pattern, and does that history fit their role?
+  context: >-
+    The query mirrors the rule's selection structure scoped to this user, aggregated by host, giving that identity's
+    ninety-day history of these exact command patterns. If the alert fires under the print application's service identity,
+    any prior history at all indicates repeated execution through the same server-side path rather than routine
+    administration.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_1:
+        CommandLine|contains|all:
+        - ' /c '
+        - powershell
+        - -nop -w hidden
+        - Invoke-WebRequest
+        - setup.msi
+        - -OutFile
+      selection_2:
+        CommandLine|contains|all:
+        - 'msiexec '
+        - '/i '
+        - 'setup.msi '
+        - '/qn '
+        - IntegratorLogin=fimaribahundq
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - host.name
+  always_include: true
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+- question: >-
+    Has this parent process historically driven either branch of the rule's pattern here or elsewhere, or is the parent new
+    for this activity?
+  context: >-
+    Exploitation of the print server runs as SYSTEM, and under a service principal the user identity attributes nothing. The
+    launch mechanism is the meaningful pivot: this query mirrors the rule's selection structure scoped to the alerting
+    parent, giving that parent's ninety-day history of driving these patterns. A parent that has never driven them before is
+    the deviation to chase.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_1:
+        CommandLine|contains|all:
+        - ' /c '
+        - powershell
+        - -nop -w hidden
+        - Invoke-WebRequest
+        - setup.msi
+        - -OutFile
+      selection_2:
+        CommandLine|contains|all:
+        - 'msiexec '
+        - '/i '
+        - 'setup.msi '
+        - '/qn '
+        - IntegratorLogin=fimaribahundq
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - host.name
+  always_include: true
+  answer_sources:
+  - process_creation
+- question: What else did this user account do across the environment around this time?
+  context: >-
+    If the alert fires under a named account, its activity on other hosts in the same window shows whether the same operator
+    worked beyond the print server. If it fires under a service or computer account, this view fills with routine
+    service-owned processes and the parent-scoped view is the one that answers the question.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  always_include: true
+  answer_sources:
+  - process_creation
+- question: >-
+    Did the same parent-driven pattern fire on other hosts in the same window, or is the activity isolated to this host?
+  context: >-
+    Under a service principal, tracking the user across the environment returns service-owned noise. Whether the same launch
+    mechanism produced these command patterns elsewhere in the alert window is the answerable version: several hosts at once
+    points to automated exploitation across reachable servers, a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_1:
+        CommandLine|contains|all:
+        - ' /c '
+        - powershell
+        - -nop -w hidden
+        - Invoke-WebRequest
+        - setup.msi
+        - -OutFile
+      selection_2:
+        CommandLine|contains|all:
+        - 'msiexec '
+        - '/i '
+        - 'setup.msi '
+        - '/qn '
+        - IntegratorLogin=fimaribahundq
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - host.name
+  always_include: true
+  answer_sources:
+  - process_creation
+- question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Aggregating parent-child pairs around the alert collapses repetitive service telemetry and leaves novel pairs visible at
+    low counts. Look for other children of the print server application, defender or antivirus tampering, deletion of
+    competing processes, and any long-running process that starts shortly after the install and does not correspond to the
+    server's own components.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+  answer_sources:
+  - process_creation
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Exploitation of the application server is reachable without credentials, so the preceding hours may hold detections for
+    web-facing probing, script-host execution under the server process, or configuration changes rather than a credential
+    trail. Earlier alerts help fix when server-side code execution first succeeded.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+  answer_sources:
+  - alert

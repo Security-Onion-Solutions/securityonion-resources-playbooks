@@ -1,0 +1,466 @@
+name: COLDSTEEL RAT Cleanup Command Execution
+id: 333ccff4-16b7-4543-90b4-ee75366af2bb
+description: |
+  Detects an svchost.exe service host whose command line names one of the ' -k msupdate', ' -k msupdate2', or ' -k alg'
+  service groups spawning rundll32.exe with a command line that calls UpdateDriverForPlugAndPlayDevicesW, ServiceMain, or
+  DiUninstallDevice. COLDSTEEL persists as a Windows service and calls back into its own exports through rundll32.exe; the
+  export names above are the RAT's uninstall/cleanup entry points, so this alert marks the operator finishing an operation
+  rather than starting one. Self-cleanup on implant uninstall (T1070 indicator removal) destroys the artifacts an analyst
+  would most want, so the investigation looks backwards: identify the parent service process and the DLL it hosts, recover
+  the implant's earlier executions and egress from process and network telemetry that survive the file deletion, and
+  determine what else ran on the host before the cleanup fired. A narrow benign explanation exists — some uninstallers and
+  deployment tooling self-delete through a rundll32 export — and the identity and path of the hosted DLL settles it.
+type: detection
+detection_id: 88516f06-ebe0-47ad-858e-ae9fd060ddea
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-16
+questions:
+- question: Does this event show an svchost.exe parent hosting one of the named service groups spawning rundll32.exe with one of the three exported functions?
+  context: >-
+    The rule fires only when all four conditions hold at once. The parent Image ends in svchost.exe, the parent command
+    line contains ' -k msupdate', ' -k msupdate2', or ' -k alg', the child Image ends in rundll32.exe, and the child
+    command line contains UpdateDriverForPlugAndPlayDevicesW, ServiceMain, or DiUninstallDevice. Confirm each against the
+    event, and note which export was called and which DLL path precedes it — the export name identifies which routine of
+    the hosted DLL was invoked, and DiUninstallDevice in particular is the uninstall path.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - Image
+      - CommandLine
+  answer_sources:
+  - alert
+  - process_creation
+- question: Is this host expected to run rundll32.exe out of a service-hosted svchost.exe process, and does the account it ran under fit that expectation?
+  context: >-
+    Service-hosted execution normally runs as SYSTEM, LOCAL SERVICE, or NETWORK SERVICE, so the account rarely attributes
+    the behavior to a person. What it does tell you is whether a service on this host is legitimately registered under the
+    msupdate, msupdate2, or alg service groups. Check the host's role and its installed service inventory rather than the
+    user's habits.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: What service DLL is this svchost.exe instance hosting, and what registered and started that service?
+  context: >-
+    The parent is the single most valuable pivot here. A service group named msupdate, msupdate2, or alg is not a stock
+    Windows grouping, so the parent's own command line and the ServiceDll value registered under that service name identify
+    the binary that is calling its own cleanup export. That DLL is the implant candidate, and its path on disk is what
+    distinguishes an uninstaller shipped with vendor software from an implant removing itself. Trace the parent's own
+    creation event to see what registered and launched it.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+  answer_sources:
+  - process_creation
+- question: What other child processes did this same svchost.exe instance spawn?
+  context: >-
+    A service-hosted implant typically spawns more than the cleanup call. Command execution through a spawned cmd.exe,
+    additional rundll32 calls into other exports, and file-removal commands all appear as siblings under the same parent
+    instance. Enumerating them reconstructs the operation that the cleanup command is ending.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Does the timing of this execution align with a maintenance window, a software removal, or scheduled service activity on this host?
+  context: >-
+    Uninstall activity clusters around change windows. If a package removal or agent upgrade was running on this host at
+    this time, a self-deleting uninstaller is a plausible explanation. If nothing was scheduled and the host is otherwise
+    idle, the timing points at operator-driven removal instead.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - organizational_knowledge
+  - asset_inventory
+- question: What DLL and exported function did this rundll32.exe invocation load, and where does that DLL live on disk?
+  context: >-
+    rundll32.exe takes a DLL path and an export name as its arguments, so the command line names both the binary and the
+    routine being run. Record the full path — a DLL under System32 alongside a registered service reads differently from one
+    in ProgramData, a user profile, or a temp directory. If the file is already gone from disk, this command line and the
+    surrounding executions are the surviving record of what it was.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: Did the parent service process make outbound network connections in the days before this cleanup command ran?
+  context: >-
+    A cleanup call implies the implant was running and reachable beforehand, so egress history from the parent process is
+    the record of the command-and-control channel it used. Connection records persist after the implant binary is deleted.
+    Look for repeated connections to a small set of external addresses on 443, 8443, or other operator-chosen ports, and
+    carry any destination address forward as an indicator for other hosts.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Initiated
+  answer_sources:
+  - network_connection
+- question: What else did an svchost.exe service host running the msupdate, msupdate2, or alg service groups launch on this host?
+  context: >-
+    Widening from the exact parent instance to any svchost.exe hosting these three service groups catches restarts of the
+    service and earlier instances of the same implant. The window spans both directions because the cleanup command marks
+    the end of an operation, so the launches worth finding mostly precede it — a spawned cmd.exe used for interactive
+    command execution is the pattern to look for.
+  range: +/-24h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: \svchost.exe
+        ParentCommandLine|contains:
+          - ' -k msupdate'
+          - ' -k msupdate2'
+          - ' -k alg'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Has this host previously run rundll32.exe calling any of these three exported functions?
+  context: >-
+    rundll32.exe itself runs constantly on Windows, so the export names are the discriminator rather than the binary. This
+    counts only invocations naming UpdateDriverForPlugAndPlayDevicesW, ServiceMain, or DiUninstallDevice over 90 days.
+    Repeated prior hits point at a resident component that has been calling these exports for a long time and give you the
+    installation window; a first-ever occurrence narrows the timeline to this event.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|contains:
+          - UpdateDriverForPlugAndPlayDevicesW
+          - ServiceMain
+          - DiUninstallDevice
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: How often has svchost.exe spawned rundll32.exe on this host over the past 90 days?
+  context: >-
+    svchost.exe launching rundll32.exe is a routine Windows pattern on its own, so this count establishes the background
+    rate rather than flagging the pairing. Use it to calibrate what the export-filtered history means. Read the returned
+    command lines to see which service groups and DLLs normally account for this relationship on this host.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - process_creation
+- always_include: true
+  question: Has this account previously produced the rule's pattern, and does that history fit what the account is for?
+  context: >-
+    The query mirrors the rule's selection scoped to the alerting account, so the result is that account's 90-day history of
+    this specific export-call pattern rather than generic rundll32 use, aggregated by host. Service-hosted execution usually
+    runs under a machine or built-in service account, in which case a zero count says the pattern is new to that principal
+    but does not attribute it to a person. Weigh the count against what the account is meant to do.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \svchost.exe
+        ParentCommandLine|contains:
+        - ' -k msupdate'
+        - ' -k msupdate2'
+        - ' -k alg'
+        Image|endswith: \rundll32.exe
+        CommandLine|contains:
+        - UpdateDriverForPlugAndPlayDevicesW
+        - ServiceMain
+        - DiUninstallDevice
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+- always_include: true
+  question: Has this parent process historically driven the rule's pattern on this host or across the environment, or is the parent new for this activity?
+  context: >-
+    When the alert fires under a service principal, account identity does not attribute behavior and the launch mechanism
+    does. The query mirrors the rule's selection scoped to the alerting parent process, so the result is the 90-day history
+    of this parent driving this exact pattern, aggregated by host. A parent that already accounts for a long run of prior
+    events is resident software; a parent that is new for this pattern is the deviation to chase, and the first date it
+    appears approximates when the component was installed.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \svchost.exe
+        ParentCommandLine|contains:
+        - ' -k msupdate'
+        - ' -k msupdate2'
+        - ' -k alg'
+        Image|endswith: \rundll32.exe
+        CommandLine|contains:
+        - UpdateDriverForPlugAndPlayDevicesW
+        - ServiceMain
+        - DiUninstallDevice
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- always_include: true
+  question: What else did this account run across the environment around the time of the alert?
+  context: >-
+    Tracking the account's activity across all hosts in the alert window shows whether the same principal was active
+    elsewhere at the same time. If the alert fired under SYSTEM or another service principal, expect this to return routine
+    service and agent telemetry from every host, and rely on the parent-scoped fleet question for the meaningful answer
+    instead.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+- always_include: true
+  question: Did this same parent-driven pattern fire on other hosts in the same window, or is the activity isolated to this host?
+  context: >-
+    The query mirrors the rule's selection scoped to the alerting parent process, fleet-wide, in the alert window. Several
+    hosts calling the cleanup export within the same window points at an operator tearing down an implant across a set of
+    machines at once, and each of those hosts needs the same backward-looking review. A single host points at a host-local
+    trigger. Any host that appears here should also be checked for the hosted DLL and for the parent's egress history.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \svchost.exe
+        ParentCommandLine|contains:
+        - ' -k msupdate'
+        - ' -k msupdate2'
+        - ' -k alg'
+        Image|endswith: \rundll32.exe
+        CommandLine|contains:
+        - UpdateDriverForPlugAndPlayDevicesW
+        - ServiceMain
+        - DiUninstallDevice
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- question: What other process activity occurred on this host around the time of the alert?
+  context: >-
+    Aggregating every process launch on the host by binary and parent collapses routine telemetry into high-count rows and
+    leaves novel parent-child pairs standing out at low counts. Around a cleanup command, the pairs worth noticing are file
+    deletion and delayed-execution helpers such as cmd.exe, ping.exe, and timeout.exe, and any archiving or transfer tool
+    that ran shortly before the removal.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+  answer_sources:
+  - process_creation
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    A cleanup command sits at the end of an operation, so earlier detections on the same host are the record of what
+    preceded it — discovery, credential access, or command execution through a spawned interpreter. Those alerts often
+    survive the removal of the implant that produced them and are the cheapest way to reconstruct the timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+  answer_sources:
+  - alert
+- question: Were other process-based persistence mechanisms installed on this host?
+  context: >-
+    Removing one service-based foothold does not mean the host is clean. A second mechanism installed through schtasks, sc,
+    reg, bitsadmin, or wmic in the same timeframe is what an operator would rely on after uninstalling the first, and it is
+    also how the service under these groups may have been registered in the first place. Look in both directions from the
+    alert.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Were files dropped to persistence locations such as Startup folders or scheduled-task definitions on this host?
+  context: >-
+    File-based persistence leaves no command line to detect. A binary or script written into a Startup folder, or a
+    scheduled-task XML written directly under the Tasks directories, achieves the same result without running schtasks, sc,
+    or reg. Around an implant uninstall these writes are the replacement foothold worth ruling out.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist_paths:
+        TargetFilename|contains:
+          - '\Start Menu\Programs\Startup\'
+          - '\Windows\System32\Tasks\'
+          - '\Windows\Tasks\'
+      condition: selection and selection_persist_paths
+    fields:
+      - TargetFilename
+      - Image
+  answer_sources:
+  - file_event

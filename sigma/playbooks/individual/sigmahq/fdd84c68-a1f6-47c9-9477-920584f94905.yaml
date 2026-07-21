@@ -1,0 +1,513 @@
+name: Exploit for CVE-2017-8759
+id: 2c1e2f16-9b34-4f52-9c25-6d1a3e5a7b41
+description: |
+  Detects Microsoft Word spawning the .NET C# compiler. The rule fires only when both conditions hold
+  together: the parent process image ends in \WINWORD.EXE and the child process image ends in \csc.exe.
+  CVE-2017-8759 is a code-injection flaw in the .NET Framework SOAP WSDL parser: a document carrying a
+  crafted SOAP moniker causes the Office process to fetch a WSDL definition and compile the attacker's C#
+  source through csc.exe, which then produces a library that runs inside the document's process lineage.
+  Word has no legitimate reason to invoke the C# compiler, so the parent-child pairing is the signal itself
+  rather than a command-line pattern. The investigation should identify the document that Word had open,
+  determine what csc.exe was told to compile and what it wrote to disk, enumerate the other children Word
+  spawned in the same window, establish whether the resulting payload was executed and where it came from
+  on the network, and confirm whether the .NET Framework and Office on this host carry the patches that
+  close this vulnerability.
+type: detection
+detection_id: fdd84c68-a1f6-47c9-9477-920584f94905
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-17
+questions:
+- question: Did a process whose image ends in \csc.exe start with a parent process whose image ends in \WINWORD.EXE?
+  context: >-
+    The rule requires both halves of the pairing to be true in the same event — the child must be the .NET
+    C# compiler and the parent must be Word. Read the two image paths off the alerting event and confirm
+    them. Check that the parent path is the real Office installation directory rather than a copy of
+    WINWORD.EXE placed in a user-writable location, and that csc.exe resolves under the .NET Framework
+    directories rather than a same-named binary somewhere else. Both being genuine is what turns this into
+    an exploitation question rather than a naming coincidence.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+  answer_sources:
+  - alert
+  - process_creation
+- question: Is Word expected to spawn the C# compiler, and what document was it opened with?
+  context: >-
+    Word never invokes csc.exe during normal document editing; compilation of C# source is a developer and
+    build-server activity, and the .NET Framework also drives it for server-side page compilation. The
+    combination is what this rule exists to surface. The parent lookup returns Word's own command line,
+    which usually names the document file it was opened with, and the grandparent, which shows how Word was
+    started — a mail client indicates an attachment was double-clicked, a browser or download handler
+    indicates a fetched file, explorer.exe indicates a file opened from disk or a share. Record the document
+    path from the parent command line; it is the artifact the rest of the investigation chases.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+  answer_sources:
+  - process_creation
+- question: What document reached this user, and how was it delivered?
+  context: >-
+    Exploitation of a document parser starts with the document arriving. Word's command line names the file
+    it opened; take that filename back to the mail gateway, the web proxy, or the file-share audit trail to
+    establish sender, subject, URL, or share path. A document opened from a Temporary Internet Files or
+    Content.Outlook path was received as an attachment; one opened from Downloads came over the web. The
+    delivery details are what allow the same file to be blocked at the perimeter and the other recipients to
+    be found. Preserve the document itself before the user deletes it or the mailbox item is purged.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+  answer_sources:
+  - manual_review
+  - edr_console
+- question: Is this user and host expected to compile C# source from an Office application?
+  context: >-
+    Establish the function of the host and the role of the user. A developer workstation runs csc.exe
+    routinely, but through a build tool, an editor, or a shell — not through Word. A build server or a
+    machine hosting server-side .NET pages compiles constantly, again with no Office parent. On a general
+    office endpoint, csc.exe under any parent is already uncommon. No user role makes Word the expected
+    launcher of the compiler, so the answer here is normally about weighting the rest of the evidence rather
+    than closing the alert.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: Are the .NET Framework and Office on this host patched against CVE-2017-8759?
+  context: >-
+    CVE-2017-8759 is a flaw in the .NET Framework SOAP WSDL parser reached through a document; the fix ships
+    as a .NET Framework security update, and Office updates harden the moniker handling that reaches it.
+    Check the installed .NET Framework versions and their update level, and the Office build, against the
+    servicing baseline for this host. An unpatched host means the exploit could have succeeded and that
+    every similarly unpatched host is exposed to the same document. A fully patched host means the parser
+    should have rejected the payload, which reframes the question toward what else on the document ran and
+    whether a different weakness was used.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+  answer_sources:
+  - asset_inventory
+  - edr_console
+- question: What was csc.exe told to compile, and where did the source and the output go?
+  context: >-
+    The compiler's command line is the payload description. Exploitation of the SOAP WSDL parser typically
+    invokes it with /noconfig /fullpaths and an @-prefixed response file under the temporary directory, so
+    the arguments name a randomly-named .cmdline file rather than the C# source directly; that response file
+    in turn names the .cs input and the output assembly path. Note every path in the arguments — the
+    response file, the source file, and the /out target — and note the working directory. Compilation is
+    normally followed immediately by cvtres.exe linking a resource file, so a second invocation in the same
+    window is part of the same operation rather than a separate event. Those paths are what the file and
+    payload-execution questions look for on disk.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+      - ParentImage
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: What other processes did this same Word instance spawn?
+  context: >-
+    A document that reaches code execution rarely stops at one child. The compiler is one branch; the same
+    Word process commonly also starts a script host or a downloader to fetch and run the next stage, and the
+    compiler's own output is linked by cvtres.exe. Anything under this Word instance that is not an Office
+    component — mshta.exe, powershell.exe, cmd.exe, wscript.exe, cscript.exe, rundll32.exe, regsvr32.exe,
+    curl.exe, msiexec.exe, taskkill.exe — is part of the same execution and needs its own command line read.
+    The query is anchored on the exact parent instance, so every row belongs to this document's session.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: What files did the Word process itself write around the time of this event?
+  context: >-
+    Word's file activity is where the delivery document and the staged exploit content appear. The query is
+    scoped to the exact Word process instance that spawned the compiler, so it returns that session's
+    writes — the cached copy of the opened document under the profile's temporary Internet or Outlook
+    content directories, the auto-recovery copy, and any content the exploit staged before compilation, such
+    as the .cs source and the response file the compiler reads. A document path here that matches the
+    filename on Word's command line is the artifact to preserve and submit for analysis. Note that file
+    writes carry no hash, so hashing means locating the file on disk or reading the hash off a later
+    execution of the compiled output.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+  answer_sources:
+  - file_event
+  - manual_review
+- question: What did the compiler write to disk, and are those files still present for analysis?
+  context: >-
+    Compilation produces artifacts: the assembly named by the /out argument, an intermediate resource file
+    written by the linked cvtres.exe child, and often .pdb and .cs files left alongside them under the
+    temporary directory or the .NET Framework's SOAPAssembly working directory. The query correlates file
+    activity to the alerting compiler process and to its direct children by process lineage, which is how
+    the resource file written by cvtres.exe is caught rather than missed. Cleanup is a normal step in this
+    chain — a script stage that deletes the .pdb, .dll and .cs files minutes later is itself informative.
+    Collect whatever survives before it is removed; a compiled assembly can be hashed and analyzed, and its
+    source, if still present, states plainly what the payload does.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+  answer_sources:
+  - file_event
+  - manual_review
+- question: Did any executable in a user-writable directory run on this host after the alert, and what is its hash?
+  context: >-
+    The compiled assembly is a stage, not the objective. What follows is typically a download of a further
+    payload into a user-writable directory and its execution, often under a filename that mimics an update
+    package. This query lists processes started from the writable paths this chain stages in —
+    \AppData\Roaming\, \AppData\Local\Temp\, \Users\Public\, \Windows\Temp\ and \Downloads\ — in the hours
+    after the alert. It is also the point where a hash becomes available: file writes carry no hash, so a
+    payload dropped by the document lineage can only be hashed once it executes, and the Hashes value on
+    these rows is what goes to reputation and sandbox analysis. Match the returned image paths against the
+    files the compiler and Word wrote, and read the parent of each row to see which stage launched it.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|contains:
+          - \AppData\Roaming\
+          - \AppData\Local\Temp\
+          - \Users\Public\
+          - \Windows\Temp\
+          - \Downloads\
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - Hashes
+      - ParentImage
+  answer_sources:
+  - process_creation
+  - external_threat_intel
+  - manual_review
+- question: Did Word record an application error, hang, or abnormal exit on this host around the alert?
+  context: >-
+    Exploitation of a document parser frequently leaves a trace in the application error channel — the
+    handler crashes outright, hangs, or exits abnormally as memory is corrupted, and the faulting module
+    name recorded with the error points at the component that failed. Event 1000 records the application
+    error with the faulting module, 1002 records a hang, and 1001 records the associated error report. A
+    Word error naming a .NET or parser module close to the compiler launch corroborates that the document
+    drove the exploit rather than a macro simply calling out. Some chains also terminate Word deliberately
+    to suppress the document-recovery prompt, which produces the same absence of a clean exit. If the
+    application channel is not collected from this host, treat an empty result as a visibility gap rather
+    than evidence the process ran normally.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: application
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID:
+          - 1000
+          - 1001
+          - 1002
+      condition: selection
+    fields:
+      - EventID
+      - Provider_Name
+      - Data
+  answer_sources:
+  - manual_review
+- question: Did Word or the processes it spawned make outbound connections around this event?
+  context: >-
+    This exploit path is network-dependent by construction: the crafted moniker points the parser at a
+    remote WSDL definition, so the Office process fetches it over HTTP before any compilation happens, and
+    the stages that follow retrieve further payloads. The query returns outbound connections from the
+    processes involved in this chain on this host in the alert window. An HTTP connection from Word to an
+    address that is not an Office service, immediately before the compiler started, is the retrieval of the
+    exploit content itself; connections from a script host or downloader afterward are the payload fetch.
+    Record the destination addresses and ports — they are the blocking and hunting indicators, and they
+    identify the infrastructure to search for across other hosts.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+        Image|endswith:
+          - \WINWORD.EXE
+          - \csc.exe
+          - \cvtres.exe
+          - \mshta.exe
+          - \powershell.exe
+          - \cmd.exe
+          - \wscript.exe
+          - \cscript.exe
+          - \rundll32.exe
+          - \regsvr32.exe
+          - \msiexec.exe
+          - \curl.exe
+          - \bitsadmin.exe
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+  answer_sources:
+  - network_connection
+- question: Did this same detection fire for other users or hosts?
+  context: >-
+    A document engineered to exploit a parser is normally sent to more than one recipient. This query counts
+    the same rule firing across the environment in the past day, grouped by host and user, which shows
+    whether one mailbox was targeted or a wave was delivered. Several hosts within a short span identifies
+    the set of recipients who opened the file and the set of machines that need the same investigation; it
+    also means the message is still sitting unopened in other mailboxes and can be pulled. A single host
+    keeps the scope local, but the delivery details should still be searched against the mail gateway for
+    undelivered or unopened copies.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        rule.uuid|expand: '%rule_uuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: >-
+    The query mirrors the rule's selection scoped to this user, so the result is the user's 90-day history
+    of Word spawning the C# compiler specifically, aggregated by host, rather than generic use of either
+    binary. For this pairing there is no benign baseline to establish: any prior occurrence means the same
+    condition arose before and was not investigated, which extends the timeline backward rather than
+    normalizing the alert. Read a non-zero count as a set of earlier events to triage, and note the hosts it
+    names. A zero count is the expected result and leaves the current event to be judged on its own
+    evidence.
+  range: -90d
+  always_include: true
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \WINWORD.EXE
+        Image|endswith: \csc.exe
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+- question: Has this parent process historically driven the rule's pattern on this host or across the environment, or is the parent new for this activity?
+  context: >-
+    User identity attributes a document being opened, but it does not attribute the launch mechanism, and it
+    degenerates entirely when the alert fires under a service or machine account. The query mirrors the
+    rule's selection scoped to the alerting parent process, so the result is the 90-day history of Word
+    driving this specific pattern, aggregated by host. A parent that already accounts for a steady count
+    across many hosts would point at an Office add-in or a templating product that compiles code through
+    Word, which is the only structural way this pairing recurs benignly and should be identifiable by name.
+    A first occurrence, or a handful of events concentrated on this host, points at the document instead.
+  range: -90d
+  always_include: true
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \WINWORD.EXE
+        Image|endswith: \csc.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- question: What else did this user account do across the network around this time?
+  context: >-
+    Following the account rather than the host shows whether the document's execution stayed on this
+    endpoint. Every host this user touched in the hour around the alert is listed with the binaries that ran
+    there, which surfaces the same account opening the file on a second machine or credentials being reused
+    outward from this one. The query intentionally omits a host filter. If the alert fired under a service
+    or machine account rather than a person, this pivot returns the constant background of service-owned
+    processes across the fleet and the count is not meaningful on its own — the parent-mechanism clustering
+    question is the readable answer in that case.
+  range: +/-1h
+  always_include: true
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+- question: Did this same parent-driven pattern fire on other hosts in the same window, or is the activity isolated to this host?
+  context: >-
+    The query mirrors the rule's selection scoped to the alerting parent process, fleet-wide, in the alert
+    window, so it counts Word spawning the compiler on every host rather than whatever the alerting account
+    happened to be doing. Several hosts within the same hour is what a delivered document looks like when
+    the recipients open it around the same time, and the host set defines who needs the same investigation
+    and whose mailboxes to purge. A single host points at a host-local trigger and keeps the scope there.
+    Read this together with the same-rule alert count across the environment.
+  range: +/-1h
+  always_include: true
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \WINWORD.EXE
+        Image|endswith: \csc.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    The aggregate of process activity on the host in the quarter-hour around the alert collapses routine
+    telemetry into high-count rows and leaves novel parent-child pairs standing out at low counts, which is
+    what to scan for. Beyond the document's own lineage, look for a second Office application starting, a
+    script host or downloader under an unexpected parent, deletion utilities cleaning up staged files,
+    registry tooling removing the Office document-recovery entries that would otherwise prompt the user, and
+    anything that restarts Word to make the session look normal. Rows that do not trace back to the document
+    lineage may indicate the execution had already branched.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+  answer_sources:
+  - process_creation
+  - file_event
+  - registry_event

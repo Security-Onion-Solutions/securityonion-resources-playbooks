@@ -1,0 +1,338 @@
+name: Run PowerShell Script from ADS
+id: d8047a83-fb68-446e-be66-2de42a26077b
+description: |
+  Detects PowerShell (powershell.exe or pwsh.exe) reading content from an NTFS
+  Alternate Data Stream via Get-Content with the -Stream parameter, where the parent
+  is also PowerShell. Reading script content out of an ADS is a defense-evasion
+  pattern: the payload is hidden in a stream attached to an otherwise benign-looking
+  host file and never appears as a standalone file on disk. Legitimate use is rare
+  but possible (some admin tooling enumerates streams), so investigation should
+  confirm what stream was read, what host file carried it, when and how that stream
+  was written, and whether the decoded content was then executed.
+type: detection
+detection_id: 45a594aa-1fbd-4972-a809-ff5a99dd81b8
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- question: Does the command line read an alternate data stream with Get-Content -Stream under a PowerShell parent?
+  context: Confirm the alert is a true positive by reviewing the exact command line and process lineage. The rule fires only when both the parent and the child are powershell.exe or pwsh.exe and the command line contains both Get-Content and -Stream. Verify the referenced host file and the stream name being read.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Is this user and host expected to read content from alternate data streams via PowerShell?
+  context: Legitimate ADS enumeration or stream reads are uncommon outside of specific admin or forensic tooling. Knowing whether this user role and host function routinely involve PowerShell stream operations is often the fastest way to separate a true positive from sanctioned activity.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Is a PowerShell parent expected to spawn this PowerShell child, and what started the parent?
+  context: This rule requires a PowerShell-on-PowerShell lineage. PowerShell spawning PowerShell can be benign (a script launching a child shell) or can indicate a multi-stage loader where a first-stage script reads and runs a payload hidden in an ADS. Tracing the parent's own origin shows whether the chain began from an interactive user action or from an automated or injected source.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What other child processes did the same PowerShell parent spawn?
+  context: If the parent PowerShell process orchestrated the ADS read, it likely spawned other processes too. Examining siblings of the alerting child reveals the full scope of activity from that parent, such as additional script hosts, network tooling, or the process that ultimately ran the decoded stream content.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: What exactly was read from the alternate data stream? Decode the full Get-Content -Stream command line.
+  context: The full command line reveals which host file and which named stream were read, and whether the output was piped into Invoke-Expression, Add-Content, or another execution or write step. The query scopes to PowerShell stream-read commands on this host so multi-step operations that read then execute the stream are visible together.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|contains|all:
+          - Get-Content
+          - -Stream
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Was the stream content or the surrounding command encoded or obfuscated, and what does it decode to?
+  context: Payloads hidden in an alternate data stream are frequently base64-encoded or otherwise obfuscated so the readable command line only shows the read step. Decode any -EncodedCommand argument and inspect the stream content itself for download cradles, reverse shells, or in-memory .NET assembly loads. Decoding establishes what the hidden content actually does.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did PowerShell script block logging capture the deobfuscated stream content that was executed?
+  context: Script block logging records the deobfuscated script content PowerShell actually executed, which is the ground truth for what the ADS payload contained even when the command line only shows the read step. If PowerShell operational logs are not ingested in this environment, treat zero results as a visibility gap rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Were PowerShell security controls bypassed or weakened before this stream read?
+  context: Operators commonly disable or bypass PowerShell protections before running a hidden payload. Common precursors include AMSI bypass, execution policy changes, and PowerShell version downgrade to evade logging. Finding these before the ADS read strengthens the case that the stream content was malicious.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: When and by what process was the alternate data stream on this host file written?
+  context: The read step is only half of the technique. Defend does not emit a dedicated stream-hash event; it records a named-stream write as an ordinary file event, with the stream name appended after the file path's second colon. Correlating that write against the process that produced it shows whether the payload was staged moments earlier by the same actor or is a pre-existing artifact, tightening the malicious context around the read. No hash or content is recorded for the stream itself — confirming what it actually contained requires the deobfuscated script-block content captured above, or retrieving the file directly.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_stream:
+        TargetFilename|re: '^[A-Za-z]:\\.*:.*'
+      condition: selection and selection_stream
+    fields:
+      - TargetFilename
+      - Image
+- question: What file activity on this host involved alternate-data-stream colon syntax around the time of the alert?
+  context: File creation and modification events that carry colon syntax in the path name a host file together with the stream attached to it. Reviewing these reveals which file was used as the ADS carrier, whether multiple streams were staged, and whether the carrier file is an ordinary document or a planted dropper. This links the read step to the on-disk artifact that holds the hidden content.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains: ':'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        CommandLine|contains|all:
+        - Get-Content
+        - -Stream
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        CommandLine|contains|all:
+        - Get-Content
+        - -Stream
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or staging across multiple endpoints. If the same user triggered similar PowerShell activity on other hosts, the scope of the operation may be larger than this single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        CommandLine|contains|all:
+        - Get-Content
+        - -Stream
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Does this parent PowerShell process normally spawn a PowerShell child on this host?
+  context: A PowerShell-on-PowerShell spawning relationship that has never been seen on this host is more suspicious than one that recurs as part of a known script or job. Historical frequency of this specific parent-child pairing distinguishes routine automation from a novel loader chain.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining activity around the alert reveals what led to the stream read and what happened after, and whether it is part of a larger sequence. Novel parent-child pairs stand out at low counts while routine agent telemetry collapses into high-count rows.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host, such as defense tampering, reconnaissance, or credential access, may reveal the attack stages that preceded the ADS read and help reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

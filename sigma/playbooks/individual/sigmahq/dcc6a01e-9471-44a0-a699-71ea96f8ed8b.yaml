@@ -1,0 +1,507 @@
+name: Exploitation Attempt Of CVE-2020-1472 - Execution of ZeroLogon PoC
+id: 9e352f8e-7375-4926-8415-aa7f60ad49fc
+description: |
+  Detects cmd.exe spawning a binary named cool.exe or zero.exe whose command line carries both
+  `Administrator` and `-c`, together with either a `taskkill /f /im` payload or a `powershell` payload —
+  the invocation form of the widely circulated CVE-2020-1472 (ZeroLogon) proof-of-concept executables.
+  These tools abuse the Netlogon AES-CFB8 zero-IV flaw to authenticate to a domain controller as its own
+  machine account, blank that account's password, and then replicate credential material out of the
+  directory; the trailing `-c` argument runs an arbitrary command once the exploit lands, which is the
+  branch the two payload selections distinguish. Determine which payload branch fired and what that
+  command did, whether the named domain controller was actually reached and its machine account altered,
+  whether domain credentials were replicated afterwards, and whether the DC machine account password was
+  restored — an unrestored account breaks domain trust regardless of the operator's intent.
+type: detection
+detection_id: dcc6a01e-9471-44a0-a699-71ea96f8ed8b
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-17
+questions:
+- question: Does the alerting command line match this rule — a cmd.exe-spawned cool.exe or zero.exe carrying
+    Administrator and -c, plus either a taskkill payload or a powershell payload?
+  context: The rule requires the parent, binary name, and the `Administrator` plus `-c` pair to match together,
+    and then requires either of two independent payload branches — `taskkill` with `/f` and `/im` all present,
+    or the literal `powershell`. Note which branch matched before continuing, because the branch names what the
+    exploit was told to run afterwards. A taskkill branch points at a specific process being terminated on this
+    host, typically to force a shell or an injected process to restart under new credentials; a powershell branch
+    points at an interpreter being handed control post-exploit. Read the remaining arguments as well — the
+    positional operands of these tools are the target DC address, the DC hostname, and the domain name, which
+    name the system that was attacked.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Is this user and host expected to run domain controller exploitation tooling?
+  context: There is no routine administrative operation that invokes a binary named cool.exe or zero.exe against
+    a domain controller with an Administrator argument. The realistic benign explanations are a scoped penetration
+    test or a vulnerability-validation exercise, or a security researcher's lab traffic on a workstation used for
+    that purpose. Confirming whether an assessment is currently authorized against this host and this domain is
+    the fastest way to resolve the alert; without one, treat the account and host as compromised for the remainder
+    of the investigation.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What started the cmd.exe that spawned this binary, and is that grandparent chain expected?
+  context: cmd.exe is the immediate parent by construction, so the useful information is one level up. An
+    interactive shell under explorer.exe or a remote-access service points to a person at a keyboard on this host.
+    A script host, an Office application, an injected system process, or a remote-execution service binary as the
+    grandparent points to a session the account owner did not start, and makes this host a foothold rather than an
+    administrator's console. The parent's own command line also frequently carries the wrapper form used to launch
+    the tool.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What other child processes did the same cmd.exe instance spawn?
+  context: An operator working through a single command interpreter usually issues more than one command through
+    it. Sibling processes under the same cmd.exe instance reveal the steps that bracket the exploit — domain and
+    domain-controller enumeration beforehand (nltest, net group, ping, ipconfig), and credential handling or
+    remote execution afterwards. A cmd.exe whose only child is the exploit binary points to a wrapper launched
+    programmatically rather than typed.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Decode the full invocation of the exploit binary — which domain controller, which domain, and what
+    command was passed to -c?
+  context: These tools take the target DC address, the DC NetBIOS hostname, and the domain name as positional
+    operands before the account name, so the command line itself identifies the system that was attacked and gives
+    the analyst the host to pivot to. The `-c` operand is the arbitrary command run after the Netlogon
+    authentication succeeds. Read the surrounding executions of the same binary on this host as well, since the
+    same tooling is often run more than once — once to blank the machine account password, once again to restore
+    it. The working directory names where the binary was staged from.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What did the exploit binary actually launch after the Netlogon authentication step?
+  context: The `-c` operand is executed as a child of the exploit process once the flaw is exercised, so the
+    children of the alerting process are the payload branch made concrete. A taskkill child terminating a shell or
+    a browser process is the pattern used to force an injected process to restart and inherit the new privilege
+    context. A powershell child is a handoff to an interpreter, and its own command line carries whatever was
+    intended to run with domain-level access — commonly a machine-account password reset cmdlet, a credential
+    replication call, or an encoded loader. An empty result means the exploit did not reach the command-execution
+    stage, which narrows the finding to an attempt.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - User
+- question: Did this host open connections to remote-service ports on the domain controller around the time of
+    the alert?
+  context: Exploitation of a remote service leaves a network leg, and for this flaw it is Netlogon RPC reached
+    through the endpoint mapper on 135 and dynamic high ports, or through the \\pipe\netlogon named pipe over SMB
+    on 445. The query returns connections from this host to the monitored service-port set — 445, 135, 3389, 5985,
+    5986, 1433 and 3306 — with 135 and 445 the two that carry this attack and the rest showing whether the same
+    host also reached out over RDP, WinRM, or database services in the same window. The correlation window between
+    the network access and the process activity is normally under 10 minutes, so connections far outside the alert
+    window belong to separate activity. The exploit works by repeating Netlogon authentication attempts with a
+    zero-filled client credential until one succeeds, which on average takes a few hundred tries in a couple of
+    seconds — a burst of failed sessions followed by one success, well above the roughly 30 percent
+    failed-connection rate that would be considered anomalous for normal traffic. Connection outcome is not a
+    projected field here, so read burst volume and timing rather than an error rate, and compare the destination
+    against the management networks from which administrative traffic to this DC is expected. If endpoint network
+    telemetry is not collected from this host, treat an empty result as a visibility gap.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationPort:
+          - 445
+          - 135
+          - 3389
+          - 5985
+          - 5986
+          - 1433
+          - 3306
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
+- question: Was a domain controller machine account changed, or an anonymous or machine-account logon recorded,
+    around the time of this alert?
+  context: This is the decisive evidence and it lives on the domain controller, not on this host. A successful
+    exercise of the flaw produces event 4742 (a computer account was changed) against the DC's own machine
+    account, with SubjectUserName recorded as ANONYMOUS LOGON because the Netlogon call is unauthenticated —
+    a combination that has no legitimate cause. It is normally accompanied by a 4624 showing the DC computer
+    account authenticating from an address that is not a domain controller, and a 4648 (explicit credentials) on
+    the source. A 4768 for the Administrator account shortly afterwards indicates the replicated hash was already
+    put to use. A second 4742 minutes later is the password being restored, which the tooling does to avoid
+    breaking domain trust — its absence means the machine account is still blanked and secure-channel failures
+    across the domain should be expected. Query the domain controller named in the alerting command line, not this
+    host. If DC security event forwarding is not collected in this environment, an empty result is a visibility
+    gap rather than evidence the exploit failed.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        EventID:
+          - 4742
+          - 4624
+          - 4648
+          - 4768
+      condition: selection
+    fields:
+      - host.name
+      - EventID
+      - SubjectUserName
+      - TargetUserName
+      - IpAddress
+- question: Was a service installed or did a process fault on the domain controller in the hours around this
+    alert?
+  context: Exploitation of a remote service is often visible on the target as instability or as a new service
+    where none is expected — a 1000 application-error entry for the exploited service, or a 7045 service
+    installation. For this flaw the 7045 is the more common artifact — restoring the blanked machine account
+    password is typically done by installing a short-lived service that runs a password-reset cmdlet, so a service
+    named for no product and pointing at an interpreter is the restore step rather than an application. The
+    combination also identifies the account and host that pushed the service. Query the domain controller named in
+    the alerting command line as well as this host.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: system
+    detection:
+      selection:
+        EventID:
+          - 7045
+          - 1000
+      condition: selection
+    fields:
+      - host.name
+      - ServiceName
+      - ServiceFileName
+      - EventID
+- question: What modules did the exploit binary load, and do their signer and hash identify a known build?
+  context: Module loads describe what the tool is built from and carry the signer, signature status, and hash of
+    each library directly on the load event. Netlogon client work pulls netapi32.dll, rpcrt4.dll, secur32.dll and
+    the SMB client stack; a load of python3x.dll, vcruntime, or an unpacked temporary directory identifies a
+    packed script build, which is how most public proofs-of-concept for this flaw are distributed. An unsigned or
+    mismatched library loading under one of these tool names, or loads from a user-writable staging path, tie the
+    execution to a specific dropped copy that can then be hashed and searched for elsewhere.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_tool:
+        Image|endswith:
+          - '\cool.exe'
+          - '\zero.exe'
+      condition: selection and selection_tool
+    fields:
+      - ImageLoaded
+      - Signature
+      - SignatureStatus
+      - Hashes
+- question: What files did the exploit binary and its children write on this host?
+  context: These tools write their output to disk rather than only to the console — the replicated NTLM hashes,
+    a saved copy of the original machine account password needed for the restore step, and the temporary
+    extraction directory a packed build unpacks itself into. Scoping file activity to the alerting process and its
+    direct children rather than to the whole host isolates exactly what this execution produced. Recovering the
+    output file tells the analyst precisely which accounts were replicated, which is the difference between
+    scoping a single privileged account reset and a domain-wide one. A saved password file that is still present
+    is also the material needed to restore the machine account if the tool did not.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+- question: Did cross-process memory-write or execution-hijack API calls occur on this host in the alert window?
+  context: The taskkill branch of this rule exists to make an injected process restart, which implies process
+    injection is already in use on this host. The behavioral API channel records the injection side of that —
+    WriteProcessMemory, QueueUserAPC, SetWindowsHookEx — and a match names the process pair involved. This is a
+    partial substitute only, because read-side cross-process access, including memory reads of lsass.exe, produces
+    no telemetry in this environment. Treat an empty result as a visibility gap rather than as evidence no
+    cross-process access occurred, and pair it with the identity of whatever process the taskkill payload
+    terminated.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        event.dataset: endpoint.events.api
+        process.Ext.api.name:
+          - WriteProcessMemory
+          - QueueUserAPC
+          - SetWindowsHookEx
+      condition: selection
+    fields:
+      - Image
+      - process.Ext.api.name
+      - User
+- question: Has this host run a binary of this name at any point in the last 90 days?
+  context: A binary of this name has no vendor, no installer, and no maintenance role, so any prior execution
+    history on this host is itself a finding rather than a normalising baseline. A zero count establishes this as
+    a first-time execution and dates the staging to shortly before the alert. A non-zero count means the tooling
+    has been present and used before, which moves the earliest execution — not this alert — to the start of the
+    incident timeline, and the accounts it ran under name who else touched it.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: Where has this user authenticated recently?
+  context: >-
+    The account that ran the exploit is the one whose reach across the environment matters, both
+    before If the alert fired under SYSTEM, LOCAL SERVICE, NETWORK SERVICE, or a machine account
+    (name ending in $), this query intentionally returns nothing — service-principal logons are
+    background noise, not an actor trail. For a human account, zero results can also mean the
+    Security channel is not ingested for the relevant hosts; confirm 4624 visibility before
+    reading zero as "no authentications".
+
+    the event (how it arrived on this host) and after (where the replicated domain credentials were used). Logon
+    type 3 entries appearing across several systems in a short window is the pattern to look for, since
+    credentials obtained this way are typically replayed over the network rather than at a console. Failures
+    alongside successes distinguish credential testing from confirmed access. If the alert fired under a machine
+    or service account, this trail attributes little and the parent-driven and cross-host questions carry more
+    weight.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        EventID:
+        - 4624
+        - 4625
+        TargetUserName|expand: '%User%'
+      filter_svcprin_builtin:
+        TargetUserName:
+        - SYSTEM
+        - LOCAL SERVICE
+        - NETWORK SERVICE
+      filter_svcprin_machine:
+        TargetUserName|endswith: $
+      condition: (selection) and not 1 of filter_svcprin_*
+    fields:
+    - host.name
+    - IpAddress
+    - EventID
+    - LogonType
+- always_include: true
+  question: Has this user previously produced this rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user, so the result is the user's
+    90-day history of this specific firing pattern rather than generic use of a command interpreter, aggregated by
+    host. For this rule the expected answer is zero, and a zero confirms the execution is novel for the account.
+    A non-zero count is more informative than usual — it means this account has run domain controller exploitation
+    tooling before, and the hosts it appears on extend the timeline backwards well beyond this alert. Weigh any
+    history against whether the account belongs to someone provisioned for authorized security testing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_main:
+        ParentImage|endswith: \cmd.exe
+        Image|endswith:
+        - \cool.exe
+        - \zero.exe
+        CommandLine|contains|all:
+        - Administrator
+        - -c
+      selection_payloads_1:
+        CommandLine|contains|all:
+        - taskkill
+        - /f
+        - /im
+      selection_payloads_2:
+        CommandLine|contains: powershell
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection_main and 1 of selection_payloads_*) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: Has this parent process historically driven this rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: When the alert fires under a machine account or a service principal, user identity does not attribute
+    the behavior and the launch mechanism is the meaningful pivot. The query mirrors the rule's selection
+    structure scoped to the alerting parent process, so the result is the 90-day history of this parent driving
+    this specific pattern. A prior run of the same pattern under the same launch mechanism indicates the tooling
+    is wired into something that re-invokes it, and the host spread of those prior events maps how far it reached.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_main:
+        ParentImage|endswith: \cmd.exe
+        Image|endswith:
+        - \cool.exe
+        - \zero.exe
+        CommandLine|contains|all:
+        - Administrator
+        - -c
+      selection_payloads_1:
+        CommandLine|contains|all:
+        - taskkill
+        - /f
+        - /im
+      selection_payloads_2:
+        CommandLine|contains: powershell
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection_main and 1 of selection_payloads_*) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: What else did this user do across the network around this time?
+  context: Tracking the account's activity across all hosts rather than only this one shows whether the exploit
+    execution is a single step or one move in a sequence running on several systems. Domain and share enumeration,
+    credential handling, remote execution, or the same tooling appearing elsewhere in the same window all widen
+    what has to be contained. Under a machine or service account this query returns agent telemetry from every
+    host and answers little, in which case the parent-driven cross-host question is the one to read.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- always_include: true
+  question: Did this same parent-driven pattern fire on other hosts in the same window, or is the activity
+    isolated to this host?
+  context: The query mirrors the rule's selection structure scoped to the alerting parent process, fleet-wide, in
+    the alert window, so it counts only hosts that produced this rule's pattern rather than every host running a
+    command interpreter. Several hosts in the same window points to a pushed or scheduled invocation and means the
+    tooling was distributed before it was run; a single host points to an operator working from this machine. Any
+    additional host returned here is a second foothold to be triaged in its own right.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_main:
+        ParentImage|endswith: \cmd.exe
+        Image|endswith:
+        - \cool.exe
+        - \zero.exe
+        CommandLine|contains|all:
+        - Administrator
+        - -c
+      selection_payloads_1:
+        CommandLine|contains|all:
+        - taskkill
+        - /f
+        - /im
+      selection_payloads_2:
+        CommandLine|contains: powershell
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection_main and 1 of selection_payloads_*) and _pb_scope
+    fields:
+    - host.name

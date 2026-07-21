@@ -1,0 +1,457 @@
+name: WerFault LSASS Process Memory Dump
+id: 769037b7-f412-4d53-8f25-b36f71896c3b
+description: >-
+  Detects WerFault.exe creating a file whose name references lsass, which is the
+  signature of LSASS process memory being written to disk. LSASS holds the
+  credential material of logged-on accounts, so a dump of it hands an attacker
+  offline access to those secrets. Windows Error Reporting can legitimately
+  produce crash dumps, but an LSASS dump written through WerFault is also the
+  outcome of the SilentProcessExit feature and related forced-crash techniques,
+  which coerce WerFault into dumping LSASS on demand. Investigation should
+  confirm the dump is a real LSASS minidump, determine what drove WerFault to
+  produce it, and establish whether the dump file was accessed, copied, or
+  exfiltrated.
+type: detection
+detection_id: c3e76af5-4ce0-4a14-9c9a-25ceb8fda182
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-10
+questions:
+- question: Does the dump file name and the WerFault process that created it match what this rule detects?
+  context: >-
+    Before investing investigation time, confirm the alert is a true positive.
+    The rule fires when WerFault.exe is the creating process AND the written file
+    name contains an lsass reference. Review the exact file path, the operation
+    performed, and confirm the responsible process is WerFault.exe under
+    system32 rather than a renamed look-alike.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - Image
+      - TargetFilename
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this host and account expected to produce an LSASS memory dump?
+  context: >-
+    Legitimate crash handling can write LSASS dumps, but only on hosts that are
+    actually experiencing an LSASS fault or that run diagnostic tooling. Knowing
+    whether the host role and the account driving the activity fit a diagnostic
+    context is often the fastest way to separate a genuine crash from coerced
+    credential theft. When the account is a machine or service account, judge by
+    the writing process and host role instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is the dump file still on disk, or was it deleted, renamed, or moved after the alert?
+  context: >-
+    The dump file is the crown-jewel artifact, so its post-alert lifecycle drives
+    both urgency and next steps. A dump still on disk can be retrieved, hashed,
+    and analyzed; a dump deleted or renamed seconds after creation points to
+    cleanup or staging for exfiltration and shifts the focus to what read the
+    file in between. A copy or rename to a staging path is a strong signal the
+    credentials are being prepared to leave the host.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Is this file actually an LSASS minidump, or a decoy or unrelated crash dump?
+  context: >-
+    Confirm the artifact is what the filename implies. A real LSASS dump begins
+    with the minidump magic bytes and parses as a minidump whose streams include
+    the LSASS module list and memory ranges; its size typically runs tens of
+    megabytes. Retrieve the file from its on-disk path and inspect it directly,
+    since file-creation telemetry records only the name and writer, not the
+    content. A tiny or non-minidump file may be a benign report or a decoy.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: Was LSASS memory successfully dumped, and by what method?
+  context: >-
+    This rule pins the WerFault path, but LSASS is dumped many ways and more than
+    one method may be present around the same event. The triggering process
+    command line shows the WerFault invocation and the crash context it claims to
+    handle. Correlate with other known dumping techniques on the host, such as
+    procdump, comsvcs.dll MiniDump invoked through rundll32, or direct memory
+    reads, to establish whether the dump was a genuine fault or forced. The
+    method reveals attacker sophistication and which offline extraction follows.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did any process perform injection-side memory operations against LSASS on this host around the alert?
+  context: >-
+    A full-access handle to LSASS (access mask 0x1F0FFF) followed by a memory
+    operation is the core of credential scraping. Endpoint behavioral API
+    telemetry records injection-side calls such as WriteProcessMemory,
+    QueueUserAPC, and SetWindowsHookEx; filter the results for lsass.exe as the
+    target and correlate within roughly a five-minute window of the dump. Note
+    the blind spot: the read-side memory access that a dumper uses to copy LSASS
+    is not emitted here, and WerFault-driven dumps run through legitimate crash
+    handling rather than injection, so an empty result does not clear the host.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        event.dataset: endpoint.events.api
+        process.Ext.api.name|contains:
+          - WriteProcessMemory
+          - QueueUserAPC
+          - SetWindowsHookEx
+      condition: selection
+    fields:
+      - Image
+      - User
+      - process.Ext.api.name
+- question: Was the SilentProcessExit registry configuration for lsass created or modified before the dump?
+  context: >-
+    Forcing WerFault to dump LSASS requires seeding registry values first. The
+    SilentProcessExit path for lsass.exe and its GlobalFlag, DumpType, and
+    LocalDumpFolder values tell WerFault to write a full dump to an
+    attacker-chosen folder such as a path under %TEMP% or C:\Windows\Temp. A
+    modification to these keys shortly before the dump is strong evidence the
+    crash was coerced rather than genuine. Registry deletion is not observable
+    here, so focus on the presence and target folder of these writes.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains:
+          - '\SilentProcessExit\lsass'
+          - '\Image File Execution Options\lsass.exe'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - User
+- question: What process launched WerFault, and is that parent chain expected for crash handling?
+  context: >-
+    Legitimate WerFault runs are spawned by the service control and error
+    reporting infrastructure. A WerFault launched by an interactive shell, a
+    scripting host, an Office application, or an unfamiliar binary points to a
+    coerced dump. Allowlist known security and diagnostic tooling that
+    legitimately drives WerFault, and treat any other parent as the pivot worth
+    chasing. Walk further up the tree by querying the parent's own parent when
+    the immediate launcher looks unremarkable.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - Image
+      - CommandLine
+- question: When this host has previously produced this dump pattern, what programs and users drove it, and does the current alert fit?
+  context: >-
+    The query mirrors the rule's selection scoped to this host, so the resulting program and
+    user distribution reflects how this specific LSASS-dump pattern has historically appeared
+    here, not generic WerFault usage. The Image column will show WerFault.exe itself — file
+    events carry no parent lineage, so pivot to its process-creation event if launch lineage
+    matters. An unexpected account against this pattern is the anomaly worth chasing; a stable
+    user distribution that already accounts for prior events suggests routine crash handling.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        Image: C:\WINDOWS\system32\WerFault.exe
+        TargetFilename|contains:
+        - \lsass
+        - lsass.exe
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - Image
+    - User
+- question: Which accounts may be exposed by this LSASS dump, and do any have elevated privileges?
+  context: >-
+    An LSASS dump exposes the credentials of every account with a session on this
+    host at dump time, including cached logons and service credentials. The
+    severity depends on the privilege of those accounts: domain admin or service
+    accounts with broad access require escalation, while a standard user may only
+    need monitoring. Cross-reference the users and services active on this host
+    against directory group memberships to scope the exposure.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What other files did the responsible process write or delete around the alert?
+  context: >-
+    A process that writes an LSASS dump often touches related paths: staging the
+    dump under a new name, dropping tooling, or writing a second dump. The
+    breadth, paths, and extensions of the writing process's other file activity
+    distinguish an isolated crash dump from active credential staging and
+    enumerate what else needs review, including copies of the dump prepared for
+    exfiltration.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Were outbound remote-access connections (RDP, SMB, WinRM, SSH) initiated from this host after this event?
+  context: >-
+    Stolen credentials are typically replayed or the dump is carried off-host.
+    The query returns outbound connections from this host to remote-access ports
+    -- 3389 (RDP), 445 (SMB/PsExec), 5985/5986 (WinRM), 22 (SSH) -- in the hours
+    after the event, with the originating Image and User showing what drove each.
+    Two limits: credentials extracted offline and replayed from another machine
+    will not appear here (check logon records on suspected targets for these
+    accounts), and if network telemetry is not collected from this host, treat
+    zero rows as a visibility gap rather than evidence no movement occurred.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
+- always_include: true
+  question: Has this user previously produced this LSASS-dump pattern, and does that history fit their role?
+  context: >-
+    The query mirrors the rule's selection scoped to this user, returning the
+    user's 90-day history of this specific dump pattern aggregated by host, not
+    generic WerFault use. A user who has never produced this pattern is more
+    suspicious than one who does so regularly as part of a diagnostic role; weigh
+    the count against the account's expected duties and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        Image: C:\WINDOWS\system32\WerFault.exe
+        TargetFilename|contains:
+        - \lsass
+        - lsass.exe
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: Has this program historically driven this dump pattern, or is the program new for this activity?
+  context: >-
+    When the alert fires under a service or machine account, user identity does
+    not attribute the behavior; the launch mechanism does. The query mirrors the
+    rule's selection scoped to the alerting program, returning the 90-day
+    history of this program driving this dump pattern, aggregated by host. A new
+    or rare program for this pattern is the deviation worth chasing; a program that
+    already accounts for many prior events is diagnostic or OS automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        Image: C:\WINDOWS\system32\WerFault.exe
+        TargetFilename|contains:
+        - \lsass
+        - lsass.exe
+      _pb_scope:
+        Image|endswith|expand: '%Image%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the user's activity across all hosts reveals whether credential
+    access is part of wider movement. If the same account triggered similar
+    activity on multiple endpoints in this window, the scope of compromise may be
+    larger than this one host. Correlate the hosts and binaries returned to spot
+    a spreading pattern.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- always_include: true
+  question: Did this same program-driven dump pattern fire on other hosts in the same window, or is it isolated to this host?
+  context: >-
+    Under a service or machine account, asking what else the user did returns
+    agent-telemetry noise. The meaningful question is whether the same launch
+    mechanism fired elsewhere: the query mirrors the rule's selection scoped to
+    the alerting program, fleet-wide, in the alert window. Multiple hosts
+    in the same window points to scripted or pushed activity; a single host
+    points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        Image: C:\WINDOWS\system32\WerFault.exe
+        TargetFilename|contains:
+        - \lsass
+        - lsass.exe
+      _pb_scope:
+        Image|endswith|expand: '%Image%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Have other hosts produced this LSASS-dump pattern in the past week, and does the spread look like automation or one-off activity?
+  context: >-
+    The query mirrors the rule's selection with no host scope, giving a
+    fleet-wide count of this dump pattern rather than generic WerFault use. Many
+    hosts producing the same pattern can indicate a diagnostic rollout or a
+    spreading operation; one host or a small unrelated set points to targeted
+    manual activity. Use the host distribution to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        Image: C:\WINDOWS\system32\WerFault.exe
+        TargetFilename|contains:
+        - \lsass
+        - lsass.exe
+      condition: selection
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Credential access rarely happens in isolation. Earlier detections on the same
+    host -- defense tampering, privilege escalation, or reconnaissance -- may
+    reveal the stages that preceded the dump and help reconstruct the timeline.
+    Registry tampering to enable forced crashes or attempts to disable protection
+    on LSASS are common precursors to look for.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

@@ -1,0 +1,297 @@
+name: Suspicious PowerShell Mailbox Export to Share
+id: 197979b3-3064-4e23-b588-d6a105e15128
+description: |
+  Detects a PowerShell command line that invokes the New-MailboxExportRequest cmdlet with both a -Mailbox target and a -FilePath pointing at a UNC path (\\host\share). The cmdlet dumps an entire Exchange mailbox to a .pst on the named share, which is a normal e-discovery / migration action for Exchange administrators but is also used to bulk-collect and stage mailbox contents for exfiltration, and has been observed as the file-write primitive at the end of pre-auth Exchange exploitation chains. The investigation should confirm the export parameters, establish whether the user and host are an expected Exchange-administration path, and trace what preceded the export and where the .pst landed.
+type: detection
+detection_id: 889719ef-dd62-43df-86c3-768fb08dc7c0
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the command line contain New-MailboxExportRequest with a -Mailbox target and a -FilePath pointing at a UNC share?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the exact command line. The rule fires only when all three appear together — the New-MailboxExportRequest cmdlet, a -Mailbox argument naming the source mailbox, and a -FilePath argument whose value begins with a UNC prefix (\\). Read the full command and confirm those three elements are present and form one coherent export request.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Is this user and host an expected place for an Exchange mailbox export to run?
+  context: Mailbox exports are a routine Exchange-administration and e-discovery action, but only from accounts holding the Mailbox Import Export management role and typically only from Exchange servers or admin workstations. Confirm whether the executing account is an Exchange administrator and whether this host normally performs mailbox management. An export driven by a service account, a non-admin user, or a host with no Exchange administration role is the deviation worth chasing.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What mailbox was exported, and to what UNC destination was the .pst written?
+  context: The full command line names both the source mailbox (-Mailbox) and the export destination (-FilePath \\host\share\file). Decode the destination UNC path — which host and share received the export, whether the host is an internal file server or an attacker-controlled or unfamiliar endpoint, and whether the filename uses an unusual extension. A high-value or shared mailbox exported to an unfamiliar or external share is a stronger signal of collection than a single user mailbox exported to a known archive share.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Was the export command obfuscated, or were the mailbox or path arguments hidden behind encoding, variables, or concatenation?
+  context: The cmdlet name and arguments are plaintext in the alerting command, but attackers wrap mailbox-export operations in -EncodedCommand payloads, string concatenation, backtick escaping, or variable substitution to obscure which mailbox and destination were used. Decode any encoded or obfuscated segments to recover the true -Mailbox target and -FilePath value. Obfuscation around an administrative cmdlet that normally runs in the clear weighs toward deliberate concealment.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did PowerShell script block logging capture the full export script content?
+  context: Event ID 4104 records the deobfuscated script content PowerShell actually executed, including any New-MailboxExportRequest calls and the surrounding script that built the mailbox and path arguments. This provides ground truth even when the command line was encoded or assembled at runtime, and may reveal additional cmdlets (further exports, role assignments, mailbox searches) run in the same session. If PowerShell operational logs are not ingested in this environment, treat zero results as a visibility gap rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Were PowerShell security controls bypassed or weakened on this host before the export ran?
+  context: Operators often disable or downgrade PowerShell and host protections before running a payload — AMSI bypass, execution-policy bypass flags, real-time-monitoring disable, or a v2 downgrade that lacks logging. Finding these precursor events in the hour before a mailbox export strengthens the case that the export is part of hands-on-keyboard activity rather than routine administration.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: What process spawned the PowerShell session that ran the export, and is that parent chain expected?
+  context: The parent process reveals how the export was launched. An interactive administrator session typically descends from explorer.exe or a remote-management host, while a remote PowerShell endpoint on an Exchange server descends from the IIS or WinRM worker process. A parent such as a web worker process, a scripting host, or an Office application points toward exploitation of the mail server or a delivered script rather than deliberate administration.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What .pst export files were written on this host around the time of the alert?
+  context: The export dumps the mailbox to a .pst at the UNC destination named in the command line. Surfacing .pst files written on this host shows what was actually produced — the export file itself, plus any additional mailbox dumps written in the same window. Multiple .pst files, or output written somewhere other than a recognized administrative archive location, broadens the scope of data potentially collected.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains: '.pst'
+      condition: selection
+    fields:
+      - TargetFilename
+- question: Was the exported .pst subsequently accessed, copied, or moved after creation?
+  context: Mailbox collection typically precedes exfiltration — the .pst is staged and then relocated toward removable media, an upload directory, or another host before leaving the environment. Look for file activity touching .pst files on this host in the hour after the export, noting which process touched them. A .pst created by the export and then opened or relocated by a different process is more concerning than one that stays at its administrative archive location.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains: '.pst'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: When this host has previously run a New-MailboxExportRequest export to a UNC share, what parents and users normally drive it, and does the current alert fit that pattern?
+  context: Even legitimate exports recur on Exchange hosts. The query mirrors the rule's selection scoped to this host, so the parent and user distribution reflects how this exact export-to-share pattern has historically run here. A new parent process, an unexpected user account, or an unusual command-line structure against that history is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - New-MailboxExportRequest
+        - ' -Mailbox '
+        - ' -FilePath \\\\'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - New-MailboxExportRequest
+        - ' -Mailbox '
+        - ' -FilePath \\\\'
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - New-MailboxExportRequest
+        - ' -Mailbox '
+        - ' -FilePath \\\\'
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals whether the export was an isolated administrative action or one step in broader hands-on activity. The same account running mailbox searches, role assignments, or logons on multiple hosts in this window widens the scope of what needs review.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - New-MailboxExportRequest
+        - ' -Mailbox '
+        - ' -FilePath \\\\'
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Mailbox export rarely happens in isolation when it is malicious. Earlier detections on the same host — web-server exploitation, credential access, role or permission changes, or reconnaissance — may reveal the stages that preceded the export and help reconstruct whether the mail server itself was compromised before data was staged.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Have other hosts run a New-MailboxExportRequest export to a UNC share in the past week, and does the distribution look like routine administration or one-off activity?
+  context: The query mirrors the rule's selection with no host scope, so the result is a fleet-wide count of this export-to-share pattern. Many hosts firing it points to scheduled migration or e-discovery automation; one host or a small unrelated set points to manual operator activity. Use the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - New-MailboxExportRequest
+        - ' -Mailbox '
+        - ' -FilePath \\\\'
+      condition: selection
+    fields:
+    - host.name

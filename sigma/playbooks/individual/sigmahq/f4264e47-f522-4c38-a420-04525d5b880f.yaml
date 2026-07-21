@@ -1,0 +1,450 @@
+name: Renamed AutoIt Execution
+id: 61d0e1e6-9063-4aec-9092-3601712caf01
+description: |
+  Detects execution of a renamed AutoIt interpreter (AutoIt2.exe / AutoIt3.exe). The rule fires when any one of three
+  conditions holds and the on-disk name is NOT a canonical AutoIt name: either the command line carries an AutoIt script
+  switch (/AutoIt3ExecuteScript or /ErrorStdOut), or the import hash matches a known AutoIt build, or the embedded
+  OriginalFileName is AutoIt.exe / AutoIt2.exe / AutoIt3.exe. AutoIt is a legitimate Windows automation interpreter, but
+  because compiled AutoIt scripts wrap the interpreter and retain its PE metadata, adversaries rename the binary to a
+  benign-looking name and pass a compiled .a3x or .au3 script that loads an encrypted shellcode loader. Investigation
+  should confirm which branch fired, recover the binary's true identity from its metadata and hash, decode the script it
+  ran, and determine how the renamed binary arrived and what it did afterward.
+type: detection
+detection_id: f4264e47-f522-4c38-a420-04525d5b880f
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- question: Which branch of the rule fired, and does the event match it — an AutoIt script switch on the command line, a known AutoIt import hash, or an embedded OriginalFileName of AutoIt.exe/AutoIt2.exe/AutoIt3.exe?
+  context: >-
+    The rule fires when EITHER the command line contains /AutoIt3ExecuteScript or /ErrorStdOut, OR the import hash
+    matches a known AutoIt build, OR the OriginalFileName metadata is AutoIt.exe/AutoIt2.exe/AutoIt3.exe — provided the
+    on-disk name is not a canonical AutoIt name. Confirm the true positive by reading the exact CommandLine, Hashes, and
+    OriginalFileName from the triggering event, and note which branch matched. The branch that fired changes what carries
+    weight downstream — an OriginalFileName or import-hash match with a non-AutoIt on-disk name is the renamed-binary case,
+    while a command-line-only match still warrants confirming the binary's real identity.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - OriginalFileName
+      - CommandLine
+      - Hashes
+- question: Is this user and host expected to run an AutoIt interpreter or compiled AutoIt scripts?
+  context: >-
+    Legitimate AutoIt use clusters around IT automation, software installers, deployment tooling, and developer test
+    harnesses, and usually runs the canonical binary from Program Files or a deployment share. A renamed interpreter run
+    by a user or on a host with no automation role is the deviation worth chasing. Knowing whether the user role and host
+    function fit AutoIt usage is often the fastest way to separate routine automation from a masqueraded loader.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What is the actual identity of this binary based on its OriginalFileName metadata and hash?
+  context: >-
+    When an AutoIt interpreter is renamed, the on-disk Image name changes but the PE metadata still reports OriginalFileName
+    AutoIt3.exe (and the import hash still matches an AutoIt build). Comparing the Image path against OriginalFileName
+    exposes the rename, and the file hash enables a reputation lookup to tell a known-good AutoIt build apart from a known
+    malware sample or a novel binary. The signing status and signer further indicate whether this is the genuine AutoIt
+    interpreter or a tampered copy.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Hashes
+- question: What exactly did this interpreter run — decode the full command line, including any script path passed to /AutoIt3ExecuteScript?
+  context: >-
+    The full command line names the compiled script the interpreter loaded. Identify the .a3x or .au3 path passed to
+    /AutoIt3ExecuteScript, any output redirection from /ErrorStdOut, the working directory, and any additional arguments.
+    For a renamed AutoIt loader the script argument is the payload — its name and location point to where the loader and
+    its encoded content live on disk.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Is the AutoIt script or its payload encoded or obfuscated, and what does the decoded content do?
+  context: >-
+    Compiled AutoIt scripts (.a3x) are wrapped binaries that frequently carry encoded or encrypted loader code, and the
+    script the interpreter ran often unpacks shellcode in memory. Recover the script file referenced on the command line
+    and inspect it for embedded encoded blobs, decryption routines, or staged second-stage payloads. Decoding reveals the
+    actual intent — an in-memory loader, a download cradle, credential theft, or a reverse shell — rather than the benign
+    automation the renamed name suggests.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: How did this renamed interpreter arrive on the host, and which process wrote it to disk?
+  context: >-
+    A renamed AutoIt interpreter does not appear on its own — it was downloaded, extracted from an archive, copied, or
+    dropped by another process. Tracing the file-creation event for this binary by basename over a long window reveals the
+    delivery mechanism and the writing process. A user-writable landing spot such as AppData, Temp, or a public profile
+    paired with a downloader or archive utility as the writer points to malicious delivery; an installer or deployment tool
+    writing it to Program Files points to legitimate automation.
+  range: -30d
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains|expand: '%file_name%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: What process spawned this interpreter, and is that parent chain expected for automation on this host?
+  context: >-
+    The parent process shows how the interpreter was launched. Legitimate automation tends to have predictable parents —
+    explorer.exe for interactive use, an installer, or a deployment agent. Parents such as a browser, an email client,
+    wscript.exe, mshta.exe, or an Office application point to user-execution delivery or macro-driven launch rather than
+    sanctioned automation. Walk up to the parent's own parent if the immediate launcher looks routine.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What did this interpreter do after execution, and is the same renamed binary present on other hosts?
+  context: >-
+    The point of renaming the interpreter is to run its intended function while evading name-based detection. Examine the
+    child processes it spawned and the operations that followed to recover its real objective — recon, credential access,
+    lateral movement, or further staging. The same renamed binary appearing on multiple hosts points to deliberate
+    distribution rather than an isolated execution.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Are the renamed interpreter and the script it loaded still on disk for analysis?
+  context: >-
+    The command line references a compiled script (.a3x or .au3) and the interpreter itself sits at a path on disk.
+    Confirming both still exist enables hash lookups, content review, and submission to a safe environment for detonation.
+    If the files have been deleted, that points to cleanup and shifts the file-creation history and any cached copies into
+    the primary evidence.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: When this host has previously fired the rule's pattern, which parents and users drove it, and does the current alert fit that pattern?
+  context: >-
+    Even legitimate AutoIt automation can recur on a host. This query mirrors the rule's selection structure scoped to this
+    host, so the resulting parent and user distribution reflects how the rule's specific firing pattern — not generic AutoIt
+    usage — has historically run here. A new parent process, an unexpected user account, or an unfamiliar command-line structure
+    against that history is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_1:
+        CommandLine|contains:
+        - ' /AutoIt3ExecuteScript'
+        - ' /ErrorStdOut'
+      selection_2:
+        Hashes|contains:
+        - IMPHASH=FDC554B3A8683918D731685855683DDF
+        - IMPHASH=CD30A61B60B3D60CECDB034C8C83C290
+        - IMPHASH=F8A00C72F2D667D2EDBB234D0C0AE000
+      selection_3:
+        OriginalFileName:
+        - AutoIt3.exe
+        - AutoIt2.exe
+        - AutoIt.exe
+      filter_main_legit_name:
+        Image|endswith:
+        - \AutoIt.exe
+        - \AutoIt2.exe
+        - \AutoIt3_x64.exe
+        - \AutoIt3.exe
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (1 of selection_* and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Have other hosts fired the rule's pattern in the past week, and does the cross-host distribution look like consistent automation or one-off activity?
+  context: >-
+    This query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of the rule's
+    firing pattern rather than generic AutoIt usage. Many hosts firing the same pattern points to scripted deployment or
+    vendor automation that renamed the interpreter as part of packaging; one host or a small unrelated set points to manual
+    operator activity. Use the host distribution and parent/binary consistency to calibrate scope.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_1:
+        CommandLine|contains:
+        - ' /AutoIt3ExecuteScript'
+        - ' /ErrorStdOut'
+      selection_2:
+        Hashes|contains:
+        - IMPHASH=FDC554B3A8683918D731685855683DDF
+        - IMPHASH=CD30A61B60B3D60CECDB034C8C83C290
+        - IMPHASH=F8A00C72F2D667D2EDBB234D0C0AE000
+      selection_3:
+        OriginalFileName:
+        - AutoIt3.exe
+        - AutoIt2.exe
+        - AutoIt.exe
+      filter_main_legit_name:
+        Image|endswith:
+        - \AutoIt.exe
+        - \AutoIt2.exe
+        - \AutoIt3_x64.exe
+        - \AutoIt3.exe
+      condition: 1 of selection_* and not 1 of filter_main_*
+    fields:
+    - host.name
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_1:
+        CommandLine|contains:
+        - ' /AutoIt3ExecuteScript'
+        - ' /ErrorStdOut'
+      selection_2:
+        Hashes|contains:
+        - IMPHASH=FDC554B3A8683918D731685855683DDF
+        - IMPHASH=CD30A61B60B3D60CECDB034C8C83C290
+        - IMPHASH=F8A00C72F2D667D2EDBB234D0C0AE000
+      selection_3:
+        OriginalFileName:
+        - AutoIt3.exe
+        - AutoIt2.exe
+        - AutoIt.exe
+      filter_main_legit_name:
+        Image|endswith:
+        - \AutoIt.exe
+        - \AutoIt2.exe
+        - \AutoIt3_x64.exe
+        - \AutoIt3.exe
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (1 of selection_* and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_1:
+        CommandLine|contains:
+        - ' /AutoIt3ExecuteScript'
+        - ' /ErrorStdOut'
+      selection_2:
+        Hashes|contains:
+        - IMPHASH=FDC554B3A8683918D731685855683DDF
+        - IMPHASH=CD30A61B60B3D60CECDB034C8C83C290
+        - IMPHASH=F8A00C72F2D667D2EDBB234D0C0AE000
+      selection_3:
+        OriginalFileName:
+        - AutoIt3.exe
+        - AutoIt2.exe
+        - AutoIt.exe
+      filter_main_legit_name:
+        Image|endswith:
+        - \AutoIt.exe
+        - \AutoIt2.exe
+        - \AutoIt3_x64.exe
+        - \AutoIt3.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (1 of selection_* and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the user's activity across all hosts in the alert window reveals whether the execution is isolated or part of
+    movement across endpoints. If the same account triggered similar activity on multiple hosts, the scope may be larger
+    than a single endpoint and points toward lateral movement.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_1:
+        CommandLine|contains:
+        - ' /AutoIt3ExecuteScript'
+        - ' /ErrorStdOut'
+      selection_2:
+        Hashes|contains:
+        - IMPHASH=FDC554B3A8683918D731685855683DDF
+        - IMPHASH=CD30A61B60B3D60CECDB034C8C83C290
+        - IMPHASH=F8A00C72F2D667D2EDBB234D0C0AE000
+      selection_3:
+        OriginalFileName:
+        - AutoIt3.exe
+        - AutoIt2.exe
+        - AutoIt.exe
+      filter_main_legit_name:
+        Image|endswith:
+        - \AutoIt.exe
+        - \AutoIt2.exe
+        - \AutoIt3_x64.exe
+        - \AutoIt3.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (1 of selection_* and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Alerts rarely occur in isolation. Examining activity surrounding the execution reveals what led to it and what followed
+    — reconnaissance, privilege escalation, persistence, or data staging — and whether the renamed interpreter is one step
+    in a larger sequence. Novel parent-child pairs at low counts are what to scan for against the high-count background of
+    routine process activity.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host — defense tampering, reconnaissance, credential access, or delivery — may reveal
+    the stages that preceded this execution and help reconstruct the timeline. A renamed loader running mid-chain is more
+    serious than one firing with no surrounding alerts, and the prior-alert sequence often tells the story of how the host
+    reached this point.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

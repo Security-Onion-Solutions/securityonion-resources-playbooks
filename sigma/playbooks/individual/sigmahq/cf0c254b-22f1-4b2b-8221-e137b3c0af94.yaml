@@ -1,0 +1,410 @@
+name: HackTool - Impersonate Execution
+id: 13e3c402-3173-43cf-83b2-aca23195893e
+description: |
+  Detects execution of the Impersonate token-manipulation tool, which enumerates access tokens system-wide, duplicates the
+  tokens of higher-privileged users, and runs actions or creates accounts under those identities without touching LSASS. The rule fires when EITHER a command line contains impersonate.exe together with one of the tool's subcommands (list, exec, adduser), OR a process matches one of the tool's known file hashes. Legitimate hits are essentially limited to
+  authorized red-team or penetration-test activity; outside that, investigate which token was duplicated, what ran under the
+  impersonated context, and whether a privileged account or domain group was modified as a result.
+type: detection
+detection_id: cf0c254b-22f1-4b2b-8221-e137b3c0af94
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- question: Did the alert fire on the impersonate.exe name together with one of its subcommands, or on a known tool hash, and which branch matched?
+  context: This rule matches when EITHER the command line contains impersonate.exe together with one of the subcommands (list, exec, adduser), OR the process hash matches a known build of the tool. Review the exact command line and hashes against
+    the detection criteria and note which branch fired. A subcommand-only match (no impersonate.exe in the line) can mean the
+    binary was renamed, so the file name on disk and the hash carry more weight than the literal name in that case.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - Hashes
+- question: Is this user and host expected to run a token-manipulation tool?
+  context: Token impersonation tooling is not part of routine administration. Confirm whether the account and host are tied
+    to a sanctioned security-testing function. If the user role and host function have no security-assessment purpose, the
+    match is far more likely to be operator activity than a benign tool with a colliding name.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Is this Impersonate execution part of an authorized penetration test or red team engagement?
+  context: Token-manipulation tools are used in sanctioned assessments to demonstrate privilege escalation and lateral movement.
+    Check whether a pentest or red team exercise is active on this host or network segment. An authorized engagement with matching
+    tool usage and timing resolves the alert without further analysis.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Which subcommand of the tool was invoked — list, exec, or adduser?
+  context: The tool exposes three modules with very different impact. "list" enumerates available tokens (reconnaissance);
+    "exec" runs a command under a duplicated token (execution as another user); "adduser" creates an account and places it
+    into a privileged domain group such as Domain Admins. The subcommand determines the scope of compromise and the response
+    actions required. Identify which one ran from the command line.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Parse the full command line for this execution — what token id, target user, group, or command was passed to the subcommand?
+  context: The subcommand arguments reveal the operation. "exec <token_id> <cmd>" shows the token chosen and the command run
+    under it; "adduser <token_id> <username> <password> <group> <DC>" shows the account being created, the target privileged
+    group, and the remote domain controller. Decode every positional argument to understand exactly what identity was assumed
+    and what was done with it.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains:
+          - 'impersonate.exe'
+          - ' list '
+          - ' exec '
+          - ' adduser '
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+      - User
+- question: Did this process, or a process it spawned, write any file to disk that a duplicated-token "exec" or "adduser" run could have produced?
+  context: The tool's core action is enumerating the system handle table, opening other processes with PROCESS_DUP_HANDLE,
+    and duplicating their access tokens — work that requires SeDebugPrivilege, and that handle-open activity is not
+    observable in this environment; there is no process-access telemetry here, so a zero result below does not prove
+    no token was duplicated. What is observable is anything written to disk once a command ran under the duplicated
+    identity — output redirected to a file, a dropped payload, or staging for the account-creation path. A file
+    written by this process or a child corroborates that the impersonation reached an actionable outcome.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Did a new logon session or special-privilege assignment appear on this host for a privileged account in the minutes around the alert?
+  context: When a duplicated or freshly created token is used, the host often records a new logon (Logon Type 9 NewCredentials
+    or a network logon sourced locally) and a special-privileges-assigned event for the impersonated account, with no interactive
+    desktop behind it. A privileged or domain-admin account showing such a logon that does not correspond to a real sign-in
+    points to an assumed identity. If Security logon auditing is not ingested, treat zero results as a visibility gap.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      service: security
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID:
+          - 4624
+          - 4672
+      condition: selection
+    fields:
+      - TargetUserName
+      - LogonType
+      - PrivilegeList
+- question: What process spawned this tool, and is that parent chain expected?
+  context: The parent process shows how the tool was launched. Remote-execution paths (PsExec service hosts, WMI providers
+    such as WmiPrvSE.exe) or script hosts as the parent indicate hands-on-keyboard or lateral-movement delivery rather than
+    a local interactive run. Walk up from the immediate parent to see what launched it.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What processes ran under a different account context shortly after this tool executed?
+  context: The exec subcommand spawns a command under a duplicated token, so a child or near-simultaneous process whose user
+    context differs from the parent's logon user is the visible outcome of impersonation. Common payloads are reconnaissance
+    (whoami, net group) or account-management commands run as the assumed identity. Look for processes on this host in the
+    window after the alert whose owning user does not match the launching user.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - User
+- question: Were accounts created, group memberships changed, or files written on this host consistent with the tool's use?
+  context: Even after the process exits, the adduser path leaves an account-creation and group-add footprint on the targeted
+    domain controller, and the exec path may write output or staging files. Account creation, addition to a privileged group,
+    or files dropped by this process around the alert window confirm impact and reveal its scope. Pair file-event review with
+    directory-services account and group-membership changes.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|contains|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Has this host run the tool's command-line pattern before, and how often?
+  context: A command line carrying impersonate.exe or its subcommands that has never been seen on this host is more concerning
+    than one that recurs as part of established testing. Zero or very low historical counts indicate first-time or rare execution
+    of this specific pattern here.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains:
+          - 'impersonate.exe'
+          - ' list '
+          - ' exec '
+          - ' adduser '
+      condition: selection
+    fields:
+      - User
+- question: When this host has previously matched the rule's pattern, what parents and users drove it, and does the current alert fit?
+  context: The query mirrors the rule's selection structure scoped to this host, so the resulting parent/user distribution reflects
+    how the rule's specific firing pattern has historically run here, not generic binary usage. A new parent process, an unexpected
+    account, or an unusual command-line structure relative to that history is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_commandline_exe:
+        CommandLine|contains: impersonate.exe
+      selection_commandline_opt:
+        CommandLine|contains:
+        - ' list '
+        - ' exec '
+        - ' adduser '
+      selection_hash:
+        Hashes|contains:
+        - MD5=9520714AB576B0ED01D1513691377D01
+        - SHA256=E81CC96E2118DC4FBFE5BAD1604E0AC7681960143E2101E1A024D52264BB0A8A
+        - IMPHASH=0A358FFC1697B7A07D0E817AC740DF62
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_commandline_* or selection_hash) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Have other hosts matched the rule's pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of the rule's
+    firing pattern rather than generic binary usage. Many hosts firing the same pattern can point to a scripted assessment;
+    a single host or a small unrelated set points to manual operator activity. Use the host distribution to calibrate scope.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_commandline_exe:
+        CommandLine|contains: impersonate.exe
+      selection_commandline_opt:
+        CommandLine|contains:
+        - ' list '
+        - ' exec '
+        - ' adduser '
+      selection_hash:
+        Hashes|contains:
+        - MD5=9520714AB576B0ED01D1513691377D01
+        - SHA256=E81CC96E2118DC4FBFE5BAD1604E0AC7681960143E2101E1A024D52264BB0A8A
+        - IMPHASH=0A358FFC1697B7A07D0E817AC740DF62
+      condition: all of selection_commandline_* or selection_hash
+    fields:
+    - host.name
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_commandline_exe:
+        CommandLine|contains: impersonate.exe
+      selection_commandline_opt:
+        CommandLine|contains:
+        - ' list '
+        - ' exec '
+        - ' adduser '
+      selection_hash:
+        Hashes|contains:
+        - MD5=9520714AB576B0ED01D1513691377D01
+        - SHA256=E81CC96E2118DC4FBFE5BAD1604E0AC7681960143E2101E1A024D52264BB0A8A
+        - IMPHASH=0A358FFC1697B7A07D0E817AC740DF62
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_commandline_* or selection_hash) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_commandline_exe:
+        CommandLine|contains: impersonate.exe
+      selection_commandline_opt:
+        CommandLine|contains:
+        - ' list '
+        - ' exec '
+        - ' adduser '
+      selection_hash:
+        Hashes|contains:
+        - MD5=9520714AB576B0ED01D1513691377D01
+        - SHA256=E81CC96E2118DC4FBFE5BAD1604E0AC7681960143E2101E1A024D52264BB0A8A
+        - IMPHASH=0A358FFC1697B7A07D0E817AC740DF62
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_commandline_* or selection_hash) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around the time of the alert?
+  context: Tracking the account's activity across all hosts reveals lateral movement or repeated impersonation on other endpoints.
+    If the same user drove similar activity on multiple hosts, the scope of compromise may extend beyond this one.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_commandline_exe:
+        CommandLine|contains: impersonate.exe
+      selection_commandline_opt:
+        CommandLine|contains:
+        - ' list '
+        - ' exec '
+        - ' adduser '
+      selection_hash:
+        Hashes|contains:
+        - MD5=9520714AB576B0ED01D1513691377D01
+        - SHA256=E81CC96E2118DC4FBFE5BAD1604E0AC7681960143E2101E1A024D52264BB0A8A
+        - IMPHASH=0A358FFC1697B7A07D0E817AC740DF62
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_commandline_* or selection_hash) and _pb_scope
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Token impersonation is usually a mid-chain action. Earlier detections on the same host — credential access, reconnaissance,
+    defense tampering, or remote-execution tooling — may reveal how the operator reached the point of duplicating tokens and
+    help reconstruct the timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

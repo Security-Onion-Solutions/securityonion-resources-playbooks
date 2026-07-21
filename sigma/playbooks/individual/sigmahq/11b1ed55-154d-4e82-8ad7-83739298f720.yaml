@@ -1,0 +1,492 @@
+name: NTDS.DIT Creation By Uncommon Process
+id: 2a85fabb-547f-4635-bad0-d0f8b864538e
+description: |
+  Detects creation of a file named ntds.dit -- the Active Directory database that stores every
+  domain account's password hash -- when the responsible process EITHER is one of a set of uncommon
+  interpreters and utilities (cmd.exe, powershell.exe, cscript.exe, wscript.exe, mshta.exe,
+  rundll32.exe, regsvr32.exe, and similar) OR runs from a user-writable directory (AppData, Temp,
+  Public, PerfLogs). On a domain controller ntds.dit lives at C:\Windows\NTDS\ and is written by
+  trusted directory-service and backup processes; a copy produced by one of these processes, or from
+  a staging directory, is a common signature of credential dumping, where an operator snapshots the
+  volume or runs an export tool to lift the database for offline hash extraction. Investigation
+  should confirm the creating process and its command line, whether a volume shadow copy or registry
+  hive export accompanied the write, and whether the copy was staged, moved, or followed by lateral
+  movement.
+type: detection
+detection_id: 11b1ed55-154d-4e82-8ad7-83739298f720
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-03
+questions:
+- question: Was a file named ntds.dit created on this host by one of the flagged processes or from a user-writable directory?
+  context: >-
+    Before investing investigation time, confirm the alert is a true positive by reviewing the file
+    path, the operation performed (created, deleted, renamed), and the responsible process. The rule
+    fires when a write to a file ending in \ntds.dit is produced by a process that EITHER is one of
+    the uncommon interpreters/utilities (cmd.exe, powershell.exe, wscript.exe, rundll32.exe, and
+    similar) OR runs from a user-writable path (\AppData\, \Temp\, \Public\, \PerfLogs\). Note which
+    branch fired: an uncommon-image match points at the tool used, while a user-writable-path match
+    points at where the process ran from -- both change what the downstream questions weigh. The
+    legitimate database lives at C:\Windows\NTDS\ntds.dit and is written by directory-service and
+    backup processes, so a copy elsewhere or by these processes is the anomaly.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - Image
+      - TargetFilename
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this user and host expected to create an ntds.dit copy?
+  context: >-
+    Only domain controllers host the live Active Directory database, and even there it is written by
+    directory-service and backup processes rather than interpreters or utilities. If this host is not
+    a domain controller, or the user and writing process have no backup/administration role, the
+    creation is hard to explain as routine. When the user is a machine or service account, judge by
+    the writing process and the host's role instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Was ntds.dit copied or accessed, and by what method?
+  context: >-
+    NTDS.dit is locked while the directory service runs, so operators reach it indirectly: copying it
+    out of a volume shadow copy, running ntdsutil "Install From Media" to produce a clean export, or
+    reading it raw off the volume. Read the responsible process's command line to identify which
+    method was used and where the copy was written. Endpoint file telemetry does not record the
+    handle access mask (the full-access 0x1F0FFF pattern seen in Sysmon handle events is not
+    available here), so the command line and the accompanying shadow-copy or export activity are the
+    evidence of intent.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What process created ntds.dit, and what launched that process?
+  context: >-
+    The parent chain reveals how the write was invoked. Backup and directory-service tooling has
+    predictable parents; an interpreter launched by a remote-execution service (WmiPrvSE, a service
+    host spawned by a remote tool), by an Office application, or by a scripting host points at
+    hands-on-keyboard operation rather than scheduled maintenance. Walk up from the immediate parent
+    to see what started it.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - Image
+      - CommandLine
+- question: Was a volume shadow copy or ntdsutil IFM set created on this host shortly before the write?
+  context: >-
+    Because the live database is locked, the dominant extraction path is to snapshot the volume
+    (vssadmin, wmic shadowcopy, diskshadow) or run ntdsutil "Install From Media" to produce an
+    offline copy, then read ntds.dit from that snapshot. A shadow-copy or IFM command in the minutes
+    before the file write ties the creation to a deliberate dumping workflow; the temporal gap
+    between snapshot and file write is typically only a few minutes.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_shadow:
+        CommandLine|contains:
+          - 'vssadmin'
+          - 'shadowcopy'
+          - 'shadow copy'
+          - 'diskshadow'
+          - 'Win32_ShadowCopy'
+          - 'ntdsutil'
+          - ' ifm '
+          - 'create full'
+          - 'ac i ntds'
+      condition: selection and selection_shadow
+    fields:
+      - Image
+      - CommandLine
+- question: Were the SYSTEM, SAM, or SECURITY registry hives saved or exported around the same time?
+  context: >-
+    Offline extraction of credentials from ntds.dit also needs the SYSTEM hive to recover the boot
+    key that decrypts it, and SAM/SECURITY hive dumps are the parallel local-account path. Look for
+    reg save (or reg.exe save) of HKLM\SYSTEM, HKLM\SAM, or HKLM\SECURITY, and PowerShell
+    equivalents, on this host near the alert. These hive exports are backup-read operations that
+    surface in process command lines and as .save output file writes rather than as
+    registry-modification events, so the command line is where they are visible.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_hive:
+        CommandLine|contains:
+          - 'reg save'
+          - 'reg.exe save'
+          - 'save hklm\sam'
+          - 'save hklm\system'
+          - 'save hklm\security'
+          - 'sam.save'
+          - 'system.save'
+      condition: selection and selection_hive
+    fields:
+      - Image
+      - CommandLine
+- question: If PowerShell created the file, was its command encoded or obfuscated, and what does it decode to?
+  context: >-
+    Two of the flagged interpreters are powershell.exe and pwsh.exe, and PowerShell-based NTDS
+    extraction (raw-volume copy helpers, reflective in-memory loaders) frequently hides its logic
+    behind -EncodedCommand (-enc) base64, string concatenation, backtick escaping, or variable
+    substitution. If the creating process was PowerShell, decode the command line to reveal the
+    actual copy or dump logic, the source and destination paths, and any download or memory-load
+    cradle.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did PowerShell script block logging capture the copy operation's full script content?
+  context: >-
+    Script block logging (Event ID 4104) records the deobfuscated script content PowerShell actually
+    executes, even when the command line is encoded, giving ground truth about what ran. For
+    PowerShell-driven NTDS extraction this is often the only place the raw-volume read or reflective
+    loader logic is fully visible. If PowerShell operational logs are not ingested in this
+    environment, treat zero results as a visibility gap rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Is the ntds.dit copy still on disk, or was it deleted or renamed after the alert?
+  context: >-
+    The copy's post-alert lifecycle drives both urgency and next steps. A database copy still on disk
+    can be located, hashed, and secured before it is exfiltrated; a copy deleted or renamed shortly
+    after creation suggests the operator has already staged or moved it and is cleaning up, shifting
+    the focus to what read or transferred it in between.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What other files did the responsible process write or delete around the alert?
+  context: >-
+    A process that produces an ntds.dit copy usually touches related artifacts -- the SYSTEM hive
+    export, an IFM output folder, a compressed archive staged for exfiltration, or an ntds.dit.log.
+    The breadth, paths, and extensions of the process's other file activity distinguish a single copy
+    from a full staging operation and enumerate what else needs to be located and secured.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What other processes ran on this host around the time of the alert?
+  context: >-
+    Credential dumping rarely occurs in isolation. Activity surrounding the ntds.dit write may reveal
+    the reconnaissance that preceded it, the remote-execution tooling that launched it, or the
+    archiving and transfer utilities that follow it. Aggregating by process and parent collapses
+    routine agent telemetry into high-count rows while a novel parent-child pair stands out at low
+    counts.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- always_include: true
+  question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: >-
+    The query mirrors the rule's selection structure scoped to this user -- the result is the user's
+    90-day history of this specific firing pattern (an ntds.dit write by one of the flagged processes
+    or from a user-writable path), aggregated by host, not generic use of the binary. A user who has
+    never produced this pattern is more suspicious than one who does so regularly; weigh the count
+    against whether the account has a legitimate directory-service or backup role.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection_ntds:
+        TargetFilename|endswith: \ntds.dit
+      selection_process_img:
+        Image|endswith:
+        - \cmd.exe
+        - \cscript.exe
+        - \mshta.exe
+        - \powershell.exe
+        - \pwsh.exe
+        - \regsvr32.exe
+        - \rundll32.exe
+        - \wscript.exe
+        - \wsl.exe
+        - \wt.exe
+      selection_process_paths:
+        Image|contains:
+        - \AppData\
+        - \Temp\
+        - \Public\
+        - \PerfLogs\
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection_ntds and 1 of selection_process_*) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: Has this program historically driven the rule's pattern on this host or across the environment, or is the program new for this activity?
+  context: >-
+    When the alert fires under a service principal (SYSTEM, LOCAL SERVICE, a machine account), user
+    identity does not attribute the behavior; the launch mechanism does. The query mirrors the rule's
+    selection structure scoped to the alerting program, so the result is the 90-day history of
+    this program driving this specific pattern, aggregated by host. A new or rare program for this
+    pattern is the deviation worth chasing; a program already accounting for many prior events is more
+    likely backup or directory-service automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection_ntds:
+        TargetFilename|endswith: \ntds.dit
+      selection_process_img:
+        Image|endswith:
+        - \cmd.exe
+        - \cscript.exe
+        - \mshta.exe
+        - \powershell.exe
+        - \pwsh.exe
+        - \regsvr32.exe
+        - \rundll32.exe
+        - \wscript.exe
+        - \wsl.exe
+        - \wt.exe
+      selection_process_paths:
+        Image|contains:
+        - \AppData\
+        - \Temp\
+        - \Public\
+        - \PerfLogs\
+      _pb_scope:
+        Image|endswith|expand: '%Image%'
+      condition: (selection_ntds and 1 of selection_process_*) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the user's activity across all hosts reveals lateral movement or credential-dumping
+    activity spanning multiple endpoints. If the same account touched ntds.dit or ran dumping and
+    transfer tools on more than one host, the scope of compromise is broader than the single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- always_include: true
+  question: Did this same program-driven pattern fire on other hosts in the same window, or is the activity isolated to this host?
+  context: >-
+    Under a service principal, "what else did this user do" returns agent-telemetry noise. The
+    meaningful question is whether the same launch mechanism fired elsewhere: the query mirrors the
+    rule's selection structure scoped to the alerting program, fleet-wide, in the alert
+    window. Multiple hosts in the same window points at scheduled or pushed automation; a single host
+    points at a host-local trigger, which for domain-controller credential dumping is the higher-
+    concern case.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection_ntds:
+        TargetFilename|endswith: \ntds.dit
+      selection_process_img:
+        Image|endswith:
+        - \cmd.exe
+        - \cscript.exe
+        - \mshta.exe
+        - \powershell.exe
+        - \pwsh.exe
+        - \regsvr32.exe
+        - \rundll32.exe
+        - \wscript.exe
+        - \wsl.exe
+        - \wt.exe
+      selection_process_paths:
+        Image|contains:
+        - \AppData\
+        - \Temp\
+        - \Public\
+        - \PerfLogs\
+      _pb_scope:
+        Image|endswith|expand: '%Image%'
+      condition: (selection_ntds and 1 of selection_process_*) and _pb_scope
+    fields:
+    - host.name
+- question: Were outbound remote-access connections (RDP, SMB, WinRM, SSH) initiated from this host after this event?
+  context: >-
+    Credential theft is typically followed by movement to reach or reuse the harvested accounts. The
+    query returns outbound connections from this host to remote-access ports -- 3389 (RDP), 445
+    (SMB/PsExec), 5985/5986 (WinRM), 22 (SSH) -- in the hours after the event; the originating Image
+    and User show what drove each connection. Two limits: credentials extracted here and replayed
+    from another machine will not appear (check logon events on suspected targets for these
+    accounts), and if network telemetry is not collected from this host, treat zero rows as a
+    visibility gap rather than evidence no movement occurred.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
+- question: Which accounts may be compromised, and do any have elevated privileges?
+  context: >-
+    A successful ntds.dit extraction exposes the password hashes of every domain account, including
+    Domain Admins, Enterprise Admins, and the krbtgt account -- the last of which enables Golden
+    Ticket forgery. Confirm whether the copy was completed and cross-reference the affected domain
+    and its privileged group memberships to scope remediation; recovery of a fully copied database
+    warrants domain-wide credential resets, including krbtgt.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Credential dumping sits late in an intrusion. Earlier detections on the same host -- privilege
+    escalation, defense tampering, reconnaissance, or remote-execution activity -- may reveal the
+    stages that led here and help reconstruct how the operator reached the domain controller.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

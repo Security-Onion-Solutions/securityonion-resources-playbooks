@@ -1,0 +1,478 @@
+name: Suspicious Invoke-WebRequest Execution
+id: c4608586-7376-4446-a4f9-357fd14f4c96
+description: |
+  Detects a PowerShell process (powershell.exe, powershell_ise.exe, or pwsh.exe) invoking a
+  download cmdlet (Invoke-WebRequest, iwr, curl, or wget) together with an output flag (-uri/-url
+  or -outfile/-o) where the command line also references a user-writable or staging location such
+  as AppData, Desktop, Temp, Users\Public, or C:\Windows. This is the download-cradle phase of
+  ingress tool transfer: a signed interpreter pulls a remote file and writes it to a low-friction
+  drop path, where a follow-on signed binary may side-load a weaponized DLL. The rule fires only
+  when all four conditions match simultaneously, so the investigation should confirm the URL and
+  destination, verify whether the file actually landed, and determine whether the download was
+  expected for this user, host, and parent process.
+type: detection
+detection_id: 5e3cc4d8-3e68-43db-8656-eaaeefdec9cc
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the command line show a PowerShell download cmdlet writing to a user-writable or staging location?
+  context: Confirm the alert is a true positive by reviewing the exact command line. The rule fires only when
+    all four conditions are present at once - a PowerShell binary (powershell.exe, powershell_ise.exe, or pwsh.exe),
+    a download cmdlet (Invoke-WebRequest, iwr, curl, or wget), an output flag (-uri/-url or -outfile/-o), and a
+    suspicious destination (AppData, Desktop, Temp, Users\Public, or C:\Windows). Verify all four are genuinely
+    present before investing further.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to download files with command-line PowerShell into staging directories?
+  context: Legitimate administration and software installs occasionally fetch files via command-line tools, but a
+    download cradle that writes into AppData, Temp, or Users\Public is unusual for most user roles. Knowing whether
+    this host and account routinely perform scripted downloads is often the fastest way to separate routine activity
+    from operator-driven staging.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Is the downloaded file still on disk at the destination path for analysis?
+  context: The command line names an output path under a user-writable or staging location. If that file still exists,
+    it can be hashed, submitted for reputation lookup, or reviewed - especially relevant when the dropped file is a
+    DLL or log file staged next to a signed binary for side-loading.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What is the full Invoke-WebRequest command - which URL is fetched and where is the output written?
+  context: Decode the complete command line to extract the source URL (the -uri/-url value) and the output destination
+    (the -outfile/-o value). The download itself may be benign; what matters is the remote host being contacted and
+    whether the destination path stages a payload for later execution. Scoping to this binary on this host within a
+    few minutes also surfaces sequential download commands that together form one staging operation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|contains:
+          - 'curl '
+          - 'Invoke-WebRequest'
+          - 'iwr '
+          - 'wget '
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Is the download command wrapped in encoding or obfuscation, and what does it resolve to?
+  context: The download cmdlet may be readable, but the URL, output path, or surrounding logic can be hidden with
+    base64 (-EncodedCommand/-enc), string concatenation, backtick escaping, or variable substitution. Decode any
+    such wrapping to recover the true source URL and destination. A fetched file that is immediately executed or
+    loaded into memory indicates the transfer was a delivery step rather than a benign download.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did PowerShell script block logging capture the deobfuscated download script?
+  context: Script block logging (Event ID 4104) records the script content PowerShell actually executed, even when
+    the command line is encoded or obfuscated, providing ground truth about the URL contacted and the file written.
+    If PowerShell operational logs are not ingested in this environment, treat zero results as a visibility gap
+    rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: What process spawned this PowerShell instance, and is that parent chain expected?
+  context: The parent reveals how the download was invoked. A legitimate updater or interactive session (explorer.exe,
+    a console host) is routine; parents such as Office applications, mshta.exe, wscript.exe, web-server worker
+    processes, or a web shell point to exploitation-driven execution. Known-good updater parents (for example
+    software-update services) can be treated as expected once confirmed.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What outbound connections did this PowerShell instance make, and are the destinations external and uncommon?
+  context: Ingress tool transfer pairs a process initiating an outbound connection with a file write. Pivot from the
+    alerting process to its network connections to identify the remote host the cradle contacted. External destinations
+    that are uncommon for this host - especially raw IP addresses or hosts on non-standard ports - are higher concern
+    than connections to known internal or vendor infrastructure; filter out routine internal ranges when calibrating.
+  range: +/-10m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+      - Initiated
+- question: Did the file actually land at the destination path?
+  context: A download command does not guarantee the transfer succeeded - network errors, blocked URLs, or controls
+    may have stopped it. Confirming a file-creation event at the named output path under the user-writable or staging
+    directory establishes whether the operation progressed past delivery.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: If the downloaded file was executed, what is its hash and reputation?
+  context: The hash for a reputation lookup is recorded when the payload runs, not when Invoke-WebRequest writes it to
+    disk — file-creation events carry no hash. If PowerShell then runs it, the payload is a child or sibling of the
+    alerting process, so this query returns those processes with their executable hashes. If instead a weaponized DLL
+    was staged beside a signed executable to be side-loaded, it won't appear here as a process — check its load event
+    (dll.hash) and review the drop directory. If the file was run later by an unrelated process, retrieve it from disk
+    and hash it manually.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_children:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      selection_siblings:
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - Image
+      - Hashes
+- question: What other file activity occurred in the same drop directory?
+  context: Staging operations often write multiple files to one directory - a signed binary, a weaponized DLL, and an
+    encrypted payload, or several sequential downloads. Examining directory-level file writes in user-writable or
+    staging paths reveals the broader scope of the delivery beyond the single file named in the alert.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Were PowerShell security controls bypassed or weakened before this download ran?
+  context: Operators frequently disable or evade PowerShell controls before fetching a payload. Common precursors include
+    AMSI bypass (patching amsi.dll in memory), execution-policy changes (Set-ExecutionPolicy or -ep bypass), and version
+    downgrade to PowerShell v2 to evade logging. Finding these on the host shortly before the download strengthens the
+    case that the transfer was a delivery step.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: When this host has previously fired this download-cradle pattern, what parents and users drove it, and does the current alert fit?
+  context: Even common tools can be abused. The query mirrors the rule's selection structure scoped to this host, so the
+    resulting parent and user distribution reflects how this specific firing pattern - not generic PowerShell usage - has
+    run here. A new parent process, an unexpected account, or an unusual command structure relative to that history is the
+    anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell_ise.exe
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - powershell_ise.EXE
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_commands:
+        CommandLine|contains:
+        - 'curl '
+        - Invoke-WebRequest
+        - 'iwr '
+        - 'wget '
+      selection_flags:
+        CommandLine|contains:
+        - ' -ur'
+        - ' -o'
+      selection_susp_locations:
+        CommandLine|contains:
+        - \AppData\
+        - \Desktop\
+        - \Temp\
+        - \Users\Public\
+        - '%AppData%'
+        - '%Public%'
+        - '%Temp%'
+        - '%tmp%'
+        - :\Windows\
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell_ise.exe
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - powershell_ise.EXE
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_commands:
+        CommandLine|contains:
+        - 'curl '
+        - Invoke-WebRequest
+        - 'iwr '
+        - 'wget '
+      selection_flags:
+        CommandLine|contains:
+        - ' -ur'
+        - ' -o'
+      selection_susp_locations:
+        CommandLine|contains:
+        - \AppData\
+        - \Desktop\
+        - \Temp\
+        - \Users\Public\
+        - '%AppData%'
+        - '%Public%'
+        - '%Temp%'
+        - '%tmp%'
+        - :\Windows\
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell_ise.exe
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - powershell_ise.EXE
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_commands:
+        CommandLine|contains:
+        - 'curl '
+        - Invoke-WebRequest
+        - 'iwr '
+        - 'wget '
+      selection_flags:
+        CommandLine|contains:
+        - ' -ur'
+        - ' -o'
+      selection_susp_locations:
+        CommandLine|contains:
+        - \AppData\
+        - \Desktop\
+        - \Temp\
+        - \Users\Public\
+        - '%AppData%'
+        - '%Public%'
+        - '%Temp%'
+        - '%tmp%'
+        - :\Windows\
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around the time of this alert?
+  context: Tracking the account's activity across all hosts in the alert window reveals whether the download is isolated or
+    part of broader hands-on activity such as lateral movement or multi-host staging. The same user driving similar activity
+    on several endpoints widens the apparent scope.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell_ise.exe
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - powershell_ise.EXE
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_commands:
+        CommandLine|contains:
+        - 'curl '
+        - Invoke-WebRequest
+        - 'iwr '
+        - 'wget '
+      selection_flags:
+        CommandLine|contains:
+        - ' -ur'
+        - ' -o'
+      selection_susp_locations:
+        CommandLine|contains:
+        - \AppData\
+        - \Desktop\
+        - \Temp\
+        - \Users\Public\
+        - '%AppData%'
+        - '%Public%'
+        - '%Temp%'
+        - '%tmp%'
+        - :\Windows\
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name

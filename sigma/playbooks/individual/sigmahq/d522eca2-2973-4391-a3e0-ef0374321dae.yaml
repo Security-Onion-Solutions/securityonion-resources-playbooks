@@ -1,0 +1,457 @@
+name: Abused Debug Privilege by Arbitrary Parent Processes
+id: 7f3c1d92-6b48-4c0a-9e21-2d8a4f5b3c10
+description: |
+  Detects a command interpreter (powershell.exe, pwsh.exe, or cmd.exe) spawned
+  directly by a core Windows system process (winlogon.exe, services.exe, lsass.exe,
+  csrss.exe, smss.exe, wininit.exe, spoolsv.exe, or searchindexer.exe) while running
+  under an NT AUTHORITY service principal. These system processes do not normally
+  launch interactive shells; the pattern is consistent with parent-process spoofing,
+  where an actor holding SeDebugPrivilege calls CreateProcess with the parent-process
+  attribute to make a payload appear to descend from a trusted system process and
+  defeat parent-child detection logic. The rule excludes the benign `route ADD`
+  command line. Investigation should confirm the parent-child pair and service-account
+  context, decode what the shell ran, and determine whether the claimed parent
+  lineage is real or spoofed by checking integrity-level and user mismatches.
+type: detection
+detection_id: d522eca2-2973-4391-a3e0-ef0374321dae
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- question: Does the alert match the rule — a system process such as winlogon.exe, services.exe, or lsass.exe spawning powershell.exe, pwsh.exe, or cmd.exe under an NT AUTHORITY account?
+  context: Confirm the alert is a true positive before investing time. The ParentImage
+    should be one of the core system binaries (winlogon.exe, services.exe, lsass.exe,
+    csrss.exe, smss.exe, wininit.exe, spoolsv.exe, searchindexer.exe), the Image or
+    OriginalFileName should be a command interpreter, and the User should be an
+    NT AUTHORITY principal. A `route ADD` command line is excluded by the rule and
+    would not fire. Note the exact parent and child, since the parent identity drives
+    the rest of the investigation.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - OriginalFileName
+      - User
+- question: Is this host and service account expected to launch command interpreters from a core system process?
+  context: Core system processes launching shells under a service account is rare in
+    normal operation. A small set of legitimate cases exist — for example, OS servicing
+    or vendor automation that runs under SYSTEM — and knowing whether this host performs
+    such tasks is often the fastest way to separate routine activity from a spoofed
+    parent lineage.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Is this system process expected to spawn this command interpreter, and what started the parent itself?
+  context: The parent-child relationship is the core signal. Tracing the parent's own
+    origin shows whether the lineage is genuine or fabricated. With parent-process
+    spoofing, the visible parent never actually called CreateProcess for this child,
+    so the claimed parent's own event and its grandparent may not line up with a shell
+    launch at all. Compare the parent's start time and command line against the child's.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What other child processes did this same parent instance spawn around the alert?
+  context: If the parent genuinely spawned the detected child, it likely spawned other
+    processes too. Multiple shells or tools descending from the same system-process
+    instance points to orchestrated activity. With a spoofed parent, sibling lookups
+    keyed to the parent instance may return little, which itself is informative.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: What did the spawned command interpreter actually run? Decode its full command line.
+  context: The full command line reveals the operational purpose of the shell. Decode any
+    flags, encoded content, file paths, or download cradles. Because this query scopes to
+    all interpreter executions on the host within a short window, a multi-step operation
+    that spans several invocations is visible as a sequence rather than a single line.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Was the command encoded or obfuscated, and what does it decode to?
+  context: PowerShell payloads launched from a spoofed system parent frequently use
+    -EncodedCommand (-enc), string concatenation, backtick escaping, or variable
+    substitution to hide intent. Base64-encoded commands are the most common form.
+    Decoding reveals the actual payload — download cradles, reverse shells, or in-memory
+    execution of .NET assemblies. For a plain cmd.exe child, read the command line directly.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Does the child process integrity level and account match what the claimed parent would produce?
+  context: Parent-process spoofing leaves a fingerprint in mismatches between the claimed
+    parent and the spawned child. A shell allegedly launched by a Medium-integrity process
+    but running at System integrity, or a child whose owning account differs from the
+    visible parent's account, indicates the parent attribute was forged via CreateProcess.
+    Compare the child's integrity level and user against what the named system process
+    normally yields.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - IntegrityLevel
+      - User
+      - ParentImage
+      - Image
+- question: Were PowerShell security controls bypassed or weakened before this execution?
+  context: Operators often disable or bypass PowerShell defenses before running a payload.
+    Common methods include AMSI bypass (patching amsi.dll in memory), execution-policy
+    changes (Set-ExecutionPolicy or -ep bypass), constrained language mode escape, and
+    downgrade to PowerShell v2, which lacks logging. Finding these precursor events on the
+    host strengthens the case that the system-parented shell is malicious.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: Did PowerShell script block logging capture the full script content?
+  context: Script block logging records the deobfuscated script content PowerShell actually
+    executed, even when the command line is encoded or obfuscated, providing ground truth
+    about what ran. If PowerShell operational logs are not ingested in this environment,
+    treat zero results as a visibility gap rather than evidence nothing ran. For a cmd.exe
+    child this query returns nothing by construction.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: What actions ran at high or system integrity on this host shortly after the alert?
+  context: Spoofing a system parent yields a high-privilege shell as a means to an end —
+    installing persistence, dumping credentials, tampering with security tools, or accessing
+    protected resources. Examining processes running at High or System integrity in the
+    minutes after the alert reveals what the elevated context was used for.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        IntegrityLevel:
+          - 'High'
+          - 'System'
+          - 'S-1-16-16384'
+          - 'S-1-16-12288'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - IntegrityLevel
+- question: Were registry-based elevation or auto-elevation handlers modified on this host before the alert?
+  context: Some elevation routes write a command to a registry key that an auto-elevated
+    process reads and runs. Common targets include keys under HKCU Software Classes for
+    ms-settings, mscfile, and exefile handlers, and the Environment key. Finding such a
+    write near the alert points to a registry-handler elevation path rather than a pure
+    token or parent-attribute manipulation.
+  range: -15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\reg.exe'
+          - '\powershell.exe'
+          - '\cmd.exe'
+        CommandLine|contains:
+          - 'ms-settings'
+          - 'mscfile'
+          - 'Classes\exefile'
+          - 'Classes\Folder'
+          - 'Environment'
+          - 'Shell\Open\command'
+          - 'DelegateExecute'
+      condition: selection
+    fields:
+      - CommandLine
+      - Image
+- question: Did other privilege escalation or elevation detections fire on this host around the alert?
+  context: Actors who attempt one elevation route often try several until one succeeds.
+    Other privilege-escalation or token-manipulation alerts on the same host near this
+    event confirm deliberate escalation activity rather than a benign anomaly, and help
+    place this shell launch in the broader sequence.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - rule.name
+      - rule.uuid
+      - event.severity_label
+- question: How often has this specific system process spawned this command interpreter on this host historically?
+  context: Some parent-child pairs are routine while a core system process launching a shell
+    is inherently unusual. A zero or very low historical count for this exact parent-child
+    pairing marks it as a novel relationship; an established history points to a sanctioned
+    automation or OS behavior on this host.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_parent:
+        ParentImage|endswith:
+        - \winlogon.exe
+        - \services.exe
+        - \lsass.exe
+        - \csrss.exe
+        - \smss.exe
+        - \wininit.exe
+        - \spoolsv.exe
+        - \searchindexer.exe
+        User|contains:
+        - AUTHORI
+        - AUTORI
+      selection_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        - \cmd.exe
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+        - Cmd.Exe
+      filter:
+        CommandLine|contains|all:
+        - ' route '
+        - ' ADD '
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_* and not filter) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_parent:
+        ParentImage|endswith:
+        - \winlogon.exe
+        - \services.exe
+        - \lsass.exe
+        - \csrss.exe
+        - \smss.exe
+        - \wininit.exe
+        - \spoolsv.exe
+        - \searchindexer.exe
+        User|contains:
+        - AUTHORI
+        - AUTORI
+      selection_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        - \cmd.exe
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+        - Cmd.Exe
+      filter:
+        CommandLine|contains|all:
+        - ' route '
+        - ' ADD '
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_* and not filter) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this account do across the network around the time of the alert?
+  context: Tracking the account's activity across all hosts reveals movement or activity spanning
+    multiple endpoints. If the same account drove similar activity elsewhere, the scope is larger.
+    Under a service principal this user pivot returns broad agent telemetry, so the parent-and-binary
+    clustering companion carries the actionable answer in that case.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_parent:
+        ParentImage|endswith:
+        - \winlogon.exe
+        - \services.exe
+        - \lsass.exe
+        - \csrss.exe
+        - \smss.exe
+        - \wininit.exe
+        - \spoolsv.exe
+        - \searchindexer.exe
+        User|contains:
+        - AUTHORI
+        - AUTORI
+      selection_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        - \cmd.exe
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+        - Cmd.Exe
+      filter:
+        CommandLine|contains|all:
+        - ' route '
+        - ' ADD '
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_* and not filter) and _pb_scope
+    fields:
+    - host.name

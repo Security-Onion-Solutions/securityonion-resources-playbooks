@@ -1,0 +1,386 @@
+name: Suspicious Velociraptor Child Process
+id: 13907ee2-7f9d-401d-a141-0624ca012c32
+description: |
+  Detects Velociraptor.exe spawning a child process that matches one of three patterns: a Visual Studio Code tunnel
+  launch (code.exe with tunnel and --accept-server-license-terms), an msiexec install pulling an MSI over HTTP
+  (msiexec /i http...), or a PowerShell download cradle (Invoke-WebRequest, IWR, .DownloadFile, .DownloadString).
+  The rule fires when the Velociraptor parent is present AND any one of these child branches matches, so the analyst
+  should first note which branch fired. Velociraptor is a legitimate open-source DFIR/collection tool, so the parent
+  alone is not malicious; the suspicious signal is a legitimate response agent being used to fetch additional payloads,
+  install software, or stand up a remote-access tunnel. Determine whether the activity maps to a sanctioned IR engagement
+  or deployment, or whether the tool is being repurposed for foothold and remote execution.
+type: detection
+detection_id: 4bc90587-e6ca-4b41-be0b-ed4d04e4ed0c
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does this Velociraptor child process match one of the rule's three child patterns?
+  context: >-
+    The rule fires when Velociraptor.exe is the parent AND at least one child branch matches: a VS Code tunnel launch
+    (code.exe with 'tunnel' and '--accept-server-license-terms'), an msiexec HTTP install ('msiexec' with '/i' and
+    'http'), or a PowerShell download cradle (powershell/powershell_ise/pwsh running 'Invoke-WebRequest', 'IWR',
+    '.DownloadFile', or '.DownloadString'). Confirm the parent is Velociraptor.exe and note which of the three branches
+    fired, because the branch determines which downstream questions carry the most weight.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Is this user and host expected to be running Velociraptor and to spawn installers, tunnels, or download cradles from it?
+  context: >-
+    Legitimate Velociraptor deployments run as a managed collection agent under a known service account or during a
+    sanctioned IR engagement on a defined set of hosts. If this host is not part of a known Velociraptor deployment, or
+    the account is not one that normally drives DFIR collection, the parent-child chain is harder to explain as routine.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Is Velociraptor expected to spawn this child, and what started Velociraptor itself?
+  context: >-
+    The Velociraptor-to-child relationship is the core signal. Velociraptor normally executes collection artifacts and
+    its own helper binaries, not msiexec installers, VS Code tunnels, or PowerShell download cradles. Trace the parent's
+    own origin to see whether Velociraptor was deployed through a sanctioned mechanism (managed agent install, IR
+    engagement) or dropped and run by an unexpected grandparent.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What exactly did the spawned child command do? Decode its full command line, flags, URLs, and target paths.
+  context: >-
+    Parse the full child command line. For the msiexec branch, identify the HTTP source of the MSI and any properties
+    passed. For the VS Code branch, confirm the tunnel flags and any service-install or output-redirection arguments. For
+    the PowerShell branch, extract the source URL and the local path the payload is saved or executed from. The download
+    cradle and tunnel arguments reveal the operational intent of the chain.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%ParentImage%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - CurrentDirectory
+- question: If the PowerShell branch fired, was the command encoded or obfuscated, and what does it decode to?
+  context: >-
+    PowerShell child processes in this chain frequently arrive as -EncodedCommand (-enc) base64 payloads or use download
+    cradles such as IWR/Invoke-WebRequest piped to execution, or Net.WebClient .DownloadFile/.DownloadString. Decode any
+    base64 and resolve the cradle to identify the source URL being fetched and what gets executed or written to disk.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did PowerShell script block logging capture the full deobfuscated script content?
+  context: >-
+    Script block logging (Event ID 4104) records the deobfuscated script PowerShell actually executed, even when the
+    command line is encoded. This is ground truth for what the download cradle did. If PowerShell operational logs are
+    not ingested in this environment, treat zero results as a visibility gap rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Were PowerShell security controls bypassed or weakened on this host before the child ran?
+  context: >-
+    Operators often weaken PowerShell controls before running a download cradle: AMSI patching, execution policy bypass
+    (-ExecutionPolicy Bypass / -ep bypass), or a v2 downgrade that lacks logging. Finding these precursor events on the
+    host strengthens the case that the Velociraptor-spawned PowerShell was used for payload delivery rather than routine
+    collection.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: When the fetched or installed file runs, what is its hash and does threat intel flag it?
+  context: >-
+    A file's hash is recorded when it runs, not when it is fetched or installed, and on a process-creation alert the
+    downloaded file's own path is not retained in telemetry -- so the hash is recovered from execution. This returns the
+    processes that the download or install spawned, and those its parent spawned (its children and siblings), with their
+    executable hashes; the payload that msiexec installed or that the download cradle pulled and ran appears here. Submit
+    the hash to VirusTotal, Hybrid Analysis, or internal threat intel. A file fetched but not yet executed will not appear
+    -- retrieve it from disk (the command-decode step gives its path) and hash it manually.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_children:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      selection_siblings:
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - Image
+      - Hashes
+- question: What other child processes did this same Velociraptor instance spawn?
+  context: >-
+    If this Velociraptor instance was repurposed, it likely spawned more than the one process that triggered the alert.
+    Reviewing siblings of the same parent reveals the full scope of what was launched through this agent — additional
+    installers, tunnels, shells, or reconnaissance tools point to hands-on operation rather than an isolated collection
+    artifact.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Has this Velociraptor parent spawned this child binary on this host before?
+  context: >-
+    A Velociraptor instance that has never previously spawned msiexec, code.exe, or a PowerShell interpreter on this host
+    is a novel relationship. Zero or very low historical counts indicate a first-time spawning pattern, which is the
+    deviation worth chasing; a high count suggests an established collection or deployment routine.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Is Velociraptor on this organization's approved tooling list for this host?
+  context: >-
+    Velociraptor is a legitimate DFIR and endpoint-collection tool, but it is also a full remote-execution capability. If
+    it is not part of a sanctioned deployment or an active IR engagement covering this host, its presence may represent
+    shadow tooling or an attacker repurposing a known-good binary for remote access and payload staging.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+- question: Is there an active IR engagement, helpdesk ticket, or maintenance window explaining this Velociraptor activity?
+  context: >-
+    Sanctioned Velociraptor use typically maps to a documented IR engagement, a managed deployment, or an approved
+    collection effort with a defined scope and timeframe. If no such context exists for this host and time window, the
+    agent spawning installers, tunnels, or download cradles is harder to attribute to authorized work.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What external endpoints did the child process and any installed tunnel connect to?
+  context: >-
+    The chain's endpoints reveal intent: an MSI or payload pulled from an unfamiliar host, or a VS Code tunnel exposing
+    the machine through external tunneling infrastructure, both establish outbound or remote-access channels. Compare the
+    destinations against expected update, vendor, and management infrastructure; connections to unfamiliar staging hosts
+    or tunnel relays are the load-bearing signal for this remote-access chain.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationHostname
+      - DestinationPort
+- question: Was a service or autorun entry installed on this host that would relaunch the staged tool after reboot?
+  context: >-
+    Remote-access chains commonly persist the staged tool by registering it as a Windows service or writing an autorun
+    registry value, so the tunnel or agent survives reboot. Look for service-install or Run/RunOnce registry writes around
+    the alert time, and tie the target image back to the file the child fetched. A persistence write that points at a
+    recently staged binary is a strong escalation signal.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        TargetObject|contains:
+          - '\Services\'
+          - '\CurrentVersion\Run'
+          - '\CurrentVersion\RunOnce'
+      condition: selection and selection_persist
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- question: What else did this account do across the environment around the time of the alert?
+  context: >-
+    Tracking the account's activity across all hosts in the alert window reveals whether the Velociraptor abuse is
+    isolated or part of broader hands-on activity. Similar staging, installation, or tunnel activity under the same
+    account on other hosts widens the scope of the engagement or compromise.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent:
+        ParentImage|endswith: \Velociraptor.exe
+      selection_child_vscode_tunnel:
+        CommandLine|contains|all:
+        - code.exe
+        - tunnel
+        - --accept-server-license-terms
+      selection_child_msiexec:
+        CommandLine|contains|all:
+        - msiexec
+        - /i
+        - http
+      selection_child_powershell:
+        Image|endswith:
+        - \powershell.exe
+        - \powershell_ise.exe
+        - \pwsh.exe
+        CommandLine|contains:
+        - 'Invoke-WebRequest '
+        - 'IWR '
+        - .DownloadFile
+        - .DownloadString
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection_parent and 1 of selection_child_*) and _pb_scope
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance, or the
+    initial delivery that installed Velociraptor — may reveal the stages that preceded this event and help reconstruct
+    the timeline leading up to the remote-access activity.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

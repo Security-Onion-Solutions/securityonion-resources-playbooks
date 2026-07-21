@@ -1,0 +1,312 @@
+name: DLL Execution via Rasautou.exe
+id: f1ec3e81-7fe8-44f4-82c3-ef3f2ab8a052
+description: |
+  Detects rasautou.exe (or a renamed copy whose OriginalFileName is rasdlui.exe) run with a command line that contains both the -d and -p switches. The rule fires only when the image/original-name condition AND the command-line condition both hold. rasautou.exe is the Microsoft-signed Windows Remote Access AutoDial Dialer; its undocumented -d flag loads an arbitrary DLL and -p names an export to call, letting an operator run shellcode under a trusted signed binary to inherit its trust and bypass application allowlisting. These switches were removed in Windows 10, so the pattern is meaningful only on pre-Windows-10 hosts and where command-line auditing is configured. When it fires, decode the DLL path and export name, determine what the loaded DLL did (in-memory code execution, child processes, network beaconing), and confirm whether the user, host, and parent process are expected to invoke this binary in this way.
+type: detection
+detection_id: cd3d1298-eb3b-476c-ac67-12847de55813
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- question: Does the command line match what this rule detects — rasautou.exe (or rasdlui.exe by OriginalFileName) run with both -d and -p?
+  context: >-
+    Before investing investigation time, confirm the alert is a true positive. The rule fires only when both conditions hold together: the image ends in rasautou.exe (or the OriginalFileName is rasdlui.exe, catching a renamed copy), AND the command line contains both the -d and -p switches. Review the exact command line and process metadata to confirm a DLL path follows -d and an export name follows -p, rather than the switches appearing incidentally.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to run rasautou.exe with a DLL-load command line?
+  context: >-
+    rasautou.exe is the legitimate RAS AutoDial dialer, but its -d/-p DLL-loading capability is undocumented and has no routine administrative use. The switches were removed in Windows 10, so a fire generally implies a pre-Windows-10 host. Knowing whether the user role and host function involve dial-up/RAS configuration, legacy software testing, or known automation is often the fastest path to separating a true positive from a sanctioned activity.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What DLL was loaded and which export was called — decode the -d path and the -p export name from the command line.
+  context: >-
+    The -d switch names the DLL to load and -p names the export to invoke; together they reveal exactly what code rasautou.exe executed. Identify the full DLL path (where it lives and whether the directory is user-writable), the export name (a generic-sounding export such as a download/run handler is a common shellcode-runner convention), and any -a/-e arguments passed through. The host+binary scope with the -d/-p filters captures the operation even if it spanned more than one invocation, while excluding unrelated rasautou activity.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_img:
+      - Image|endswith: \rasautou.exe
+      - OriginalFileName: rasdlui.exe
+      selection_cli:
+        CommandLine|contains|all:
+        - ' -d '
+        - ' -p '
+      condition: selection_host and selection_img and selection_cli
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What process spawned rasautou.exe, and is that parent chain expected?
+  context: >-
+    The parent process reveals how the binary was invoked. A legitimate RAS-related launch comes from a service or a user-initiated networking action. A scripting host (cmd.exe, powershell.exe, wscript.exe, mshta.exe), an Office application, or an unfamiliar binary spawning rasautou.exe with a DLL-load command line points to operator-driven proxy execution rather than a system function.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What DLL did rasautou.exe load into its process, and is it signed and from an expected location?
+  context: >-
+    The core of this technique is rasautou.exe loading an arbitrary DLL named by -d so the payload runs under a trusted signed binary. Image-load events for this process surface the modules it pulled in. An unsigned or oddly named DLL, or one loaded from a user-writable path (a profile, temp, or public directory) rather than System32, is the artifact that confirms the proxy load. If image-load telemetry is not collected in this environment, recover the DLL path from the decoded command line instead and treat the absence of load events as a visibility gap.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: \rasautou.exe
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+- question: Did rasautou.exe make any network connections after loading the DLL?
+  context: >-
+    rasautou.exe performing genuine RAS dialing has a narrow, predictable network profile. A DLL loaded through -d that runs shellcode commonly opens an outbound connection to retrieve a second stage or to beacon to a controller. Outbound connections from this process to an external or unexpected address — particularly on non-standard ports or to a newly seen destination — indicate the loaded code is doing more than dialing. Correlate any destination with the timing of the DLL load.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: \rasautou.exe
+        Initiated: 'true'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- question: What child processes did rasautou.exe spawn afterward?
+  context: >-
+    The processes the loaded DLL launches reveal its real impact. Shellcode delivered through a DLL-proxy load frequently spawns cmd.exe, powershell.exe, an injection target such as svchost.exe or explorer.exe, or an unfamiliar binary dropped to a user-writable path. Legitimate RAS dialing does not spawn interpreter or post-exploitation children.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: When this host previously fired this rasautou.exe DLL-load pattern, what parents and users drove it, and does the current alert fit that history?
+  context: >-
+    The query mirrors the rule's full selection structure scoped to this host, so the resulting parent and user distribution reflects how this specific DLL-load pattern has run here historically — not generic rasautou.exe usage. Because -d/-p were removed in Windows 10, any prior firing is itself notable; a new parent process, an unexpected user account, or a first-ever appearance of the pattern on this host is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+      definition: Since options '-d' and '-p' were removed in Windows 10 this rule is relevant only for Windows before 10. And as Windows 7 doesn't log command line in 4688 by default, to detect this attack you need Sysmon 1 configured or KB3004375 installed for command-line auditing (https://support.microsoft.com/en-au/help/3004375/microsoft-security-advisory-update-to-improve-windows-command-line-aud)
+    detection:
+      selection_img:
+      - Image|endswith: \rasautou.exe
+      - OriginalFileName: rasdlui.exe
+      selection_cli:
+        CommandLine|contains|all:
+        - ' -d '
+        - ' -p '
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+      definition: Since options '-d' and '-p' were removed in Windows 10 this rule is relevant only for Windows before 10. And as Windows 7 doesn't log command line in 4688 by default, to detect this attack you need Sysmon 1 configured or KB3004375 installed for command-line auditing (https://support.microsoft.com/en-au/help/3004375/microsoft-security-advisory-update-to-improve-windows-command-line-aud)
+    detection:
+      selection_img:
+      - Image|endswith: \rasautou.exe
+      - OriginalFileName: rasdlui.exe
+      selection_cli:
+        CommandLine|contains|all:
+        - ' -d '
+        - ' -p '
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+      definition: Since options '-d' and '-p' were removed in Windows 10 this rule is relevant only for Windows before 10. And as Windows 7 doesn't log command line in 4688 by default, to detect this attack you need Sysmon 1 configured or KB3004375 installed for command-line auditing (https://support.microsoft.com/en-au/help/3004375/microsoft-security-advisory-update-to-improve-windows-command-line-aud)
+    detection:
+      selection_img:
+      - Image|endswith: \rasautou.exe
+      - OriginalFileName: rasdlui.exe
+      selection_cli:
+        CommandLine|contains|all:
+        - ' -d '
+        - ' -p '
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the same user triggered similar proxy-execution or other notable activity on other hosts in the same window, the scope of the incident may be larger than a single endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+      definition: Since options '-d' and '-p' were removed in Windows 10 this rule is relevant only for Windows before 10. And as Windows 7 doesn't log command line in 4688 by default, to detect this attack you need Sysmon 1 configured or KB3004375 installed for command-line auditing (https://support.microsoft.com/en-au/help/3004375/microsoft-security-advisory-update-to-improve-windows-command-line-aud)
+    detection:
+      selection_img:
+      - Image|endswith: \rasautou.exe
+      - OriginalFileName: rasdlui.exe
+      selection_cli:
+        CommandLine|contains|all:
+        - ' -d '
+        - ' -p '
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection*) and _pb_scope
+    fields:
+    - host.name
+- question: Have other hosts fired this rasautou.exe DLL-load pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: >-
+    The query mirrors the rule's full selection structure with no host scope, so the result is a fleet-wide count of this DLL-load pattern rather than generic rasautou.exe usage. Many hosts firing the same pattern points to scripted deployment or a sanctioned legacy tool; one host or a small unrelated set points to manual operator activity. Use the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+      definition: Since options '-d' and '-p' were removed in Windows 10 this rule is relevant only for Windows before 10. And as Windows 7 doesn't log command line in 4688 by default, to detect this attack you need Sysmon 1 configured or KB3004375 installed for command-line auditing (https://support.microsoft.com/en-au/help/3004375/microsoft-security-advisory-update-to-improve-windows-command-line-aud)
+    detection:
+      selection_img:
+      - Image|endswith: \rasautou.exe
+      - OriginalFileName: rasdlui.exe
+      selection_cli:
+        CommandLine|contains|all:
+        - ' -d '
+        - ' -p '
+      condition: all of selection*
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Alerts rarely occur in isolation. Examining the surrounding activity reveals what led to this event and what followed — reconnaissance, privilege escalation, persistence installation, or data staging. Novel parent-child pairs at low counts stand out against high-count agent-telemetry noise and are what to scan for.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host — defense tampering, reconnaissance, credential access — may reveal the attack stages that preceded the proxy-execution event and help reconstruct the timeline. Defense tampering followed by execution, or reconnaissance followed by exploitation, are the sequences to look for.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

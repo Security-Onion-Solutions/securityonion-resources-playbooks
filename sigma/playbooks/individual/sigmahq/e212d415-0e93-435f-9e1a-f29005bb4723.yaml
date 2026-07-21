@@ -1,0 +1,278 @@
+name: Suspicious Remote Child Process From Outlook
+id: dbac4410-232a-4b8f-b1f8-d73732089f36
+description: |
+  Fires when outlook.exe spawns a child process whose image path begins with a UNC prefix, meaning the executable lives on an SMB or WebDAV network share rather than local disk. Outlook normally launches only local helper binaries, so a child running directly from a remote share is the discriminator. This pattern matches client-side Outlook abuse (malicious mail rules, custom forms, or folder home pages) that configures Outlook to ShellExec a self-contained binary hosted on a share, giving an actor remote code execution and persistence on whatever workstation the targeted mailbox logs into. Determine what the remote binary is, what mailbox-side mechanism configured the launch, and whether the same launch is appearing on other hosts.
+type: detection
+detection_id: e212d415-0e93-435f-9e1a-f29005bb4723
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- question: Did outlook.exe spawn a child process whose image runs from a UNC network share?
+  context: Confirm the alert is a true positive by reviewing the triggering event against the rule's two criteria - the parent is outlook.exe and the child image path begins with the UNC prefix that marks an SMB or WebDAV share rather than local disk. Note the full child image path and the share host it points at.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+- question: Is this user and host expected to launch programs from a network share through Outlook?
+  context: Outlook launching a child binary that resides on a remote share is not a normal user workflow. Knowing whether the mailbox owner or host has any legitimate reason to run share-hosted tooling helps separate an unusual but sanctioned automation from client-side mailbox abuse.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What exactly did the share-hosted child binary do? Decode its command line and identify the share it loaded from.
+  context: The remote child is the payload. Decode every argument and resolve the UNC path to the share host - a WebDAV path encodes a remote host or IP, and the binary itself is often a small launcher (for example an AutoIt-compiled executable) that then fetches and runs a script. High-risk child images in this pattern include powershell.exe, cmd.exe, rundll32.exe, regsvr32.exe, mshta.exe, msiexec.exe, curl.exe, and bitsadmin.exe. Capture the full command line and current directory for downstream pivots.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Is outlook.exe expected to spawn this child, and what started outlook.exe itself?
+  context: A child running from a remote share is never a normal Outlook helper. Tracing outlook.exe's own origin shows whether this is an ordinary interactive mail session or part of a larger chain. In client-side mailbox abuse the launch is configured server-side and fires automatically when the mailbox is opened, so the parent will typically be a routine Outlook startup with no obvious local trigger.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What other child processes did this same Outlook instance spawn?
+  context: If the mailbox-side mechanism launched the share-hosted binary, the same Outlook instance may have spawned additional helpers in sequence - reconnaissance, a script host, or a download utility. Multiple children from one Outlook instance points to orchestrated post-execution activity rather than a one-off launch.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: What mailbox-side mechanism configured Outlook to launch this binary?
+  context: This execution is triggered from inside the mailbox, not by a double-clicked attachment. The configured launch usually comes from a malicious server-side mail rule with a run-application or run-a-script action, a custom Outlook form, or a folder home page pointed at attacker content. Review the mailbox for unexpected rules, forms, or home-page settings, and check whether the EnableUnsafeClientMailRules value was re-enabled to permit the rule actions.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+- question: Did the same Outlook-spawns-remote-child pattern fire on other hosts or for other mailboxes?
+  context: Client-side mailbox abuse follows the user, not the machine - the configured launch fires on whatever workstation the targeted mailbox logs into, and an actor with valid credentials may have planted it in several mailboxes. The same rule firing across multiple hosts or users reveals how many mailboxes were tampered with and which additional endpoints need investigation.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        rule.uuid|expand: '%rule_uuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Is this Outlook installation patched, and are the client-side abuse mitigations enforced?
+  context: Several Outlook abuse vectors are mitigated by default in current builds but can be re-enabled through registry values. Confirm Outlook is current and that the mail-rule, custom-form, and folder-home-page mitigations are in force - an unpatched or de-mitigated client confirms the launch path was viable and indicates which other clients in the environment are similarly exposed.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+- question: What outbound network connections did the share-hosted child make after launch?
+  context: Indirect execution from a share usually leads to second-stage retrieval or command-and-control. Pivot from the child process to its outbound connections to see whether it reached external infrastructure to fetch a follow-on payload or beacon. Connections to known-good administrative egress are expected; connections to unfamiliar external destinations shortly after launch indicate active C2.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- question: What files did the share-hosted child write to local disk?
+  context: Launchers retrieved from a share commonly stage a follow-on script or payload locally - for example a PowerShell script dropped under a user profile path, or an encoded data file in a public downloads directory. Identifying what the child wrote shows whether a persistent second stage was placed on the host and gives concrete artifacts to scope and remediate.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - EventType
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \outlook.exe
+        Image|startswith: \\\\
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \outlook.exe
+        Image|startswith: \\\\
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the mailbox owner's activity across all hosts reveals lateral movement or activity on multiple endpoints. If the same user triggered similar activity elsewhere, the scope of compromise may be larger than this one host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \outlook.exe
+        Image|startswith: \\\\
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate context: what led to this event, what happened after, and whether it is part of a larger sequence. Aggregating by image and parent collapses repetitive agent telemetry while novel parent-child pairs stand out at low counts.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host - credential access, reconnaissance, or defense tampering - may reveal the stages that preceded this execution and help reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

@@ -1,0 +1,392 @@
+name: Command Line Execution with Suspicious URL and AppData Strings
+id: fa2eebf2-2f71-4ec7-9556-f830ca45ff79
+description: |
+  Detects a cmd.exe command line that simultaneously contains an HTTP URL ('http' and '://') and an '%AppData%'
+  reference -- the AND combination commonly produced by script-based droppers that orchestrate a download-and-run
+  chain (a script host spawns cmd.exe, which builds an obfuscated PowerShell or native download command that
+  fetches a payload over HTTP and drops it into the per-user AppData directory). Legitimate cmd.exe invocations
+  rarely combine a remote URL with an AppData write path in one command line, but some installers and helper
+  scripts can. The investigation should decode the full command line, identify the download mechanism and source
+  URL, confirm whether a payload landed on disk under AppData, and establish the parent chain and user context to
+  separate a real download-and-execute chain from benign automation.
+type: detection
+detection_id: 1ac8666b-046f-4201-8aba-1951aaec03a3
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does this cmd.exe command line contain an HTTP URL and an %AppData% reference together?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule fires only when a
+    single cmd.exe command line contains 'http' AND '://' AND '%AppData%' together. Read the exact command line and
+    confirm all three are present in one invocation rather than coincidentally split across unrelated arguments.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Is this user and host expected to run cmd.exe commands that download files into AppData?
+  context: Legitimate administrative activity and some installers can trigger this. Knowing whether the user role
+    and host function are consistent with command-line downloads into a per-user AppData directory is often the
+    fastest path to distinguishing a true positive from routine operations.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What exactly did this command do? Decode the full command line, including any caret or escape obfuscation.
+  context: The full command line reveals the download mechanism and the payload destination. Droppers frequently
+    break PowerShell keywords and switches apart with caret ('^') characters that cmd.exe strips before passing to
+    the child interpreter; reconstruct the cleaned command. Identify the source URL, the download method (for
+    example New-Object Net.WebClient DownloadFile, Invoke-WebRequest, bitsadmin, certutil), and the exact AppData
+    drop path.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: \cmd.exe
+        CommandLine|contains|all:
+        - http
+        - '://'
+        - '%AppData%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Did cmd.exe spawn an obfuscated PowerShell downloader, and what does the deobfuscated command do?
+  context: This pattern typically chains cmd.exe into a caret-fragmented or otherwise obfuscated PowerShell command
+    that pulls a payload over HTTP. Reconstruct the cleaned PowerShell command from the alerting cmd.exe command
+    line, identify the cradle (for example a Net.WebClient DownloadFile or DownloadString call), and note the source
+    URL and the AppData destination so the download can be tracked to disk.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Does the command line carry shell-chaining or obfuscation markers such as carets, ampersand chaining,
+    or /c and /k switches?
+  context: cmd.exe abuse is characterized by anomalous command-line structure -- caret splitting between keyword
+    letters, '&&' or '&' chaining of multiple commands, and /c or /k driving a one-liner. These markers distinguish
+    a scripted dropper orchestration from an interactive operator typing a single command. Note which markers are
+    present, since they indicate runtime command assembly designed to defeat static parsing.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - Image
+- question: What process spawned this cmd.exe, and is that parent chain expected?
+  context: The parent reveals how the command was invoked. cmd.exe launched from a script host such as wscript.exe
+    or cscript.exe, from a browser, or from an Office application is characteristic of a delivered-file execution
+    chain, whereas explorer.exe or an interactive shell parent is more consistent with user-driven activity. Identify
+    the immediate parent and what spawned it.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Did the spawning process tree make outbound network connections to the URL host around the alert time?
+  context: The download stage of this chain reaches out over HTTP to fetch the payload. Pivot from the alerting
+    host to outbound connections in the alert window to confirm a transfer occurred and to capture the destination
+    address and port, which can be enriched against threat intelligence. Exclude routine system-owned connections to
+    focus on the interpreter-driven traffic.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+      filter_browsers:
+        Image|endswith:
+        - \chrome.exe
+        - \msedge.exe
+        - \firefox.exe
+      condition: selection and not filter_browsers
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationHostname
+      - DestinationPort
+- question: Was the download successful? Check for file creation at the AppData destination.
+  context: A download command does not guarantee the file was retrieved. Network errors, blocked URLs, or security
+    controls may have prevented the transfer. Confirming file creation under the AppData path from the command line
+    establishes whether the chain progressed past delivery into execution.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Is the downloaded payload still on disk under AppData for analysis?
+  context: If the dropped file references a path the command wrote to (a downloaded payload, often with an unusual
+    or extensionless name under AppData), checking whether it still exists enables hash lookup, sandbox submission,
+    or content review.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: If the downloaded payload was executed, what is its hash and does it have known threat-intel detections?
+  context: The hash for a reputation lookup is recorded when the payload runs, not when it is written to the per-user
+    AppData drop path — file-creation events carry no hash. If the same command then runs it, the payload is a child or
+    sibling of the alerting process, so this query returns those processes with their executable hashes — match the
+    dropped file name and submit its hash. If it was run later by an unrelated process, retrieve it from disk and hash
+    it manually.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_children:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      selection_siblings:
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - Image
+      - Hashes
+- question: What other file activity occurred in the AppData target directory?
+  context: Droppers often write multiple files to the same staging directory, or the downloaded file triggers
+    further writes (extraction, decompression, additional downloads). Examining directory-level file activity reveals
+    the broader scope of the delivery operation.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Did the downloaded payload under AppData get executed afterward?
+  context: This chain typically ends with Start-Process or a direct launch of the file dropped into AppData. Look
+    for process creation where the image path resolves to the per-user AppData directory in the period after the
+    download, which confirms the chain progressed from delivery into execution.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|contains:
+        - \AppData\Roaming\
+        - \AppData\Local\
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+      - CommandLine
+- question: When this host previously fired this download-into-AppData pattern, what parents and users drove it, and
+    does the current alert fit?
+  context: Even common shells can be abused. The query mirrors the rule's selection scoped to this host, so the
+    resulting parent and user distribution reflects how this specific firing pattern has historically run here. A new
+    parent process, an unexpected user account, or an unusual command-line structure is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \cmd.exe
+        CommandLine|contains|all:
+        - http
+        - '://'
+        - '%AppData%'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \cmd.exe
+        CommandLine|contains|all:
+        - http
+        - ://
+        - '%AppData%'
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \cmd.exe
+        CommandLine|contains|all:
+        - http
+        - ://
+        - '%AppData%'
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple
+    endpoints. If the same user triggered similar activity on several hosts, the scope of the delivery operation may
+    be larger than a single endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \cmd.exe
+        CommandLine|contains|all:
+        - http
+        - ://
+        - '%AppData%'
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host -- script execution, reconnaissance,
+    or defense tampering -- may reveal the stages that preceded this download chain and help reconstruct the full
+    timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

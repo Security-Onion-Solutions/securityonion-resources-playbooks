@@ -1,0 +1,392 @@
+name: Suspicious Get-ADReplAccount
+id: e6cc0818-a2f5-4c83-87cf-471d739d8885
+description: |
+  This rule fires when PowerShell script block logging records a Get-ADReplAccount invocation carrying both the -All and -Server parameters — the DSInternals cmdlet syntax that requests password hashes for every account in the directory from a chosen domain controller over the directory replication (DRSUAPI) channel, the same mechanism as a DCSync attack (T1003.006). DSInternals also has legitimate uses — password auditing, FIDO2/NGC key review, and domain-controller recovery — so identity or security teams may run this cmdlet from designated hosts. The investigation should establish who ran the script and whether that account and host are sanctioned for directory auditing, whether the replication request actually reached a domain controller, and whether retrieved credential material was put to use; because the technique reads credentials through the replication API without touching LSASS or NTDS.dit, the script content, directory-service access auditing on domain controllers, and subsequent authentication activity carry most of the evidence.
+type: detection
+detection_id: 060c3ef1-fd0a-4091-bf46-e7d625f60b73
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-17
+questions:
+- question: Does the script block contain a Get-ADReplAccount invocation with both the -All and -Server parameters?
+  context: The rule fires only when the script text carries all three fragments — Get-ADReplAccount, '-All ', and '-Server '. Long scripts are split across multiple 4104 events, so this query retrieves every chunk of the alerting block in sequence order and the match should be judged on the complete script, not the alerting fragment. Confirm the cmdlet is actually invoked rather than merely appearing in a comment, help text, or a defensive audit script's string table.
+  range: +/-5m
+  answer_sources:
+  - alert
+  - ps_script
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - ScriptBlockText
+- question: Is this user and host sanctioned to run Active Directory replication or password-audit tooling?
+  context: DSInternals has legitimate uses — password auditing, FIDO2/NGC key review, domain-controller recovery — and identity or security teams may run Get-ADReplAccount from designated administrative hosts on a schedule. The query displays the alerting block's host, user, and on-disk script path (when file-based). An account outside directory-administration roles, or an ordinary workstation, producing a directory-wide hash pull is the case to pursue; a SYSTEM user would be unusual for this cmdlet and points at automation worth identifying.
+  range: +/-5m
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - host.name
+      - user.name
+      - Path
+- question: What does the complete script do with the retrieved credential data?
+  context: Reassembled in sequence order, the full block shows the whole invocation — the -Server value naming the targeted domain controller, whether output is exported to disk or held in variables for further processing, and surrounding staging such as Install-Module DSInternals or credential objects built for the run. Script block logging records post-compilation content, so -EncodedCommand wrappers are already unwrapped here; only string-level obfuscation inside the script (concatenation, format operators, backticks) still needs manual decoding.
+  range: +/-5m
+  answer_sources:
+  - ps_script
+  - manual_review
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - powershell.sequence
+      - powershell.total
+      - ScriptBlockText
+- question: Did this script run from a file on disk, and what wrote it there?
+  context: When the block ran from a file, its path is recorded on the alerting event; a script staged in Temp, AppData, ProgramData, or Downloads implies a delivery step — find the file-creation event to identify the process and account that wrote it. Get-ADReplAccount is just as often typed interactively, which logs no path at all, so an in-memory block here means an interactive or fileless session rather than an answer in itself; in that case lean on the identity and history questions instead.
+  range: +/-24h
+  answer_sources:
+  - file_event
+  - manual_review
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - EventType
+      - TargetFilename
+      - Image
+      - User
+- question: Which accounts did the replication request target?
+  context: The '-All ' parameter requests secrets for every account in the directory — krbtgt, domain administrators, and service accounts included — rather than a single principal, and the -Server value in the script text names the domain controller asked to serve them. This query surfaces command-line-visible Get-ADReplAccount and DSInternals invocations by this user on this host across the surrounding month, catching narrower per-account pulls that the rule's -All requirement would miss; invocations typed inside an interactive session appear only in script block content, not on process command lines.
+  range: +/-30d
+  answer_sources:
+  - process_creation
+  - ps_script
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        User|expand: '%User%'
+      selection_tool:
+        CommandLine|contains:
+          - 'Get-ADReplAccount'
+          - 'DSInternals'
+      condition: selection and selection_tool
+    fields:
+    - CommandLine
+- question: Did a domain controller record a directory-replication access from a non-DC account in this window?
+  context: Get-ADReplAccount only yields hashes if the DRSUAPI GetNCChanges request succeeds, and domain controllers with directory-service access auditing enabled record that as event 4662 carrying the replicating-directory-changes control-access GUIDs. Legitimate entries come from domain controller computer accounts (names ending in $) replicating with each other; a user account here — especially the one tied to this alert — corroborates that the pull ran and shows which DC served it. If domain controllers do not forward their Security logs or this auditing is not enabled, treat zero results as a visibility gap rather than evidence the replication never happened.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        EventID: 4662
+        Properties|contains:
+          - '1131f6aa-9c07-11d1-f79f-00c04fc2dcd2'
+          - '1131f6ad-9c07-11d1-f79f-00c04fc2dcd2'
+          - '89e95b76-444d-4c62-991a-0facbeda640c'
+      condition: selection
+    fields:
+      - SubjectUserName
+      - SubjectLogonId
+      - host.name
+- question: Were PowerShell security controls bypassed or weakened before this script ran?
+  context: Operators who bring DSInternals onto a host frequently prepare the session first — AMSI bypass (patching amsi.dll in memory), execution-policy overrides, antivirus preference changes, or a downgrade to PowerShell v2, which lacks script block logging entirely. The query lists command lines on this host in the preceding hour matching common bypass and tamper indicators; a hit close to the alert marks where the session began and weakens the routine-audit explanation.
+  range: -1h
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: What launched this PowerShell session, and did it spawn follow-on tools?
+  context: Script block events carry no process identity, so this pivots by host, user, and time across process telemetry. Process starts where PowerShell is the image show the launcher — an interactive console under explorer.exe, a remoting host, and a scheduled task each tell a different delivery story — while starts where PowerShell is the parent show what the session executed next, such as archiving utilities or transfer tools handling the replicated material. If the alert fired under a service principal, the user anchor reads broadly; the fleet-pattern questions then carry more weight.
+  range: +/-30m
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        User|expand: '%User%'
+      selection_ps:
+        Image|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+          - '\powershell_ise.exe'
+      selection_children:
+        ParentImage|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+          - '\powershell_ise.exe'
+      condition: selection and (selection_ps or selection_children)
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+      - User
+- question: Were outbound remote-access connections (RDP, SMB, WinRM, SSH) initiated from this host after this event?
+  context: Hashes obtained through replication are usable directly for pass-the-hash and ticket forging — no offline cracking step is needed — so movement can follow quickly. The query returns outbound connections from this host to remote-access ports (3389 RDP, 445 SMB, 5985/5986 WinRM, 22 SSH) in the hours after the event, with the originating image and user. Credentials replayed from a different machine will not appear here — check logon activity on suspected targets for the exposed accounts — and where network telemetry is not collected from this host, treat zero rows as a visibility gap rather than evidence no movement occurred.
+  range: +4h
+  answer_sources:
+  - network_connection
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
+- question: What other PowerShell script activity occurred on this host around the alert?
+  context: A replication pull rarely stands alone — module installation, reconnaissance cmdlets, and output handling typically produce a cluster of script blocks around the alerting one, often containing plaintext the alerting fragment lacks. The log level column also calibrates the view — verbose entries mean full script block logging is enabled, while warning-only entries mean the host records just automatically-flagged suspicious content, so surrounding benign blocks may simply not have been logged.
+  range: +/-1h
+  answer_sources:
+  - ps_script
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - user.name
+      - log.level
+      - ScriptBlockText
+- question: What other process activity occurred on this host around the time of the alert?
+  context: The aggregated image and parent pairs collapse routine agent heartbeats into high-count rows while novel pairings stand out at low counts. Around a credential-replication attempt, look for reconnaissance utilities, archiving or transfer helpers, and identity tooling that place this script inside a longer sequence of activity rather than an isolated invocation.
+  range: +/-15m
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Credential access typically sits midway through an intrusion. Earlier detections on the same host — initial execution, defense tampering, privilege escalation, reconnaissance — reconstruct the stages that led to a replication attempt and mark when the session worth investigating began.
+  range: -6h
+  answer_sources:
+  - alert
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Is full script block logging enabled on this host, or is only suspicious-content logging active?
+  context: PowerShell records all script blocks at verbose level when the Script Block Logging policy is enabled, and only Microsoft's automatically-flagged suspicious content (at warning level) when it is not. On a warning-only host this alert is a fragment of the host's PowerShell activity, not a complete record — absence of surrounding script-block evidence is not absence of activity. The level distribution over the past week tells you how complete every other script-content view in this investigation is.
+  range: -7d
+  answer_sources:
+  - ps_script
+  query: |
+    aggregation: true
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - log.level
+- always_include: true
+  question: What else did this user do across the environment around this time?
+  context: Aggregating the account's process activity across all hosts in the alert window shows whether the same identity was active elsewhere — replication rights are domain-scoped, so the pull can be launched from any machine the account can reach. Similar activity on several hosts widens the scope of the review. When the alert fired under SYSTEM or another service principal, this view degenerates to agent telemetry and the fleet-pattern questions carry the signal instead.
+  range: +/-1h
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- always_include: true
+  question: Did this same script pattern fire on other hosts in the same window, or is it isolated to this host?
+  context: 'Under a service principal, user identity does not attribute behavior, and script block events carry no process identity to pivot on — the meaningful pivot is the pattern itself. The query mirrors the rule''s selection fleet-wide in the alert window, aggregated by host: several hosts at once suggests pushed automation such as a scheduled directory audit, while a single host points to a host-local session. Only hosts shipping the PowerShell channel (and, for content Microsoft does not auto-flag, with full script block logging enabled) can appear, so absence elsewhere is weak evidence.'
+  range: +/-1h
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: ps_script
+      definition: 'Requirements: Script Block Logging must be enabled'
+    detection:
+      selection:
+        ScriptBlockText|contains|all:
+        - Get-ADReplAccount
+        - '-All '
+        - '-Server '
+      condition: selection
+    fields:
+    - host.name
+- always_include: true
+  question: Has this user produced this replication pattern before, and does that history fit their role?
+  context: The query mirrors the rule's selection scoped to this user over 90 days, aggregated by host — the user's history of this specific Get-ADReplAccount pattern, not generic PowerShell use. An identity-team member who runs scheduled password audits will show prior hits from designated hosts; an account with no history suddenly producing a directory-wide hash pull is the deviation worth chasing. Weigh the count against the user's role and typical toolset.
+  range: -90d
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: ps_script
+      definition: 'Requirements: Script Block Logging must be enabled'
+    detection:
+      selection:
+        ScriptBlockText|contains|all:
+        - Get-ADReplAccount
+        - '-All '
+        - '-Server '
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: Which hosts have historically produced this script pattern, and is the alerting host among them?
+  context: When the alert fires under a service principal, user identity does not attribute the behavior, so the pattern is the pivot — the query mirrors the rule's selection fleet-wide over 90 days, aggregated by host. A pattern that routinely appears on a designated audit host reads as scheduled tooling; one that has never appeared anywhere, or shows up on this host for the first time, is new behavior for the environment. History is only as complete as each host's script block logging policy — default hosts record just automatically-flagged content.
+  range: -90d
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: ps_script
+      definition: 'Requirements: Script Block Logging must be enabled'
+    detection:
+      selection:
+        ScriptBlockText|contains|all:
+        - Get-ADReplAccount
+        - '-All '
+        - '-Server '
+      condition: selection
+    fields:
+    - host.name
+- question: Which accounts should be treated as exposed if the replication succeeded?
+  context: A successful Get-ADReplAccount run with '-All ' returns current and historical secrets for every principal in the directory — krbtgt (whose hash enables forged Kerberos tickets), domain and enterprise administrators, and service accounts. Success requires the invoking account to hold replicating-directory-changes rights, so verify its group membership and replication permissions in the directory; a run from an account without them fails, which narrows the incident to attempted access. The query lists this user's PowerShell command lines on the host over the surrounding month as input to that review — the exposure determination itself comes from directory group membership and privilege data.
+  range: +/-30d
+  answer_sources:
+  - active_directory
+  - organizational_knowledge
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        User|expand: '%User%'
+      selection_ps:
+        Image|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+      condition: selection and selection_ps
+    fields:
+    - CommandLine

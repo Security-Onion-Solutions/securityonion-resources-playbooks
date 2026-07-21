@@ -1,0 +1,372 @@
+name: Suspicious Service Binary Directory
+id: ec1bde63-b5ab-4258-9e31-2b541145dca2
+description: |
+  Detects a process whose image runs from a suspicious or non-standard directory
+  (such as \Users\Public\, \$Recycle.bin, C:\Perflogs\, \config\systemprofile\, or
+  certain Windows subdirectories like \Windows\Fonts\ and \Windows\addins\) while its
+  parent is a Windows service host (services.exe or svchost.exe). Legitimate service
+  binaries almost always live under Program Files, System32, or vendor-specific
+  installation paths; a service spawning code from a user-writable or recycle/temp
+  location is a common pattern for service-based persistence and for masquerading a
+  payload as a service. The investigation should confirm what binary actually ran,
+  why a service launched it from that directory, and whether the binary went on to
+  spawn child processes or open network connections.
+type: detection
+detection_id: 883faa95-175a-4e22-8181-e5761aeb373c
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- question: Does the alerting process match this rule — a binary running from a suspicious directory under a service-host parent?
+  context: Confirm the alert is a true positive by reviewing the triggering event. The rule fires when the parent is services.exe
+    or svchost.exe AND the image path contains one of the watched directories (\Users\Public\, \$Recycle.bin, \Users\All Users\,
+    \Users\Default\, \Users\Contacts\, \Users\Searches\, C:\Perflogs\, \config\systemprofile\, \Windows\Fonts\, \Windows\IME\,
+    or \Windows\addins\). Note the exact image path and which directory matched — that location drives the rest of the investigation.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+- question: Is this host expected to run a service whose binary lives in this directory?
+  context: Legitimate service binaries are normally installed under Program Files, System32, or a vendor path. A service host
+    launching code from a user-writable or recycle/temp directory is rarely a sanctioned configuration. Knowing whether this
+    host has any approved service that installs to such a location is often the fastest way to separate a real finding from
+    an unusual but sanctioned deployment.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Is this service host expected to spawn this child, and what started the service host itself?
+  context: The service-host-to-binary relationship is the core signal here. Tracing the parent's own origin shows whether
+    the launch came from a legitimately registered service (services.exe loading a configured ImagePath) or from an injected
+    or hijacked service-host instance. ParentCommandLine often reveals the -k service group or the service name that maps to
+    this image.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What is the full command line of the binary the service launched, and what does it do?
+  context: The command line reveals the binary's operational purpose — flags, file paths, URLs, or downstream commands. Decode
+    any encoded content and identify what action the binary takes. A service binary in a suspicious directory that carries
+    download, scripting, or interpreter arguments is a stronger signal than a self-contained executable with no arguments.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Did this service-launched binary spawn high-risk child processes such as command interpreters or scripting/download utilities?
+  context: Indirect command execution chains continue when the launched binary spawns a secondary program — powershell.exe,
+    cmd.exe, rundll32.exe, regsvr32.exe, mshta.exe, msiexec.exe, curl.exe, or bitsadmin.exe. The presence of these children
+    indicates the service binary is a launcher rather than a self-contained service, and identifies the next stage to triage.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      selection_children:
+        Image|endswith:
+          - \powershell.exe
+          - \cmd.exe
+          - \rundll32.exe
+          - \regsvr32.exe
+          - \mshta.exe
+          - \msiexec.exe
+          - \curl.exe
+          - \bitsadmin.exe
+      condition: selection and selection_children
+    fields:
+      - Image
+      - CommandLine
+- question: Did the service-launched binary open outbound network connections, and to where?
+  context: Indirection utilities frequently transfer payloads or open command-and-control channels after launch. Outbound
+    connections from a binary running out of a suspicious service directory — especially to addresses outside known-good
+    admin egress ranges — indicate the binary is doing more than a local service task. Correlate the destination against
+    expected egress for this host.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Initiated
+- question: Was the SSH client config modified on this host before the alert, adding LocalCommand or ProxyCommand directives?
+  context: One indirect-execution precursor persists command execution by writing LocalCommand or ProxyCommand into the SSH
+    client config (%USERPROFILE%\.ssh\config), so an ordinary ssh invocation silently runs an attacker command. File writes
+    to a .ssh\config path in the hours before this service-binary execution may be the staging step. If file events for that
+    path are not collected in this environment, treat zero results as a visibility gap rather than evidence nothing happened.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains:
+          - \.ssh\config
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - User
+- question: What other child processes did the same service-host instance spawn around the alert?
+  context: A single service-host instance normally launches one configured service binary. If the same parent instance spawned
+    multiple children, that breaks the expected one-service-per-instance pattern and reveals the full set of programs launched
+    through this service host. Sibling processes scope the activity that originated from the same parent.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Has this service-host parent spawned a binary from this directory on this host before?
+  context: Routine service launches repeat with stable parent-child pairings. A service host launching a binary from one of
+    the watched suspicious directories with zero or very low historical frequency indicates a novel spawning relationship,
+    which is more consistent with newly installed persistence than with established service behavior.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|contains:
+        - \Users\Public\
+        - \$Recycle.bin
+        - \Users\All Users\
+        - \Users\Default\
+        - \Users\Contacts\
+        - \Users\Searches\
+        - C:\Perflogs\
+        - \config\systemprofile\
+        - \Windows\Fonts\
+        - \Windows\IME\
+        - \Windows\addins\
+        ParentImage|endswith:
+        - \services.exe
+        - \svchost.exe
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|contains:
+        - \Users\Public\
+        - \$Recycle.bin
+        - \Users\All Users\
+        - \Users\Default\
+        - \Users\Contacts\
+        - \Users\Searches\
+        - C:\Perflogs\
+        - \config\systemprofile\
+        - \Windows\Fonts\
+        - \Windows\IME\
+        - \Windows\addins\
+        ParentImage|endswith:
+        - \services.exe
+        - \svchost.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user account do across the network around this time?
+  context: Tracking the account's activity across hosts in the alert window reveals lateral movement or coordinated activity
+    on multiple endpoints. If the same account drove similar service-binary executions elsewhere, the scope is larger than a
+    single host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|contains:
+        - \Users\Public\
+        - \$Recycle.bin
+        - \Users\All Users\
+        - \Users\Default\
+        - \Users\Contacts\
+        - \Users\Searches\
+        - C:\Perflogs\
+        - \config\systemprofile\
+        - \Windows\Fonts\
+        - \Windows\IME\
+        - \Windows\addins\
+        ParentImage|endswith:
+        - \services.exe
+        - \svchost.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Is a service host launching a binary from this directory occurring on other hosts?
+  context: The same service-host-to-suspicious-directory pattern appearing on multiple hosts may indicate a service-persistence
+    rollout across the environment rather than an isolated event. Enterprise-wide comparison helps calibrate scope and severity.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+      - CommandLine
+- question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Aggregating process activity around the alert window surfaces what led to this
+    event and what followed — reconnaissance, privilege escalation, or additional persistence — while collapsing repetitive
+    agent telemetry into high-count rows so novel parent-child pairs stand out.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — defense tampering, reconnaissance, or credential access — may reveal the
+    attack stages that preceded a service being made to launch a binary from a suspicious directory and help reconstruct the
+    timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

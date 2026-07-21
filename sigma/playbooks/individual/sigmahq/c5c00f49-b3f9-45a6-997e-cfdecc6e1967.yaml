@@ -1,0 +1,387 @@
+name: Suspicious Schtasks Execution AppData Folder
+id: 7f7ca19e-52b2-4a4f-8e21-6a4d6f9d24c8
+description: |
+  Detects schtasks.exe creating a scheduled task (/Create with /RU and /TR) whose target command runs a
+  file from a user AppData\Local path under a privileged run-as account (NT AUTHORITY or SYSTEM), excluding
+  a known TeamViewer installer task. This is a common persistence pattern: a task in a user-writable folder
+  set to run as SYSTEM survives reboots and re-launches the payload on a schedule, frequently a base64
+  PowerShell cradle that reads its next stage from the registry or fetches it over the network. Legitimate
+  software deployment and management tooling can also register AppData-relative tasks, so the investigation
+  should confirm the task name and run-command, decode any encoded payload, and determine whether the
+  creation was authorized and whether the task has already executed.
+type: detection
+detection_id: c5c00f49-b3f9-45a6-997e-cfdecc6e1967
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- question: Does the schtasks command line match this rule -- /Create with /RU and /TR running a file from
+    a user AppData\Local path as a privileged account?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the exact
+    command line. The rule requires /Create, /RU, /TR, a 'C:\Users\' path, an '\AppData\Local\' segment, and
+    a privileged run-as value (NT AUTHORITY or SYSTEM) all present together. Confirm the alerting event
+    carries each of these and is not the excluded TeamViewer install task.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Is this user and host expected to register scheduled tasks that run AppData payloads as SYSTEM?
+  context: Legitimate administrative activity can trigger this detection. Knowing whether the account and host
+    function are consistent with creating privileged scheduled tasks from user-writable folders is often the
+    fastest path to distinguishing routine deployment automation from unauthorized persistence.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Was there a change ticket, maintenance window, or documented approval for creating this scheduled task?
+  context: Many organizations require change tickets for persistence-class modifications. A corresponding ticket
+    for this task registration suggests authorized activity; absence of one when policy requires it points toward
+    unauthorized persistence. This check can quickly close false positives or escalate true positives.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What scheduled task was created -- what are its task name (/TN), run command (/TR), schedule (/SC),
+    and run-as account (/RU)?
+  context: The schtasks command line carries the task name, trigger schedule, run-as account, and the program
+    to execute. A /RU of SYSTEM or NT AUTHORITY is high-risk, and a /TR pointing at an AppData\Local file
+    reveals the persistence payload -- often a script, binary, or download cradle. Randomized or GUID-style
+    task names are an additional anomaly worth noting.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: If the task command runs PowerShell, was it encoded or obfuscated, and what does it decode to?
+  context: Persistence tasks frequently set /TR to a PowerShell command using -EncodedCommand (-enc), string
+    concatenation, or backtick escaping to hide intent. Decoding the payload reveals the actual operation --
+    a download cradle, a registry-read-and-IEX loader that pulls an encrypted stage from HKCU, or in-memory
+    execution of a .NET assembly. Focus on the source the payload reads from and what it executes.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Does the task command read or write an encoded payload to a per-user registry hive on this host?
+  context: A common scheduled-task persistence pattern stores its next-stage payload as a base64 string under a
+    randomly named per-user registry key and has the task decode and execute it on each run. Registry writes to
+    HKCU\SOFTWARE around the task-creation time, especially randomized 8-character key names holding long
+    encoded values, corroborate that the task is a loader rather than a benign job.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains: '\SOFTWARE\'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- question: Did the task run its AppData payload as SYSTEM, and what is its hash?
+  context: The scheduled task is set to run a file from a user's AppData\Local folder under the SYSTEM account --
+    a process executing from a user-profile path as SYSTEM is abnormal and is the qbot-style persistence this
+    rule targets. A file's hash is recorded when it runs, so this looks on the host for a SYSTEM-context process
+    whose image path is under AppData\Local and reads its hash; submit it to VirusTotal, Hybrid Analysis, or
+    internal threat intel. The task runs only when the scheduler fires it, so an empty result may mean it has not
+    triggered yet (see the trigger-and-timing question) -- retrieve the /TR file from its AppData path and hash
+    it by hand. If the /TR command wraps an interpreter (powershell, cmd), the executing process is the
+    interpreter and the payload is the script it runs -- hash that script from disk.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|contains: '\AppData\Local\'
+        User|contains: 'SYSTEM'
+      condition: selection
+    fields:
+      - Image
+      - Hashes
+- question: When is the task scheduled to run, and has the scheduler already executed it?
+  context: The trigger schedule determines when the persistence activates. Tasks set to run at logon or boot fire
+    on the next restart; recurring tasks (every few minutes, daily) may have already executed multiple times.
+    Processes spawned by the Task Scheduler service after task creation show whether the payload has run.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: '\svchost.exe'
+        ParentCommandLine|contains: 'Schedule'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Is the scheduled task still registered on the system?
+  context: Persistence is only effective if the task still exists. Some operators delete tasks after execution
+    to reduce forensic artifacts. Confirming the task is still present (via schtasks /query for the task name or
+    the Task Scheduler interface) determines whether the persistence mechanism is active and requires removal.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What process spawned schtasks.exe, and is that parent chain expected?
+  context: The parent process reveals how the task was registered. Legitimate usage often has predictable parents
+    (deployment agents, management tooling, an interactive admin shell). Unusual parents such as a process running
+    from a temp or AppData folder, an Office application, or a script host point toward malicious task creation.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        Image|endswith: \schtasks.exe
+        CommandLine|contains|all:
+        - /Create
+        - /RU
+        - /TR
+        - C:\Users\
+        - \AppData\Local\
+        CommandLine|contains:
+        - NT AUT
+        - ' SYSTEM '
+      filter:
+        ParentImage|contains|all:
+        - \AppData\Local\Temp\
+        - TeamViewer_.exe
+        Image|endswith: \schtasks.exe
+        CommandLine|contains: /TN TVInstallRestore
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        Image|endswith: \schtasks.exe
+        CommandLine|contains|all:
+        - /Create
+        - /RU
+        - /TR
+        - C:\Users\
+        - \AppData\Local\
+        CommandLine|contains:
+        - NT AUT
+        - ' SYSTEM '
+      filter:
+        ParentImage|contains|all:
+        - \AppData\Local\Temp\
+        - TeamViewer_.exe
+        Image|endswith: \schtasks.exe
+        CommandLine|contains: /TN TVInstallRestore
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the account's activity across all hosts reveals lateral movement or parallel persistence on
+    multiple endpoints. If the same account triggered similar activity elsewhere in the same window, the scope of
+    compromise may be larger than this single host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        Image|endswith: \schtasks.exe
+        CommandLine|contains|all:
+        - /Create
+        - /RU
+        - /TR
+        - C:\Users\
+        - \AppData\Local\
+        CommandLine|contains:
+        - NT AUT
+        - ' SYSTEM '
+      filter:
+        ParentImage|contains|all:
+        - \AppData\Local\Temp\
+        - TeamViewer_.exe
+        Image|endswith: \schtasks.exe
+        CommandLine|contains: /TN TVInstallRestore
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - host.name
+- question: How often has this host fired the rule's schtasks AppData-persistence pattern over the past 90 days,
+    and what command-line structures are typical?
+  context: A privileged AppData scheduled-task pattern with no prior history on a host is more suspicious than one
+    that recurs under a stable parent. The query mirrors the rule's selection so the count reflects the rule's
+    specific firing pattern, not generic schtasks usage. The command-line projection lets the analyst compare
+    typical invocation patterns against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        Image|endswith: \schtasks.exe
+        CommandLine|contains|all:
+        - /Create
+        - /RU
+        - /TR
+        - C:\Users\
+        - \AppData\Local\
+        CommandLine|contains:
+        - NT AUT
+        - ' SYSTEM '
+      filter:
+        ParentImage|contains|all:
+        - \AppData\Local\Temp\
+        - TeamViewer_.exe
+        Image|endswith: \schtasks.exe
+        CommandLine|contains: /TN TVInstallRestore
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - CommandLine
+- question: Were other process-based persistence mechanisms installed on this host around the same time?
+  context: Operators rarely rely on a single persistence mechanism. After establishing one foothold they commonly
+    install backups using different techniques -- additional scheduled tasks, services, registry Run keys, BITS
+    jobs, or WMI subscriptions. Several persistence installations in the same timeframe indicate intentional
+    stacking rather than isolated administrative action.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine

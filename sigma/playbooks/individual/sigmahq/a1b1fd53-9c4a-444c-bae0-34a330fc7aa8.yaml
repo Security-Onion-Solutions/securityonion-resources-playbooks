@@ -1,0 +1,380 @@
+name: Potential Persistence Via DLLPathOverride
+id: 15486c71-dfd6-4f6e-80ed-93be0ad55193
+description: |
+  Detects a registry write that adds a DLL path override or class value (StemmerDLLPathOverride,
+  WBDLLPathOverride, StemmerClass, or WBreakerClass) under
+  HKLM\SYSTEM\CurrentControlSet\Control\ContentIndex\Language. SearchIndexer.exe reads these entries
+  and loads the referenced DLL via LoadLibrary, so a value pointing at an attacker-controlled DLL yields
+  code execution inside a SYSTEM-context service that persists across reboot. These keys are effectively
+  never modified through normal use, so investigate which DLL path was written, which process wrote it and
+  what launched that process, whether the referenced DLL exists on disk, whether SearchIndexer.exe
+  subsequently loaded it, and whether the value was later changed or reverted.
+type: detection
+detection_id: a1b1fd53-9c4a-444c-bae0-34a330fc7aa8
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-10
+questions:
+- question: Does the alerting registry write set a DLLPathOverride or class value under the ContentIndex Language key?
+  context: >-
+    Before investing investigation time, confirm the alert is a true positive. The rule fires when the
+    TargetObject sits under \SYSTEM\CurrentControlSet\Control\ContentIndex\Language\ AND its value name ends
+    in one of \StemmerDLLPathOverride, \WBDLLPathOverride, \StemmerClass, or \WBreakerClass. Review the exact
+    TargetObject and Details on the triggering event to confirm both conditions hold. On a clean host these
+    override entries are absent or point at the built-in Natural Language libraries, so any write here is the
+    setup step of a DLL-load persistence mechanism.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this user and host expected to modify the search-indexer language configuration keys?
+  context: >-
+    The ContentIndex Language keys are set by the operating system and effectively never change through
+    normal administration, so knowing whether the writing account and host function match any sanctioned
+    change is the fastest way to separate a rare maintenance action from a live persistence attempt. Because
+    the key lives under HKLM and is typically touched by a SYSTEM or service context, User attribution is
+    present on roughly 94% of endpoint registry events; when it is a machine account or missing, pivot on the
+    writing process (Image) instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Which ContentIndex override value was written, and why is this key a persistence location?
+  context: >-
+    The keys under \SYSTEM\CurrentControlSet\Control\ContentIndex\Language hold DLL path overrides and class
+    registrations that SearchIndexer.exe loads via LoadLibrary while indexing. A value name of
+    StemmerDLLPathOverride or WBDLLPathOverride names a DLL that the SYSTEM-context indexer will load
+    directly, while StemmerClass and WBreakerClass register COM classes it instantiates. Confirming the exact
+    value name and writing process establishes that this is the search-indexer override location rather than
+    an unrelated ContentIndex edit, and sets up decoding the DLL path.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: What DLL path was written to the override value, and does it point to a legitimate library?
+  context: >-
+    The Details field holds the DLL path SearchIndexer.exe will load for this override. A path in a
+    user-writable location such as Temp, AppData, ProgramData, or a user profile directory, or a DLL with an
+    unexpected name, indicates attacker-controlled code staged for the indexer to load; a signed library
+    under system32 is the expected value. If Details references a file path, that path becomes the lead for
+    confirming the payload on disk. Details is populated on roughly 79% of registry modifications and should
+    be present for this string value.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- question: What process wrote this value, and what launched it?
+  context: >-
+    The registry event carries no command line, so pivot by ProcessGuid to the writing process to read its
+    Image, full command, and parent. A write from reg.exe, powershell.exe, or cmd.exe launched by a script
+    host such as wscript.exe or mshta.exe, an Office application, or an unsigned binary points to persistence
+    being staged programmatically, while a write from a management or deployment tool under a documented
+    parent points to routine configuration. The parent chain distinguishes a scripted implant from a
+    deliberate administrative edit.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: Is the DLL referenced by the override value present on disk, and was it recently written?
+  context: >-
+    The override is only effective if the DLL exists at the path written to the registry value. Correlating
+    file activity by the writing process and its child processes shows whether the referenced DLL was dropped
+    in the same session as the registry write, which confirms the persistence mechanism is armed and identifies
+    what would load into the indexer. The file-write event carries no hash; if the DLL is present, hash it from
+    a later load or execution for a reputation lookup.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What DLLs did SearchIndexer.exe load on this host after this registry change?
+  context: >-
+    The persistence fires when SearchIndexer.exe reads the override entry and loads the referenced DLL via
+    LoadLibrary. Listing the DLLs the indexer loaded after the write shows whether the override took effect;
+    compare each ImageLoaded path against the DLL path from the value data and check the signature. A load of
+    the overridden path, especially an unsigned or non-system32 DLL, confirms active persistence. DLL load
+    events carry signature and hash directly, so no separate execution pivot is needed.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: '\SearchIndexer.exe'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+      - SignatureStatus
+      - Hashes
+- question: After this write, was the override value changed again or reverted to a legitimate library?
+  context: >-
+    Registry key or value deletions are not observable in this telemetry, so durability is judged from the
+    key's re-modification history rather than from a delete event. A later write that restores the value to a
+    built-in system32 library indicates the change was reverted, while the value remaining an
+    attacker-controlled path leaves the DLL primed to load the next time the indexer starts. Compare the
+    Details values written over the following window and note which process made each change.
+  range: +24h
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - Details
+      - Image
+- question: Has this ContentIndex override value been modified before on this host?
+  context: >-
+    The search-indexer language override keys change rarely and only through deliberate action, so a history
+    with no prior writes makes this a first-time change and raises its weight. A history of periodic writes to
+    the same value points instead to a management process or a repeatedly run tool. Compare the historical
+    Details values to see whether the same DLL path was set before or whether this is new.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - Details
+      - Image
+- question: Was this override value modified on other hosts in the environment?
+  context: >-
+    The same write across many hosts suggests a broad tool run or a mis-scoped deployment, while the same
+    write confined to one host suggests targeted persistence. Compare the Details values across hosts to see
+    whether they all reference the same DLL path and whether the writing process is consistent, which
+    separates a single hands-on operation from repeated use of the same technique across the environment.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+      - Details
+- question: What other registry modifications were made on this host in the same window?
+  context: >-
+    An actor establishing persistence often makes other configuration changes in the same session -
+    additional autostart keys, service registrations, or Defender and firewall policy edits. Clustering the
+    registry writes on this host in a short window around the alert reveals the full scope of changes and
+    which process made them. The triggering key appears in the results; the signal is what else was modified
+    and by which process.
+  range: +/-30m
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - User
+- question: What other process activity occurred on this host around the time of the alert?
+  context: >-
+    Alerts rarely occur in isolation. Aggregating process activity in a tight window around the alert
+    surfaces what led up to the registry write and what ran immediately after it. Novel parent-child pairs
+    stand out at low counts against high-count routine telemetry, which is what points to the tool that staged
+    the override and any follow-on actions taken once persistence was in place.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host - reconnaissance, execution of scripting tools, or defense tampering -
+    may reveal the stages that preceded this change and help reconstruct the timeline. Persistence is commonly
+    installed after an initial foothold, so prior alerts help place this override write within a larger
+    sequence of activity.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Were other process-based persistence mechanisms installed on this host in the same window?
+  context: >-
+    Attackers rarely rely on a single persistence mechanism. After establishing one foothold, they commonly
+    install backups using different techniques - scheduled tasks, services, registry Run keys, BITS jobs, or
+    WMI subscriptions created by schtasks.exe, sc.exe, reg.exe, bitsadmin.exe, or wmic.exe. Multiple
+    persistence installations near this override write indicate intentional stacking rather than an isolated
+    configuration change.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- question: Were files dropped to Startup or scheduled-task locations on this host in the same window?
+  context: >-
+    File-based persistence bypasses command-line detection entirely - dropping an executable or script into a
+    Startup folder or a path referenced by a registry Run key achieves persistence without invoking schtasks,
+    sc, or reg. File writes to these locations near this override write indicate the actor established a
+    parallel persistence mechanism on disk alongside the search-indexer DLL load.
+    Run-key persistence itself is a registry write, not a file drop, so it does not appear in file telemetry; this query covers Startup folders and scheduled-task definition files, and Run-key writes surface in registry questions instead.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist_paths:
+        TargetFilename|contains:
+          - '\Start Menu\Programs\Startup\'
+          - '\Windows\System32\Tasks\'
+          - '\Windows\Tasks\'
+      condition: selection and selection_persist_paths
+    fields:
+      - TargetFilename
+      - Image
+- question: Does an administrator recall making this search-indexer configuration change?
+  context: >-
+    The ContentIndex Language override keys have no routine reason to change, so direct confirmation from the
+    responsible administrator or team is a fast way to resolve the alert. If an operator was testing a search
+    customization or a documented deployment set the value, that closes it; if no one recalls the action, the
+    account may be compromised or the change was made by automated tooling, and the investigation should
+    continue into the writing process and whether the indexer loaded the DLL. Because the write typically runs
+    in a SYSTEM or service context, direct the question to the team that owns the host rather than a single
+    user.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine

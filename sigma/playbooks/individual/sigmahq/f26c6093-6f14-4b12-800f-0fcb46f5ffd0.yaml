@@ -1,0 +1,602 @@
+name: Malicious Base64 Encoded PowerShell Keywords in Command Lines
+id: 368b07ca-c611-45b6-8476-6a088e603407
+description: |
+  Detects PowerShell or pwsh launched with a hidden window argument and a command line carrying base64-encoded fragments of known offensive keywords. The encoded fragments correspond to staged-download and in-memory injection primitives such as bitsadmin /transfer, IO.Compression, IO.MemoryStream, GetChunk, THREAD_INFO64, CreateRemoteThread, and memmove. The rule fires only when the powershell/pwsh image (or OriginalFileName) AND a hidden-window token AND at least one of these encoded keyword fragments all appear together, so a true positive is a hidden PowerShell process whose encoded payload contains injection or download tradecraft. Investigation should decode the full command line, confirm what the payload does, and establish whether the launching context and parent chain are expected.
+type: detection
+detection_id: f26c6093-6f14-4b12-800f-0fcb46f5ffd0
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- question: Does the alerting process match all three conditions this rule requires — a powershell/pwsh image, a hidden-window argument, and an encoded offensive keyword fragment?
+  context: This rule fires only when the image is powershell.exe/pwsh.exe (or OriginalFileName PowerShell.EXE/pwsh.dll) AND the command line contains a hidden-window token AND the command line contains at least one base64-encoded fragment of an offensive keyword. Confirm all three are present in the triggering event before investing further; partial matches indicate a tuning issue rather than a real detection.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to run hidden, encoded PowerShell?
+  context: Legitimate administration and software deployment occasionally run PowerShell with a hidden window, but encoded payloads carrying injection or download keywords are rarely part of routine operations. Knowing whether this account and endpoint normally perform scripted PowerShell automation is often the fastest way to separate a sanctioned job from operator activity.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What did this hidden PowerShell invocation actually do? Decode every argument and the base64 payload.
+  context: The full command line reveals the operation. Decode the hidden-window flag, any -EncodedCommand/-enc payload, and the base64 keyword fragments the rule matched. The encoded keywords map to bitsadmin /transfer (staged download), IO.Compression and IO.MemoryStream (in-memory decompression of an embedded payload), and GetChunk, THREAD_INFO64, CreateRemoteThread, and memmove (process injection). Establish which of these the decoded payload performs and what remote source or target process it references.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains: ' hidden '
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+      - ProcessGuid
+- question: Was the command encoded or obfuscated? What does it decode to?
+  context: PowerShell payloads are commonly hidden with -EncodedCommand (-enc), string concatenation, backtick escaping, or variable substitution. Base64 is the most common form. Decoding reveals the actual payload — download cradles, reflective loaders, in-memory decompression of an embedded assembly, or remote-thread injection. The encoded fragments this rule matches indicate the payload likely fetches or unpacks a stage and writes it into another process.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did PowerShell script block logging capture the deobfuscated script content?
+  context: Script block logging (Event ID 4104) records the deobfuscated script PowerShell actually executed, even when the command line was encoded. This is ground truth that bypasses the encoding the rule matched on. If PowerShell operational logs are not ingested in this environment, treat zero results as a visibility gap rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: What unusual .NET or scripting assemblies did this PowerShell process load into memory?
+  context: Several of the encoded keywords this rule matches — IO.Compression, IO.MemoryStream, CreateRemoteThread, memmove — point to in-memory execution that loads .NET assemblies or native modules rather than dropping files to disk. Module-load events for the alerting process show which assemblies were pulled in; rare or never-before-seen assemblies tied to compression, reflection, or interop confirm a fileless loader. If module-load telemetry is not collected in this environment, treat zero results as a visibility gap.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+- question: Were PowerShell security controls bypassed or weakened before this execution?
+  context: Attackers often disable or bypass PowerShell controls before running a payload. Common precursors include AMSI patching, execution-policy changes (Set-ExecutionPolicy or -ep bypass), constrained-language-mode escapes, and version-2 downgrade attacks that lack logging. Finding these on the host shortly before the encoded payload ran strengthens the case for operator activity.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: What process spawned this PowerShell instance, and is that parent chain expected?
+  context: The parent process reveals how PowerShell was invoked. Predictable parents like explorer.exe, a management agent, or a scheduler suggest sanctioned automation. Office applications, mshta.exe, wscript.exe, or a browser spawning a hidden encoded PowerShell points to macro-borne or exploitation-driven execution. Walk up the chain to see what spawned the parent and what else it launched.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: When did this run relative to normal working hours and maintenance windows, and what other process activity clustered around it on this host?
+  context: Scripted automation that legitimately uses hidden PowerShell tends to run on a schedule inside known maintenance windows. Encoded payloads firing off-hours, outside any change window, or in a tight burst alongside other unusual process activity point toward hands-on-keyboard execution. Compare the alert timestamp against expected automation timing and scan the surrounding window for staging activity.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Does this host normally run powershell.exe or pwsh.exe?
+  context: A binary that is rare on a host is more notable than one that runs constantly. Most endpoints run PowerShell regularly, so a high count here is expected and not exculpatory on its own — the encoded hidden invocation is the anomaly. Zero or very low counts on a host that does not normally run PowerShell sharpen the concern.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: When this host previously fired this rule's exact pattern, what parents and users drove it, and does the current alert fit?
+  context: Even common tools get abused. This query mirrors the rule's full selection — powershell/pwsh image, hidden-window token, and the encoded keyword fragments — scoped to this host, so the parent and user distribution reflects how this specific firing pattern has run here before, not generic PowerShell usage. A new parent, an unexpected account, or a first-ever occurrence is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_hidden:
+        CommandLine|contains: ' hidden '
+      selection_encoded:
+        CommandLine|contains:
+        - AGkAdABzAGEAZABtAGkAbgAgAC8AdAByAGEAbgBzAGYAZQByA
+        - aXRzYWRtaW4gL3RyYW5zZmVy
+        - IAaQB0AHMAYQBkAG0AaQBuACAALwB0AHIAYQBuAHMAZgBlAHIA
+        - JpdHNhZG1pbiAvdHJhbnNmZX
+        - YgBpAHQAcwBhAGQAbQBpAG4AIAAvAHQAcgBhAG4AcwBmAGUAcg
+        - Yml0c2FkbWluIC90cmFuc2Zlc
+        - AGMAaAB1AG4AawBfAHMAaQB6AGUA
+        - JABjAGgAdQBuAGsAXwBzAGkAegBlA
+        - JGNodW5rX3Npem
+        - QAYwBoAHUAbgBrAF8AcwBpAHoAZQ
+        - RjaHVua19zaXpl
+        - Y2h1bmtfc2l6Z
+        - AE8ALgBDAG8AbQBwAHIAZQBzAHMAaQBvAG4A
+        - kATwAuAEMAbwBtAHAAcgBlAHMAcwBpAG8Abg
+        - lPLkNvbXByZXNzaW9u
+        - SQBPAC4AQwBvAG0AcAByAGUAcwBzAGkAbwBuA
+        - SU8uQ29tcHJlc3Npb2
+        - Ty5Db21wcmVzc2lvb
+        - AE8ALgBNAGUAbQBvAHIAeQBTAHQAcgBlAGEAbQ
+        - kATwAuAE0AZQBtAG8AcgB5AFMAdAByAGUAYQBtA
+        - lPLk1lbW9yeVN0cmVhb
+        - SQBPAC4ATQBlAG0AbwByAHkAUwB0AHIAZQBhAG0A
+        - SU8uTWVtb3J5U3RyZWFt
+        - Ty5NZW1vcnlTdHJlYW
+        - 4ARwBlAHQAQwBoAHUAbgBrA
+        - 5HZXRDaHVua
+        - AEcAZQB0AEMAaAB1AG4Aaw
+        - LgBHAGUAdABDAGgAdQBuAGsA
+        - LkdldENodW5r
+        - R2V0Q2h1bm
+        - AEgAUgBFAEEARABfAEkATgBGAE8ANgA0A
+        - QASABSAEUAQQBEAF8ASQBOAEYATwA2ADQA
+        - RIUkVBRF9JTkZPNj
+        - SFJFQURfSU5GTzY0
+        - VABIAFIARQBBAEQAXwBJAE4ARgBPADYANA
+        - VEhSRUFEX0lORk82N
+        - AHIAZQBhAHQAZQBSAGUAbQBvAHQAZQBUAGgAcgBlAGEAZA
+        - cmVhdGVSZW1vdGVUaHJlYW
+        - MAcgBlAGEAdABlAFIAZQBtAG8AdABlAFQAaAByAGUAYQBkA
+        - NyZWF0ZVJlbW90ZVRocmVhZ
+        - Q3JlYXRlUmVtb3RlVGhyZWFk
+        - QwByAGUAYQB0AGUAUgBlAG0AbwB0AGUAVABoAHIAZQBhAGQA
+        - 0AZQBtAG0AbwB2AGUA
+        - 1lbW1vdm
+        - AGUAbQBtAG8AdgBlA
+        - bQBlAG0AbQBvAHYAZQ
+        - bWVtbW92Z
+        - ZW1tb3Zl
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: What child processes did this PowerShell instance spawn afterward?
+  context: The processes a payload spawns reveal its impact. A staged download or injector may launch cmd.exe, another PowerShell, certutil.exe, rundll32.exe, or a freshly written binary, or open a connection to a remote host. Unexpected children point to post-exploitation following the initial execution.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_hidden:
+        CommandLine|contains: ' hidden '
+      selection_encoded:
+        CommandLine|contains:
+        - AGkAdABzAGEAZABtAGkAbgAgAC8AdAByAGEAbgBzAGYAZQByA
+        - aXRzYWRtaW4gL3RyYW5zZmVy
+        - IAaQB0AHMAYQBkAG0AaQBuACAALwB0AHIAYQBuAHMAZgBlAHIA
+        - JpdHNhZG1pbiAvdHJhbnNmZX
+        - YgBpAHQAcwBhAGQAbQBpAG4AIAAvAHQAcgBhAG4AcwBmAGUAcg
+        - Yml0c2FkbWluIC90cmFuc2Zlc
+        - AGMAaAB1AG4AawBfAHMAaQB6AGUA
+        - JABjAGgAdQBuAGsAXwBzAGkAegBlA
+        - JGNodW5rX3Npem
+        - QAYwBoAHUAbgBrAF8AcwBpAHoAZQ
+        - RjaHVua19zaXpl
+        - Y2h1bmtfc2l6Z
+        - AE8ALgBDAG8AbQBwAHIAZQBzAHMAaQBvAG4A
+        - kATwAuAEMAbwBtAHAAcgBlAHMAcwBpAG8Abg
+        - lPLkNvbXByZXNzaW9u
+        - SQBPAC4AQwBvAG0AcAByAGUAcwBzAGkAbwBuA
+        - SU8uQ29tcHJlc3Npb2
+        - Ty5Db21wcmVzc2lvb
+        - AE8ALgBNAGUAbQBvAHIAeQBTAHQAcgBlAGEAbQ
+        - kATwAuAE0AZQBtAG8AcgB5AFMAdAByAGUAYQBtA
+        - lPLk1lbW9yeVN0cmVhb
+        - SQBPAC4ATQBlAG0AbwByAHkAUwB0AHIAZQBhAG0A
+        - SU8uTWVtb3J5U3RyZWFt
+        - Ty5NZW1vcnlTdHJlYW
+        - 4ARwBlAHQAQwBoAHUAbgBrA
+        - 5HZXRDaHVua
+        - AEcAZQB0AEMAaAB1AG4Aaw
+        - LgBHAGUAdABDAGgAdQBuAGsA
+        - LkdldENodW5r
+        - R2V0Q2h1bm
+        - AEgAUgBFAEEARABfAEkATgBGAE8ANgA0A
+        - QASABSAEUAQQBEAF8ASQBOAEYATwA2ADQA
+        - RIUkVBRF9JTkZPNj
+        - SFJFQURfSU5GTzY0
+        - VABIAFIARQBBAEQAXwBJAE4ARgBPADYANA
+        - VEhSRUFEX0lORk82N
+        - AHIAZQBhAHQAZQBSAGUAbQBvAHQAZQBUAGgAcgBlAGEAZA
+        - cmVhdGVSZW1vdGVUaHJlYW
+        - MAcgBlAGEAdABlAFIAZQBtAG8AdABlAFQAaAByAGUAYQBkA
+        - NyZWF0ZVJlbW90ZVRocmVhZ
+        - Q3JlYXRlUmVtb3RlVGhyZWFk
+        - QwByAGUAYQB0AGUAUgBlAG0AbwB0AGUAVABoAHIAZQBhAGQA
+        - 0AZQBtAG0AbwB2AGUA
+        - 1lbW1vdm
+        - AGUAbQBtAG8AdgBlA
+        - bQBlAG0AbQBvAHYAZQ
+        - bWVtbW92Z
+        - ZW1tb3Zl
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_hidden:
+        CommandLine|contains: ' hidden '
+      selection_encoded:
+        CommandLine|contains:
+        - AGkAdABzAGEAZABtAGkAbgAgAC8AdAByAGEAbgBzAGYAZQByA
+        - aXRzYWRtaW4gL3RyYW5zZmVy
+        - IAaQB0AHMAYQBkAG0AaQBuACAALwB0AHIAYQBuAHMAZgBlAHIA
+        - JpdHNhZG1pbiAvdHJhbnNmZX
+        - YgBpAHQAcwBhAGQAbQBpAG4AIAAvAHQAcgBhAG4AcwBmAGUAcg
+        - Yml0c2FkbWluIC90cmFuc2Zlc
+        - AGMAaAB1AG4AawBfAHMAaQB6AGUA
+        - JABjAGgAdQBuAGsAXwBzAGkAegBlA
+        - JGNodW5rX3Npem
+        - QAYwBoAHUAbgBrAF8AcwBpAHoAZQ
+        - RjaHVua19zaXpl
+        - Y2h1bmtfc2l6Z
+        - AE8ALgBDAG8AbQBwAHIAZQBzAHMAaQBvAG4A
+        - kATwAuAEMAbwBtAHAAcgBlAHMAcwBpAG8Abg
+        - lPLkNvbXByZXNzaW9u
+        - SQBPAC4AQwBvAG0AcAByAGUAcwBzAGkAbwBuA
+        - SU8uQ29tcHJlc3Npb2
+        - Ty5Db21wcmVzc2lvb
+        - AE8ALgBNAGUAbQBvAHIAeQBTAHQAcgBlAGEAbQ
+        - kATwAuAE0AZQBtAG8AcgB5AFMAdAByAGUAYQBtA
+        - lPLk1lbW9yeVN0cmVhb
+        - SQBPAC4ATQBlAG0AbwByAHkAUwB0AHIAZQBhAG0A
+        - SU8uTWVtb3J5U3RyZWFt
+        - Ty5NZW1vcnlTdHJlYW
+        - 4ARwBlAHQAQwBoAHUAbgBrA
+        - 5HZXRDaHVua
+        - AEcAZQB0AEMAaAB1AG4Aaw
+        - LgBHAGUAdABDAGgAdQBuAGsA
+        - LkdldENodW5r
+        - R2V0Q2h1bm
+        - AEgAUgBFAEEARABfAEkATgBGAE8ANgA0A
+        - QASABSAEUAQQBEAF8ASQBOAEYATwA2ADQA
+        - RIUkVBRF9JTkZPNj
+        - SFJFQURfSU5GTzY0
+        - VABIAFIARQBBAEQAXwBJAE4ARgBPADYANA
+        - VEhSRUFEX0lORk82N
+        - AHIAZQBhAHQAZQBSAGUAbQBvAHQAZQBUAGgAcgBlAGEAZA
+        - cmVhdGVSZW1vdGVUaHJlYW
+        - MAcgBlAGEAdABlAFIAZQBtAG8AdABlAFQAaAByAGUAYQBkA
+        - NyZWF0ZVJlbW90ZVRocmVhZ
+        - Q3JlYXRlUmVtb3RlVGhyZWFk
+        - QwByAGUAYQB0AGUAUgBlAG0AbwB0AGUAVABoAHIAZQBhAGQA
+        - 0AZQBtAG0AbwB2AGUA
+        - 1lbW1vdm
+        - AGUAbQBtAG8AdgBlA
+        - bQBlAG0AbQBvAHYAZQ
+        - bWVtbW92Z
+        - ZW1tb3Zl
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the account's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the same account triggered similar encoded PowerShell on other hosts in this window, the scope of the activity is larger than a single host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_hidden:
+        CommandLine|contains: ' hidden '
+      selection_encoded:
+        CommandLine|contains:
+        - AGkAdABzAGEAZABtAGkAbgAgAC8AdAByAGEAbgBzAGYAZQByA
+        - aXRzYWRtaW4gL3RyYW5zZmVy
+        - IAaQB0AHMAYQBkAG0AaQBuACAALwB0AHIAYQBuAHMAZgBlAHIA
+        - JpdHNhZG1pbiAvdHJhbnNmZX
+        - YgBpAHQAcwBhAGQAbQBpAG4AIAAvAHQAcgBhAG4AcwBmAGUAcg
+        - Yml0c2FkbWluIC90cmFuc2Zlc
+        - AGMAaAB1AG4AawBfAHMAaQB6AGUA
+        - JABjAGgAdQBuAGsAXwBzAGkAegBlA
+        - JGNodW5rX3Npem
+        - QAYwBoAHUAbgBrAF8AcwBpAHoAZQ
+        - RjaHVua19zaXpl
+        - Y2h1bmtfc2l6Z
+        - AE8ALgBDAG8AbQBwAHIAZQBzAHMAaQBvAG4A
+        - kATwAuAEMAbwBtAHAAcgBlAHMAcwBpAG8Abg
+        - lPLkNvbXByZXNzaW9u
+        - SQBPAC4AQwBvAG0AcAByAGUAcwBzAGkAbwBuA
+        - SU8uQ29tcHJlc3Npb2
+        - Ty5Db21wcmVzc2lvb
+        - AE8ALgBNAGUAbQBvAHIAeQBTAHQAcgBlAGEAbQ
+        - kATwAuAE0AZQBtAG8AcgB5AFMAdAByAGUAYQBtA
+        - lPLk1lbW9yeVN0cmVhb
+        - SQBPAC4ATQBlAG0AbwByAHkAUwB0AHIAZQBhAG0A
+        - SU8uTWVtb3J5U3RyZWFt
+        - Ty5NZW1vcnlTdHJlYW
+        - 4ARwBlAHQAQwBoAHUAbgBrA
+        - 5HZXRDaHVua
+        - AEcAZQB0AEMAaAB1AG4Aaw
+        - LgBHAGUAdABDAGgAdQBuAGsA
+        - LkdldENodW5r
+        - R2V0Q2h1bm
+        - AEgAUgBFAEEARABfAEkATgBGAE8ANgA0A
+        - QASABSAEUAQQBEAF8ASQBOAEYATwA2ADQA
+        - RIUkVBRF9JTkZPNj
+        - SFJFQURfSU5GTzY0
+        - VABIAFIARQBBAEQAXwBJAE4ARgBPADYANA
+        - VEhSRUFEX0lORk82N
+        - AHIAZQBhAHQAZQBSAGUAbQBvAHQAZQBUAGgAcgBlAGEAZA
+        - cmVhdGVSZW1vdGVUaHJlYW
+        - MAcgBlAGEAdABlAFIAZQBtAG8AdABlAFQAaAByAGUAYQBkA
+        - NyZWF0ZVJlbW90ZVRocmVhZ
+        - Q3JlYXRlUmVtb3RlVGhyZWFk
+        - QwByAGUAYQB0AGUAUgBlAG0AbwB0AGUAVABoAHIAZQBhAGQA
+        - 0AZQBtAG0AbwB2AGUA
+        - 1lbW1vdm
+        - AGUAbQBtAG8AdgBlA
+        - bQBlAG0AbQBvAHYAZQ
+        - bWVtbW92Z
+        - ZW1tb3Zl
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance, or credential access — may reveal the stages that preceded this execution and help reconstruct the timeline. Defense tampering followed by execution, or reconnaissance followed by exploitation, are common orderings.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Have other hosts fired this rule's pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: This query mirrors the rule's full selection with no host scope, so the result is a fleet-wide count of this exact firing pattern, not generic PowerShell usage. Many hosts firing the same encoded pattern points to scripted deployment or a shared automation source; one host or a small unrelated set points to manual operator activity. Use the host distribution to calibrate scope.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_hidden:
+        CommandLine|contains: ' hidden '
+      selection_encoded:
+        CommandLine|contains:
+        - AGkAdABzAGEAZABtAGkAbgAgAC8AdAByAGEAbgBzAGYAZQByA
+        - aXRzYWRtaW4gL3RyYW5zZmVy
+        - IAaQB0AHMAYQBkAG0AaQBuACAALwB0AHIAYQBuAHMAZgBlAHIA
+        - JpdHNhZG1pbiAvdHJhbnNmZX
+        - YgBpAHQAcwBhAGQAbQBpAG4AIAAvAHQAcgBhAG4AcwBmAGUAcg
+        - Yml0c2FkbWluIC90cmFuc2Zlc
+        - AGMAaAB1AG4AawBfAHMAaQB6AGUA
+        - JABjAGgAdQBuAGsAXwBzAGkAegBlA
+        - JGNodW5rX3Npem
+        - QAYwBoAHUAbgBrAF8AcwBpAHoAZQ
+        - RjaHVua19zaXpl
+        - Y2h1bmtfc2l6Z
+        - AE8ALgBDAG8AbQBwAHIAZQBzAHMAaQBvAG4A
+        - kATwAuAEMAbwBtAHAAcgBlAHMAcwBpAG8Abg
+        - lPLkNvbXByZXNzaW9u
+        - SQBPAC4AQwBvAG0AcAByAGUAcwBzAGkAbwBuA
+        - SU8uQ29tcHJlc3Npb2
+        - Ty5Db21wcmVzc2lvb
+        - AE8ALgBNAGUAbQBvAHIAeQBTAHQAcgBlAGEAbQ
+        - kATwAuAE0AZQBtAG8AcgB5AFMAdAByAGUAYQBtA
+        - lPLk1lbW9yeVN0cmVhb
+        - SQBPAC4ATQBlAG0AbwByAHkAUwB0AHIAZQBhAG0A
+        - SU8uTWVtb3J5U3RyZWFt
+        - Ty5NZW1vcnlTdHJlYW
+        - 4ARwBlAHQAQwBoAHUAbgBrA
+        - 5HZXRDaHVua
+        - AEcAZQB0AEMAaAB1AG4Aaw
+        - LgBHAGUAdABDAGgAdQBuAGsA
+        - LkdldENodW5r
+        - R2V0Q2h1bm
+        - AEgAUgBFAEEARABfAEkATgBGAE8ANgA0A
+        - QASABSAEUAQQBEAF8ASQBOAEYATwA2ADQA
+        - RIUkVBRF9JTkZPNj
+        - SFJFQURfSU5GTzY0
+        - VABIAFIARQBBAEQAXwBJAE4ARgBPADYANA
+        - VEhSRUFEX0lORk82N
+        - AHIAZQBhAHQAZQBSAGUAbQBvAHQAZQBUAGgAcgBlAGEAZA
+        - cmVhdGVSZW1vdGVUaHJlYW
+        - MAcgBlAGEAdABlAFIAZQBtAG8AdABlAFQAaAByAGUAYQBkA
+        - NyZWF0ZVJlbW90ZVRocmVhZ
+        - Q3JlYXRlUmVtb3RlVGhyZWFk
+        - QwByAGUAYQB0AGUAUgBlAG0AbwB0AGUAVABoAHIAZQBhAGQA
+        - 0AZQBtAG0AbwB2AGUA
+        - 1lbW1vdm
+        - AGUAbQBtAG8AdgBlA
+        - bQBlAG0AbQBvAHYAZQ
+        - bWVtbW92Z
+        - ZW1tb3Zl
+      condition: all of selection_*
+    fields:
+    - host.name

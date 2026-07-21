@@ -1,0 +1,476 @@
+name: New Netsh Helper DLL Registered From A Suspicious Location
+id: 34cecdef-96f5-4382-b92c-8ac4d2f3e95d
+description: |
+  Detects a value written under a registry path containing \SOFTWARE\Microsoft\NetSh whose
+  data points to a DLL in a suspicious location — either a common staging directory
+  (Perflogs, Users\Public, Windows\Temp, AppData\Local\Temp, Temporary Internet Files) or a
+  user-profile subfolder (Favorites, Favourites, Contacts, Pictures). Netsh loads every
+  registered helper DLL and calls its InitHelperDll export each time netsh.exe starts, so a
+  helper registered from a user-writable path gives whoever registered it code execution on
+  every netsh run — an event-triggered persistence mechanism (T1546.007) that requires local
+  administrator rights to set up. The investigation should establish what process and command
+  wrote the value, whether the referenced DLL exists on disk and was loaded, and whether
+  netsh executions or child processes show the payload firing.
+type: detection
+detection_id: e7b18879-676e-4a0e-ae18-27039185a8e7
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-10
+questions:
+- question: Does this write match the rule — a value under the NetSh key whose DLL path is either in a staging directory or in a user-profile subfolder?
+  context: |
+    The rule fires when the registry path (TargetObject) contains \SOFTWARE\Microsoft\NetSh AND
+    the value data (Details) contains EITHER a staging directory (:\Perflogs\, :\Users\Public\,
+    :\Windows\Temp\, \AppData\Local\Temp\, \Temporary Internet) OR a path under :\Users\ that
+    also contains \Favorites\, \Favourites\, \Contacts\, or \Pictures\ (that pair must match
+    together). Note which branch fired — it narrows where to look for the DLL on disk.
+  range: +/-5m
+  answer_sources:
+  - alert
+  - registry_event
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this user and host expected to register netsh helper DLLs?
+  context: |
+    Registering a netsh helper requires local administrator rights, and legitimate registrations
+    happen almost exclusively when Windows components or networking software are installed —
+    those point at DLLs under System32 or Program Files, not temp or profile directories. When
+    the user is SYSTEM or a machine account, the write is service-driven and the writing process
+    (Image) is the better attribution pivot.
+  range: +/-5m
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: What process spawned the one that wrote the helper value, and is that chain expected?
+  context: |
+    The parent chain reveals how the registration was initiated. An interactive cmd.exe or
+    explorer.exe ancestry fits a hands-on session; script hosts, Office applications, or an
+    unfamiliar binary point to malicious automation. Long-running parents may have started days
+    before the alert. If the parent linkage is not populated on the registry event, fall back to
+    the registration-command question, which projects the writer's parent.
+  range: +/-30d
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What other processes did the responsible process spawn?
+  context: A process that performs this action rarely stops there. Listing the children it launched shows
+    whether the activity was an isolated change or one step in a longer chain - payload execution,
+    additional persistence, or follow-on tooling. Note this shows what the acting process started,
+    not what started alongside it. Sibling processes cannot be identified from this telemetry,
+    because registry and library events do not record the acting process's parent.
+  range: +/-15m
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Was this helper registration part of a documented change or software deployment?
+  context: |
+    Legitimate netsh helpers arrive with networking software installations or OS servicing, and
+    those normally leave a deployment record — a change ticket, a package rollout, an installer
+    run. A new helper value appearing outside any documented change, and pointing into a temp or
+    profile directory rather than an installation directory, has no routine explanation.
+  range: +/-30d
+  answer_sources:
+  - organizational_knowledge
+  - manual_review
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What command did the writing process run to register the helper?
+  context: |
+    The documented command-line route is netsh add helper followed by the DLL path, which
+    requires local administrator rights; reg.exe or PowerShell writes to the key achieve the
+    same effect. If the writer's creation event shows no registration-related command line, the
+    value was set through direct registry APIs, which is common for implants. This event also
+    exposes the writer's parent and user, useful when the parent linkage is missing on the
+    registry event itself.
+  range: +/-30d
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - User
+- question: Which value was written under the NetSh key, and what does the DLL path in the value data say about intent?
+  context: |
+    HKLM\SOFTWARE\Microsoft\NetSh holds one value per registered helper, and every netsh.exe
+    start loads each listed DLL and calls its InitHelperDll export — this key is a known
+    event-triggered persistence location. Legitimate helper values point at DLLs under System32;
+    decode the Details path instead for the directory branch that fired, whether the filename
+    imitates a system DLL, and treat that path as the payload artifact to chase in the
+    file-presence and module-load questions.
+  range: +/-5m
+  answer_sources:
+  - registry_event
+  - manual_review
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is the helper DLL referenced by the registry value present on disk?
+  context: |
+    The persistence only works if the DLL exists at the path in the value data when netsh next
+    runs, and the drop usually lands in the same session as the registry write — this correlates
+    file activity from the writing process and its children. File-write events carry no hash; if
+    the payload is present, hash it from a later module-load or execution event, or retrieve it
+    for a reputation lookup.
+  range: +15m
+  answer_sources:
+  - file_event
+  - manual_review
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Did netsh.exe run on this host after the helper was registered?
+  context: |
+    Every netsh invocation — interactive, scripted, or service-driven — loads all registered
+    helpers, so the first netsh start after the write is when the payload executes. Detection
+    guidance for this technique correlates the registration with execution inside a tight window
+    (on the order of minutes): attackers commonly launch netsh themselves right after
+    registering, or pair the helper with a logon-triggered netsh start so it fires without any
+    user action.
+  range: +4h
+  answer_sources:
+  - process_creation
+  - registry_event
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: '\netsh.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- question: Was the registered helper DLL actually loaded?
+  context: |
+    The first clause matches loads of the exact DLL path from the value data; the second
+    surfaces any module netsh.exe loaded from a temp, profile, or user-writable directory
+    (netsh normally loads helpers from System32 only). The load event carries the DLL's
+    signature status and hash directly — use the hash for a reputation lookup. If the alert's
+    value data was not captured, the path-heuristic clause still covers the load.
+  range: +24h
+  answer_sources:
+  - edr_console
+  - external_threat_intel
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection_registered:
+        host.name|expand: '%hostname%'
+        ImageLoaded|contains|expand: '%Details%'
+      selection_suspicious_path:
+        host.name|expand: '%hostname%'
+        Image|endswith: '\netsh.exe'
+        ImageLoaded|contains:
+          - ':\Perflogs\'
+          - ':\Users\'
+          - ':\Windows\Temp\'
+          - '\AppData\Local\Temp\'
+          - '\Temporary Internet'
+      condition: 1 of selection_*
+    fields:
+      - Image
+      - ImageLoaded
+      - Signed
+      - Signature
+      - Hashes
+- question: What child processes did netsh.exe spawn after the registration?
+  context: |
+    netsh rarely spawns children in routine use, so compare any results against the child
+    processes your environment's automation is known to produce. Malicious helpers commonly
+    launch a hidden PowerShell with an encoded payload or spawn a command shell; helpers that
+    inject shellcode instead may surface their payload under a different parent, so pair this
+    with the host-activity clustering question when netsh shows no children but the alert looks
+    genuine.
+  range: +24h
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: '\netsh.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Were other registry modifications made on this host in the same session?
+  context: |
+    Operators who register a netsh helper often make companion writes in the same session — a
+    Run value launching netsh at logon so the helper fires unattended, an encoded payload
+    stashed in another key for the helper to read, or defense-tampering values. The triggering
+    key will appear in these results; the signal is what ELSE changed. If the host is
+    registry-noisy, narrow to the writer's executable name or to Run, Services, Policies,
+    Winlogon, and IFEO paths.
+  range: +/-30m
+  answer_sources:
+  - registry_event
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - User
+- question: What other process activity occurred on this host around the time of the alert?
+  context: |
+    Aggregated parent-child process pairs around the alert reveal the immediate context: what
+    led to the registration and what followed. Repetitive agent telemetry collapses into
+    high-count rows while novel low-count pairs — script hosts, archive tools, unfamiliar
+    binaries, or a payload surfacing under an unexpected parent after injection — stand out.
+  range: +/-15m
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Has this NetSh helper value been modified before on this host?
+  context: |
+    Helper values are written when the OS or networking software is installed and rarely change
+    afterward. Zero history over 90 days means this exact value has never been written before on
+    this host — consistent with a fresh persistence implant — while recurring writes with the
+    same Details data and writer fit managed software behavior. Compare historical Details
+    values and writing processes against the alerting event.
+  range: -90d
+  answer_sources:
+  - registry_event
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - Details
+      - Image
+- question: Was the same NetSh helper value written on other hosts in the environment?
+  context: |
+    The identical value written across many hosts in a short window, with the same Details data
+    and writing process, fits a software rollout. A single host receiving the write — especially
+    with a Details path in a profile or temp directory — fits targeted persistence. Compare
+    Details values and writers across hosts to separate the two.
+  range: -24h
+  answer_sources:
+  - registry_event
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+      - Details
+- question: Did other detections fire on this host in the hours before this alert?
+  context: |
+    Event-triggered persistence typically comes after access and privileges are already
+    established, so earlier detections on the same host — initial access, credential access,
+    defense tampering, payload downloads — may reveal the stages that preceded this registration
+    and help reconstruct the timeline.
+  range: -6h
+  answer_sources:
+  - alert
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Were other persistence mechanisms installed on this host around the helper registration?
+  context: |
+    Attackers rarely rely on a single persistence mechanism — a netsh helper is often one layer
+    in a stack that also includes scheduled tasks, services, Run keys, BITS jobs, or WMI
+    subscriptions. Multiple persistence installations in the same timeframe indicate intentional
+    stacking rather than isolated administration; a Run value that points at netsh itself is a
+    documented companion to this exact technique.
+  range: +/-4h
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- question: Were files dropped to Startup folders or scheduled-task definition paths on this host?
+  context: |
+    File-based persistence bypasses command-line detection entirely: an executable or shortcut
+    dropped into a Startup folder runs at the next logon without any schtasks, sc, or reg
+    invocation. A Startup drop that launches netsh would also trigger the registered helper at
+    every logon, so check what landed in these paths around the registration and what it points
+    at.
+  range: +/-4h
+  answer_sources:
+  - file_event
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist_paths:
+        TargetFilename|contains:
+          - '\Start Menu\Programs\Startup\'
+          - '\Windows\System32\Tasks\'
+          - '\Windows\Tasks\'
+      condition: selection and selection_persist_paths
+    fields:
+      - TargetFilename
+      - Image

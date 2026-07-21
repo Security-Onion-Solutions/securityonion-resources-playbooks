@@ -1,0 +1,324 @@
+name: Suspicious Usage of For Loop with Recursive Directory Search in CMD
+id: e1f80391-78ad-4f54-b507-93e7caaf1e06
+description: |
+  Detects a cmd.exe 'for /f' loop combined with a 'tokens=' field selector and a recursive directory listing ('dir ... /s /b'). The pattern is fired by EITHER the alerting process's own command line OR its parent command line, so the alert may be the cmd.exe running the loop itself, or a child process the loop dynamically located and invoked (for example a powershell.exe found by enumerating for *shell.exe and then called with an execution-policy bypass). The construct is used to discover the full path of a system interpreter at runtime rather than referencing it directly, which evades static name-based detection. Investigation should determine which branch fired, decode the full loop and any binary it called, and trace the parent chain that produced the loop.
+type: detection
+detection_id: 2782fbd8-b662-4eb5-9962-5bfbfb671e7b
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- question: Did the alerting command line, or its parent command line, contain a 'for /f' loop with a 'tokens=' selector and a recursive 'dir' search?
+  context: |
+    Confirm which branch of the detection fired before investing further time. The rule matches when the token set ('for /f', 'tokens=', 'in (', 'dir') appears EITHER in the alerting process's own CommandLine OR in its ParentCommandLine. If the loop is in the alerting process's CommandLine, the alert IS the cmd.exe running the FOR loop. If the loop is in the ParentCommandLine, the alert is a child the loop located and invoked (commonly the interpreter the 'dir ...*shell.exe' search resolved). Note which branch fired -- it determines whether the binary-origin and decode questions below apply to this process or to the parent.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentCommandLine
+      - CommandLine
+- question: Is this user and host expected to run cmd.exe FOR-loop directory searches that locate and launch interpreters at runtime?
+  context: Runtime path discovery of an interpreter via a recursive 'dir' loop is uncommon in interactive administration; it is more typical of packaged loaders and scripted installers. If the user is a developer or the host runs a known software-distribution job that resolves binaries dynamically, this can be routine. If neither is true, the indirection itself is the signal worth pursuing.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What process started the FOR loop, and is that parent chain expected?
+  context: The parent-child relationship is the core signal. Tracing the loop's own origin (its grandparent) reveals whether the chain is benign (a user double-clicked a shortcut, an installer ran) or suspicious (a document, archive, or shortcut file spawned cmd.exe which then ran the discovery loop). A loop launched from an Office application, a script host, or a recently opened shortcut is the higher-concern path.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What other child processes did the same parent spawn around the alert?
+  context: If the FOR loop or its parent orchestrated multiple stages, the sibling processes reveal the full scope. The documented pattern of this construct continues past the loop into a located interpreter that reads bytes from a file and drops further payloads, so siblings may include the interpreter, a dropped script, or a hidden batch process.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Decode the full FOR-loop command. What directory was searched, what binary did it resolve, and what arguments did the loop pass to it?
+  context: |
+    The full loop reveals the operation. Read the 'dir' target (which directory tree and filename mask were enumerated, for example a recursive *shell.exe search under the WindowsPowerShell path), the 'tokens=' selector, and the 'do call'/'do' clause that invokes the resolved path. Capture any arguments handed to the located binary -- an execution-policy bypass or an encoded command passed to a discovered powershell.exe is the operative payload, not the loop itself.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains|all:
+          - for /f
+          - tokens=
+          - in (
+          - dir
+      condition: selection
+    fields:
+      - CommandLine
+      - ParentCommandLine
+      - CurrentDirectory
+- question: Does the command line resolved by the loop carry encoded or concatenated content, and what does it decode to?
+  context: |
+    Resolving an interpreter at runtime is frequently paired with an obfuscated argument so the payload is not visible in static rules. Look at the command the loop hands to the located binary for base64, hex, string concatenation, backtick or caret escaping, and environment-variable substitution. Decode it to recover the actual operation -- a download cradle, an in-memory loader, or a routine that reads bytes from a file and drops a further payload.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - ParentCommandLine
+- question: After the loop resolved an interpreter, what modules did that interpreter load on this host around the alert?
+  context: |
+    When the loop locates and launches an interpreter (commonly powershell.exe), the modules it loads can distinguish a routine script host from a hosting cradle. Reflectively loaded or unusual managed-runtime modules around the alert time point to in-memory execution rather than a plain script run. If image-load telemetry is not collected in this environment, treat zero results as a visibility gap rather than evidence nothing loaded, and rely on the command-line decode instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - \powershell.exe
+          - \pwsh.exe
+          - \cmd.exe
+      condition: selection
+    fields:
+      - Image
+      - ImageLoaded
+- question: Are the files referenced or dropped by the resolved command still on disk for analysis?
+  context: This construct commonly enumerates files (including the launching shortcut), reads bytes from one of them, and writes a decoy document and a hidden batch payload to a temporary directory. Checking whether those artifacts still exist enables hashing, content review, or sandbox submission. Pull the dropped paths from the decoded command and confirm presence.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What did the parent of the loop do in the hours after the alert?
+  context: A loader that resolves an interpreter at runtime usually continues into later stages -- reconnaissance, a dropped payload, or persistence. Listing what the same parent spawned after the alert helps reconstruct the operation and shows whether the loop was a single step or one stage in a chain.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: What other process activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining surrounding activity reveals the immediate context: what led to the loop, what ran after, and whether a dropped script or batch payload executed. Novel parent-child pairs at low counts are what to scan for against the high-count routine telemetry.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Has this host run cmd.exe FOR-loop directory searches of this kind before?
+  context: A discovery loop that resolves a binary path at runtime is rare on most endpoints. Zero or very low historical counts for this command pattern indicate first-time or anomalous use; a steady prior count points to a packaged installer or automation that already behaves this way on this host.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains|all:
+          - for /f
+          - tokens=
+          - in (
+          - dir
+      condition: selection
+    fields:
+      - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_tokens:
+        CommandLine|contains|all:
+        - for /f
+        - tokens=
+        - in (
+        - dir
+      selection_tokens_parent:
+        ParentCommandLine|contains|all:
+        - for /f
+        - tokens=
+        - in (
+        - dir
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_tokens:
+        CommandLine|contains|all:
+        - for /f
+        - tokens=
+        - in (
+        - dir
+      selection_tokens_parent:
+        ParentCommandLine|contains|all:
+        - for /f
+        - tokens=
+        - in (
+        - dir
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around the time of the alert?
+  context: Tracking the user's activity across all hosts reveals lateral movement or parallel activity on other endpoints. If the same user produced similar discovery-and-launch activity on multiple hosts in the window, the scope is larger than a single endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_tokens:
+        CommandLine|contains|all:
+        - for /f
+        - tokens=
+        - in (
+        - dir
+      selection_tokens_parent:
+        ParentCommandLine|contains|all:
+        - for /f
+        - tokens=
+        - in (
+        - dir
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: 'Earlier detections on the same host -- shortcut or document execution, reconnaissance, defense tampering -- may reveal the stages that preceded the loop and help reconstruct the timeline. Look for an opened shortcut or script host immediately upstream of the discovery loop.'
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

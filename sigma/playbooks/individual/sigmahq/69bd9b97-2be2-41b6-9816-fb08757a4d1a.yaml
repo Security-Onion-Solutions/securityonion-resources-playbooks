@@ -1,0 +1,465 @@
+name: Potentially Suspicious Execution From Parent Process In Public Folder
+id: e177b340-24f4-43c2-a0c9-ebc2140f44e5
+description: |
+  Detects a process whose parent image lives under \Users\Public\ spawning a child that is one of a set of shell or
+  scripting binaries (bitsadmin, certutil, cmd, cscript, mshta, powershell, pwsh, regsvr32, rundll32, wscript) or whose
+  command line references one of those interpreters. The \Users\Public\ directory is world-writable and is a common staging
+  location for dropped payloads, so a parent executing from there that then launches a command interpreter is a hand-off
+  from a staged binary into live execution. Legitimate installers and helper utilities occasionally stage under Public, so
+  the investigation should determine what the parent binary is, what the child command actually does, and whether the
+  parent-child pairing is routine for this host and user.
+type: detection
+detection_id: 69bd9b97-2be2-41b6-9816-fb08757a4d1a
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does this alert match the rule pattern — a parent process under \Users\Public\ spawning one of the listed shell or scripting binaries?
+  context: Confirm the alert is a true positive by reviewing the triggering event. The rule fires when the parent image path
+    contains \Users\Public\ AND the child either is one of the named interpreter binaries (bitsadmin, certutil, cmd, cscript,
+    mshta, powershell, pwsh, regsvr32, rundll32, wscript) or carries one of those interpreter names in its command line. Note
+    which branch matched — a direct interpreter binary versus an interpreter named only in the command line — because that
+    patterns which downstream questions carry weight.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Is this user and host expected to run a command interpreter spawned from a binary under \Users\Public\?
+  context: Legitimate installers and vendor helper utilities occasionally stage executables under \Users\Public\ and launch
+    interpreters from them. Knowing whether this user role and host function routinely produce that pattern is often the
+    fastest path to separating a benign deployment from a staged payload hand-off.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What is the parent binary under \Users\Public\, and what spawned the parent itself?
+  context: The parent-child relationship is the core signal here. The parent lives in a world-writable directory, so tracing
+    its own origin (the grandparent process) reveals whether the chain is a legitimate installer flow or a staged binary that
+    was dropped and then executed. Identify the parent's full path, signing status, and what process launched it.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What exactly did the spawned interpreter do? Decode its full command line.
+  context: The full command line of the interpreter reveals the operational purpose. Decode any flags, encoded content, file
+    paths, or URLs. Multi-command tools such as bitsadmin may span several sequential invocations on the host that together
+    form one logical operation, so review all executions of the same binary in the surrounding window, not only the triggering event.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Was the command encoded or obfuscated? What does it decode to?
+  context: When the spawned interpreter is PowerShell, attackers frequently use -EncodedCommand (-enc), string concatenation,
+    backtick escaping, or variable substitution to hide intent. Base64-encoded commands are the most common form. Decoding
+    reveals the actual payload — download cradles, reverse shells, or in-memory execution of .NET assemblies. If the
+    interpreter is not PowerShell, decode whatever encoding the command line carries (certutil -decode, hex, character chains).
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did PowerShell script block logging capture the full script content on this host?
+  context: Script block logging records the deobfuscated script content PowerShell actually executed, even when the command
+    line is encoded or obfuscated, providing ground truth about what ran. If PowerShell operational logs are not ingested in
+    this environment, treat zero results as a visibility gap rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Were PowerShell security controls bypassed or weakened on this host before this execution?
+  context: Attackers often disable or bypass PowerShell security controls before running a payload — AMSI bypass, execution
+    policy changes (-ExecutionPolicy Bypass or -ep bypass), constrained language mode escape, or a v2 downgrade that lacks
+    logging. Finding these precursor events on the host strengthens the case for malicious activity.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: Were file-attribute or alternate-data-stream operations used to hide artifacts on this host around the alert?
+  context: The hide-artifacts technique abuses file and registry attributes to conceal dropped files. Look for attrib.exe
+    setting hidden or system flags, creation of files using alternate data stream syntax (a colon mid-path), or moves of
+    payloads into \Users\Public\ where they blend with normal shared-folder contents. These operations explain why a staged
+    binary went unnoticed before it executed.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_hide:
+        CommandLine|contains:
+          - 'attrib +h'
+          - 'attrib +s'
+          - 'attrib.exe +h'
+      condition: selection and selection_hide
+    fields:
+      - Image
+      - CommandLine
+- question: Were registry values modified to alter file or folder visibility on this host?
+  context: Hiding artifacts can also be achieved through the registry — setting Hidden, ShowSuperHidden, or related Explorer
+    advanced settings to keep dropped files out of view. Registry changes that flip file-visibility flags around the time a
+    binary was staged under \Users\Public\ point to deliberate concealment rather than incidental activity.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_keys:
+        TargetObject|contains:
+          - '\Explorer\Advanced\Hidden'
+          - '\Explorer\Advanced\ShowSuperHidden'
+          - '\Explorer\Advanced\HideFileExt'
+      condition: selection and selection_keys
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- question: What other child processes did this same parent spawn?
+  context: A parent staged under \Users\Public\ that launched the detected interpreter likely launched other processes too.
+    Examining siblings from the same parent instance reveals the full scope of activity — multiple interpreter or tool
+    children from one staged parent points to orchestrated execution rather than a one-off.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent:
+        ParentImage|contains: :\Users\Public\
+      selection_child:
+      - Image|endswith:
+        - \bitsadmin.exe
+        - \certutil.exe
+        - \cmd.exe
+        - \cscript.exe
+        - \mshta.exe
+        - \powershell.exe
+        - \pwsh.exe
+        - \regsvr32.exe
+        - \rundll32.exe
+        - \wscript.exe
+      - CommandLine|contains:
+        - bitsadmin
+        - certutil
+        - cscript
+        - mshta
+        - powershell
+        - regsvr32
+        - rundll32
+        - wscript
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent:
+        ParentImage|contains: :\Users\Public\
+      selection_child:
+      - Image|endswith:
+        - \bitsadmin.exe
+        - \certutil.exe
+        - \cmd.exe
+        - \cscript.exe
+        - \mshta.exe
+        - \powershell.exe
+        - \pwsh.exe
+        - \regsvr32.exe
+        - \rundll32.exe
+        - \wscript.exe
+      - CommandLine|contains:
+        - bitsadmin
+        - certutil
+        - cscript
+        - mshta
+        - powershell
+        - regsvr32
+        - rundll32
+        - wscript
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If
+    the same user triggered similar activity on other hosts, the scope is larger than a single endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent:
+        ParentImage|contains: :\Users\Public\
+      selection_child:
+      - Image|endswith:
+        - \bitsadmin.exe
+        - \certutil.exe
+        - \cmd.exe
+        - \cscript.exe
+        - \mshta.exe
+        - \powershell.exe
+        - \pwsh.exe
+        - \regsvr32.exe
+        - \rundll32.exe
+        - \wscript.exe
+      - CommandLine|contains:
+        - bitsadmin
+        - certutil
+        - cscript
+        - mshta
+        - powershell
+        - regsvr32
+        - rundll32
+        - wscript
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance, or
+    credential access — may reveal the stages that preceded the staged-binary execution and help reconstruct the timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Was the spawned binary executed from its expected system path?
+  context: Interpreter binaries executed from non-standard paths (outside System32 or SysWOW64) may have been copied or renamed
+    to evade path-based allowlists. Compare the image path and the OriginalFileName field — a certutil.exe or powershell.exe
+    running from a user-writable directory is more notable than one in System32.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- question: Were any other LOLBins used for download or proxy-execution on this host recently?
+  context: Attackers who use one living-off-the-land binary often use several. If the spawned interpreter was used to download
+    or proxy-execute a payload, check whether other download or execution LOLBins were also active on the host in the same
+    timeframe. Multiple LOLBins performing the same objective strengthens the case for malicious activity.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\curl.exe'
+          - '\esentutl.exe'
+          - '\expand.exe'
+          - '\extrac32.exe'
+          - '\makecab.exe'
+          - '\replace.exe'
+          - '\msbuild.exe'
+          - '\cmstp.exe'
+          - '\installutil.exe'
+          - '\msiexec.exe'
+          - '\forfiles.exe'
+          - '\msdt.exe'
+          - '\wmic.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- question: How often has this host fired the rule's parent-in-Public LOLBin pattern over the past 90 days?
+  context: A pattern with no prior history on a host is more notable than one seen regularly under stable parents. The query
+    mirrors the rule's selection structure scoped to this host, so the count reflects the rule's specific firing pattern — a
+    parent under \Users\Public\ spawning one of the listed interpreters — not generic usage of those binaries. The command-line
+    projection lets the analyst compare typical invocation patterns against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent:
+        ParentImage|contains: :\Users\Public\
+      selection_child:
+      - Image|endswith:
+        - \bitsadmin.exe
+        - \certutil.exe
+        - \cmd.exe
+        - \cscript.exe
+        - \mshta.exe
+        - \powershell.exe
+        - \pwsh.exe
+        - \regsvr32.exe
+        - \rundll32.exe
+        - \wscript.exe
+      - CommandLine|contains:
+        - bitsadmin
+        - certutil
+        - cscript
+        - mshta
+        - powershell
+        - regsvr32
+        - rundll32
+        - wscript
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - CommandLine

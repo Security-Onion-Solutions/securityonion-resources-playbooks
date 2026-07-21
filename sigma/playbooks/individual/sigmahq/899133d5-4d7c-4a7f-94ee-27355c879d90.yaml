@@ -1,0 +1,460 @@
+name: Python Inline Command Execution
+id: a0132517-9c3b-4a49-9baf-21835bd8ca88
+description: |
+  Detects a Python interpreter (python.exe, python3.exe, or python2.exe, or any binary
+  whose OriginalFileName is python.exe) launched with a command line containing the -c
+  flag, which executes inline Python statements in-process rather than running a script
+  on disk. The rule fires when both the interpreter and the -c usage are present AND none
+  of the known-benign patterns match (pip bootstrap/ensurepip, the pip setuptools caller,
+  and VS Code-spawned interpreters are filtered out). Inline -c execution is routine for
+  developer tooling and automation, but it is also a common reverse-shell and in-memory
+  code-execution delivery method that leaves no script artifact on disk. The investigation
+  should decode the inline statements, confirm the parent chain and user are expected, and
+  determine whether the execution led to network connections or follow-on processes.
+type: detection
+detection_id: 899133d5-4d7c-4a7f-94ee-27355c879d90
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the alert show a Python interpreter launched with the -c inline-execution flag?
+  context: Before investing investigation time, confirm the alert is a true positive. The
+    Image (or OriginalFileName) should resolve to python.exe, python3.exe, or python2.exe,
+    and the command line should contain the -c flag that runs inline statements in-process.
+    Confirm the execution is not one of the benign patterns the rule already excludes (pip
+    bootstrap or VS Code-spawned interpreters). The decoded statements after -c are what
+    decide whether this is a developer one-liner or something hostile.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to run Python with inline command-line code?
+  context: Inline Python -c execution is routine on developer and engineering workstations
+    and on hosts that run Python-based automation, but it is unusual on general-purpose
+    user endpoints and most servers where Python is not part of the normal workflow. Knowing
+    whether the account and host function involve Python development is often the fastest way
+    to separate routine activity from an interpreter being abused for code execution.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What does the inline Python code after -c actually do? Decode the full statement.
+  context: The statements following -c are the operation. Read the full command line and
+    decode what the inline code does. Watch for socket setup and connect calls, os.dup2 file-descriptor
+    redirection, subprocess or os.system shelling out, pty.spawn shell upgrades, http.server
+    or SimpleHTTPServer payload staging, and base64/exec/compile wrappers that hide a second
+    stage. Inline code leaves no script on disk, so the command line itself is the primary
+    evidence of intent.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|contains: ' -c'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What process spawned this Python interpreter and is that parent chain expected?
+  context: The parent process reveals how the interpreter was invoked. A Python parent chain
+    rooted in a developer IDE, a build tool, or a scheduled automation host is expected. A
+    parent of cmd.exe, powershell.exe, an Office application, mshta.exe, wscript.exe, or a
+    web/application server spawning python -c is the kind of launch context that points to
+    injection or a hands-on operator rather than normal development.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What child processes did this Python interpreter spawn afterward?
+  context: The processes spawned by the interpreter reveal its actual impact. A reverse shell
+    or command-execution payload typically spawns cmd.exe or powershell.exe, while staging
+    payloads may spawn downloaders or droppers. Inline code that only manipulates data in-process
+    leaves no children, so unexpected child processes shortly after the interpreter started
+    are a strong signal of an interactive or shell payload.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Did this Python interpreter open any outbound network connections?
+  context: A common reason to run python -c inline is to open a socket and connect back to an
+    operator-controlled host for a reverse shell, or to stand up a listener for payload staging.
+    Pivot from the interpreter's process to any network connections it initiated and compare the
+    destination against expected internal services. Outbound connections to an external or unfamiliar
+    address shortly after the interpreter started shift the disposition toward C2 or data movement.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+      - Initiated
+- question: Does this host normally run Python interpreters at all?
+  context: A Python interpreter that has never run on a host is more notable than one seen
+    daily. Zero or very low historical counts indicate first-time or rare execution and raise
+    the priority of decoding the inline statement; high counts suggest the host is a routine
+    Python development or automation endpoint.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: When this host has previously fired the rule's pattern, what parents and users normally drive that activity, and does the current alert fit?
+  context: Even on a host where Python development is common, the parent and user behind inline
+    -c execution form a pattern. The query mirrors the rule's selection and filters scoped to
+    this host, so the resulting parent/user distribution reflects how the rule's specific firing
+    pattern has historically run here. A new parent process, an unexpected account, or an unusual
+    command-line structure against that baseline is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - OriginalFileName: python.exe
+      - Image|endswith:
+        - python.exe
+        - python3.exe
+        - python2.exe
+      selection_cli:
+        CommandLine|contains: ' -c'
+      filter_main_python_1:
+        ParentImage|startswith:
+        - C:\Program Files\Python
+        - C:\Program Files (x86)\Python
+        ParentImage|endswith: \python.exe
+        ParentCommandLine|contains: -E -s -m ensurepip -U --default-pip
+      filter_main_python_trace:
+        ParentImage|startswith:
+        - C:\Program Files\Python
+        - C:\Program Files (x86)\Python
+        CommandLine|contains|all:
+        - -W ignore::DeprecationWarning
+        - '[''install'', ''--no-cache-dir'', ''--no-index'', ''--find-links'','
+        - '''--upgrade'', ''pip'''
+      filter_optional_vscode:
+      - ParentImage|endswith: \AppData\Local\Programs\Microsoft VS Code\Code.exe
+      - ParentImage:
+        - C:\Program Files\Microsoft VS Code\Code.exe
+        - C:\Program Files (x86)\Microsoft VS Code\Code.exe
+      filter_optional_pip:
+        CommandLine|contains|all:
+        - <pip-setuptools-caller>
+        - exec(compile(
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_* and not 1 of filter_main_* and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - OriginalFileName: python.exe
+      - Image|endswith:
+        - python.exe
+        - python3.exe
+        - python2.exe
+      selection_cli:
+        CommandLine|contains: ' -c'
+      filter_main_python_1:
+        ParentImage|startswith:
+        - C:\Program Files\Python
+        - C:\Program Files (x86)\Python
+        ParentImage|endswith: \python.exe
+        ParentCommandLine|contains: -E -s -m ensurepip -U --default-pip
+      filter_main_python_trace:
+        ParentImage|startswith:
+        - C:\Program Files\Python
+        - C:\Program Files (x86)\Python
+        CommandLine|contains|all:
+        - -W ignore::DeprecationWarning
+        - '[''install'', ''--no-cache-dir'', ''--no-index'', ''--find-links'','
+        - '''--upgrade'', ''pip'''
+      filter_optional_vscode:
+      - ParentImage|endswith: \AppData\Local\Programs\Microsoft VS Code\Code.exe
+      - ParentImage:
+        - C:\Program Files\Microsoft VS Code\Code.exe
+        - C:\Program Files (x86)\Microsoft VS Code\Code.exe
+      filter_optional_pip:
+        CommandLine|contains|all:
+        - <pip-setuptools-caller>
+        - exec(compile(
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_* and not 1 of filter_main_* and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - OriginalFileName: python.exe
+      - Image|endswith:
+        - python.exe
+        - python3.exe
+        - python2.exe
+      selection_cli:
+        CommandLine|contains: ' -c'
+      filter_main_python_1:
+        ParentImage|startswith:
+        - C:\Program Files\Python
+        - C:\Program Files (x86)\Python
+        ParentImage|endswith: \python.exe
+        ParentCommandLine|contains: -E -s -m ensurepip -U --default-pip
+      filter_main_python_trace:
+        ParentImage|startswith:
+        - C:\Program Files\Python
+        - C:\Program Files (x86)\Python
+        CommandLine|contains|all:
+        - -W ignore::DeprecationWarning
+        - '[''install'', ''--no-cache-dir'', ''--no-index'', ''--find-links'','
+        - '''--upgrade'', ''pip'''
+      filter_optional_vscode:
+      - ParentImage|endswith: \AppData\Local\Programs\Microsoft VS Code\Code.exe
+      - ParentImage:
+        - C:\Program Files\Microsoft VS Code\Code.exe
+        - C:\Program Files (x86)\Microsoft VS Code\Code.exe
+      filter_optional_pip:
+        CommandLine|contains|all:
+        - <pip-setuptools-caller>
+        - exec(compile(
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_* and not 1 of filter_main_* and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity
+    spanning multiple endpoints. If the same user triggered similar interpreter activity on
+    several hosts in a short window, the scope of the activity may be larger than a single host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - OriginalFileName: python.exe
+      - Image|endswith:
+        - python.exe
+        - python3.exe
+        - python2.exe
+      selection_cli:
+        CommandLine|contains: ' -c'
+      filter_main_python_1:
+        ParentImage|startswith:
+        - C:\Program Files\Python
+        - C:\Program Files (x86)\Python
+        ParentImage|endswith: \python.exe
+        ParentCommandLine|contains: -E -s -m ensurepip -U --default-pip
+      filter_main_python_trace:
+        ParentImage|startswith:
+        - C:\Program Files\Python
+        - C:\Program Files (x86)\Python
+        CommandLine|contains|all:
+        - -W ignore::DeprecationWarning
+        - '[''install'', ''--no-cache-dir'', ''--no-index'', ''--find-links'','
+        - '''--upgrade'', ''pip'''
+      filter_optional_vscode:
+      - ParentImage|endswith: \AppData\Local\Programs\Microsoft VS Code\Code.exe
+      - ParentImage:
+        - C:\Program Files\Microsoft VS Code\Code.exe
+        - C:\Program Files (x86)\Microsoft VS Code\Code.exe
+      filter_optional_pip:
+        CommandLine|contains|all:
+        - <pip-setuptools-caller>
+        - exec(compile(
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_* and not 1 of filter_main_* and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining activity around the alert reveals what
+    led to this event and what happened after it, and whether it is part of a larger sequence.
+    Look for reconnaissance, credential access, privilege escalation, or staging that surrounds
+    the interpreter execution.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense
+    tampering, reconnaissance, credential access — may reveal the stages that preceded this
+    interpreter execution and help reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Have other hosts fired the rule's pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: The query mirrors the rule's selection and filters with no host scope, so the result
+    is a fleet-wide count of the rule's firing pattern rather than generic Python usage. Many
+    hosts firing the same inline -c pattern points to scripted deployment or vendor automation;
+    one host or a small unrelated set points to manual operator activity. Use the host distribution
+    and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - OriginalFileName: python.exe
+      - Image|endswith:
+        - python.exe
+        - python3.exe
+        - python2.exe
+      selection_cli:
+        CommandLine|contains: ' -c'
+      filter_main_python_1:
+        ParentImage|startswith:
+        - C:\Program Files\Python
+        - C:\Program Files (x86)\Python
+        ParentImage|endswith: \python.exe
+        ParentCommandLine|contains: -E -s -m ensurepip -U --default-pip
+      filter_main_python_trace:
+        ParentImage|startswith:
+        - C:\Program Files\Python
+        - C:\Program Files (x86)\Python
+        CommandLine|contains|all:
+        - -W ignore::DeprecationWarning
+        - '[''install'', ''--no-cache-dir'', ''--no-index'', ''--find-links'','
+        - '''--upgrade'', ''pip'''
+      filter_optional_vscode:
+      - ParentImage|endswith: \AppData\Local\Programs\Microsoft VS Code\Code.exe
+      - ParentImage:
+        - C:\Program Files\Microsoft VS Code\Code.exe
+        - C:\Program Files (x86)\Microsoft VS Code\Code.exe
+      filter_optional_pip:
+        CommandLine|contains|all:
+        - <pip-setuptools-caller>
+        - exec(compile(
+      condition: all of selection_* and not 1 of filter_main_* and not 1 of filter_optional_*
+    fields:
+    - host.name

@@ -1,0 +1,492 @@
+name: Suspicious Mshta.EXE Execution Patterns
+id: 5ea301a0-8d47-4b57-9677-bc8f9d8f7454
+description: |
+  Detects mshta.exe firing under either of two patterns: a suspicious parent (cmd, cscript, powershell, pwsh, regsvr32, rundll32, or wscript) combined with a command line that references a user-writable path (AppData\Local, ProgramData, Users\Public, or Windows\Temp), OR mshta identified by name or metadata running from outside System32/SysWOW64 or without a normal .htm/.hta invocation. mshta.exe is a signed system binary that runs fully trusted HTA content (HTML plus VBScript/JScript) outside the browser sandbox, so it is a common proxy-execution and script-launch vector; legitimate HTA use is rare in modern environments. Determine whether the invocation is a sanctioned HTA application or operator-driven proxy execution by decoding the command line, validating the parent chain, and confirming the binary's true identity and origin.
+type: detection
+detection_id: e32f92d1-523e-49c3-9374-bdb13b46a3ba
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- question: Does this event match one of the two mshta patterns the rule fires on?
+  context: >-
+    The rule fires on either of two independent branches, so confirm which one matched. Branch one is mshta.exe (by Image
+    or OriginalFileName) spawned by cmd, cscript, powershell, pwsh, regsvr32, rundll32, or wscript with a command line
+    referencing AppData\Local, ProgramData, Users\Public, or Windows\Temp. Branch two is mshta identified by name or
+    metadata but running outside System32/SysWOW64, or without a .htm/.hta argument, or not ending in mshta. Note which
+    branch fired, because the path-anomaly branch makes the binary-origin and signing questions load-bearing while the
+    suspicious-parent branch shifts weight onto the parent chain and command line.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to run mshta.exe for HTA application work?
+  context: >-
+    Legitimate HTA usage is rare in modern environments, so a user or host that has no business running HTA applications
+    raises the weight of the alert. Knowing whether the user role and host function involve any HTA-based internal tooling
+    is often the fastest path to separating sanctioned use from operator-driven proxy execution.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What exactly did mshta.exe execute? Decode the full command line, including any inline script or referenced file.
+  context: >-
+    The full command line reveals what mshta was told to run. Decode any inline javascript: or vbscript: URI, the path to
+    the HTA or non-.hta file it loads, and any embedded URL, IP, or base64 content. mshta runs HTA content fully trusted
+    outside the browser sandbox, so the argument it carries is the actual payload. The query returns all mshta executions
+    on the host within a few minutes of the alert so sequential launches that form one logical operation are visible.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What is the content of the HTA or file referenced on the command line? Check for obfuscation and encoded payloads.
+  context: >-
+    Read and analyze the actual content of the file mshta loaded. HTA payloads commonly embed base64-encoded blobs,
+    obfuscated VBScript or JScript, embedded URLs or IP addresses, and downstream PowerShell or cmd commands. Retrieve the
+    file from the endpoint and inspect it directly; the command line names the path but not the behavior inside.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What did mshta launch, and what is its hash?
+  context: >-
+    An .hta is script content that mshta interprets, so the HTA file itself has no execution hash -- its content is the
+    payload (see the content question). What carries a hash is whatever mshta then spawns -- HTA cradles routinely download
+    and run an executable. This returns the processes mshta launched, and those its parent launched (its children and
+    siblings), with their hashes; submit any to VirusTotal, Hybrid Analysis, or internal threat intel. If the HTA only ran
+    script in-process and spawned nothing, this is empty -- work the HTA content and any network destination instead, and
+    retrieve the HTA from its path to hash it by hand.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_children:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      selection_siblings:
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - Image
+      - Hashes
+- question: Is the parent expected to spawn mshta.exe, and what started the parent?
+  context: >-
+    The parent-child relationship is the core signal for the suspicious-parent branch. Script hosts and shells such as
+    cmd, powershell, wscript, cscript, regsvr32, and rundll32 spawning mshta is a common loader-to-proxy-execution chain.
+    Tracing the parent's own origin reveals whether the chain is a legitimate user or admin action or a macro or exploit
+    that launched the shell which then launched mshta.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What other child processes did the same parent spawn?
+  context: >-
+    If the parent that launched mshta also launched other processes, examining the siblings reveals the full scope of
+    activity from that parent. Multiple suspicious children from one parent points to orchestrated execution rather than a
+    single isolated launch.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Is this really the system mshta.exe, or a renamed or relocated binary masquerading as it?
+  context: >-
+    The path-anomaly branch fires when mshta is identified by name or metadata but runs from outside System32/SysWOW64.
+    Compare the Image path on disk against OriginalFileName in the PE metadata, and check the signing status. Genuine
+    mshta is Microsoft-signed and lives in System32 or SysWOW64; a copy renamed to mshta, or the real mshta relocated to a
+    user-writable directory, is a deliberate attempt to evade path-based controls. The hash enables a reputation lookup to
+    confirm whether this is the stock binary.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Hashes
+- question: Was mshta.exe executed from its expected System32 or SysWOW64 path?
+  context: >-
+    mshta running from outside System32 or SysWOW64 is one of the conditions the path-anomaly branch detects and may
+    indicate the binary was copied or renamed to bypass path-based allowlists. mshta launched from a user temp directory,
+    AppData, or a download folder is far more suspicious than one in its canonical system location.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- question: How did this mshta binary arrive at the path it ran from?
+  context: >-
+    A relocated or renamed mshta does not appear spontaneously -- it was copied, downloaded, or dropped. Tracing the file
+    creation event for the binary by basename over a long window reveals the delivery mechanism: a download tool, an
+    archive extraction, a remote-admin copy, or a dropper. The process that created the file identifies which tool placed
+    it. A binary in a user-writable location was likely downloaded or extracted; one in a system path may reflect a routine
+    OS update or compromise of a privileged process.
+  range: -30d
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains|expand: '%file_name%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: What did mshta do after launch, and is the same binary present on other hosts?
+  context: >-
+    The point of relocating or renaming mshta is to run its intended function while evading detection. Examining the child
+    processes, file operations, and network connections that follow reveals the actual objective. The same renamed or
+    relocated binary appearing on multiple hosts points to deliberate distribution rather than an isolated event.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Is the referenced HTA or payload file still on disk for analysis?
+  context: >-
+    The command line references a file path in a user-writable directory. Checking whether that file still exists on disk
+    enables deeper analysis -- hash lookups, sandbox submission, or reading the HTA source directly. Operators frequently
+    delete the staged HTA after execution, so absence is itself informative.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \mshta.exe
+      - OriginalFileName: MSHTA.EXE
+      selection_susp:
+        ParentImage|endswith:
+        - \cmd.exe
+        - \cscript.exe
+        - \powershell.exe
+        - \pwsh.exe
+        - \regsvr32.exe
+        - \rundll32.exe
+        - \wscript.exe
+        CommandLine|contains:
+        - \AppData\Local\
+        - C:\ProgramData\
+        - C:\Users\Public\
+        - C:\Windows\Temp\
+      filter_img:
+      - Image|startswith:
+        - C:\Windows\System32\
+        - C:\Windows\SysWOW64\
+      - CommandLine|contains:
+        - .htm
+        - .hta
+      - CommandLine|endswith:
+        - mshta.exe
+        - mshta
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_* or (selection_img and not filter_img)) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \mshta.exe
+      - OriginalFileName: MSHTA.EXE
+      selection_susp:
+        ParentImage|endswith:
+        - \cmd.exe
+        - \cscript.exe
+        - \powershell.exe
+        - \pwsh.exe
+        - \regsvr32.exe
+        - \rundll32.exe
+        - \wscript.exe
+        CommandLine|contains:
+        - \AppData\Local\
+        - C:\ProgramData\
+        - C:\Users\Public\
+        - C:\Windows\Temp\
+      filter_img:
+      - Image|startswith:
+        - C:\Windows\System32\
+        - C:\Windows\SysWOW64\
+      - CommandLine|contains:
+        - .htm
+        - .hta
+      - CommandLine|endswith:
+        - mshta.exe
+        - mshta
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_* or (selection_img and not filter_img)) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the user's activity across all hosts reveals lateral movement or coordinated activity on multiple endpoints.
+    If the same user triggered similar activity elsewhere in the same window, the scope of the event may be larger than one
+    host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \mshta.exe
+      - OriginalFileName: MSHTA.EXE
+      selection_susp:
+        ParentImage|endswith:
+        - \cmd.exe
+        - \cscript.exe
+        - \powershell.exe
+        - \pwsh.exe
+        - \regsvr32.exe
+        - \rundll32.exe
+        - \wscript.exe
+        CommandLine|contains:
+        - \AppData\Local\
+        - C:\ProgramData\
+        - C:\Users\Public\
+        - C:\Windows\Temp\
+      filter_img:
+      - Image|startswith:
+        - C:\Windows\System32\
+        - C:\Windows\SysWOW64\
+      - CommandLine|contains:
+        - .htm
+        - .hta
+      - CommandLine|endswith:
+        - mshta.exe
+        - mshta
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_* or (selection_img and not filter_img)) and _pb_scope
+    fields:
+    - host.name
+- question: Were any other proxy-execution LOLBins used on this host recently?
+  context: >-
+    Operators who use one proxy-execution LOLBin often chain several -- if mshta launched a payload, check whether
+    rundll32, regsvr32, msbuild, cmstp, installutil, or similar binaries ran the same objective nearby. Several
+    proxy-execution LOLBins performing related work strengthens the case for hands-on-keyboard activity.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\rundll32.exe'
+          - '\regsvr32.exe'
+          - '\msbuild.exe'
+          - '\cmstp.exe'
+          - '\msiexec.exe'
+          - '\installutil.exe'
+          - '\forfiles.exe'
+          - '\pcalua.exe'
+          - '\presentationhost.exe'
+          - '\control.exe'
+          - '\infdefaultinstall.exe'
+          - '\msdt.exe'
+          - '\mavinject.exe'
+          - '\wmic.exe'
+          - '\xwizard.exe'
+          - '\ie4uinit.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- question: How often has this host fired the rule's mshta pattern over the past 90 days, and what command-line structures are typical?
+  context: >-
+    An mshta pattern with no prior history on a host is more suspicious than one used routinely under stable parents. The
+    query mirrors the rule's selection structure scoped to this host, so the count reflects the rule's specific firing
+    pattern rather than generic mshta usage. The command-line projection lets the analyst compare typical invocation patterns
+    against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \mshta.exe
+      - OriginalFileName: MSHTA.EXE
+      selection_susp:
+        ParentImage|endswith:
+        - \cmd.exe
+        - \cscript.exe
+        - \powershell.exe
+        - \pwsh.exe
+        - \regsvr32.exe
+        - \rundll32.exe
+        - \wscript.exe
+        CommandLine|contains:
+        - \AppData\Local\
+        - C:\ProgramData\
+        - C:\Users\Public\
+        - C:\Windows\Temp\
+      filter_img:
+      - Image|startswith:
+        - C:\Windows\System32\
+        - C:\Windows\SysWOW64\
+      - CommandLine|contains:
+        - .htm
+        - .hta
+      - CommandLine|endswith:
+        - mshta.exe
+        - mshta
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_* or (selection_img and not filter_img)) and _pb_scope
+    fields:
+    - CommandLine

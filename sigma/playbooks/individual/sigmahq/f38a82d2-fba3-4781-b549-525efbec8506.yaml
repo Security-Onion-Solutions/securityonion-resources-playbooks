@@ -1,0 +1,371 @@
+name: PUA - 3Proxy Execution
+id: b237350c-c5b2-4f53-9957-f801062c2e7c
+description: |
+  Detects execution of 3proxy, a small standalone proxy server, identified when at least one of three conditions matches:
+  the process image ends in 3proxy.exe, the file Description metadata reads "3proxy - tiny proxy server", or the command
+  line contains the local SOCKS-listener pattern ".exe -i127.0.0.1 -p". 3proxy is a legitimate open-source tool but is
+  frequently dropped on victim hosts as a SOCKS pivot or reverse port-forwarder because it is a single static binary with
+  no dependencies; operators commonly rename it and start a loopback listener that is later tunneled out via SSH/plink. The
+  investigation should confirm which branch fired, decode the listener parameters, establish whether a tunnel or outbound
+  relay was set up, and determine whether the tool is authorized for this host and user.
+type: detection
+detection_id: f38a82d2-fba3-4781-b549-525efbec8506
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- question: Did this process match the 3proxy image name, the 3proxy file description, or the loopback SOCKS-listener command line?
+  context: >-
+    The rule fires when EITHER the image ends in 3proxy.exe, OR the file Description reads "3proxy - tiny proxy server",
+    OR the command line contains ".exe -i127.0.0.1 -p". Review the alerting event and note which branch matched. A description
+    or command-line match on a renamed binary is more interesting than a plain 3proxy.exe name match, because renaming is a
+    deliberate step to evade name-based detection; the loopback-listener command line indicates the tool was actively started
+    rather than merely present on disk.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - Description
+- question: Is this user and host expected to run a standalone proxy server?
+  context: >-
+    Standalone proxy binaries are rare on most endpoints outside of specific networking or development roles. Confirm whether
+    the user account and host function would plausibly run a SOCKS/HTTP proxy. A general-purpose workstation or server with
+    no proxy responsibility running this tool is harder to explain as routine administration.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Is 3proxy on the organization's approved software list for this host?
+  context: >-
+    Organizations typically sanction a specific set of remote access and tunneling tools for IT and networking work. A proxy
+    server not on that list may represent shadow IT or operator-deployed tooling, regardless of the tool's legitimate origin.
+    The binary is small and dependency-free, so its mere presence carries little business justification on its own.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+- question: Is there a change ticket, maintenance window, or networking task that explains a proxy server running here?
+  context: >-
+    Legitimate use of a proxy or tunneling tool usually correlates with a documented task -- a networking change, a development
+    test, or an approved administrative procedure. If no such context exists for this execution, the tool may have been placed
+    for unauthorized relaying or persistent access.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Decode the 3proxy command line -- what listener interface, port, and proxy mode were configured?
+  context: >-
+    The command line defines the proxy's behavior. The "-i127.0.0.1 -p" pattern binds a listener to loopback on a chosen port,
+    which is the classic SOCKS-pivot setup that an operator later tunnels outbound; an "-i" bound to a non-loopback interface
+    exposes the proxy directly to the network. Identify the port, the bind interface, and any config-file or auth arguments
+    to understand exactly what relay was stood up.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Did a companion tunneling tool establish an outbound session that wraps the local proxy port?
+  context: >-
+    A loopback proxy by itself does not reach the internet; protocol tunneling completes the path. Operators pair the local
+    SOCKS listener with an outbound reverse tunnel -- commonly plink/ssh with -R/-L/-D forwarding, or netsh portproxy -- so
+    that external traffic is encapsulated over an allowed protocol. Look for these tunnelers running on the host near the proxy
+    start, and inspect their command lines for forwarding flags that reference the proxy's loopback port.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_tools:
+        - Image|endswith:
+            - \plink.exe
+            - \ssh.exe
+            - \netsh.exe
+        - CommandLine|contains:
+            - ' -R '
+            - ' -L '
+            - ' -D '
+            - 'portproxy'
+            - 'connect=127.0.0.1'
+      condition: selection_host and selection_tools
+    fields:
+      - Image
+      - CommandLine
+      - User
+- question: What external endpoints did proxy or tunneling activity on this host connect to?
+  context: >-
+    Outbound connections reveal where traffic is being relayed. A loopback-only proxy paired with a separate outbound tunnel
+    means the meaningful destination is the tunnel endpoint, not the proxy itself. A large asymmetry between bytes sent and
+    received, or connections to an unfamiliar hosting provider, points to active relaying rather than incidental traffic.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationHostname
+      - DestinationPort
+- question: What process spawned 3proxy, and is that parent chain expected?
+  context: >-
+    The parent process shows how the proxy was launched. A launch from explorer.exe or a known management agent is consistent
+    with deliberate administration, while a launch from a script host, an unpacking/archive utility, or an interactive shell
+    suggests the binary was staged and run as part of hands-on-keyboard activity.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What child processes did 3proxy spawn afterward?
+  context: >-
+    The processes a tool spawns reveal its operational impact. A proxy server normally has few or no children; spawned command
+    interpreters, archive utilities, or credential-access tools indicate the proxy execution is embedded in a broader operation
+    rather than a standalone service start.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Has this host run 3proxy before?
+  context: >-
+    A binary that has never appeared on a host is more notable than one that runs regularly. Zero or very low historical counts
+    over the trailing window indicate first-time or rare execution, which raises the bar for a routine-administration explanation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: When this host previously matched the 3proxy rule pattern, what parents and users drove it, and does the current alert fit?
+  context: >-
+    The query mirrors the rule's selection structure scoped to this host, so the parent and user distribution reflects how
+    this specific firing pattern -- image name, file description, or loopback-listener command line -- has run here historically,
+    not generic proxy usage. A new parent process, an unexpected account, or a first-ever match is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+        Image|endswith: \3proxy.exe
+      selection_pe:
+        Description: 3proxy - tiny proxy server
+      selection_params:
+        CommandLine|contains: .exe -i127.0.0.1 -p
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+        Image|endswith: \3proxy.exe
+      selection_pe:
+        Description: 3proxy - tiny proxy server
+      selection_params:
+        CommandLine|contains: .exe -i127.0.0.1 -p
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+        Image|endswith: \3proxy.exe
+      selection_pe:
+        Description: 3proxy - tiny proxy server
+      selection_params:
+        CommandLine|contains: .exe -i127.0.0.1 -p
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the user's activity across all hosts can reveal lateral movement or staging on multiple endpoints. If the same
+    user triggered similar activity elsewhere in the same window, the scope of the operation may extend beyond this host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+        Image|endswith: \3proxy.exe
+      selection_pe:
+        Description: 3proxy - tiny proxy server
+      selection_params:
+        CommandLine|contains: .exe -i127.0.0.1 -p
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Have other hosts matched the 3proxy rule pattern in the past week, and does the distribution look like automation or one-off activity?
+  context: >-
+    The query mirrors the rule's selection structure with no host scope, giving a fleet-wide count of this firing pattern rather
+    than generic binary usage. Many hosts matching the same pattern points to scripted deployment or vendor automation; one
+    host or a small unrelated set points to manual operator activity. Use the host distribution to calibrate scope.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+        Image|endswith: \3proxy.exe
+      selection_pe:
+        Description: 3proxy - tiny proxy server
+      selection_params:
+        CommandLine|contains: .exe -i127.0.0.1 -p
+      condition: 1 of selection_*
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    A proxy or tunnel is usually stood up after earlier stages. Prior detections on this host -- defense tampering, reconnaissance,
+    credential access, or staging -- may reveal the activity that preceded this event and help reconstruct the timeline leading
+    to outbound relaying.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

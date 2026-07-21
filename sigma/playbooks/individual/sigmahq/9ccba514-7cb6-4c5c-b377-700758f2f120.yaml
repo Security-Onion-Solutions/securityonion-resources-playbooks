@@ -1,0 +1,367 @@
+name: Suspicious Child Process of AspNetCompiler
+id: 04dfbbe3-9a67-4b5e-a5ab-f438009fc51a
+description: |
+  Detects aspnet_compiler.exe spawning a suspicious child process. The rule fires when the parent image ends in
+  aspnet_compiler.exe AND the child either is calc.exe/notepad.exe or runs from a user-writable directory such as
+  the public profile, Temp, AppData, or the Tasks folders. aspnet_compiler.exe is a Microsoft-signed .NET utility
+  that legitimately runs only on build/developer hosts; on ordinary endpoints it is rarely executed. It can be abused
+  to proxy arbitrary code execution by loading an attacker-supplied build provider DLL through a crafted web.config,
+  so the spawned child or any dropped PE/DLL is the operational payload. Investigation should confirm the parent-child
+  pairing, decode what the child did, and look for the supporting artifacts (user-writable DLL load, dropped PE,
+  outbound network connection) that accompany this proxy-execution pattern.
+type: detection
+detection_id: 9ccba514-7cb6-4c5c-b377-700758f2f120
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does this alert match the rule — aspnet_compiler.exe as parent spawning a child that is calc.exe or notepad.exe, or that runs from a user-writable path?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule requires the parent image to
+    end in aspnet_compiler.exe AND the child to either be calc.exe/notepad.exe or live under a user-writable directory
+    (public profile, Temp, AppData, or the Windows Tasks folders). Confirm both conditions hold for this event.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+- question: Is this user and host expected to run aspnet_compiler.exe and the .NET compilation toolchain?
+  context: aspnet_compiler.exe is legitimately used almost exclusively on build and developer systems. On a general-purpose
+    endpoint, or under a user who does not perform .NET builds, its execution is anomalous and raises the priority of this
+    alert regardless of the specific child.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Is aspnet_compiler.exe expected to spawn this child, and what started aspnet_compiler.exe itself?
+  context: The parent-child relationship is the core signal for this detection. Tracing the parent's own origin (the
+    grandparent) reveals whether the chain is a legitimate build invocation or an abuse path — for example a shell or
+    scripting host launching aspnet_compiler.exe with a -p path pointing at a user-writable directory.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What exactly did the spawned child process do? Decode its full command line.
+  context: The child is the operational payload of this proxy-execution pattern. Decode every argument, flag, encoded blob,
+    file path, or URL on the child's command line to determine what action it took. A child running from a user-writable path
+    is more likely to be attacker-controlled than a name-only match like calc.exe.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What other child processes did this same aspnet_compiler.exe instance spawn?
+  context: If aspnet_compiler.exe was abused to proxy execution, it likely spawned more than one process. Examining the
+    siblings of the alerting child reveals the full scope of activity launched through this compiler invocation — multiple
+    suspicious children from the same parent strongly suggests malicious orchestration rather than a one-off build helper.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Did aspnet_compiler.exe or its child write a new PE or DLL into a user-writable directory around the time of the alert?
+  context: This proxy-execution pattern relies on an attacker-supplied build-provider DLL (commonly dropped under a bin\
+    subfolder) and may write or run a fresh PE from a user-writable path. Files written to the public profile, Temp, or
+    AppData immediately before or after the alert are the candidate payloads.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith:
+          - '.dll'
+          - '.exe'
+      filter_writable:
+        TargetFilename|contains:
+          - '\Users\Public\'
+          - '\AppData\Local\Temp\'
+          - '\AppData\Local\Roaming\'
+          - ':\Temp\'
+          - ':\Windows\Temp\'
+      condition: selection and filter_writable
+    fields:
+      - TargetFilename
+      - Image
+      - User
+- question: Did aspnet_compiler.exe load any unsigned or user-writable DLL?
+  context: The abuse path loads an attacker-controlled build-provider DLL into the signed compiler process. A module loaded
+    by aspnet_compiler.exe from a user-writable path, or one that is unsigned, is the in-process payload that distinguishes
+    proxy execution from a legitimate build that loads only framework assemblies.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: '\aspnet_compiler.exe'
+      filter_writable:
+        ImageLoaded|contains:
+          - '\Users\Public\'
+          - '\AppData\Local\Temp\'
+          - '\AppData\Local\Roaming\'
+          - ':\Temp\'
+          - ':\Windows\Temp\'
+      condition: selection and filter_writable
+    fields:
+      - ImageLoaded
+      - Signed
+      - SignatureStatus
+- question: Did aspnet_compiler.exe or its child make an outbound network connection shortly after execution?
+  context: An immediate outbound connection from the signed compiler or its child is a strong supporting signal for proxy
+    execution being used as a loader or command-and-control stager. Legitimate compilation is local and does not initiate
+    egress; a connection to a rare or unknown destination raises the priority of the finding.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\aspnet_compiler.exe'
+        Initiated: 'true'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- question: Does aspnet_compiler.exe on this host normally spawn this child binary?
+  context: Some parent-child pairings are routine on build hosts; most are not on ordinary endpoints. Zero or very low
+    historical counts for aspnet_compiler.exe spawning this specific child indicate a novel spawning relationship worth
+    chasing. A nonzero history on a known build host points toward legitimate compilation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Is this aspnet_compiler.exe parent-child spawning pattern occurring on other hosts?
+  context: The same compiler-to-child pairing appearing across multiple hosts may indicate a tooling rollout or a
+    multi-host operation; a single occurrence is more likely targeted or a one-off build. Comparing across the environment
+    helps calibrate severity and scope.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+      - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent:
+        ParentImage|endswith: \aspnet_compiler.exe
+      selection_child:
+      - Image|endswith:
+        - \calc.exe
+        - \notepad.exe
+      - Image|contains:
+        - \Users\Public\
+        - \AppData\Local\Temp\
+        - \AppData\Local\Roaming\
+        - :\Temp\
+        - :\Windows\Temp\
+        - :\Windows\System32\Tasks\
+        - :\Windows\Tasks\
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent:
+        ParentImage|endswith: \aspnet_compiler.exe
+      selection_child:
+      - Image|endswith:
+        - \calc.exe
+        - \notepad.exe
+      - Image|contains:
+        - \Users\Public\
+        - \AppData\Local\Temp\
+        - \AppData\Local\Roaming\
+        - :\Temp\
+        - :\Windows\Temp\
+        - :\Windows\System32\Tasks\
+        - :\Windows\Tasks\
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around the time of the alert?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints.
+    If the same user triggered similar activity on other hosts, the scope of the activity may be larger than this single
+    detection.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent:
+        ParentImage|endswith: \aspnet_compiler.exe
+      selection_child:
+      - Image|endswith:
+        - \calc.exe
+        - \notepad.exe
+      - Image|contains:
+        - \Users\Public\
+        - \AppData\Local\Temp\
+        - \AppData\Local\Roaming\
+        - :\Temp\
+        - :\Windows\Temp\
+        - :\Windows\System32\Tasks\
+        - :\Windows\Tasks\
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining activity around the alert reveals what led to this event, what
+    happened after, and whether it is part of a larger sequence — look for reconnaissance, privilege escalation, or
+    persistence around the compiler execution.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — defense tampering, reconnaissance, credential access — may reveal the
+    attack stages that preceded this event and help reconstruct the full timeline leading up to the compiler abuse.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

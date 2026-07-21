@@ -1,0 +1,464 @@
+name: Suspicious PowerShell IEX Execution Patterns
+id: 11286f44-b138-41aa-aa72-1df8c1a5eeb9
+description: |
+  Detects PowerShell or pwsh launched with command lines that pipe content into Invoke-Expression (the IEX alias) or that
+  build a string to evaluate via base64 decoding helpers. The rule fires when EITHER a powershell/pwsh process pipes into an IEX form AND the command line also contains base64 decode helpers (FromBase64String, System.Convert GetString), OR a standalone IEX-pipe idiom appears. These are the canonical code-from-string execution primitive at the heart of download cradles and
+  in-memory payload execution. Legitimate scripts and tooling occasionally use IEX, so the investigation should decode the
+  full command line, identify what string is being evaluated and where it comes from, confirm the parent chain and user, and
+  look for surrounding preparation or follow-on activity.
+type: detection
+detection_id: 09576804-7a05-458e-a817-eb718ca91f54
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-04
+questions:
+- question: Does the command line match an IEX pipe form combined with a base64-decode helper, or a standalone IEX idiom?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the exact command line and
+    process details. The rule fires when EITHER of two branches is met, so note which branch matched, because that determines the rest of the investigation. The first branch is a powershell or pwsh process whose command line pipes into an IEX form AND also contains base64 decode helpers (FromBase64String or the System.Convert GetString idiom). The second branch is a standalone IEX pipe idiom. A command line evaluating an attacker-supplied string
+    is the core concern; benign scripts that legitimately use IEX are the main false positive.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Is this user and host expected to run PowerShell that evaluates strings via Invoke-Expression?
+  context: Legitimate administrative activity and some installer or automation scripts use IEX to evaluate generated code,
+    so knowing whether the user role and host function are consistent with that pattern is often the fastest path to
+    separating routine operations from intrusion. A developer workstation or a configuration-management host running IEX
+    differs sharply from an IEX-piped command line on a server that has no scripting role.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What string is being evaluated by IEX, and where does it come from?
+  context: The full command line reveals the specific code being passed to Invoke-Expression. Identify whether the string is
+    a literal script, a download cradle that fetches and runs remote content, or a base64 blob decoded inline via
+    FromBase64String. For download cradles, extract the source URL or host and check its reputation; for base64 forms, decode
+    the blob to read the actual payload. The query scopes to powershell and pwsh executions on this host that carry the IEX
+    or base64-decode patterns, so a multi-stage operation that spans more than one invocation is captured rather than just the
+    single triggering event.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - \powershell.exe
+          - \pwsh.exe
+        CommandLine|contains:
+          - ' | iex'
+          - ' | IEX'
+          - ');iex'
+          - ');IEX'
+          - '|iex'
+          - ::FromBase64String
+          - '.GetString([System.Convert]::'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Is the evaluated string base64-encoded or otherwise obfuscated, and what does it decode to?
+  context: The base64-decode branch of this rule matches FromBase64String and the System.Convert GetString idiom, which
+    attackers use to hide the payload that IEX then runs in memory. Decode the blob to recover the actual script, which is
+    frequently a download cradle, a reverse shell, or in-memory loading of a .NET assembly. Even when the command line is
+    plain text, IEX with a piped string can be assembled from concatenation, backtick escaping, or variable substitution that
+    masks the real intent until evaluated.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did the PowerShell automation and scripting runtime assemblies load into this process around the alert?
+  context: Invoke-Expression with a base64-decoded string commonly drives in-memory execution of .NET, where the payload is
+    loaded reflectively rather than written to disk. Module load events for the PowerShell scripting runtime and the .NET
+    common language runtime confirm that script evaluation actually occurred in this process, and an unexpected or rare
+    assembly loaded alongside them can indicate reflective loading of attacker code. Correlate the load events to the same
+    process by host and time.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|contains:
+          - \System.Management.Automation
+          - \clr.dll
+          - \clrjit.dll
+          - \mscoree.dll
+          - \amsi.dll
+      condition: selection
+    fields:
+      - Image
+      - ImageLoaded
+      - Signed
+- question: Did PowerShell script block logging capture the full deobfuscated content that IEX executed?
+  context: Script block logging records the deobfuscated script content PowerShell actually executes, even when the command
+    line is encoded or assembled at runtime. This is the ground truth for what the IEX-evaluated string contained, bypassing
+    base64 encoding and concatenation. If PowerShell operational logs are not ingested in this environment, treat zero results
+    as a visibility gap rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Were PowerShell security controls bypassed or weakened before this execution?
+  context: Attackers often disable or bypass PowerShell security controls before running an IEX payload. Common techniques
+    include AMSI bypass (patching amsi.dll in memory), execution policy changes, constrained language mode escapes, and
+    downgrade to PowerShell version 2 which lacks script block logging. Finding these precursor events on the same host
+    strengthens the case that the IEX evaluation was hostile rather than a benign script.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: What process spawned this PowerShell instance and is that parent chain expected?
+  context: The parent process reveals how PowerShell was invoked. Legitimate usage often has predictable parent chains
+    (explorer.exe for interactive user actions, services.exe or a scheduler for automation). Unusual parents like mshta.exe,
+    wscript.exe, or an Office application may indicate exploitation or a malicious macro that handed off to an IEX cradle.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What child processes did this PowerShell instance spawn afterward?
+  context: The processes spawned after IEX evaluation reveal the payload's actual impact. An evaluated download cradle often
+    spawns additional cmd.exe, powershell.exe, certutil.exe, or dropped binaries for post-exploitation, while a benign script
+    typically has predictable or no children.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: When this host has previously fired the rule's pattern, what parents and users normally drive it, and does the
+    current alert fit?
+  context: Even common scripting idioms can be abused. The query mirrors the rule's selection structure scoped to this host,
+    so the resulting parent and user distribution reflects how this specific IEX firing pattern has historically run here.
+    A new parent process, an unexpected user account, or an unusual command-line structure is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_combined_1:
+        Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        CommandLine|contains:
+        - ' | iex;'
+        - ' | iex '
+        - ' | iex}'
+        - ' | IEX ;'
+        - ' | IEX -Error'
+        - ' | IEX (new'
+        - ');IEX '
+      selection_combined_2:
+        CommandLine|contains:
+        - ::FromBase64String
+        - '.GetString([System.Convert]::'
+      selection_standalone:
+        CommandLine|contains:
+        - )|iex;$
+        - );iex($
+        - );iex $
+        - ' | IEX | '
+        - ' | iex\"'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_combined_* or selection_standalone) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Have other hosts fired the rule's pattern in the past week, and does the cross-host distribution look like
+    consistent automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of this
+    IEX firing pattern rather than generic PowerShell usage. Many hosts firing the same pattern points to scripted deployment
+    or vendor automation; one host or a small unrelated set points to manual operator activity. Use the host distribution and
+    parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_combined_1:
+        Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        CommandLine|contains:
+        - ' | iex;'
+        - ' | iex '
+        - ' | iex}'
+        - ' | IEX ;'
+        - ' | IEX -Error'
+        - ' | IEX (new'
+        - ');IEX '
+      selection_combined_2:
+        CommandLine|contains:
+        - ::FromBase64String
+        - '.GetString([System.Convert]::'
+      selection_standalone:
+        CommandLine|contains:
+        - )|iex;$
+        - );iex($
+        - );iex $
+        - ' | IEX | '
+        - ' | iex\"'
+      condition: all of selection_combined_* or selection_standalone
+    fields:
+    - host.name
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_combined_1:
+        Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        CommandLine|contains:
+        - ' | iex;'
+        - ' | iex '
+        - ' | iex}'
+        - ' | IEX ;'
+        - ' | IEX -Error'
+        - ' | IEX (new'
+        - ');IEX '
+      selection_combined_2:
+        CommandLine|contains:
+        - ::FromBase64String
+        - '.GetString([System.Convert]::'
+      selection_standalone:
+        CommandLine|contains:
+        - )|iex;$
+        - );iex($
+        - );iex $
+        - ' | IEX | '
+        - ' | iex\"'
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_combined_* or selection_standalone) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_combined_1:
+        Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        CommandLine|contains:
+        - ' | iex;'
+        - ' | iex '
+        - ' | iex}'
+        - ' | IEX ;'
+        - ' | IEX -Error'
+        - ' | IEX (new'
+        - ');IEX '
+      selection_combined_2:
+        CommandLine|contains:
+        - ::FromBase64String
+        - '.GetString([System.Convert]::'
+      selection_standalone:
+        CommandLine|contains:
+        - )|iex;$
+        - );iex($
+        - );iex $
+        - ' | IEX | '
+        - ' | iex\"'
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_combined_* or selection_standalone) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If
+    the same user triggered similar activity on several hosts, the scope of the operation may be larger than this single
+    alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_combined_1:
+        Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        CommandLine|contains:
+        - ' | iex;'
+        - ' | iex '
+        - ' | iex}'
+        - ' | IEX ;'
+        - ' | IEX -Error'
+        - ' | IEX (new'
+        - ');IEX '
+      selection_combined_2:
+        CommandLine|contains:
+        - ::FromBase64String
+        - '.GetString([System.Convert]::'
+      selection_standalone:
+        CommandLine|contains:
+        - )|iex;$
+        - );iex($
+        - );iex $
+        - ' | IEX | '
+        - ' | iex\"'
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_combined_* or selection_standalone) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate context: what led to
+    this event, what happened after, and whether it is part of a larger sequence. Look for reconnaissance, privilege
+    escalation, or persistence mechanisms surrounding the IEX execution.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host, such as defense tampering, reconnaissance,
+    or credential access, may reveal the attack stages that preceded this event and help reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

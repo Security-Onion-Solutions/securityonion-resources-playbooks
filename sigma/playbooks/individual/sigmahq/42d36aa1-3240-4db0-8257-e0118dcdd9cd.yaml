@@ -1,0 +1,464 @@
+name: Suspicious Hyper-V Cmdlets
+id: e543935e-133f-4d76-9ec8-9b56705ddedb
+description: |
+  Fires when PowerShell script-block content (EID 4104) contains any of the Hyper-V cmdlets
+  New-VM, Set-VMFirmware, or Start-VM. These cmdlets are routine for virtualization
+  administrators, developers, and lab automation, but they are also how an actor runs a
+  payload inside a guest virtual machine to conceal it from host-based security tools
+  (T1564.006 Run Virtual Instance) — ransomware operations have created a VM, mapped
+  guest-to-host shared folders, and encrypted the host file system from inside the guest,
+  where host telemetry sees only hypervisor processes. Investigation should establish which
+  cmdlets appeared and what VM, disks, and firmware settings the script configures, whether
+  the Hyper-V feature was newly enabled on the host, whether a VM worker process actually
+  started, and whether the user and host have a virtualization role. Script-block capture
+  is policy-gated per host — on default installs only content matching Microsoft's built-in
+  suspicious-strings checks is logged, so absence of surrounding 4104 evidence is not
+  absence of activity.
+type: detection
+detection_id: 42d36aa1-3240-4db0-8257-e0118dcdd9cd
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-17
+questions:
+- question: Does the script block contain the New-VM, Set-VMFirmware, or Start-VM cmdlets the rule detects?
+  context: Confirm the alert is a true positive by reading the complete script. The rule
+    fires when script content contains any one of the three cmdlets, so note which matched —
+    New-VM creates a guest, Set-VMFirmware alters its firmware (boot order, Secure Boot),
+    and Start-VM runs it; each implies a different stage of setting up a virtual instance.
+    Long scripts are split across multiple 4104 events, so this retrieves every chunk of
+    the alerting block (sequence/total order) and the match is judged on the whole script,
+    not the alerting fragment.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - ScriptBlockText
+- question: Is this user and host expected to create or manage Hyper-V virtual machines?
+  context: Hyper-V cmdlet use is routine for virtualization administrators, developers
+    running local test VMs, and build or lab automation. On a general workstation or a
+    server with no virtualization role, VM creation is hard to explain and matches the
+    concealment pattern this rule anticipates. The query shows the alerting block's host,
+    user, and on-disk script path (blank for interactive or in-memory execution); a SYSTEM
+    user usually means deployment tooling — judge by the host's role and the script path.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - host.name
+      - user.name
+      - Path
+- question: What does the full script do with the Hyper-V cmdlets — which VM, disks, and firmware settings does it configure?
+  context: Script-block content is logged after decoding, so any -EncodedCommand wrapper is
+    already unwrapped; only string-level obfuscation inside the script (concatenation,
+    format operators, backticks) still needs manual work. Read the complete reassembled
+    script for the VM name, the -VHDPath or -NewVHDPath disk arguments, attached ISO
+    images, Set-VMFirmware changes such as disabling Secure Boot or reordering boot
+    devices, and any shared-folder or guest-service configuration that would let the guest
+    reach the host file system. Disk and ISO paths named in the script are derived
+    artifacts — chase them with the VM-image staging question.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - powershell.sequence
+      - powershell.total
+      - ScriptBlockText
+- question: Does the script exist on disk, and what created it?
+  context: When the script block ran from a file, its path is recorded on the 4104 event.
+    A script on disk in a user-writable or staging location (Temp, AppData, ProgramData,
+    Downloads) implies a delivery step that wrote it — find the file-creation event to
+    identify the process and account that staged the script. Interactive or in-memory
+    execution logs no path at all, which for VM-creation content is itself worth noting —
+    fileless execution is a deliberate evasion choice, though admin one-liners are also
+    commonly typed interactively.
+  range: +/-24h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - EventType
+      - TargetFilename
+      - Image
+      - User
+- question: Was the Hyper-V feature enabled on this host recently, and by what command?
+  context: An actor who wants a hidden guest on a host without virtualization must first
+    enable the hypervisor — Enable-WindowsOptionalFeature -Online -FeatureName
+    Microsoft-Hyper-V -All from PowerShell, or DISM /Online /Enable-Feature
+    /FeatureName:Microsoft-Hyper-V — both requiring administrator rights and a restart.
+    Programmatic enablement on an endpoint with no business need for virtualization is the
+    preparation step this technique's detection strategy keys on. An empty result means
+    Hyper-V was already present or was enabled outside this window.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains:
+          - 'Microsoft-Hyper-V'
+          - 'hypervisorlaunchtype'
+      condition: selection
+    fields:
+      - CommandLine
+      - User
+- question: Were registry keys for virtualization services created or modified on this host around the alert?
+  context: Enabling Hyper-V registers its management and worker services (vmms, vmcompute,
+    HvHost), and dropped hypervisors such as portable VirtualBox register their own driver
+    and service keys. Registry writes to these keys landing close to VM process starts are
+    the time-coupling the technique's detection strategy looks for — install artifacts
+    appearing right before a guest runs, rather than during planned software deployment.
+    The writing process and value data show whether this came from Windows feature
+    servicing or from a user-run installer.
+  range: +/-24h
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains:
+          - '\Services\vmms'
+          - '\Services\vmcompute'
+          - '\Services\HvHost'
+          - '\Services\hvservice'
+          - '\Services\VBoxDrv'
+          - '\Oracle\VirtualBox'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- question: Did virtualization worker or management processes run on this host around the alert?
+  context: Start-VM materializes as a vmwp.exe worker process under the vmms service, so a
+    worker start near the alert confirms a guest actually ran rather than just being
+    scripted. VBoxManage, VBoxHeadless, and vmware-vmx are the equivalents when the actor
+    brings their own hypervisor — headless or notification-suppressing arguments on those
+    command lines are the concealment variant the technique's analytics call out. On hosts
+    where VM software is part of the standard build, tune this by excluding the known
+    administrative usage rather than the binaries themselves.
+  range: +/-24h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\vmwp.exe'
+          - '\vmms.exe'
+          - '\vmcompute.exe'
+          - '\VBoxManage.exe'
+          - '\VBoxHeadless.exe'
+          - '\vmware-vmx.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- question: Were VM disk or configuration files written on this host around the alert?
+  context: A guest needs a disk — a VHD/VHDX, VMDK, or VDI image, or a boot ISO, written
+    shortly before creation shows where the guest came from and whether it was staged by a
+    downloader, copied from a share, or built locally. Actors deliver a pre-built image so
+    the payload never touches the host as a scannable executable, then reach the host file
+    system through guest-to-host shared folders while host telemetry sees only hypervisor
+    processes. Image files dropped in user-writable paths, or marked hidden after writing,
+    are the staging artifacts to chase. This anchor is derived from the technique's file
+    types, not from the alert's own fields.
+  range: +/-24h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith:
+          - '.vhd'
+          - '.vhdx'
+          - '.avhdx'
+          - '.iso'
+          - '.vmcx'
+          - '.vmdk'
+          - '.vdi'
+          - '.ova'
+      condition: selection
+    fields:
+      - TargetFilename
+      - EventType
+      - Image
+- question: Did the PowerShell session spawn follow-on activity after the script ran?
+  context: A 4104 event records script content, not execution outcome, and carries no
+    process link — this pivots by host, user, and time to the children of the user's
+    PowerShell hosts in the half hour after the block was logged. Tooling launched to
+    stage a VM image, configure networking for the guest, or continue the operation
+    appears here. If the alert fired under SYSTEM or another service principal, the user
+    anchor is broad; read the results with that in mind rather than dropping it.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        User|expand: '%User%'
+        ParentImage|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+          - '\powershell_ise.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- question: Were PowerShell security controls bypassed or weakened before this execution?
+  context: Actors commonly weaken controls before running meaningful PowerShell —
+    execution-policy bypass flags, AMSI tampering (AmsiUtils, amsiInitFailed), Defender
+    preference changes, or a downgrade to PowerShell v2 to avoid script-block logging.
+    Running a payload inside a guest VM is itself an evasion technique, so a paired bypass
+    in the preceding hour makes the routine-administration explanation harder to sustain
+    and should be folded into the timeline.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: What other PowerShell script activity occurred on this host around the alert?
+  context: Attacker PowerShell rarely runs as a single block — feature enablement, image
+    staging, VM creation, and follow-on tooling produce a cluster of script blocks in a
+    short window, and surrounding blocks from the same session often contain the disk
+    paths and VM configuration the alerting fragment lacks. The log.level column shows
+    whether the host logs all blocks (verbose) or only automatically flagged content
+    (warning) — on a warning-only host this view is partial by design, and absence of
+    surrounding blocks is not evidence nothing else ran.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - user.name
+      - log.level
+      - Path
+      - ScriptBlockText
+- question: Is full script block logging enabled on this host, or is only suspicious-content logging active?
+  context: PowerShell logs every script block at verbose level only when the Script Block
+    Logging policy is enabled; by default it logs only content matching Microsoft's
+    built-in suspicious-strings checks, at warning level. On a warning-only host this
+    alert shows a fragment of the host's PowerShell activity, not all of it — surrounding
+    benign-looking blocks may simply not have been logged. Use the level distribution here
+    to calibrate how complete every other script-channel result in this investigation is.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - log.level
+- question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining process activity around the alert
+    reveals the immediate context — what led to this event, what happened after, and
+    whether it is part of a larger sequence such as reconnaissance, staging, or
+    persistence. The aggregation collapses repetitive agent noise into high-count rows so
+    novel parent-child pairs stand out at low counts.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- always_include: true
+  question: Has this user produced this Hyper-V cmdlet pattern before, and does that history fit their role?
+  context: The query mirrors the rule's own selection scoped to this user — a 90-day
+    history of this specific cmdlet pattern aggregated by host, not generic PowerShell
+    use. A virtualization administrator or developer who provisions VMs routinely reads
+    differently from an account producing this pattern for the first time; weigh the count
+    against the user's role. History covers only hosts logging the PowerShell channel, and
+    non-flagged content appears only where full script-block logging is enabled, so zero
+    history is weaker evidence on a default-logging fleet.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: ps_script
+      definition: 'Requirements: Script Block Logging must be enabled'
+    detection:
+      selection:
+        ScriptBlockText|contains:
+        - New-VM
+        - Set-VMFirmware
+        - Start-VM
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: Which hosts have produced this Hyper-V cmdlet pattern in the last 90 days, and is the alerting host among them?
+  context: When the alert fires under a service principal, user identity does not
+    attribute the behavior, and script-block events carry no process identity to pivot
+    on — the pattern itself is the pivot. This mirrors the rule's selection fleet-wide
+    over 90 days, aggregated by host. A pattern that appears routinely across many hosts
+    suggests build or lab automation; one that has never appeared before, or only on this
+    host, is the deviation worth chasing. Only hosts shipping the PowerShell channel (and,
+    for non-flagged content, with full logging enabled) can appear, so absence elsewhere
+    is weak evidence.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: ps_script
+      definition: 'Requirements: Script Block Logging must be enabled'
+    detection:
+      selection:
+        ScriptBlockText|contains:
+        - New-VM
+        - Set-VMFirmware
+        - Start-VM
+      condition: selection
+    fields:
+    - host.name
+- always_include: true
+  question: What else did this user do across the network around this time?
+  context: The same account acting on several hosts in the alert window widens the scope —
+    VM provisioning on one host paired with logons or tooling on others is how staged
+    multi-host activity looks. Hosts this account does not normally touch matter as much
+    as the commands run there. If the alert fired under SYSTEM or another service
+    principal, this view degrades to agent-telemetry noise; the fleet-wide pattern
+    question is the meaningful substitute in that case.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- always_include: true
+  question: Did this Hyper-V cmdlet pattern fire on other hosts in the same window?
+  context: The query mirrors the rule's selection fleet-wide in the alert window,
+    aggregated by host — the service-principal-safe version of the cross-network view,
+    since these events carry no process identity to pivot on. Several hosts producing the
+    pattern in the same window points to pushed or scheduled automation; a single host
+    points to a host-local action. Coverage is policy-gated per host, so absence elsewhere
+    remains weak evidence on a default-logging fleet.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: ps_script
+      definition: 'Requirements: Script Block Logging must be enabled'
+    detection:
+      selection:
+        ScriptBlockText|contains:
+        - New-VM
+        - Set-VMFirmware
+        - Start-VM
+      condition: selection
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — defense tampering, reconnaissance,
+    credential access — may reveal how the actor reached a position from which they could
+    enable virtualization and provision a guest at all. The preceding alert timeline helps
+    reconstruct the sequence that led to the VM activity rather than treating it as an
+    isolated event.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

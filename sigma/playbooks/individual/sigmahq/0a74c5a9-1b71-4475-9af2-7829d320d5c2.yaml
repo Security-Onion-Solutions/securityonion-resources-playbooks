@@ -1,0 +1,473 @@
+name: ChromeLoader Malware Execution
+id: 6bdd323f-9b3f-4a08-8a47-7f4404066be5
+description: |
+  Detects chrome.exe launched with a --load-extension switch pointing into a user-writable
+  AppData\Local\chrome directory, where the parent is powershell.exe running a hidden,
+  execution-policy-bypassing, base64-encoded command. All four conditions must hold together
+  for the rule to fire. ChromeLoader stages an unpacked browser extension under the user
+  profile and starts the browser with a side-load switch, so the extension never passes
+  through the web store install path; the encoded PowerShell launcher is typically driven
+  from a registered scheduled task, which supplies persistence across reboots. The
+  investigation should decode the parent PowerShell payload, identify the extension
+  directory and what it contains, determine which scheduled task or other mechanism starts
+  the chain, and establish whether the extension has produced outbound traffic or registry
+  artifacts.
+type: detection
+detection_id: 0a74c5a9-1b71-4475-9af2-7829d320d5c2
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-16
+questions:
+- question: >-
+    Does the alerting chrome.exe command line carry a --load-extension path under
+    AppData\Local\chrome, and was it spawned by a hidden, encoded PowerShell command?
+  context: >-
+    The rule requires all four criteria together — parent Image ending in powershell.exe,
+    a parent command line containing "-ExecutionPolicy Bypass -WindowStyle Hidden -E JAB",
+    a child Image ending in chrome.exe, and a child command line loading an extension from
+    AppData\Local\chrome. Read the full parent and child command lines and confirm each
+    element is present before spending further time on the alert.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - Image
+      - CommandLine
+  answer_sources:
+  - alert
+  - process_creation
+- question: Is this user and host expected to run Chrome with a side-loaded extension directory?
+  context: >-
+    Side-loading an unpacked extension is a developer and QA workflow, and some kiosk or
+    packaging builds ship it deliberately. Outside those roles a browser started with an
+    extension directory under the user profile is not a routine end-user action. Establish
+    the user's role and the host's function before weighing the rest of the evidence.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: Is powershell.exe expected to spawn chrome.exe here, and what started the PowerShell process itself?
+  context: >-
+    A browser started by a hidden PowerShell session is not a user-initiated launch —
+    something scripted it. The grandparent tells you which mechanism drove the chain, and
+    the recurring pattern for this family is a registered scheduled task running under
+    svchost.exe, reached through cmd.exe or services.exe. Read the parent's own parent and
+    command line to identify the launcher.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+  answer_sources:
+  - process_creation
+- question: What other child processes did this same PowerShell instance spawn?
+  context: >-
+    The encoded launcher usually does more than start the browser — it stages the extension
+    directory, may copy or unpack files, and may register or refresh its own persistence.
+    Listing every child of the same PowerShell instance in the surrounding window shows the
+    full set of actions the payload performed.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Which extension directory does the chrome.exe command line load, and what else does that command line configure?
+  context: >-
+    Read the alerting command line in full and record the exact path given to
+    --load-extension, plus any profile directory, remote-debugging port, headless, or
+    disabled-security switches alongside it. That path is the extension's on-disk location
+    and is the pivot for reviewing the manifest, background script, and requested
+    permissions on the host.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: What does the parent PowerShell base64 payload decode to?
+  context: >-
+    The parent command line carries "-E" with a base64 argument beginning "JAB", which is
+    UTF-16LE base64 for a script starting with a variable assignment. Decode it from UTF-16LE
+    to recover the launcher script — it typically names the staging path, the archive or
+    payload it expands, and the browser invocation itself. The decoded text is the clearest
+    statement of what the operator intended.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: Did PowerShell script block logging capture the deobfuscated launcher script?
+  context: >-
+    Event ID 4104 records the script text PowerShell actually compiled, after the encoding
+    layer is stripped. It is the ground-truth version of the launcher and often contains
+    strings the command line does not, such as the download source or the extension staging
+    routine. If PowerShell operational logs are not ingested in this environment, treat an
+    empty result as a visibility gap and decode the encoded argument by hand instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+  answer_sources:
+  - powershell_script_block
+- question: Was a scheduled task registered or updated on this host in the days before the alert?
+  context: >-
+    Event ID 4698 records task registration and 4702 records task update, each carrying the
+    task name and the account that made the change. Compare the registering account against
+    the account the browser ran under, and treat randomized or product-imitating task names
+    outside the environment's naming conventions as the entries to open first. A task
+    registered shortly before the encoded launcher first ran is the persistence anchor for
+    this chain.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID:
+          - 4698
+          - 4702
+      condition: selection
+    fields:
+      - EventID
+      - TaskName
+      - SubjectUserName
+  answer_sources:
+  - manual_review
+  - organizational_knowledge
+- question: Has the Task Scheduler service launched this chain again since the alert?
+  context: >-
+    Scheduled tasks execute as children of the scheduler host process, so processes whose
+    parent is svchost.exe with Schedule in its command line are the tasks that have actually
+    fired. Repeat firings in the hours after the alert show the persistence is live and tell
+    you the trigger interval; a single firing points at a logon or one-shot trigger.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: '\svchost.exe'
+        ParentCommandLine|contains: 'Schedule'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Is the task that launches this PowerShell command still registered on the host?
+  context: >-
+    Persistence only matters if the registration survives. Query the task list on the host
+    or through endpoint management for the task name identified from the registration events,
+    and inspect its action for the encoded PowerShell command. If the task has been removed
+    but the extension directory remains, the browser still side-loads it on the next scripted
+    launch, so both artifacts need clearing.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - manual_review
+  - edr_console
+- question: Were browser-extension or task-cache registry entries written on this host around the alert?
+  context: >-
+    An extension side-loaded from disk can also be pinned through registry entries under the
+    browser's Extensions or NativeMessagingHosts keys, and every registered scheduled task
+    writes a subtree under the scheduler's TaskCache. Run-key writes in the same window are a
+    parallel start mechanism. The value data on these writes names the extension identifier
+    or the payload path. Key deletion is not observable here, so read the write history rather
+    than looking for removal.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_paths:
+        TargetObject|contains:
+          - '\Schedule\TaskCache\Tree\'
+          - '\Google\Chrome\Extensions\'
+          - '\Google\Chrome\NativeMessagingHosts\'
+          - '\Chromium\Extensions\'
+          - '\CurrentVersion\Run'
+      condition: selection and selection_paths
+    fields:
+      - TargetObject
+      - Details
+      - Image
+  answer_sources:
+  - registry_event
+- question: Which modules outside the system directories did powershell.exe load on this host around the alert?
+  context: >-
+    An encoded launcher that stages and expands content commonly pulls in assemblies that a
+    routine PowerShell session never touches, and a reflectively loaded .NET assembly appears
+    on the load event rather than in any command line. Filtering out the system and framework
+    directories leaves the modules worth naming. Read the signer and signature status on each
+    remaining load — an unsigned module from a user-writable path is the one to carry forward.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: '\powershell.exe'
+      filter_system:
+        ImageLoaded|startswith:
+          - 'C:\Windows\System32\'
+          - 'C:\Windows\SysWOW64\'
+          - 'C:\Windows\Microsoft.NET\'
+          - 'C:\Windows\assembly\'
+          - 'C:\Windows\WinSxS\'
+      condition: selection and not filter_system
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+      - SignatureStatus
+  answer_sources:
+  - process_creation
+- question: Where did the alerting browser process connect after the extension was loaded?
+  context: >-
+    A side-loaded extension earns its place by talking to an operator endpoint — search
+    redirection, ad injection, and update fetches all show up as egress from the browser
+    process that loaded it. Scoping to the alerting process identifier keeps the result to
+    this launch rather than all browser traffic on the host. Compare the destinations against
+    the domains and addresses the decoded launcher script referenced, and treat direct
+    connections to bare addresses or uncommon ports as the entries to resolve first.
+  range: +4h
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+  answer_sources:
+  - network_connection
+  - external_threat_intel
+- always_include: true
+  question: Has this user previously produced this rule's pattern, and does that history fit their role?
+  context: >-
+    The query mirrors the rule's selection scoped to this user, so the result is the user's
+    90-day history of this exact hidden-PowerShell-into-side-loaded-Chrome pattern, grouped
+    by host — not generic browser or PowerShell use. A zero or near-zero count marks the
+    activity as new for this account. A recurring count across many hosts points instead at
+    a packaged build or an internal tool that legitimately side-loads an extension.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \powershell.exe
+        ParentCommandLine|contains: -ExecutionPolicy Bypass -WindowStyle Hidden -E JAB
+        CommandLine|contains: --load-extension="*\Appdata\local\chrome"
+        Image|endswith: \chrome.exe
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+- always_include: true
+  question: Has this parent process historically driven the rule's pattern, or is the launcher new for this activity?
+  context: >-
+    When the alert fires under a service or machine account, user identity attributes nothing
+    and the launch mechanism is the meaningful pivot. The query mirrors the rule's selection
+    scoped to the alerting parent process, giving the 90-day history of that parent driving
+    this specific pattern. A parent that is new or rare for this pattern is the deviation to
+    chase; a parent already accounting for a large prior volume is packaged automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \powershell.exe
+        ParentCommandLine|contains: -ExecutionPolicy Bypass -WindowStyle Hidden -E JAB
+        CommandLine|contains: --load-extension="*\Appdata\local\chrome"
+        Image|endswith: \chrome.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- always_include: true
+  question: What else did this user run across the environment around this time?
+  context: >-
+    Tracking the account's process activity on every host in the surrounding hour shows
+    whether the staging chain touched more than the alerting endpoint. The same account
+    driving comparable activity elsewhere widens the remediation boundary. If the alert fired
+    under a service or machine account, this view fills with routine agent telemetry and the
+    parent-anchored fleet question is the one that carries signal.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+- always_include: true
+  question: Did this same parent-driven pattern fire on other hosts in the same window, or is the activity isolated to this host?
+  context: >-
+    The query mirrors the rule's selection scoped to the alerting parent process, fleet-wide,
+    in the alert window. Several hosts firing together points at scheduled or pushed
+    automation reaching many endpoints at once; a single host points at a host-local trigger
+    such as one user running a dropper. This reading holds even when the alert fires under a
+    service principal, where an account-based view returns only agent noise.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \powershell.exe
+        ParentCommandLine|contains: -ExecutionPolicy Bypass -WindowStyle Hidden -E JAB
+        CommandLine|contains: --load-extension="*\Appdata\local\chrome"
+        Image|endswith: \chrome.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    The staging steps that precede a side-loaded extension — an installer running from a
+    download directory, an archive expanded into the user profile, a task registered from a
+    script — frequently raise their own detections. Reading the alert timeline for this host
+    reconstructs how the chain reached the browser launch and marks the earliest event that
+    needs containment.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+  answer_sources:
+  - alert

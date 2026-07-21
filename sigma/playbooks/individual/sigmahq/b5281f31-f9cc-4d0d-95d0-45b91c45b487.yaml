@@ -1,0 +1,464 @@
+name: DNS RCE CVE-2020-1350
+id: f3e923ea-ba7d-4b6a-bada-43b6eabc07fb
+description: |
+  Fires when a process whose ParentImage ends in \System32\dns.exe spawns a child, AND that child is not
+  one of the four routinely-expected children the rule excludes (werfault.exe, conhost.exe, dnscmd.exe,
+  dns.exe). There is no positive constraint on the child binary — any other child of the Windows DNS Server
+  service satisfies the rule. This is a consequence heuristic for CVE-2020-1350: the exploit itself is a
+  crafted SIG/TSIG DNS response processed inside dns.exe over the wire, which leaves no process-creation
+  evidence, so the rule watches for the post-exploitation step instead. The DNS Server service runs as
+  SYSTEM and normally spawns almost nothing, so any unexpected child is worth explaining; but the alert
+  does not by itself demonstrate that exploitation occurred. Determine what the child process is and what
+  it did, whether the host is patched against CVE-2020-1350 or carries the TcpReceivePacketSize registry
+  workaround, whether the DNS service crashed or restarted around the alert, and whether the same pattern
+  appears on other DNS servers.
+type: detection
+detection_id: b5281f31-f9cc-4d0d-95d0-45b91c45b487
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-16
+questions:
+- question: Is the alerting process genuinely a child of \System32\dns.exe, and is it outside the rule's exclusion list?
+  context: >-
+    The rule fires on any child of the Windows DNS Server service except werfault.exe, conhost.exe, dnscmd.exe,
+    and dns.exe. Confirm the ParentImage really is the DNS Server service binary in System32 and not a
+    similarly named process elsewhere on disk, and note the child's identity. The rule does not constrain what
+    the child is, so the child binary itself is the first thing the analyst must establish rather than something
+    the alert has already narrowed.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+  answer_sources:
+  - alert
+  - process_creation
+- question: Is this host a DNS server, and is its DNS service expected to launch child processes at all?
+  context: >-
+    The Windows DNS Server role is a prerequisite of Windows domain environments, so the alerting host is very
+    often a domain controller. The service runs as SYSTEM and its children inherit that context, which is a
+    mechanical property of the service account rather than a finding on its own. Establish the host's role and
+    whether any local tooling, monitoring agent, or maintenance script legitimately runs under the DNS service.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: Is this DNS server patched against CVE-2020-1350, or does it carry the TcpReceivePacketSize workaround?
+  context: >-
+    CVE-2020-1350 was fixed long ago, so on a patched host a benign explanation for the child process is far
+    more likely than exploitation, and a failed attempt is more likely than a successful one. The documented
+    interim mitigation sets the DWORD TcpReceivePacketSize to 0xFF00 under
+    HKLM\SYSTEM\CurrentControlSet\Services\DNS\Parameters followed by a DNS service restart; its presence is a
+    second checkable control. Patch level and workaround state together bound how much weight the rest of this
+    investigation should carry.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+  answer_sources:
+  - asset_inventory
+  - edr_console
+- question: Did this same detection fire on other DNS servers in the environment?
+  context: >-
+    CVE-2020-1350 is wormable — a compromised DNS server can be used to feed the malicious response to the next
+    one, so the same parent-child pattern appearing on several DNS servers in a short window is materially
+    different from one isolated host. Aggregating this rule's firings by host and user shows how many DNS
+    servers are involved and gives the containment boundary.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        rule.uuid|expand: '%rule_uuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+  answer_sources:
+  - alert
+- question: What exactly did the child process run? Decode its full command line and arguments.
+  context: >-
+    Because the rule places no constraint on the child, the command line is the primary evidence of intent.
+    Decode every flag, path, encoded blob, and URL, and note the working directory — a child running from a
+    temporary or user-writable directory, or a command interpreter carrying an encoded payload, points somewhere
+    very different from a vendor helper running from Program Files. The window covers all executions of this
+    binary on the host so multi-step operations that span sequential invocations stay together.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: When did the DNS service process last start, and did it crash or restart around the alert?
+  context: >-
+    Memory-corruption attempts against the DNS Server service frequently fail before they succeed, and a failed
+    attempt typically crashes dns.exe and triggers the Windows error-reporting handler. The rule deliberately
+    excludes werfault.exe as a child, so crashes do not raise this alert and must be looked for separately. A
+    dns.exe start timestamp shortly before the alerting child, or repeated error-reporting activity on the host,
+    is corroboration that the service was being fed malformed input.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\System32\dns.exe'
+          - '\System32\werfault.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+  answer_sources:
+  - process_creation
+- question: What modules did the alerting child process load, and are they all signed by an expected publisher?
+  context: >-
+    Exploitation of a service process commonly continues by loading code the host would not normally run —
+    an unsigned module, a module with a broken signature, or a legitimately named library loaded from a
+    non-system directory. Module loads carry publisher and hash data on the load event itself, so this is a
+    direct check on the child rather than a pivot. If module-load telemetry is not collected in this
+    environment, treat an empty result as a visibility gap rather than evidence nothing loaded.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+      - SignatureStatus
+      - Hashes
+  answer_sources:
+  - process_creation
+  - edr_console
+- question: What port 53 traffic did this host exchange around the alert, and were any of the peers unexpected?
+  context: >-
+    The exploit arrives as a DNS response, not as a process — the delivery vector is only visible on the wire.
+    The technique induces the victim DNS server to query an attacker-controlled authoritative name server,
+    then returns an oversized SIG record; the response exceeds the 512-byte UDP limit (4,096 with EDNS0), so
+    the truncation flag forces a retry over TCP. Port 53 peers in the alert window that are not the
+    environment's normal forwarders, clients, or replication partners — particularly a TCP exchange with an
+    external address — are the corroboration for the wire side. Correlate within roughly a 15-minute horizon
+    of the child process spawn.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationPort: 53
+      condition: selection
+    fields:
+      - DestinationIp
+      - Initiated
+      - Image
+  answer_sources:
+  - network_connection
+- question: What other child processes did the DNS service spawn on this host after the alert?
+  context: >-
+    Code running inside the DNS service executes as SYSTEM, and a first child is often a launcher for further
+    stages — reconnaissance, credential access, or lateral movement. Listing every child of the DNS service in
+    the hours after the alert shows whether this was a single event or the start of a sequence. On a domain
+    controller the follow-on set is what determines the response scope.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Has the DNS service on this host spawned this same child binary before?
+  context: >-
+    The DNS Server service normally spawns almost nothing beyond the handful of children the rule already
+    excludes, so a 90-day count is usually either zero or a large number. Zero means the pairing is novel and
+    needs an explanation. A high count means a local agent, backup product, or maintenance script routinely
+    runs under the service — in which case the command lines should look consistent and scheduled, and the
+    pairing is a candidate for environment-specific tuning.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Has the DNS service configuration under HKLM\SYSTEM\CurrentControlSet\Services\DNS\Parameters been modified?
+  context: >-
+    This key holds TcpReceivePacketSize, the documented mitigation for CVE-2020-1350 when set to 0xFF00. Its
+    history answers two things — whether the workaround was ever applied on this host, and whether anything
+    recently changed the DNS service's parameters, since removing the value re-exposes the service. Registry
+    telemetry records modifications, not the current state, so an empty result does not prove the value is
+    absent; read the live value on the host to confirm. Service-key changes followed quickly by execution are
+    also the general pattern behind service-based execution abuse.
+  range: -90d
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains: '\Services\DNS\Parameters'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: Was a new Windows service installed on this host around the time of the alert?
+  context: >-
+    Code executing as SYSTEM inside a service process commonly converts that access into a durable foothold by
+    installing a service of its own, which the Security channel records as event 4697 with the service name and
+    the binary path. Compare any service installed in this window against the set of services expected on a DNS
+    server, and treat one whose binary lives outside a vendor install directory as needing an explanation. If
+    service-installation auditing is not enabled in this environment, this query returns nothing by
+    construction.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        EventID: 4697
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - ServiceName
+      - ServiceFileName
+      - SubjectUserName
+  answer_sources:
+  - manual_review
+  - organizational_knowledge
+- question: What other process activity occurred on this host around the time of the alert?
+  context: >-
+    Aggregating every process launch on the host by binary and parent collapses routine agent telemetry into a
+    few high-count rows and leaves novel parent-child pairs standing out at low counts. On a domain controller
+    the expected process population is narrow, which makes deviations easier to spot than on a workstation.
+    Look for reconnaissance, credential access, or persistence running alongside the alerting child.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+  answer_sources:
+  - process_creation
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Exploitation of an internet-reachable service is an entry point, so earlier detections on the same host
+    help establish whether this alert is the beginning of a timeline or a later stage of one already underway.
+    Reconnaissance or defense tampering preceding this event changes the interpretation of the child process
+    considerably.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+  answer_sources:
+  - alert
+- question: Has this user account previously produced the rule's pattern, and does that history fit the account's role?
+  context: >-
+    The query mirrors the rule's selection structure scoped to this account, so the result is that account's
+    90-day history of children spawned by the DNS service, aggregated by host. Because the DNS Server service
+    runs as SYSTEM, this pivot commonly degenerates — SYSTEM is not an actor and its history says little. Read
+    it for what it is worth, and weigh the parent-mechanism history alongside it.
+  range: -90d
+  always_include: true
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \System32\dns.exe
+      filter:
+        Image|endswith:
+        - \System32\werfault.exe
+        - \System32\conhost.exe
+        - \System32\dnscmd.exe
+        - \System32\dns.exe
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+- question: Has the DNS service historically driven this pattern on this host or across the environment, or is it new for this activity?
+  context: >-
+    When an alert fires under a service principal, the account does not attribute behavior — the launch
+    mechanism does. The query mirrors the rule's selection structure scoped to the alerting parent process, so
+    the result is the 90-day history of the DNS service spawning non-excluded children, aggregated by host. A
+    parent that already accounts for thousands of prior events is local automation and a tuning candidate; a
+    parent that has never driven this pattern is the deviation worth chasing.
+  range: -90d
+  always_include: true
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \System32\dns.exe
+      filter:
+        Image|endswith:
+        - \System32\werfault.exe
+        - \System32\conhost.exe
+        - \System32\dnscmd.exe
+        - \System32\dns.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- question: What else did this account do across the environment around this time?
+  context: >-
+    Tracking the account's activity across all hosts in the alert window reveals movement between endpoints. If
+    the alert fired under SYSTEM, this returns the aggregate telemetry of every SYSTEM-owned process on every
+    reporting host and is not a usable answer — read the parent-mechanism version of this question instead. If
+    it fired under a named account, an account touching several hosts in one window is the lateral-movement
+    question.
+  range: +/-1h
+  always_include: true
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+- question: Did the same parent-driven pattern fire on other hosts in the same window, or is the activity isolated to this host?
+  context: >-
+    The query mirrors the rule's selection structure scoped to the alerting parent process, fleet-wide, within
+    the alert window. Several DNS servers producing unexpected children of the DNS service in the same window
+    points either to pushed automation or to a pattern moving between DNS servers — for a wormable server-side
+    vulnerability those are the two explanations to separate. A single host points to a host-local trigger.
+  range: +/-1h
+  always_include: true
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \System32\dns.exe
+      filter:
+        Image|endswith:
+        - \System32\werfault.exe
+        - \System32\conhost.exe
+        - \System32\dnscmd.exe
+        - \System32\dns.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation

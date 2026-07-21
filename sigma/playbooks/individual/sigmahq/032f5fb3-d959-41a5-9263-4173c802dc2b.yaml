@@ -1,0 +1,515 @@
+name: Formbook Process Creation
+id: d4a4c909-3f77-4657-a90b-2588e3beb963
+description: |
+  Fires when three conditions hold together: the parent's command line is a bare executable path under
+  C:\Windows\System32\ or C:\Windows\SysWOW64\ with no arguments, the child's command line ends in .exe, and
+  that command line carries either a `/c del` against a path under C:\Users\ inside \AppData\Local\Temp\ or
+  \Desktop\, or a `/C type nul >` against a path under C:\Users\ inside \Desktop\. The pattern corresponds to
+  a dropper that has injected code into a signed system binary and then has the injected process remove or
+  truncate the original carrier executable, so the launching process looks like ordinary Windows while the
+  file being erased is the payload carrier. Determine which executable was deleted or truncated, whether it
+  ran and what its hash resolves to, what the injected parent process did before and after the cleanup, and
+  whether the same parent-driven pattern appears elsewhere in the environment.
+type: detection
+detection_id: 032f5fb3-d959-41a5-9263-4173c802dc2b
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-16
+questions:
+- question: Does the command line match the dropper-cleanup pattern this rule detects, and is the parent's
+    command line a bare System32 or SysWOW64 executable path?
+  context: All three of the rule's criteria must hold at once. Confirm the parent's command line is nothing
+    but a path under C:\Windows\System32\ or C:\Windows\SysWOW64\ ending in .exe with no arguments, that the
+    child's command line ends in .exe, and that it carries one of the cleanup forms — `/c del` against a path
+    under C:\Users\ in \AppData\Local\Temp\ or \Desktop\, or `/C type nul >` against a path under C:\Users\
+    in \Desktop\. Note which of those forms fired and the exact path being removed; that path is the artifact
+    the rest of the investigation follows.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentCommandLine
+      - CommandLine
+  answer_sources:
+  - alert
+  - process_creation
+- question: Is this user and host expected to run command-line deletions or truncations of executables from
+    user profile directories?
+  context: Uninstallers, software updaters, and build or packaging tooling do delete executables out of Temp
+    and Desktop paths, and on a developer or IT workstation that traffic is routine. What is not routine is
+    the launch path — an argument-less System32 binary issuing the cleanup rather than an installer or a
+    shell the user was driving. Knowing the host's role and the user's normal toolset separates the two.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: Is the executable referenced in the cleanup command still on disk for analysis?
+  context: The command's whole purpose is to remove or zero out that file, so it is often already gone by the
+    time the alert is reviewed. This query correlates file activity to the alerting process and its direct
+    children, which shows whether the deletion or truncation actually landed. If the file survived, retrieve
+    it before anything else touches it; if it did not, recovery from shadow copies, backups, or the recycle
+    bin is the remaining path to the sample.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+  answer_sources:
+  - file_event
+  - manual_review
+- question: Is this System32 parent expected to spawn a command interpreter, and what started the parent
+    itself?
+  context: The rule keys on a parent whose command line is a bare system executable path with no arguments,
+    which is what an injected or hollowed process looks like from process telemetry. Looking up the parent's
+    own creation event shows the grandparent and the parent's full command line, which distinguishes a
+    service or logon-driven start from one launched by a user-profile binary, an Office application, or a
+    script host. A System32 binary started by something in a user's download or Temp folder is the branch
+    worth pulling.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+  answer_sources:
+  - process_creation
+- question: What other child processes did the same parent spawn?
+  context: Self-deletion is a cleanup step, not the objective. If the parent is carrying injected code, the
+    cleanup command is usually one of several children — reconnaissance, persistence writes, or additional
+    interpreters may come from the same parent instance. Listing every child of that exact parent instance
+    shows whether the deletion stands alone or sits inside a longer sequence.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: What exactly does the alerting command remove or truncate, and did more than one cleanup command
+    run on this host in the same window?
+  context: Read the full path out of the command line — the directory tells you whether the carrier sat in
+    \AppData\Local\Temp\ (typical drop location for an email or browser-delivered payload) or on the Desktop
+    (typical for a file the user was handed directly). The `type nul >` form does not delete the file, it
+    truncates it to zero bytes, which leaves the name and timestamps intact and defeats a naive
+    "does the file still exist" check. Scoping to the delete and truncate command patterns on this host over
+    the alert window rather than to the alerting event alone reveals whether several carriers were cleaned up
+    in one pass.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      cmd_del:
+        CommandLine|contains|all:
+          - /c
+          - del
+          - C:\Users\
+      cmd_trunc:
+        CommandLine|contains|all:
+          - /C
+          - 'type nul >'
+          - C:\Users\
+      condition: selection_host and 1 of cmd_*
+    fields:
+      - CommandLine
+      - CurrentDirectory
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: Which executables were written into this host's Temp or Desktop folders before the cleanup, and
+    what does the writing process tell you about their origin?
+  context: The alert names the path but not how the file got there. Listing .exe writes into \AppData\Local\Temp\
+    and \Desktop\ on this host over the preceding day identifies the carrier and, through the writing process,
+    its delivery route — a browser or mail client points at user-initiated download, an archive utility at an
+    attachment, another user-profile binary at a stage in a longer chain. Content analysis of the file itself
+    (packer signatures, embedded strings, imports, signing status) requires retrieving it from the endpoint or
+    from a backup; the telemetry only establishes which file to retrieve.
+  range: -24h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_path:
+        TargetFilename|contains:
+          - \AppData\Local\Temp\
+          - \Desktop\
+      selection_ext:
+        TargetFilename|endswith: .exe
+      condition: all of selection*
+    fields:
+      - TargetFilename
+      - Image
+  answer_sources:
+  - file_event
+  - manual_review
+  - safe_environment
+  - external_threat_intel
+- question: If the carrier executable ran before it was cleaned up, what is its hash and does threat intel
+    have a verdict on it?
+  context: A file write carries no hash; the hash is recorded on the execution event. Looking for executions
+    of .exe files out of \AppData\Local\Temp\ or \Desktop\ on this host recovers the hash of the file that
+    was subsequently removed, which can then go to a reputation service or internal intel. A verdict of
+    "unseen" is as informative as a hit here — freshly built or recompiled carriers are the norm for this
+    pattern. If the file never executed and is already gone, the hash has to come from a recovered copy.
+  range: -24h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_path:
+        Image|contains:
+          - \AppData\Local\Temp\
+          - \Desktop\
+      selection_ext:
+        Image|endswith: .exe
+      condition: all of selection*
+    fields:
+      - Image
+      - CommandLine
+      - Hashes
+  answer_sources:
+  - process_creation
+  - external_threat_intel
+- question: Did the System32 parent process make outbound network connections around the time of the cleanup
+    command?
+  context: When code is injected into a signed system binary, that process becomes the one doing the
+    credential collection and the outbound transfer, which is the point of moving out of the carrier and
+    deleting it. Connections from the exact parent instance are therefore the follow-on evidence. Weigh the
+    destinations against the parent binary's normal role — most argument-less System32 executables have no
+    reason to reach arbitrary external hosts, and repeated short connections to the same destination fit a
+    beacon or a staged upload. Network telemetry that comes from network sensors rather than the endpoint
+    carries no process fields and will not appear here.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Initiated
+  answer_sources:
+  - network_connection
+- question: Does this host have a history of command-line deletions or truncations of files under user
+    profile paths?
+  context: Aggregating ninety days of the same delete and truncate command patterns by user shows whether
+    this is a recurring habit on the host or a first occurrence. A steady count spread across an interactive
+    user usually traces to a cleanup script, an updater, or build tooling. Zero or near-zero history makes
+    the alerting command the only instance, which shifts weight onto the parent and the carrier file.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      cmd_del:
+        CommandLine|contains|all:
+          - /c
+          - del
+          - C:\Users\
+      cmd_trunc:
+        CommandLine|contains|all:
+          - /C
+          - 'type nul >'
+          - C:\Users\
+      condition: selection_host and 1 of cmd_*
+    fields:
+      - User
+  answer_sources:
+  - process_creation
+- question: Has this parent binary spawned this command interpreter on this host before?
+  context: Independent of the command line, the parent-child pairing itself carries signal. Many System32
+    executables never spawn a command interpreter under any normal condition, and for those a count of zero
+    over ninety days makes the pairing novel on its own. Others do so routinely as part of servicing or
+    scheduled work, and a substantial history moves the question back onto what the command actually did.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - process_creation
+- always_include: true
+  question: Has this user previously produced the rule's cleanup pattern, and does that history fit their
+    role?
+  context: The query mirrors the rule's selection structure scoped to this user, so the result is the user's
+    ninety-day history of this specific firing pattern rather than generic use of a command interpreter,
+    aggregated by host. A user who has never produced this pattern is a different proposition from one who
+    produces it weekly; weigh the count against their role and normal toolset. If the alert fired under a
+    machine or service identity, this count attributes nothing and the parent-scoped history is the
+    meaningful pivot.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection1:
+        ParentCommandLine|startswith:
+        - C:\Windows\System32\
+        - C:\Windows\SysWOW64\
+        ParentCommandLine|endswith: .exe
+      selection2:
+      - CommandLine|contains|all:
+        - /c
+        - del
+        - C:\Users\
+        - \AppData\Local\Temp\
+      - CommandLine|contains|all:
+        - /c
+        - del
+        - C:\Users\
+        - \Desktop\
+      - CommandLine|contains|all:
+        - /C
+        - type nul >
+        - C:\Users\
+        - \Desktop\
+      selection3:
+        CommandLine|endswith: .exe
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+- always_include: true
+  question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: When the alert fires under a service principal, user identity does not attribute behavior; the
+    launch mechanism does. The query mirrors the rule's selection structure scoped to the alerting parent
+    process, so the result is the ninety-day history of this parent driving this specific pattern rather than
+    generic parent-and-binary co-occurrence. A new or rare parent for this pattern is the deviation worth
+    chasing; a parent already accounting for thousands of prior events is vendor or operating-system
+    automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection1:
+        ParentCommandLine|startswith:
+        - C:\Windows\System32\
+        - C:\Windows\SysWOW64\
+        ParentCommandLine|endswith: .exe
+      selection2:
+      - CommandLine|contains|all:
+        - /c
+        - del
+        - C:\Users\
+        - \AppData\Local\Temp\
+      - CommandLine|contains|all:
+        - /c
+        - del
+        - C:\Users\
+        - \Desktop\
+      - CommandLine|contains|all:
+        - /C
+        - type nul >
+        - C:\Users\
+        - \Desktop\
+      selection3:
+        CommandLine|endswith: .exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- always_include: true
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's process activity across all hosts in the alert window shows whether the
+    account is active on more than one endpoint right now, which is what an infostealer harvesting
+    credentials and reusing them would produce. Aggregating by host and binary keeps the view summary-level.
+    If the alert fired under a machine or service identity, expect this to return agent and servicing noise
+    rather than an answer.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+- always_include: true
+  question: Did this same parent-driven pattern fire on other hosts in the same window, or is the activity
+    isolated to this host?
+  context: Under a service principal, asking what else the user did returns agent telemetry from every host.
+    The mechanism-side version of the question is whether the same launch pattern appeared elsewhere. The
+    query mirrors the rule's selection structure scoped to the alerting parent process, fleet-wide, across
+    the alert window. Several hosts at once points at pushed or scheduled automation, or at a delivery wave
+    that reached multiple recipients; a single host points at a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection1:
+        ParentCommandLine|startswith:
+        - C:\Windows\System32\
+        - C:\Windows\SysWOW64\
+        ParentCommandLine|endswith: .exe
+      selection2:
+      - CommandLine|contains|all:
+        - /c
+        - del
+        - C:\Users\
+        - \AppData\Local\Temp\
+      - CommandLine|contains|all:
+        - /c
+        - del
+        - C:\Users\
+        - \Desktop\
+      - CommandLine|contains|all:
+        - /C
+        - type nul >
+        - C:\Users\
+        - \Desktop\
+      selection3:
+        CommandLine|endswith: .exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- question: What other activity occurred on this host around the time of the alert?
+  context: Aggregating every process creation on the host by binary and parent over the alert window
+    collapses repetitive agent and servicing traffic into high-count rows while novel parent-child pairs
+    stand out at low counts. Those low-count rows are what to scan — a second system binary with an
+    argument-less command line spawning children, an interpreter under an unexpected parent, or a
+    reconnaissance utility appearing once.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+  answer_sources:
+  - process_creation
+  - file_event
+  - registry_event
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Self-deletion sits late in a delivery sequence — the carrier has already run and already injected
+    by the time cleanup happens. Earlier detections on the same host over the preceding hours may capture the
+    stages that led here, such as a document or archive spawning an executable, a download utility fetching
+    the carrier, or the injection itself. Reading those alerts in order reconstructs the timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+  answer_sources:
+  - alert

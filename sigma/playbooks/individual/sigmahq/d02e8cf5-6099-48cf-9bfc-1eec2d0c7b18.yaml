@@ -1,0 +1,581 @@
+name: Potential Emotet Activity
+id: 2b646dee-4ef5-4b81-b83d-e27bb1ba5e2c
+description: |
+  Detects command lines carrying base64-encoded UTF-16LE PowerShell fragments associated with Emotet
+  loader stages: an `-e*` switch whose payload begins `PAA` (an encoded `<`), or the encoded forms of
+  `$env:userprofile`, `$env:temp+(`, `"('*');$`, and the variable name `$Flxrhcfd`. The rule fires only
+  when one of those fragments is present AND the encoded `| ConvertTo-Json -ErrorAction SilentlyContinue`
+  string is absent, so both conditions hold for every alert; that exclusion exists because the encoded
+  form of a routine administrative one-liner collides with the selection list.
+  Emotet loader command lines of this form typically decode to a download cradle that retrieves a payload
+  over HTTP into the user profile or temp directory and executes it. The investigation should decode the
+  encoded payload, identify the URL set and drop path it references, establish how PowerShell was launched
+  and by what parent, and determine whether the retrieved file was written and run.
+type: detection
+detection_id: d02e8cf5-6099-48cf-9bfc-1eec2d0c7b18
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-17
+questions:
+- question: >-
+    Does the alerting command line contain one of the encoded PowerShell fragments this rule matches,
+    and is the encoded ConvertTo-Json exclusion absent from it?
+  context: >-
+    The rule fires on a conjunction, so confirm both halves against the exact command line before
+    investing further time. The command line must carry a base64 fragment from the selection list — an
+    encoded `$env:userprofile`, `$env:temp+(`, `"('*');$`, `$Flxrhcfd`, or an `-e*` switch whose payload
+    starts `PAA` — and must not carry the encoded `| ConvertTo-Json -ErrorAction SilentlyContinue`
+    string, which the rule filters out because it appears in routine administrative one-liners.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - alert
+  - process_creation
+- question: >-
+    Is this user and host expected to run base64-encoded PowerShell commands?
+  context: >-
+    Some build agents, packaging tools, and management platforms invoke PowerShell with encoded arguments
+    as a quoting workaround, so encoded execution is not automatically anomalous on every host. Knowing
+    whether the user's role and the host's function involve scripted or automated PowerShell is often the
+    fastest way to separate a routine invocation from a loader stage.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: >-
+    Did the alerting process or its direct children write a file to disk, and is that file still available
+    for analysis?
+  context: >-
+    The encoded fragments construct paths under `$env:temp` and `$env:userprofile`, which is where a
+    download cradle of this form drops its payload. Correlating file writes to the alerting process and
+    its children by process lineage identifies the dropped path; if the file is still present it can be
+    hashed, submitted for detonation, or reviewed directly.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+  answer_sources:
+  - file_event
+  - manual_review
+- question: >-
+    Decode the base64 payload from the command line: what script does it reconstruct, and which URLs and
+    drop paths does it reference?
+  context: >-
+    The rule matches on encoded fragments, so the command line itself is unreadable and the decode is the
+    analytical core of this investigation. The payload is base64 over UTF-16LE; decode it and read out the
+    concrete artifacts — the URL list the cradle iterates, the local path built from `$env:temp` or
+    `$env:userprofile`, and the call that executes the retrieved file. Loader stages of this form commonly
+    chain several fallback URLs, so extract the full set rather than the first one, and record every path
+    written for follow-up.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: >-
+    Did PowerShell script block logging capture the deobfuscated script content?
+  context: >-
+    Event ID 4104 records the script content PowerShell actually compiled, which is the decoded form of an
+    encoded command line and therefore ground truth about what ran. It also captures any further layers the
+    first stage builds at runtime through string concatenation or variable substitution. Long payloads are
+    split across multiple 4104 records that must be reassembled in order, and short blocks may be
+    suppressed by a configured logging threshold. If PowerShell operational logs are not ingested in this
+    environment, treat an empty result as a visibility gap and decode the encoded command line directly.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+  answer_sources:
+  - powershell_script_block
+- question: >-
+    Were PowerShell security controls bypassed or weakened before this execution?
+  context: >-
+    Loader stages that run an encoded download cradle often clear the way first — an execution policy
+    bypass, an AMSI patch, a real-time monitoring change, or a downgrade to the version 2 engine that lacks
+    script block logging. Finding one of these in the hour before the alert places the encoded execution in
+    a prepared sequence rather than an isolated invocation, and a downgrade in particular explains why
+    script block content may be missing.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: >-
+    What process launched the encoded command, and is that parent chain expected?
+  context: >-
+    The parent identifies how the encoded command was invoked. A management agent, deployment tool, or
+    scheduled task parent points toward automation; explorer.exe points to a user double-clicking
+    something; an Office application, script host, or mail client points toward document- or
+    attachment-delivered execution. The parent's own command line also shows what it was doing, which is
+    the next hop up the chain.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: >-
+    Did an Office application, script host, or HTML application launch an encoded PowerShell command on
+    this host around the alert?
+  context: >-
+    Document- and attachment-delivered loaders reach PowerShell through an intermediate host process rather
+    than launching it directly, so the parent is EXCEL.EXE, WINWORD.EXE, POWERPNT.EXE, OUTLOOK.EXE,
+    mshta.exe, wscript.exe, or cscript.exe. None of these has a routine reason to spawn an encoded command.
+    A hit here identifies the delivery vector and the document or script that carried it; the parent's own
+    command line names the file.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_scope:
+        host.name|expand: '%hostname%'
+      selection_parent:
+        ParentImage|endswith:
+          - '\EXCEL.EXE'
+          - '\WINWORD.EXE'
+          - '\POWERPNT.EXE'
+          - '\OUTLOOK.EXE'
+          - '\mshta.exe'
+          - '\wscript.exe'
+          - '\cscript.exe'
+      selection_encoded:
+        CommandLine|contains:
+          - ' -e '
+          - ' -en '
+          - ' -enc'
+          - ' -ec '
+          - '-EncodedCommand'
+      condition: all of selection_*
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: >-
+    Which .NET runtime and networking modules were loaded on this host around the alert?
+  context: >-
+    A download cradle pulls in the HTTP client libraries (wininet.dll, winhttp.dll) and, when it loads a
+    .NET assembly into memory instead of writing it to disk, the CLR hosting modules (clr.dll,
+    mscoree.dll). Loads of the automation and AMSI modules alongside them mark PowerShell being hosted
+    inside another process rather than started as powershell.exe. Compare the loading images against the
+    software that normally runs here; a module set that is routine for a build agent is not routine for a
+    user workstation. Module telemetry is agent-dependent, so an empty result is a visibility gap rather
+    than evidence nothing loaded.
+  range: +/-5m
+  query: |
+    aggregation: true
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|endswith:
+          - '\clr.dll'
+          - '\mscoree.dll'
+          - '\System.Management.Automation.dll'
+          - '\System.Management.Automation.ni.dll'
+          - '\amsi.dll'
+          - '\wininet.dll'
+          - '\winhttp.dll'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Image
+  answer_sources:
+  - process_creation
+- question: >-
+    What child processes did the alerting process spawn afterward?
+  context: >-
+    The children reveal whether the decoded payload progressed past download. A retrieved executable
+    running from the temp or user profile directory, a rundll32.exe or regsvr32.exe invocation against a
+    dropped file, or a further script host launch each indicate the next loader stage started. No children
+    suggests the cradle failed or the download did not complete.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: >-
+    When this host has previously produced the rule's encoded fragments, what parents and users drove that
+    activity, and does the current alert fit that history?
+  context: >-
+    The query mirrors the rule's selection and exclusion scoped to this host, so the parent and user
+    distribution reflects how this specific encoded pattern has run here over the past two weeks rather
+    than generic PowerShell usage. An empty result means the pattern is new to the host. A history driven
+    by one automation parent and one service account, with the current alert arriving under a different
+    parent or an interactive user, is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - ' -e* PAA'
+        - JABlAG4AdgA6AHUAcwBlAHIAcAByAG8AZgBpAGwAZQ
+        - QAZQBuAHYAOgB1AHMAZQByAHAAcgBvAGYAaQBsAGUA
+        - kAGUAbgB2ADoAdQBzAGUAcgBwAHIAbwBmAGkAbABlA
+        - IgAoACcAKgAnACkAOwAkA
+        - IAKAAnACoAJwApADsAJA
+        - iACgAJwAqACcAKQA7ACQA
+        - JABGAGwAeAByAGgAYwBmAGQ
+        - PQAkAGUAbgB2ADoAdABlAG0AcAArACgA
+        - 0AJABlAG4AdgA6AHQAZQBtAHAAKwAoA
+        - 9ACQAZQBuAHYAOgB0AGUAbQBwACsAKA
+      filter:
+        CommandLine|contains:
+        - fAAgAEMAbwBuAHYAZQByAHQAVABvAC0ASgBzAG8AbgAgAC0ARQByAHIAbwByAEEAYwB0AGkAbwBuACAAUwBpAGwAZQBuAHQAbAB5AEMAbwBuAHQAaQBuAHUAZQ
+        - wAIABDAG8AbgB2AGUAcgB0AFQAbwAtAEoAcwBvAG4AIAAtAEUAcgByAG8AcgBBAGMAdABpAG8AbgAgAFMAaQBsAGUAbgB0AGwAeQBDAG8AbgB0AGkAbgB1AGUA
+        - 8ACAAQwBvAG4AdgBlAHIAdABUAG8ALQBKAHMAbwBuACAALQBFAHIAcgBvAHIAQQBjAHQAaQBvAG4AIABTAGkAbABlAG4AdABsAHkAQwBvAG4AdABpAG4AdQBlA
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+  answer_sources:
+  - process_creation
+- question: >-
+    Has this user previously produced the rule's encoded fragments, and does that history fit their role?
+  context: >-
+    The query mirrors the rule's selection and exclusion scoped to this user, aggregated by host, so the
+    result is the user's 90-day history of this specific encoded pattern rather than generic PowerShell
+    use. A user who has never produced it is a different proposition from one who produces it daily across
+    a fleet of hosts. Weigh the count and the host spread against what the account is for — a developer or
+    an automation account has reasons an office user does not.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - ' -e* PAA'
+        - JABlAG4AdgA6AHUAcwBlAHIAcAByAG8AZgBpAGwAZQ
+        - QAZQBuAHYAOgB1AHMAZQByAHAAcgBvAGYAaQBsAGUA
+        - kAGUAbgB2ADoAdQBzAGUAcgBwAHIAbwBmAGkAbABlA
+        - IgAoACcAKgAnACkAOwAkA
+        - IAKAAnACoAJwApADsAJA
+        - iACgAJwAqACcAKQA7ACQA
+        - JABGAGwAeAByAGgAYwBmAGQ
+        - PQAkAGUAbgB2ADoAdABlAG0AcAArACgA
+        - 0AJABlAG4AdgA6AHQAZQBtAHAAKwAoA
+        - 9ACQAZQBuAHYAOgB0AGUAbQBwACsAKA
+      filter:
+        CommandLine|contains:
+        - fAAgAEMAbwBuAHYAZQByAHQAVABvAC0ASgBzAG8AbgAgAC0ARQByAHIAbwByAEEAYwB0AGkAbwBuACAAUwBpAGwAZQBuAHQAbAB5AEMAbwBuAHQAaQBuAHUAZQ
+        - wAIABDAG8AbgB2AGUAcgB0AFQAbwAtAEoAcwBvAG4AIAAtAEUAcgByAG8AcgBBAGMAdABpAG8AbgAgAFMAaQBsAGUAbgB0AGwAeQBDAG8AbgB0AGkAbgB1AGUA
+        - 8ACAAQwBvAG4AdgBlAHIAdABUAG8ALQBKAHMAbwBuACAALQBFAHIAcgBvAHIAQQBjAHQAaQBvAG4AIABTAGkAbABlAG4AdABsAHkAQwBvAG4AdABpAG4AdQBlA
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+  always_include: true
+- question: >-
+    Has this parent process historically driven the rule's encoded fragments here or across the
+    environment, or is the parent new for this activity?
+  context: >-
+    When the alert fires under SYSTEM, a service account, or a computer account, the user field attributes
+    nothing and the launch mechanism is the meaningful pivot. The query mirrors the rule's selection and
+    exclusion scoped to the alerting parent, aggregated by host, so the result is that parent's 90-day
+    history of driving this exact pattern. A parent already accounting for thousands of prior events across
+    many hosts is packaging or management automation whose encoded arguments collide with the selection
+    list; a parent that is new for this pattern is the deviation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - ' -e* PAA'
+        - JABlAG4AdgA6AHUAcwBlAHIAcAByAG8AZgBpAGwAZQ
+        - QAZQBuAHYAOgB1AHMAZQByAHAAcgBvAGYAaQBsAGUA
+        - kAGUAbgB2ADoAdQBzAGUAcgBwAHIAbwBmAGkAbABlA
+        - IgAoACcAKgAnACkAOwAkA
+        - IAKAAnACoAJwApADsAJA
+        - iACgAJwAqACcAKQA7ACQA
+        - JABGAGwAeAByAGgAYwBmAGQ
+        - PQAkAGUAbgB2ADoAdABlAG0AcAArACgA
+        - 0AJABlAG4AdgA6AHQAZQBtAHAAKwAoA
+        - 9ACQAZQBuAHYAOgB0AGUAbQBwACsAKA
+      filter:
+        CommandLine|contains:
+        - fAAgAEMAbwBuAHYAZQByAHQAVABvAC0ASgBzAG8AbgAgAC0ARQByAHIAbwByAEEAYwB0AGkAbwBuACAAUwBpAGwAZQBuAHQAbAB5AEMAbwBuAHQAaQBuAHUAZQ
+        - wAIABDAG8AbgB2AGUAcgB0AFQAbwAtAEoAcwBvAG4AIAAtAEUAcgByAG8AcgBBAGMAdABpAG8AbgAgAFMAaQBsAGUAbgB0AGwAeQBDAG8AbgB0AGkAbgB1AGUA
+        - 8ACAAQwBvAG4AdgBlAHIAdABUAG8ALQBKAHMAbwBuACAALQBFAHIAcgBvAHIAQQBjAHQAaQBvAG4AIABTAGkAbABlAG4AdABsAHkAQwBvAG4AdABpAG4AdQBlA
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  always_include: true
+- question: >-
+    What else did this user do across the network around this time?
+  context: >-
+    Tracking the account's activity across all hosts in the alert window shows whether the encoded
+    execution was a single event or one of several, and whether it reached more than one endpoint. The same
+    account driving comparable activity on multiple hosts widens the scope of the investigation. If the
+    alert fired under a service principal, expect this view to be dominated by routine agent telemetry and
+    read the parent-driven cross-host view instead.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+  always_include: true
+- question: >-
+    Did this same parent-driven pattern fire on other hosts in the same window, or is the activity isolated
+    to this host?
+  context: >-
+    Under a service principal, asking what else the account did returns agent telemetry from every host and
+    answers nothing. The query instead mirrors the rule's selection and exclusion scoped to the alerting
+    parent process, fleet-wide, within the alert window. Several hosts in the same window points to
+    scheduled or pushed automation whose encoded arguments match the selection list; a single host points
+    to a host-local trigger such as a document or a downloaded script.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - ' -e* PAA'
+        - JABlAG4AdgA6AHUAcwBlAHIAcAByAG8AZgBpAGwAZQ
+        - QAZQBuAHYAOgB1AHMAZQByAHAAcgBvAGYAaQBsAGUA
+        - kAGUAbgB2ADoAdQBzAGUAcgBwAHIAbwBmAGkAbABlA
+        - IgAoACcAKgAnACkAOwAkA
+        - IAKAAnACoAJwApADsAJA
+        - iACgAJwAqACcAKQA7ACQA
+        - JABGAGwAeAByAGgAYwBmAGQ
+        - PQAkAGUAbgB2ADoAdABlAG0AcAArACgA
+        - 0AJABlAG4AdgA6AHQAZQBtAHAAKwAoA
+        - 9ACQAZQBuAHYAOgB0AGUAbQBwACsAKA
+      filter:
+        CommandLine|contains:
+        - fAAgAEMAbwBuAHYAZQByAHQAVABvAC0ASgBzAG8AbgAgAC0ARQByAHIAbwByAEEAYwB0AGkAbwBuACAAUwBpAGwAZQBuAHQAbAB5AEMAbwBuAHQAaQBuAHUAZQ
+        - wAIABDAG8AbgB2AGUAcgB0AFQAbwAtAEoAcwBvAG4AIAAtAEUAcgByAG8AcgBBAGMAdABpAG8AbgAgAFMAaQBsAGUAbgB0AGwAeQBDAG8AbgB0AGkAbgB1AGUA
+        - 8ACAAQwBvAG4AdgBlAHIAdABUAG8ALQBKAHMAbwBuACAALQBFAHIAcgBvAHIAQQBjAHQAaQBvAG4AIABTAGkAbABlAG4AdABsAHkAQwBvAG4AdABpAG4AdQBlA
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  always_include: true
+- question: >-
+    What other activity occurred on this host around the time of the alert?
+  context: >-
+    Aggregating the process activity in the surrounding window collapses repetitive agent and service
+    telemetry into high-count rows and leaves novel parent-child pairs standing out at low counts. That is
+    what to scan for: the document or archive that preceded the execution, a second script host, an
+    unfamiliar binary running from a user-writable directory. It also fixes the alert's position in the
+    host's timeline, which is what separates activity inside a maintenance or deployment window from
+    activity outside one.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+  answer_sources:
+  - process_creation
+  - file_event
+  - registry_event
+- question: >-
+    Have other hosts produced the rule's encoded fragments in the past week, and does the cross-host
+    distribution look like consistent automation or one-off activity?
+  context: >-
+    The query mirrors the rule's selection and exclusion with no host scope, so the result is a fleet-wide
+    count of this exact encoded pattern rather than a count of PowerShell usage. Many hosts producing it on
+    a regular cadence points to a deployment tool or vendor agent whose encoded arguments collide with the
+    selection list, and is the profile to confirm against a change record. A single host or a small
+    unrelated set points to delivered execution, and the host list is then the starting scope for
+    containment.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - ' -e* PAA'
+        - JABlAG4AdgA6AHUAcwBlAHIAcAByAG8AZgBpAGwAZQ
+        - QAZQBuAHYAOgB1AHMAZQByAHAAcgBvAGYAaQBsAGUA
+        - kAGUAbgB2ADoAdQBzAGUAcgBwAHIAbwBmAGkAbABlA
+        - IgAoACcAKgAnACkAOwAkA
+        - IAKAAnACoAJwApADsAJA
+        - iACgAJwAqACcAKQA7ACQA
+        - JABGAGwAeAByAGgAYwBmAGQ
+        - PQAkAGUAbgB2ADoAdABlAG0AcAArACgA
+        - 0AJABlAG4AdgA6AHQAZQBtAHAAKwAoA
+        - 9ACQAZQBuAHYAOgB0AGUAbQBwACsAKA
+      filter:
+        CommandLine|contains:
+        - fAAgAEMAbwBuAHYAZQByAHQAVABvAC0ASgBzAG8AbgAgAC0ARQByAHIAbwByAEEAYwB0AGkAbwBuACAAUwBpAGwAZQBuAHQAbAB5AEMAbwBuAHQAaQBuAHUAZQ
+        - wAIABDAG8AbgB2AGUAcgB0AFQAbwAtAEoAcwBvAG4AIAAtAEUAcgByAG8AcgBBAGMAdABpAG8AbgAgAFMAaQBsAGUAbgB0AGwAeQBDAG8AbgB0AGkAbgB1AGUA
+        - 8ACAAQwBvAG4AdgBlAHIAdABUAG8ALQBKAHMAbwBuACAALQBFAHIAcgBvAHIAQQBjAHQAaQBvAG4AIABTAGkAbABlAG4AdABsAHkAQwBvAG4AdABpAG4AdQBlA
+      condition: selection and not filter
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- question: >-
+    Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host place the encoded execution in a sequence. Attachment or archive
+    handling, a macro or script host alert, or defense tampering in the preceding hours identifies what
+    delivered the loader; credential access or lateral movement alerts indicate a stage after it. The
+    ordering and timing of the alert list is what reconstructs the timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+  answer_sources:
+  - alert

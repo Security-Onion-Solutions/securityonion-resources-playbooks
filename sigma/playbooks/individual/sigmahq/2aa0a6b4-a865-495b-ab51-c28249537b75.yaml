@@ -1,0 +1,356 @@
+name: Startup Folder File Write
+id: 75f38278-0df7-49ad-b424-319fc4f68468
+description: |
+  Detects a file being written into a Windows Startup folder (the per-user or all-users
+  \Microsoft\Windows\Start Menu\Programs\StartUp path), excluding Windows Update servicing
+  writes and the OneNote "Send to OneNote" shortcut. Anything placed in this folder runs
+  automatically at the next interactive logon, which makes it a common logon-persistence
+  location - but installers, GPO-deployed shortcuts, and users pinning applications also
+  write here legitimately. This is a broad rule that fires on any write to the Startup
+  directory, so it is noisier than the "suspicious startup file" variant; separate benign
+  from malicious by identifying what the dropped file is, which process and parent wrote it,
+  whether it executes at logon, and whether the write fits a known software-deployment or
+  user pattern.
+type: detection
+detection_id: 2aa0a6b4-a865-495b-ab51-c28249537b75
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-03
+questions:
+- question: Does the alerting write land in a Startup folder, and is the responsible process the one shown in the alert?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the exact TargetFilename against the \Microsoft\Windows\Start Menu\Programs\StartUp path the rule matches, the file operation performed, and the responsible process. Windows Update servicing writes and the OneNote "Send to OneNote" shortcut are already excluded by the rule, so a fire here is a write the rule did not treat as routine.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this user and host expected to drop files into the Startup folder?
+  context: Legitimate installers, management tooling, and users pinning applications write shortcuts to the Startup folder. Knowing whether this user role and host function normally produce Startup writes is often the fastest way to separate a true positive from routine software activity. The write is frequently attributed to a machine or SYSTEM account, so judge by the responsible process and host role rather than the account name alone.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is the process that wrote to the Startup folder expected to do so, and what started it?
+  context: The writing process and its own parent reveal how the Startup entry was created. A user launching an installer (explorer.exe to a setup binary) looks very different from a script host or Office application spawning the writer. Tracing the parent's own origin shows whether the chain is an ordinary software install or an injected or scripted drop.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What other processes did the responsible process spawn?
+  context: A process that performs this action rarely stops there. Listing the children it launched shows
+    whether the activity was an isolated change or one step in a longer chain - payload execution,
+    additional persistence, or follow-on tooling. Note this shows what the acting process started,
+    not what started alongside it. Sibling processes cannot be identified from this telemetry,
+    because this event type does not record the acting process's parent.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: What is the file that was dropped into the Startup folder, and what does it do?
+  context: Read the dropped artifact's actual content. For a .lnk shortcut, resolve its target path, arguments, and working directory - Startup shortcuts often point at a payload stored elsewhere on disk. For scripts or executables, check for encoded or obfuscated strings, embedded URLs or IP addresses, packer signatures, and signing status. Content retrieval is a manual step from the endpoint or an EDR console.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: Did the process that wrote to the Startup folder also modify a Run or RunOnce registry value?
+  context: Startup-folder drops and Run/RunOnce registry values are the two halves of the same logon-persistence technique, and actors frequently set both for redundancy. This query returns any registry values the same process modified, with the key path and the data written. A Run key pointing at the dropped file, or a second autostart entry, expands the scope of the persistence beyond the single Startup write.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: If the dropped file has executed, what is its hash and does it have known threat-intelligence detections?
+  context: A file's hash is recorded when it runs, not when it is written, so the file-creation event carries no hash. This query looks for the dropped artifact executing by its path and reads its hash; submit that hash to a reputation or threat-intelligence source to judge whether it is known malicious, benign, or previously unseen. If the file is present but has not run, retrieve it from its on-disk path and hash it manually.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - Image
+      - Hashes
+- question: Did the dropped file execute after it was written, including at a later logon?
+  context: A Startup entry becomes active at the next interactive logon, so correlating the dropped path against later process execution shows whether the persistence has already fired. Execution shortly after the write suggests the actor ran it immediately; first execution at a subsequent logon confirms the autostart mechanism worked as intended. The immediate-execution correlation window for this technique is typically five to ten minutes, but logon-triggered execution can be arbitrarily later.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Is the dropped file still in the Startup folder, or was it deleted or renamed after the alert?
+  context: The file's post-alert lifecycle drives urgency and next steps. An artifact still on disk can be retrieved, hashed, and analyzed; a file deleted seconds after the write suggests anti-forensic cleanup or a self-removing dropper and shifts the focus to what executed in between.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Has this file been written to the Startup folder before on this host?
+  context: A shortcut or executable that has never appeared in this host's Startup folder is more suspicious than one written routinely by an installed application's updater. Zero or very low historical counts indicate a first-time or rare Startup entry that deserves closer review.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: What else has been written to the Startup folder recently, and by which processes?
+  context: The Startup folder has a small set of processes that legitimately write there - installers, management agents, and the shell. Other recent arrivals in the same folder show whether this is an isolated drop or a location under active use, and which other autostart entries belong to the same activity. A single unfamiliar writer across several files is the signal.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains: '\Microsoft\Windows\Start Menu\Programs\StartUp\'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: What other files did the responsible process write or delete around the alert?
+  context: A process that drops one Startup entry often writes several files - a dropper unpacking components, or a tool staging a payload alongside its shortcut. The breadth, paths, and extensions of the writer's other file activity separate a single artifact from a larger drop and enumerate what else needs review.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- always_include: true
+  question: Has this user produced a Startup-folder write matching this rule before, and does that fit their role?
+  context: This query mirrors the rule's own selection scoped to the alerting user, returning that user's 90-day history of Startup-folder writes that match this pattern rather than generic file activity. A user who has never produced this pattern is more suspicious than one who does so routinely; weigh the count against the user's role. Because the write is often attributed to a machine or SYSTEM account, treat a machine-account result as uninformative and lean on the parent-process history instead.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        TargetFilename|contains: \Microsoft\Windows\Start Menu\Programs\StartUp
+      filter_main_update:
+      - Image:
+        - C:\Windows\System32\wuauclt.exe
+        - C:\Windows\uus\ARM64\wuaucltcore.exe
+      - TargetFilename|startswith:
+        - C:\$WINDOWS.~BT\NewOS\
+        - C:\$WinREAgent\Scratch\Mount\
+      filter_optional_onenote:
+        Image|endswith: \ONENOTE.EXE
+        TargetFilename|endswith: \Send to OneNote.lnk
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection and not 1 of filter_main_* and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: Has this program historically driven Startup-folder writes on this host or across the environment, or is it new for this activity?
+  context: When the write is attributed to a service principal or machine account, user identity does not attribute behavior - the launch mechanism does. This query mirrors the rule's selection scoped to the alerting program, returning the 90-day history of that program driving this specific Startup-write pattern. A new or rare program for this pattern is the deviation worth chasing; a program that already accounts for thousands of prior events is vendor or OS automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        TargetFilename|contains: \Microsoft\Windows\Start Menu\Programs\StartUp
+      filter_main_update:
+      - Image:
+        - C:\Windows\System32\wuauclt.exe
+        - C:\Windows\uus\ARM64\wuaucltcore.exe
+      - TargetFilename|startswith:
+        - C:\$WINDOWS.~BT\NewOS\
+        - C:\$WinREAgent\Scratch\Mount\
+      filter_optional_onenote:
+        Image|endswith: \ONENOTE.EXE
+        TargetFilename|endswith: \Send to OneNote.lnk
+      _pb_scope:
+        Image|endswith|expand: '%Image%'
+      condition: (selection and not 1 of filter_main_* and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: What else did this user do across the environment around the time of the alert?
+  context: Tracking the user's activity across all hosts in the alert window reveals whether the Startup write is isolated or part of broader hands-on-keyboard activity. The same user producing related activity on multiple hosts widens the likely scope. When the alert fires under a machine or service account this view returns agent-telemetry noise, so the parent-driven fleet view is the meaningful companion.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- always_include: true
+  question: Did this same program-driven Startup-write pattern fire on other hosts in the same window?
+  context: This query mirrors the rule's selection scoped to the alerting program across the whole fleet in the alert window. Multiple hosts producing the same program-driven Startup write at once points to scheduled or pushed automation such as a software deployment or GPO rollout; a single host points to a host-local trigger worth closer review.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        TargetFilename|contains: \Microsoft\Windows\Start Menu\Programs\StartUp
+      filter_main_update:
+      - Image:
+        - C:\Windows\System32\wuauclt.exe
+        - C:\Windows\uus\ARM64\wuaucltcore.exe
+      - TargetFilename|startswith:
+        - C:\$WINDOWS.~BT\NewOS\
+        - C:\$WinREAgent\Scratch\Mount\
+      filter_optional_onenote:
+        Image|endswith: \ONENOTE.EXE
+        TargetFilename|endswith: \Send to OneNote.lnk
+      _pb_scope:
+        Image|endswith|expand: '%Image%'
+      condition: (selection and not 1 of filter_main_* and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining process activity on the host in the surrounding window shows what led to the Startup write and what followed - reconnaissance, privilege escalation, or additional persistence - and whether the write is one step in a larger sequence. Novel parent-child pairs stand out at low counts against the repetitive agent telemetry.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host - defense tampering, reconnaissance, or credential access - may reveal the stages that preceded the Startup write and help reconstruct the timeline. A logon-persistence drop late in a chain reads very differently from an isolated write with no precursors.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

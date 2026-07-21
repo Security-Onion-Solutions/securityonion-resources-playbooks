@@ -1,0 +1,422 @@
+name: Potentially Suspicious Child Process Of DiskShadow.EXE
+id: 6b358c8a-7ef8-495d-8df5-c081de997c5f
+description: |
+  Detects diskshadow.exe spawning a script host or proxy-execution binary (certutil.exe, cscript.exe,
+  mshta.exe, powershell.exe, pwsh.exe, regsvr32.exe, rundll32.exe, or wscript.exe) as a direct child.
+  diskshadow.exe is a signed Volume Shadow Copy administration tool whose exec sub-command and script
+  mode (/s) run an arbitrary local executable parented by diskshadow.exe, letting an operator hide
+  execution as a backup task and inherit a legitimate process tree to evade parent-of-cmd heuristics
+  and application allowlisting. Legitimately, diskshadow scripts may call helper executables during
+  backup; maliciously the same primitive launches download cradles, in-memory loaders, or shadow-copy
+  abuse for credential extraction and recovery inhibition. Investigation should confirm the parent-child
+  pair, decode what diskshadow and the child actually did, and determine whether the activity fits an
+  authorized backup workflow.
+type: detection
+detection_id: 9f546b25-5f12-4c8d-8532-5893dcb1e4b8
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the alerting event show diskshadow.exe as the parent spawning one of the watched child binaries?
+  context: Confirm the alert is a true positive by checking that ParentImage ends in diskshadow.exe and the
+    child Image is one of certutil.exe, cscript.exe, mshta.exe, powershell.exe, pwsh.exe, regsvr32.exe,
+    rundll32.exe, or wscript.exe. The rule fires purely on this parent-child pairing; there is no command-line
+    constraint, so the child binary identity and the diskshadow parent are the whole signal.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+- question: Is this user and host expected to run diskshadow-driven backup that launches these helper binaries?
+  context: diskshadow.exe requires local Administrators membership and is primarily a server backup tool; its
+    presence and use on a workstation, or under a non-backup account, is itself notable. Knowing whether this
+    host runs scheduled VSS backups and whether the user performs backup administration is often the fastest
+    way to separate an authorized backup script from operator abuse.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What started diskshadow.exe, and is that grandparent chain consistent with a backup workflow?
+  context: The parent-child pair is the core signal, so tracing diskshadow.exe's own origin reveals whether the
+    chain is legitimate (a scheduled task or backup service launching diskshadow) or suspicious (cmd.exe or a
+    script interpreter spawning diskshadow, which then proxies the detected child). A diskshadow parented by an
+    interactive shell or an unusual application is the deviation worth chasing.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What did diskshadow.exe itself do — was it run in script mode (/s) or driven interactively, and what
+    script or exec target did it use?
+  context: diskshadow runs the child via its exec sub-command or a script file (diskshadow /s script.txt). Reading
+    diskshadow's own command line shows whether a script path was supplied and which file, while inspecting that
+    script (or the interactive session) reveals whether it also issued expose, create, or delete shadows — the
+    sub-commands used to mount a snapshot for raw NTDS.dit/SAM read or to inhibit recovery.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- question: What did the child binary actually run — decode any encoded, obfuscated, or script-file arguments on
+    its command line.
+  context: The child is a script host or proxy-execution LOLBin, so its command line carries the real payload —
+    a base64-encoded PowerShell block, a certutil -decode of a staged file, an mshta or regsvr32/rundll32 entry
+    pointing at a remote or local resource, or a script path for cscript/wscript. Decode it to identify download
+    cradles, in-memory .NET loaders, or files being staged or read out of a shadow snapshot.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What other child processes did this same diskshadow.exe instance spawn?
+  context: A diskshadow script can chain several exec calls, so the detected child may be one of multiple processes
+    launched from the same parent instance. Enumerating siblings reveals the full scope of activity proxied through
+    this diskshadow tree — for example a copy of ntds.dit followed by an archive or upload tool.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Did PowerShell script block logging capture the full script content for any powershell.exe or pwsh.exe child?
+  context: When the child is powershell.exe or pwsh.exe, Event ID 4104 records the deobfuscated script that actually
+    ran, providing ground truth even when the command line is encoded. If PowerShell operational logs are not
+    ingested in this environment, treat zero results as a visibility gap rather than evidence nothing ran, and
+    decode the command line from the alerting event directly.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Were PowerShell or endpoint security controls bypassed or weakened on this host in the hour before the alert?
+  context: Operators often disable protections before running a payload through a proxied child. Common precursors
+    include AMSI patching, execution-policy bypass, a PowerShell v2 downgrade, and Defender real-time-monitoring
+    changes. Finding these before the diskshadow-spawned child strengthens the case for hands-on activity.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: What modules did the proxy-execution child load, and were any unsigned or loaded from a user-writable path?
+  context: For regsvr32.exe, rundll32.exe, and mshta.exe the operational payload is frequently a DLL or scriptlet
+    loaded after launch rather than a visible command-line argument, so the loaded-module trail shows what code
+    actually executed. An unsigned module, or one loaded from a temp or profile directory, points to externally
+    supplied code rather than a normal backup helper.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+- question: Did the diskshadow-spawned child make any network connections, and to what destinations?
+  context: Proxy-execution and download LOLBins commonly retrieve a payload or beacon out after launch. Outbound
+    connections from the child — especially to external addresses outside enterprise update or backup
+    infrastructure — indicate retrieval of externally hosted code or exfiltration, while the absence of network
+    activity points toward a local-only action such as shadow-copy mounting or recovery deletion.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Aggregating process activity around the alert reveals what led to the
+    diskshadow execution and what followed it — reconnaissance, credential access, archive or upload tools, or
+    recovery-inhibition steps — and whether this is one stage of a larger sequence.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \diskshadow.exe
+        Image|endswith:
+        - \certutil.exe
+        - \cscript.exe
+        - \mshta.exe
+        - \powershell.exe
+        - \pwsh.exe
+        - \regsvr32.exe
+        - \rundll32.exe
+        - \wscript.exe
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \diskshadow.exe
+        Image|endswith:
+        - \certutil.exe
+        - \cscript.exe
+        - \mshta.exe
+        - \powershell.exe
+        - \pwsh.exe
+        - \regsvr32.exe
+        - \rundll32.exe
+        - \wscript.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the acting user's activity across all hosts reveals lateral movement or multi-host activity.
+    If the same user triggered similar diskshadow or LOLBin activity on other endpoints in the same window, the
+    scope of the operation may be larger than this single host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \diskshadow.exe
+        Image|endswith:
+        - \certutil.exe
+        - \cscript.exe
+        - \mshta.exe
+        - \powershell.exe
+        - \pwsh.exe
+        - \regsvr32.exe
+        - \rundll32.exe
+        - \wscript.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Were any other proxy-execution or download LOLBins used on this host recently?
+  context: Operators who use one LOLBin often use several. If diskshadow proxied a script host, check whether other
+    signed binaries were used on the same host for proxy execution or payload retrieval — finding several LOLBins
+    serving the same objective strengthens the case for deliberate abuse over an isolated backup helper.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\certutil.exe'
+          - '\bitsadmin.exe'
+          - '\curl.exe'
+          - '\rundll32.exe'
+          - '\regsvr32.exe'
+          - '\mshta.exe'
+          - '\msbuild.exe'
+          - '\cmstp.exe'
+          - '\msiexec.exe'
+          - '\installutil.exe'
+          - '\mavinject.exe'
+          - '\esentutl.exe'
+          - '\expand.exe'
+          - '\extrac32.exe'
+          - '\makecab.exe'
+          - '\vssadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- question: Was the child binary executed from its expected System32 or SysWOW64 path, and does it carry its original name?
+  context: A script host or proxy LOLBin running from outside System32/SysWOW64, or whose OriginalFileName does not
+    match the on-disk name, may have been copied or renamed to evade path-based allowlists. A certutil.exe or
+    rundll32.exe launched from a temp or profile directory is more suspicious than one in System32.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- question: How often has this host fired the diskshadow-to-child pattern over the past 90 days, and what
+    command-line structures are typical?
+  context: A diskshadow parent spawning these script and proxy hosts with no prior history on this host is more
+    suspicious than a pattern that recurs under stable backup automation. The query mirrors the rule's selection
+    scoped to this host, so the count reflects this specific firing pattern, and the command-line projection lets
+    the analyst compare typical invocation patterns against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \diskshadow.exe
+        Image|endswith:
+        - \certutil.exe
+        - \cscript.exe
+        - \mshta.exe
+        - \powershell.exe
+        - \pwsh.exe
+        - \regsvr32.exe
+        - \rundll32.exe
+        - \wscript.exe
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - CommandLine

@@ -1,0 +1,298 @@
+name: MsiExec Web Install
+id: 0a59e857-870d-42ae-ade6-cf2724c2ab07
+description: |
+  Detects a process command line that invokes msiexec with an http(s):// (or other ://) URL as the install target. Windows Installer can fetch and install an MSI directly from a remote URL, which administrators occasionally use for software deployment, but enterprise software is almost always installed from a local path or UNC share rather than an Internet URL. The same native feature lets an attacker stage and run a remote payload through a trusted, signed binary without dropping an obvious downloader, so the investigation should determine what URL and package were referenced, whether the package was actually retrieved to disk, what spawned the install, and what executed afterward.
+type: detection
+detection_id: f7b5f842-a6af-4da5-9e95-e32478f3cd2f
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- question: Does the command line contain msiexec together with a :// URL as the rule detects?
+  context: Confirm the alert is a true positive by reviewing the exact command line. The rule fires when a single command line contains both " msiexec" and "://", so verify the URL target and any quiet-install flags before investing further time.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Is this user and host expected to install software from a remote URL?
+  context: Legitimate administrative deployment can invoke msiexec against a hosted package. Knowing whether this user role and host function normally install software over the network is often the fastest way to separate routine deployment from remote payload staging.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What exactly does this msiexec command line do? Decode the URL, package target, and install flags.
+  context: The full command line reveals the specific action. Extract the http(s):// URL and host it points to, the package name, and any quiet or silent flags (/q, /quiet, /i, /package) that suppress user interaction. This scopes to all command lines matching the rule pattern on this host within a few minutes so a multi-step orchestrator (cmd /c launching msiexec) is captured alongside the install.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains|all:
+          - ' msiexec'
+          - '://'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+      - Image
+- question: What process spawned this msiexec install, and is that parent chain expected?
+  context: The parent process reveals how the install was invoked. Deployment tooling and explorer.exe are routine parents; Office applications (winword.exe, excel.exe, outlook.exe), eqnedt32.exe, mshta.exe, wscript.exe, or a cmd.exe orchestrator point to document-borne or scripted delivery rather than an administrator action.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Did the installing process make an outbound connection to the URL host around the time of the alert?
+  context: Installing an MSI from a :// URL requires Windows Installer to fetch the package over the network. Correlating the process with an outbound connection to the command-line URL host confirms the transfer actually occurred and surfaces the destination address and port for reputation review. Pair the destination with the command-line URL to confirm they match.
+  range: +/-10m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: '\msiexec.exe'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationHostname
+      - DestinationPort
+      - Image
+- question: Was the package actually retrieved? Check for MSI or payload file creation on this host.
+  context: A msiexec web-install command does not guarantee the package arrived. Network errors, blocked URLs, or security controls may have stopped the transfer. Windows Installer caches the fetched package under the user INetCache and unpacks it to a transient %TEMP%\MSI<hex>.tmp file, so file creation at those paths establishes whether the attack progressed past delivery.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What did the MSI web install unpack and run, and what are those binaries' hashes?
+  context: msiexec downloads and installs the MSI; the MSI itself runs through msiexec rather than as its own process, so retrieve it from disk and hash it manually. What it unpacks and RUNS does have an execution hash — MSI loaders frequently unpack and hollow a second process — so this query returns the processes spawned by the alerting chain (msiexec and its children/siblings) with their hashes for a reputation lookup. A process-hollowing target may show a legitimate image with an unexpected hash.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_children:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      selection_siblings:
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - Image
+      - Hashes
+- question: What other file activity occurred in the staging directory the package was written to?
+  context: Remote installs often write the package, an unpacked binary, and additional dropped files into the same staging directory (INetCache, %TEMP%, ProgramData). Examining directory-level file activity reveals the broader scope of the delivery and any follow-on files written by the installed payload.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Is the referenced MSI package still on disk for analysis?
+  context: If the fetched package is still present, checking that it exists on disk enables deeper analysis -- hash lookups, sandbox submission, or content review of the install database. Windows Installer leaves the cached download and a transient unpack file that may persist briefly after the install.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: When this host has previously matched the msiexec web-install pattern, what parents and users drove it, and does this alert fit?
+  context: Even routine deployment can use a hosted package. The query mirrors the rule's selection scoped to this host, so the resulting parent/user distribution reflects how this specific firing pattern has historically run here. A new parent process, an unexpected user account, or an unusual command-line structure is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - ' msiexec'
+        - ://
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Have other hosts matched the msiexec web-install pattern in the past week, and does the distribution look like automation or one-off activity?
+  context: The query mirrors the rule's selection with no host scope, giving a fleet-wide count of this firing pattern. Many hosts matching the same pattern points to scripted deployment or vendor automation; one host or a small unrelated set points to manual operator activity. Use the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - ' msiexec'
+        - ://
+      condition: selection
+    fields:
+    - host.name
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - ' msiexec'
+        - ://
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - ' msiexec'
+        - ://
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or staging across multiple endpoints. If the same user triggered similar activity on more than one host, the scope may be larger than this single install.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - ' msiexec'
+        - ://
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host -- client-side exploitation, document execution, defense tampering, or reconnaissance -- may reveal the attack stages that preceded the install and help reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

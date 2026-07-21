@@ -1,0 +1,342 @@
+name: Proxy Execution via Vshadow
+id: 4aa54e3e-72e0-4b0d-b4f6-ea26601dc1f4
+description: |
+  Detects vshadow.exe invoked with the -exec parameter, which runs a specified command or script after volume shadow copies are created but before the tool exits. vshadow.exe is a legitimate Windows SDK command-line tool for creating and managing shadow copies, and backup or administrative scripts may use -exec for post-snapshot tasks. Because -exec runs an arbitrary command as a child of the signed Microsoft binary, attackers use it to proxy execution of malware and obscure the real launcher. Investigation should confirm the exact command vshadow.exe was asked to run, identify the resulting child process and any network or file activity it produced, and determine whether the parent chain, user, and host are consistent with sanctioned backup automation.
+type: detection
+detection_id: d7c75059-2901-4578-b209-8837fd31c6a8
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- question: Does the alerting event show vshadow.exe running with the -exec parameter?
+  context: Confirm the alert is a true positive by reviewing the exact command line and process identity. The rule fires when the image ends in vshadow.exe (or its OriginalFileName is vshadow.exe) AND the command line contains -exec, so verify both the binary identity and the presence of the -exec argument before investing further.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to run vshadow.exe with a post-snapshot command?
+  context: Legitimate backup and administrative automation can run vshadow.exe with -exec. Knowing whether the user role and host function (backup server, admin jumphost, ordinary workstation) align with shadow-copy management is often the fastest way to separate sanctioned operations from proxy execution. A standard interactive user on a workstation is more suspicious than a backup service account on a backup host.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What command did vshadow.exe run via -exec, and what does the full command line do?
+  context: The full command line reveals exactly what was proxied. Decode the value passed to -exec (vshadow treats the entire -exec value as a single command or executable), along with any shadow-copy flags such as -nw, -p, or -script. Identify the target executable or script, any arguments, and any file paths or URLs it references. This shows the operational purpose hidden behind the signed Microsoft binary.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What process spawned vshadow.exe and is that parent chain expected?
+  context: The parent process reveals how vshadow.exe was invoked. Backup automation typically launches it from a scheduler, service, or known backup product. Parents such as cmd.exe, powershell.exe, wscript.exe, mshta.exe, or an Office application suggest the tool was driven interactively or by a script rather than by sanctioned backup software.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What child processes did vshadow.exe spawn afterward?
+  context: The -exec command runs as a child of vshadow.exe, so the spawned process is the actual payload being proxied. Sanctioned backup tasks spawn predictable helpers; proxy execution often spawns command interpreters or downloaders. Review every child for unexpected interpreters or post-exploitation tooling.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Did vshadow.exe spawn a high-risk interpreter or downloader child?
+  context: Indirect command execution is most concerning when the proxied child is a command interpreter, scripting host, or downloader rather than a benign backup helper. This query narrows the children of vshadow.exe to the high-risk set commonly used for post-exploitation. Any match means the signed binary was used to launch a tool the analyst should treat as the real payload.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+        Image|endswith:
+          - \powershell.exe
+          - \pwsh.exe
+          - \cmd.exe
+          - \rundll32.exe
+          - \regsvr32.exe
+          - \mshta.exe
+          - \msiexec.exe
+          - \curl.exe
+          - \bitsadmin.exe
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - User
+- question: Did vshadow.exe or its spawned child open outbound network connections around the alert?
+  context: Proxied commands frequently reach out to the network to download or exfiltrate. Network connections initiated by vshadow.exe or its child point to a downloader or callback rather than local shadow-copy management. Compare destination addresses against known-good egress for backup or admin automation; connections to unexpected hosts raise severity.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: true
+        Image|endswith:
+          - \vshadow.exe
+          - \powershell.exe
+          - \pwsh.exe
+          - \cmd.exe
+          - \rundll32.exe
+          - \regsvr32.exe
+          - \mshta.exe
+          - \msiexec.exe
+          - \curl.exe
+          - \bitsadmin.exe
+      condition: selection
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- question: What files did vshadow.exe or its spawned child write around the alert?
+  context: The proxied command often drops a script, payload, or staged data to disk. Files written by vshadow.exe or its child in the alert window reveal what was created or staged. Backup automation that uses -script writes an environment-variable file, but executables or scripts in user-writable or temporary locations point to payload staging.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - \vshadow.exe
+          - \powershell.exe
+          - \pwsh.exe
+          - \cmd.exe
+          - \rundll32.exe
+          - \regsvr32.exe
+          - \mshta.exe
+          - \msiexec.exe
+          - \curl.exe
+          - \bitsadmin.exe
+      condition: selection
+    fields:
+      - Image
+      - TargetFilename
+      - EventType
+- question: Does this host normally run vshadow.exe?
+  context: A binary that has never been seen on a host is more suspicious than one that runs regularly. Volume shadow copy management is routine on backup servers but rare on ordinary workstations. Zero or very low historical counts indicate first-time or rare execution and raise the priority of the alert.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: When this host has previously fired this vshadow.exe -exec pattern, what parents and users normally drive it, and does the current alert fit?
+  context: Even legitimate tools can be abused. The query mirrors the rule's selection structure scoped to this host, so the resulting parent and user distribution reflects how this specific firing pattern has run here historically. A new parent process, an unexpected user account, or an unusual command-line structure is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_img:
+      - Image|endswith: \vshadow.exe
+      - OriginalFileName: vshadow.exe
+      selection_cli:
+        CommandLine|contains: -exec
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Have other hosts fired this vshadow.exe -exec pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of this specific firing pattern rather than generic vshadow usage. Many hosts firing the same pattern points to scripted deployment or vendor backup automation; one host or a small unrelated set points to manual operator activity. Use the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_img:
+      - Image|endswith: \vshadow.exe
+      - OriginalFileName: vshadow.exe
+      selection_cli:
+        CommandLine|contains: -exec
+      condition: all of selection_*
+    fields:
+    - host.name
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_img:
+      - Image|endswith: \vshadow.exe
+      - OriginalFileName: vshadow.exe
+      selection_cli:
+        CommandLine|contains: -exec
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_img:
+      - Image|endswith: \vshadow.exe
+      - OriginalFileName: vshadow.exe
+      selection_cli:
+        CommandLine|contains: -exec
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity across multiple endpoints. If the same user triggered similar activity on multiple hosts, the scope may be larger than this single alert. This asks what the actor did right now across the network, distinct from their long-term baseline.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_img:
+      - Image|endswith: \vshadow.exe
+      - OriginalFileName: vshadow.exe
+      selection_cli:
+        CommandLine|contains: -exec
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining activity around the alert reveals what led to this event, what happened after, and whether it is part of a larger sequence. Look for reconnaissance, privilege escalation, persistence installation, or data staging that surrounds the proxied execution.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host, such as defense tampering, reconnaissance, or credential access, may reveal the attack stages that preceded this event and help reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

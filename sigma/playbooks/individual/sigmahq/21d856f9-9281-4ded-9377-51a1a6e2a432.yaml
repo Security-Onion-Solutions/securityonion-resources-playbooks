@@ -1,0 +1,374 @@
+name: Potential Persistence Via Logon Scripts - CommandLine
+id: 41f40dcd-4711-4083-aa86-7c1a2e88cb89
+description: |
+  Detects a command line that references UserInitMprLogonScript, the registry value under HKCU\Environment that Windows
+  reads at every user logon and uses to launch a named executable or script after authentication (winlogon.exe to
+  userinit.exe). Writing this value is a quiet logon-persistence primitive that sits outside the Run keys, services,
+  and scheduled tasks defenders sweep first; the launched child often shows a non-existent parent because userinit.exe
+  exits immediately after spawning it. Legitimate use is rare but possible (administrators or third-party tooling
+  configuring logon scripts), so the investigation should determine what executable or script path the value points to,
+  who and what wrote it, whether that payload exists on disk, and whether it ran at the next logon.
+type: detection
+detection_id: 21d856f9-9281-4ded-9377-51a1a6e2a432
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the command line reference UserInitMprLogonScript, and what executable or script path is it writing to that value?
+  context: Confirm the alert is a true positive by reviewing the exact command line against the rule's only criterion — the
+    string UserInitMprLogonScript in the command. Read the value data being written to identify the absolute path of the
+    executable or script that would launch at the next logon; that path is the payload and drives the rest of the
+    investigation.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Is this user and host expected to configure logon scripts?
+  context: Legitimate logon-script configuration is rare and usually limited to administrators or deployment tooling. Knowing
+    whether the user role and host function are consistent with setting a per-user logon script is often the fastest path to
+    distinguishing routine administration from unauthorized persistence.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What process wrote this registry value, and what started that parent?
+  context: The parent-child relationship attributes who modified the logon-script value. Tracing the writing process and its
+    own origin reveals whether the change came from an interactive administrator action, a deployment agent, or a suspicious
+    chain such as a script host or Office application spawning the command interpreter that wrote the value.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What exact registry key and value were written, and does the data point to a payload in a user-writable path?
+  context: The registry_set event linked to this process exposes the target path and the value data as structured fields
+    rather than parsed from a command line. The canonical persistence write is the REG_SZ value UserInitMprLogonScript under
+    HKCU\Environment; the value data is the path Windows launches at logon. A payload sitting under a user-writable location
+    such as the user profile, AppData, or a temp directory is more consistent with malicious persistence than a path in a
+    managed software directory.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- question: Were other registry modifications made on this host in the same session?
+  context: Operators who set one persistence value often modify several keys in the same session — for example adding a logon
+    script and also setting a Run key or weakening a security setting. Finding a cluster of registry write commands from the
+    same host within a short window reveals the full scope of configuration changes and whether multiple objectives were pursued.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_reg:
+        - Image|endswith:
+            - '\reg.exe'
+            - '\regedit.exe'
+          CommandLine|contains:
+            - ' add '
+            - ' delete '
+            - ' import '
+            - '/s '
+        - CommandLine|contains:
+            - 'Set-ItemProperty'
+            - 'New-ItemProperty'
+            - 'Remove-ItemProperty'
+      condition: selection and selection_reg
+    fields:
+      - CommandLine
+- question: Does the referenced executable or script exist on disk, and what is it?
+  context: This persistence works only if the payload named in the value data is present at the path written to the registry.
+    Identify the executable or script path from the value data, then verify whether that file exists on the host and analyze
+    its hash and signing state. A missing file means the persistence is staged but not yet armed; a present unsigned binary
+    in a user-writable path is the active payload that would run at the next logon.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: What other child processes did the same parent spawn?
+  context: If the process that wrote the logon-script value was spawned by a suspicious parent, that parent likely spawned
+    other processes too. Examining sibling processes reveals the full scope of activity from that parent — multiple related
+    children from one parent points to scripted orchestration rather than an isolated administrative command.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Did a process launch from userinit.exe referencing the persisted script path after this value was written?
+  context: After the value is set, the payload executes at the next user logon when userinit.exe reads UserInitMprLogonScript
+    and launches the named binary, often via mpnotify.exe. Because userinit.exe exits immediately, the launched child commonly
+    shows a non-existent or already-gone parent. A process spawned by userinit.exe whose image or command line matches the
+    path written to the value confirms the persistence fired and identifies the running payload.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith:
+          - '\userinit.exe'
+          - '\mpnotify.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - User
+- question: Did a user logon occur on this host after the value was written, and which account authenticated?
+  context: Logon-script persistence triggers on the next interactive or remote logon, so correlating authentication events
+    with the registry write tells the analyst whether the payload has had a chance to run and which account it would execute
+    under. A logon for the same account that owns the modified HKCU\Environment hive shortly after the write is the moment the
+    persistence becomes active. If security authentication events are not ingested in this environment, treat zero results as
+    a visibility gap rather than evidence no logon occurred.
+  range: +6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID:
+          - 4624
+          - 4648
+      condition: selection
+    fields:
+      - TargetUserName
+      - LogonType
+      - IpAddress
+- question: When this host has previously written UserInitMprLogonScript, what parents and users drove it, and does this alert fit that pattern?
+  context: Even rare commands can have a benign history on a given host. This query mirrors the rule's selection scoped to this
+    host, so the resulting parent and user distribution reflects how this specific logon-script write has run here before. A
+    new parent process, an unexpected user account, or a first-ever occurrence is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains: UserInitMprLogonScript
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains: UserInitMprLogonScript
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains: UserInitMprLogonScript
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals whether the persistence write was part of broader hands-on
+    activity or lateral movement. If the same user triggered related actions on multiple endpoints in this window, the scope
+    of the activity may be larger than the single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains: UserInitMprLogonScript
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the write reveals the immediate context: what led to
+    it, what happened after, and whether it is part of a larger sequence. Look for reconnaissance, privilege escalation, or
+    additional persistence mechanisms.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Were other process-based persistence mechanisms installed on this host?
+  context: Operators rarely rely on a single persistence mechanism. After establishing one foothold through the logon-script
+    value, they commonly install backups using different techniques — scheduled tasks, services, Run keys, BITS jobs, or WMI
+    subscriptions. Multiple persistence installations in the same timeframe indicate intentional stacking rather than isolated
+    administrative action.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance, or
+    credential access — may reveal the stages that preceded the persistence write and help reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Have other hosts written UserInitMprLogonScript in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: This query mirrors the rule's selection with no host scope, giving a fleet-wide count of the logon-script write
+    pattern. Many hosts writing the same value points to scripted deployment or management automation; one host or a small
+    unrelated set points to manual operator activity. Use the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains: UserInitMprLogonScript
+      condition: selection
+    fields:
+    - host.name

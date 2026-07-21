@@ -1,0 +1,486 @@
+name: Suspicious Scheduled Task Write to System32 Tasks
+id: e716153a-5aee-4f90-966e-955ec01098f2
+description: |
+  Detects a file write into C:\Windows\System32\Tasks\ — the directory where the Task Scheduler
+  stores task definitions as XML — performed by a process whose own path contains \AppData\,
+  C:\PerfLogs, or \Windows\System32\config\systemprofile. Both conditions must hold for the rule
+  to fire. When a task is registered the normal way (schtasks.exe, the Task Scheduler API, group
+  policy), the Schedule service running inside svchost.exe writes that file; a process running
+  from a user-writable or staging directory writing the definition itself means the task was
+  planted by dropping the file rather than by registering it, which also skips the task-creation
+  record the API normally produces. Software installers, management agents, and imaging tooling
+  occasionally write task definitions directly as well, so the investigation is to identify the
+  writing process and its lineage, read the task XML to learn what command and trigger it
+  carries, check whether a task-registration event was logged for the same task, and determine
+  whether the task has already run.
+type: detection
+detection_id: 80e1f67a-4596-4351-98f5-a9c3efabac95
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-16
+questions:
+- question: >-
+    Does the written file sit under \Windows\System32\Tasks\, and does the writing process run
+    from \AppData\, C:\PerfLogs, or \Windows\System32\config\systemprofile?
+  context: >-
+    The rule requires both conditions together: the target path lands in the Task Scheduler's
+    definition directory AND the responsible process's own image path contains one of those three
+    location patterns. Confirm the exact path, the operation performed, and the writing process
+    before investing further. The signer columns describe the acting process; read them for
+    coherence with a process that writes task definitions, not as a verdict.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - Image
+      - TargetFilename
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+  answer_sources:
+  - alert
+  - file_event
+- question: Is this user and host expected to have scheduled tasks written by a process running from a user or staging directory?
+  context: >-
+    On most hosts the only process that writes into the task-definition directory is the Schedule
+    service. A build server, an imaging host, or a workstation mid-installation may legitimately
+    have an installer or agent under \AppData\ do it. Knowing the host's role and whether the
+    account is a person, a machine account, or a service principal is often the fastest way to
+    separate routine deployment from a planted task.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: Is the task definition file still on disk, or was it deleted or renamed after the alert?
+  context: >-
+    The file's post-alert lifecycle drives the next step. A definition still present can be read,
+    hashed, and correlated with the registered task; a definition deleted shortly after it was
+    written means the task was removed again and the investigation shifts to what ran in the
+    interval. Interpret the operation type on each event rather than the presence of events alone.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+  answer_sources:
+  - file_event
+  - manual_review
+- question: >-
+    Are scheduled tasks in this environment normally deployed through group policy or management
+    tooling rather than by a process writing a definition file directly?
+  context: >-
+    Organizations that deploy tasks via group policy, configuration management, or software
+    installers have a small, known set of programs that touch the definition directory. A writer
+    that is not on that list points either at an administrator or vendor tool taking a shortcut,
+    or at a task placed outside the normal deployment path. Establishing the normal method turns
+    the writing process's identity into a decision.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - organizational_knowledge
+- question: What command line was the process that wrote this task definition running under?
+  context: >-
+    The file event names the writing process but not its arguments. Retrieving that process's own
+    start event exposes the full command line — an installer running a silent-install switch, a
+    management agent doing a scheduled deployment, or an interpreter running a script that drops
+    the definition. The arguments usually identify which of those it is, and for an interpreter
+    they name the script that actually performed the write.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: What process performed this write, and what spawned it?
+  context: >-
+    The acting process is named in the alert but its origin is not. Retrieving its start event
+    exposes the parent that launched it. A process under \AppData\ launched by an installer,
+    services.exe, or a management agent reads very differently from the same path launched by
+    winword.exe, wscript.exe, mshta.exe, or a browser — the parent identifies whether the writer
+    arrived through a deployment or through execution of delivered content.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+  answer_sources:
+  - process_creation
+- question: What command, arguments, and triggers does the task definition XML specify?
+  context: >-
+    The task definition is XML and its Command, Arguments, and Triggers elements are the payload
+    and the schedule — this is what the task will actually do and when. File telemetry records
+    that the file was written, not what is inside it, so retrieve the definition from the host or
+    through an endpoint console and read it. Look at what the Command points to, whether the
+    Arguments carry encoded or downloaded content, whether the trigger is at logon, at boot, or
+    on a short recurring interval, and which principal the task runs as.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+  answer_sources:
+  - file_event
+  - manual_review
+  - edr_console
+- question: Was a task-registration event (Event ID 4698) recorded on this host around the time of the file write?
+  context: >-
+    Registering a task through the Task Scheduler API or schtasks.exe produces a 4698
+    task-creation record on the Security channel, and the Schedule service — not the caller —
+    writes the definition file. A definition file appearing with no matching 4698 means the XML
+    was placed on disk directly, which bypasses both the API and the record it leaves. A 4698
+    naming the same task points back toward ordinary registration and shifts the question to who
+    the subject account was. If task-scheduler auditing is not enabled or the Security channel is
+    not collected from this host, treat zero results as a visibility gap rather than evidence that
+    no registration occurred.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        EventID: 4698
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - TaskName
+      - SubjectUserName
+  answer_sources:
+  - manual_review
+  - organizational_knowledge
+- question: Has the Task Scheduler service launched anything on this host since the definition appeared?
+  context: >-
+    Scheduled tasks execute as children of the Schedule service hosted in svchost.exe, so
+    processes with that parent are the tasks that actually fired. A task set to run at logon or at
+    boot activates on the next restart; a short recurring interval may have already run several
+    times. Compare the children listed here against the Command element in the task definition to
+    determine whether this specific task has executed yet.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: '\svchost.exe'
+        ParentCommandLine|contains: 'Schedule'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Is the scheduled task still registered on the system?
+  context: >-
+    Persistence only holds while the task exists, and a task dropped as a file is removed just as
+    easily. Query the task by name on the host or through an endpoint console to confirm whether
+    it is still registered, whether the definition on disk matches what the scheduler reports, and
+    which principal it runs as. A task that no longer exists moves the investigation toward what
+    ran while it did.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - manual_review
+  - edr_console
+- question: What other files did the responsible process write or delete around the alert?
+  context: >-
+    A process that plants a task definition usually has to put the payload somewhere too. The
+    breadth and location of the writer's other file activity — and its direct children's, since
+    droppers delegate — enumerate the rest of the artifact set and often reveal the binary or
+    script the task's Command element points at. Volume alone is not the signal; where the writes
+    land is.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+  answer_sources:
+  - file_event
+- question: What else has been written to the task-definition directory on this host recently, and by which processes?
+  context: >-
+    \Windows\System32\Tasks\ has a small set of legitimate writers, dominated by the Schedule
+    service. Grouping the last week of writes to that directory by path and writing process shows
+    which programs touch it here and whether this write is the only one from an unusual location
+    or one of several. Multiple definitions from the same unfamiliar writer enumerate the other
+    tasks that need review.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains: '\Windows\System32\Tasks\'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+  answer_sources:
+  - file_event
+- question: >-
+    When this host has previously fired the rule's pattern, which processes and users drove it,
+    and does the current alert fit that history?
+  context: >-
+    The query mirrors the rule's selection structure scoped to this host, so the resulting
+    process/user distribution reflects how this specific pattern — a task definition written from
+    \AppData\, PerfLogs, or the systemprofile directory — has historically occurred here. A host
+    that produces this pattern every time an installer runs has a known writer and a known
+    account; a first-ever occurrence, or a familiar pattern under a new writer, is the deviation
+    worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        TargetFilename|contains: \Windows\System32\Tasks
+        Image|contains:
+        - \AppData\
+        - C:\PerfLogs
+        - \Windows\System32\config\systemprofile
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - Image
+    - User
+  answer_sources:
+  - file_event
+- always_include: true
+  question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: >-
+    The query mirrors the rule's selection structure scoped to this user, so the result is their
+    90-day history of writing task definitions from these locations, aggregated by host. A user
+    who does this routinely across many hosts is likely driving a deployment or imaging workflow;
+    a user with no such history is the deviation. Weigh the count against the account's role, and
+    note that a machine or service account here attributes the write to a service, not a person.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        TargetFilename|contains: \Windows\System32\Tasks
+        Image|contains:
+        - \AppData\
+        - C:\PerfLogs
+        - \Windows\System32\config\systemprofile
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - file_event
+  - organizational_knowledge
+- always_include: true
+  question: >-
+    Has this program historically produced the rule's pattern on this host or across the
+    environment, or is it new for this activity?
+  context: >-
+    When the write happens under SYSTEM or a machine account, user identity attributes nothing,
+    and a file event carries no parent to pivot on. The acting program is the meaningful pivot:
+    the query mirrors the rule's selection structure scoped to the alerting binary, giving the
+    90-day history of this program writing task definitions from these locations. A program
+    already accounting for thousands of prior events is vendor or OS automation; one that is new
+    or rare for this pattern is the deviation worth chasing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        TargetFilename|contains: \Windows\System32\Tasks
+        Image|contains:
+        - \AppData\
+        - C:\PerfLogs
+        - \Windows\System32\config\systemprofile
+      _pb_scope:
+        Image|endswith|expand: '%Image%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - file_event
+- always_include: true
+  question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the account's activity across all hosts in the alert window shows whether the task
+    write is host-local or part of activity touching several endpoints at once. The same account
+    driving processes on multiple hosts in the same window points either at an administrator
+    running a rollout or at movement between machines. Under a service principal this returns
+    routine agent telemetry and the program-scoped pivot is the meaningful reading instead.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+- always_include: true
+  question: Did this same program produce this pattern on other hosts in the same window, or is the activity isolated to this host?
+  context: >-
+    Under a service principal, asking what else the user did returns agent telemetry from every
+    host, and a file event carries no parent to pivot on. Whether the same program wrote task
+    definitions elsewhere is the answerable question: the query mirrors the rule's selection
+    structure scoped to the alerting binary, fleet-wide, in the alert window. Several hosts at
+    once points to a pushed or scheduled deployment; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        TargetFilename|contains: \Windows\System32\Tasks
+        Image|contains:
+        - \AppData\
+        - C:\PerfLogs
+        - \Windows\System32\config\systemprofile
+      _pb_scope:
+        Image|endswith|expand: '%Image%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - file_event
+- question: >-
+    Have other hosts fired the rule's pattern in the past week, and does the cross-host
+    distribution look like consistent automation or one-off activity?
+  context: >-
+    The query mirrors the rule's selection structure with no host scope, so the result is a
+    fleet-wide count of task definitions written from these locations rather than generic file
+    activity. Many hosts producing the pattern points to a packaged installer or vendor agent that
+    writes definitions directly by design, which makes this a tuning candidate; one host or a
+    small unrelated set points to activity specific to those machines.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        TargetFilename|contains: \Windows\System32\Tasks
+        Image|contains:
+        - \AppData\
+        - C:\PerfLogs
+        - \Windows\System32\config\systemprofile
+      condition: selection
+    fields:
+    - host.name
+  answer_sources:
+  - file_event

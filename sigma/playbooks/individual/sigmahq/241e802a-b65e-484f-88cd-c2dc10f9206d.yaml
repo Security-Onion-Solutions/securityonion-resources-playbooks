@@ -1,0 +1,259 @@
+name: Read Contents From Stdin Via Cmd.EXE
+id: 1500c8ce-514a-4503-bd72-af8c52a384e1
+description: |
+  Detects cmd.exe (matched by image name or original filename) whose command line contains the "<" stdin-redirection operator, which reads — and can then execute — the contents of a file or a named pipe. Plenty of legitimate scripts redirect a file into a command, so the operator alone is low-signal. The behavior that matters is cmd reading its input from a named pipe (for example cmd /c cmd < \\.\pipe\name): a launcher process feeds commands into a hidden cmd over a pipe to proxy a file read or command execution through a trusted Microsoft binary and dodge user-mode AV hooks. The investigation should decode what the "<" is reading (a file path versus a named pipe), confirm what process spawned cmd and whether that parent is a shell or something feeding it programmatically, and look for the named pipes and follow-on activity that distinguish a benign redirect from proxied execution.
+type: detection
+detection_id: 241e802a-b65e-484f-88cd-c2dc10f9206d
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-03
+questions:
+- question: Does this match the rule — cmd.exe run with the "<" stdin-redirection operator?
+  context: Confirm the alert before investing time. The rule fires when the image (or original filename) is cmd.exe and the command line contains the "<" character. Read the full command line and identify what follows the "<" — a file path is a routine redirect, while a named pipe (a path beginning \\.\pipe\) is the proxied-execution pattern that warrants the rest of this investigation.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to run cmd.exe with stdin redirection?
+  context: Build scripts, batch automation, and some admin one-liners legitimately pipe a file into a command. Knowing whether this account and host routinely run such redirects helps separate a scripted file-read from a hand-crafted pipe-fed shell. A redirect on a developer or server host doing batch work reads very differently from one on an end-user workstation that has no scripting baseline.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What is the "<" reading from — a file or a named pipe — and what does cmd do with it?
+  context: Decode the full command line. Identify the source to the right of the redirection operator — a file path under a script, temp, or public directory is a routine redirect; a named pipe (a path beginning \\.\pipe\, often with a random or BackgroundConsole-style name) is the proxied-execution variant where a launcher feeds commands to cmd over a pipe. Note any command on the left and whether the read content is piped onward or written elsewhere.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What process spawned this cmd.exe, and is that parent a shell or something feeding it programmatically?
+  context: A cmd launched from explorer.exe or another interactive shell is ordinary. The pipe-fed-stdin technique instead has a non-shell launcher — a custom binary, a browser, an Office application, or a script host — create a hidden cmd and write commands into its stdin pipe. The parent's image and command line show whether a human ran this redirect or a program orchestrated it, and walking up reconstructs how the activity began.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What other processes did the launcher that spawned this cmd start around the alert?
+  context: The proxied variant of this technique has a launcher feeding cmd's input over a named pipe. The endpoint agent does not record pipe events, so look for the same pattern in process telemetry — the launcher's other children around the alert. Repeated short-lived cmd.exe spawns from the same parent, or helper processes started alongside the alerting cmd, corroborate programmatic feeding; a parent whose only child is this single cmd with a file redirect reads as routine scripting. Correlate the siblings' command lines with what the alerting cmd's "<" was reading.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: What did this cmd.exe spawn or run afterward?
+  context: Reading a file via stdin is only interesting if the content is acted on. Children of this cmd process, or a tight sequence of commands following it, show whether the redirect fed a script that then ran tooling — a new interpreter, a dropped binary, reconnaissance commands, or a download. A redirect that produces no follow-on activity reads very differently from one that kicks off a chain.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: When this host has previously run cmd with a stdin redirect, what parents and users drove it, and does the current alert fit?
+  context: Even a common operator like "<" has a normal pattern on a given host. This mirrors the rule's pattern scoped to this host, so the parent/user distribution reflects how stdin redirects have historically run here — a build account, a scheduled batch job, an interactive admin. A new parent process (especially a non-shell launcher), an unexpected user, or an unusual command structure against that baseline is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_cmd:
+      - OriginalFileName: Cmd.Exe
+      - Image|endswith: \cmd.exe
+      selection_cli:
+        CommandLine|contains: <
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_cmd:
+      - OriginalFileName: Cmd.Exe
+      - Image|endswith: \cmd.exe
+      selection_cli:
+        CommandLine|contains: <
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_cmd:
+      - OriginalFileName: Cmd.Exe
+      - Image|endswith: \cmd.exe
+      selection_cli:
+        CommandLine|contains: <
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts in a tight window reveals lateral movement or activity spanning multiple endpoints. If the same user ran shells or tooling on other hosts in the same window, the scope is larger than a single machine. This pivot is meaningful only when a real user account fired the alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_cmd:
+      - OriginalFileName: Cmd.Exe
+      - Image|endswith: \cmd.exe
+      selection_cli:
+        CommandLine|contains: <
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Have other hosts run cmd with a stdin redirect in the past week, and does the distribution look like automation or one-off activity?
+  context: This mirrors the rule's pattern with no host scope, giving a fleet-wide count of where cmd stdin redirects fired. Many hosts at once points to a scripted or deployed routine that uses redirection; one host or a small unrelated set points to manual or targeted activity. Use the distribution to judge how unusual this single alert is.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_cmd:
+      - OriginalFileName: Cmd.Exe
+      - Image|endswith: \cmd.exe
+      selection_cli:
+        CommandLine|contains: <
+      condition: all of selection_*
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Aggregating the process activity around the alert reveals the immediate context — what launched just before, what ran just after, and whether the redirect sits inside a larger sequence. Novel parent-child pairs at low counts are what to scan for against the high-count routine noise.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, a loader, reconnaissance, or credential access — may reveal the stages that preceded this redirect and help reconstruct the timeline. A pipe-fed cmd is usually a means to an end, so what surrounds it tells the story.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

@@ -1,0 +1,426 @@
+name: Potential CVE-2023-27363 Exploitation - HTA File Creation By FoxitPDFReader
+id: cbebfa52-0c34-494b-90d9-b245b44d7f61
+description: |
+  Detects FoxitPDFReader.exe creating a file with an .hta extension inside the user's Startup
+  folder (a path ending in \Microsoft\Windows\Start Menu\Programs\Startup\). A PDF reader has no
+  legitimate reason to write an auto-start HTA script, and this file-write pattern is the
+  persistence step of CVE-2023-27363 - an arbitrary file-write flaw in Foxit's exportXFAData
+  JavaScript method (a cPath validation weakness) that lets a crafted PDF write files in the
+  logged-on user's context. An HTA planted in the Startup folder runs under mshta.exe at the next
+  logon or reboot, giving arbitrary code execution. Investigate the document Foxit opened, the
+  content of the dropped HTA, whether it has executed, what else the same process wrote, and whether
+  the drop is isolated or part of broader persistence on the host.
+type: detection
+detection_id: 9cae055f-e1d2-4f81-b8a5-1986a68cdd84
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-10
+questions:
+- question: Did FoxitPDFReader.exe create an .hta file in the user's Startup folder?
+  context: >-
+    Before investing investigation time, confirm the alert is a true positive. The rule fires when
+    FoxitPDFReader.exe writes a file whose name ends in .hta into a path containing
+    \Microsoft\Windows\Start Menu\Programs\Startup\. Review the exact TargetFilename, the operation
+    performed, and the responsible process on the triggering event. A PDF reader writing an
+    auto-start HTA is the file-write signature of CVE-2023-27363, not routine document handling.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - Image
+      - TargetFilename
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this user and host expected to have a PDF reader write an auto-start script?
+  context: >-
+    Legitimate use of Foxit is opening and rendering documents; it does not drop scripts into the
+    Startup folder. Knowing whether the account and host function are consistent with any sanctioned
+    activity is often the fastest way to separate a red-team or software-testing case from live
+    exploitation. User attribution is present on roughly 94% of endpoint file events; when it is a
+    machine account or missing, judge by the writing process and host role instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: What is the content of the dropped HTA file?
+  context: >-
+    The HTA is the payload that will run at the next logon, so read its actual content. Check for
+    obfuscated or encoded strings, embedded URLs or IP addresses, inline VBScript/JScript, calls to
+    PowerShell or cmd.exe, and any secondary file it drops or downloads. The script content reveals
+    what code the persistence will execute and provides indicators to pivot on. File content is not
+    carried in the file-write event and must be retrieved from the host or an endpoint copy.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: Has this HTA executed via mshta.exe on this host?
+  context: >-
+    A Startup-folder HTA runs under mshta.exe at the next logon or reboot rather than as a child of
+    Foxit, so its execution is a separate later event. Look for mshta.exe running with this HTA name
+    on its command line; a match confirms the persistence fired and points to what the script then
+    spawned. If the HTA drops or references a secondary executable, hash that file and submit it to
+    threat intelligence to establish whether it is known malicious. If nothing is found, the payload
+    is staged but has not yet run.
+  range: +7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: '\mshta.exe'
+        CommandLine|contains|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ProcessGuid
+- question: What launched FoxitPDFReader.exe, and which document did it open?
+  context: >-
+    The file event carries no command line, so pivot by ProcessGuid to Foxit's own process record to
+    read its command line and parent. The command line shows the document path Foxit opened, which is
+    the exploitation vector for CVE-2023-27363 - a specially crafted PDF that abuses the exportXFAData
+    method to write the HTA. The parent (a browser, a mail client, explorer.exe, or a script host)
+    shows how that document reached the user and whether the open was interactive or automated.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What child processes did FoxitPDFReader.exe spawn right after the alert?
+  context: >-
+    Beyond planting the Startup HTA for later execution, the exploit may also spawn a process
+    immediately. Listing what Foxit launched in the hours after the alert reveals whether the crafted
+    document also triggered direct execution - mshta.exe, powershell.exe, cmd.exe, or an arbitrary
+    binary - rather than relying solely on the logon-time persistence. Unexpected children of a PDF
+    reader indicate the exploit ran code in-line.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Is the HTA still on disk, or was it deleted or renamed after the alert?
+  context: >-
+    The HTA's post-alert lifecycle drives next steps. A script still on disk can be retrieved,
+    analyzed, and removed to break the persistence; an HTA deleted or renamed shortly after creation
+    suggests staging that repositioned the payload or anti-forensic cleanup, and shifts attention to
+    what ran in between. Interpret the operation type on each event over the following window.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What other files did FoxitPDFReader.exe write or delete around the alert?
+  context: >-
+    An arbitrary file-write primitive is rarely used to drop a single file. The alert's file event
+    carries the responsible process identifiers, so correlating by ProcessGuid surfaces every other
+    file Foxit (and any child it delegated to) wrote or deleted in the surrounding window. The breadth,
+    paths, and extensions distinguish a lone HTA from a wider drop of supporting components or
+    additional persistence artifacts, and enumerate what else needs review.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What else has been written to this Startup folder recently, and by which processes?
+  context: >-
+    The Startup folder is a small, high-value location that only a limited set of processes should
+    write to. Other recent arrivals in the same folder reveal whether this is an isolated drop or a
+    location under active use, and which writing processes belong to the same activity. A PDF reader,
+    a script host, or any unexpected writer appearing here alongside the HTA broadens the scope of
+    what to review.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains: '\Microsoft\Windows\Start Menu\Programs\Startup\'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: Has this HTA file been seen before on this host?
+  context: >-
+    An auto-start script that has never appeared on the host before is more suspicious than a
+    recurring, known file. Zero or very low historical counts for this HTA name indicate a first-time
+    drop consistent with fresh exploitation, while a history of the same file points to a recurring
+    process worth identifying. The query is anchored on the specific file name and host, so it reads
+    the artifact's own history rather than folder-wide volume.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: When this host previously produced this drop pattern, what programs and users drove it?
+  context: >-
+    Even the same firing pattern can have a benign explanation if it recurs under a consistent
+    program and user. This query mirrors the rule's exact selection - Foxit writing an .hta into
+    the Startup folder - scoped to this host, so the resulting program and user distribution
+    reflects how this specific pattern has run here before. Expect the Image column to show
+    FoxitPDFReader.exe itself; no prior history or an unexpected account is the deviation worth
+    chasing, while a stable recurring profile points to a repeatable, likely non-malicious cause.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        Image|endswith: \FoxitPDFReader.exe
+        TargetFilename|contains: \Microsoft\Windows\Start Menu\Programs\Startup\
+        TargetFilename|endswith: .hta
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - Image
+    - User
+- always_include: true
+  question: Has this user produced this Foxit-to-Startup drop pattern before?
+  context: >-
+    This query mirrors the rule's exact selection scoped to the alerting user, returning that
+    account's 90-day history of this specific drop pattern aggregated by host. A user who has never
+    produced this pattern is more suspicious than one who does so regularly; weigh the count against
+    whether that account routinely opens external PDFs and on how many hosts the pattern appears.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        Image|endswith: \FoxitPDFReader.exe
+        TargetFilename|contains: \Microsoft\Windows\Start Menu\Programs\Startup\
+        TargetFilename|endswith: .hta
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: Has this program driven this drop pattern before on this host or elsewhere?
+  context: >-
+    When the alert fires under a service or machine account, user identity does not attribute the
+    behavior; the launch mechanism does. This query mirrors the rule's selection scoped to the
+    alerting program, returning the 90-day history of that program driving this exact pattern,
+    aggregated by host. A new or rare program for this pattern is the deviation worth chasing, while a
+    program already accounting for many prior events points to a recurring automated cause. Read this
+    alongside the user-history view - one answers whether the account is routine, the other whether
+    the launch mechanism is.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        Image|endswith: \FoxitPDFReader.exe
+        TargetFilename|contains: \Microsoft\Windows\Start Menu\Programs\Startup\
+        TargetFilename|endswith: .hta
+      _pb_scope:
+        Image|endswith|expand: '%Image%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: What else did this user do across the environment around this time?
+  context: >-
+    Tracking the alerting account's activity across all hosts in a tight window reveals whether the
+    exploitation is confined to this endpoint or the same user is active on several. The same account
+    opening documents or spawning tools on multiple hosts around the alert widens the likely scope of
+    compromise and helps distinguish a single opened document from coordinated activity.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- always_include: true
+  question: Did this same program-driven drop pattern fire on other hosts in this window?
+  context: >-
+    Under a service or machine account, a user-scoped network sweep returns agent-telemetry noise, so
+    the meaningful question is whether the same launch mechanism fired elsewhere. This query mirrors
+    the rule's selection scoped to the alerting program, fleet-wide, within the alert window.
+    Multiple hosts producing the same pattern at once points to a pushed or scripted rollout; a single
+    host points to a local trigger such as one user opening a crafted document.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        Image|endswith: \FoxitPDFReader.exe
+        TargetFilename|contains: \Microsoft\Windows\Start Menu\Programs\Startup\
+        TargetFilename|endswith: .hta
+      _pb_scope:
+        Image|endswith|expand: '%Image%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Have other hosts produced this Foxit-to-Startup drop pattern in the past week?
+  context: >-
+    This query mirrors the rule's exact selection with no host scope, returning a fleet-wide count of
+    this specific drop pattern rather than generic Foxit usage. Many hosts producing the same pattern
+    suggests a widely distributed malicious document or a shared vulnerable Foxit build being
+    exploited at scale; one host or a small unrelated set points to a targeted or opportunistic
+    single case. Use the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        Image|endswith: \FoxitPDFReader.exe
+        TargetFilename|contains: \Microsoft\Windows\Start Menu\Programs\Startup\
+        TargetFilename|endswith: .hta
+      condition: selection
+    fields:
+    - host.name
+- question: Were files dropped to other persistence locations on this host?
+  context: >-
+    The detected HTA is one file-based persistence mechanism; an actor with an arbitrary file-write
+    primitive often plants more than one. This query surfaces writes to Startup folders and to paths
+    associated with registry Run and RunOnce keys in the surrounding window, capturing additional
+    auto-start drops that bypass command-line-based detection. Multiple persistence artifacts from the
+    same timeframe indicate deliberate stacking rather than an isolated event.
+    Run-key persistence itself is a registry write, not a file drop, so it does not appear in file telemetry; this query covers Startup folders and scheduled-task definition files, and Run-key writes surface in registry questions instead.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist_paths:
+        TargetFilename|contains:
+          - '\Start Menu\Programs\Startup\'
+          - '\Windows\System32\Tasks\'
+          - '\Windows\Tasks\'
+      condition: selection and selection_persist_paths
+    fields:
+      - TargetFilename
+      - Image
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Exploitation rarely happens in isolation. Earlier detections on the same host - phishing-related
+    execution, script hosts running, or defense tampering - may reveal how the crafted document
+    reached the user and what preceded the file write. The alert timeline helps place this drop within
+    a larger sequence and reconstruct the delivery path.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

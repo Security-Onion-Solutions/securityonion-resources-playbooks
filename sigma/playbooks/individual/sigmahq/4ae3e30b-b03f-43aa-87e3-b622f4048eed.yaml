@@ -1,0 +1,426 @@
+name: Potential Arbitrary File Download Using Office Application
+id: b556c2ec-99f2-4724-b835-9d0b3d44af62
+description: |
+  Detects a Microsoft Office application (excel.exe, powerpnt.exe, or winword.exe) launched
+  with an http:// or https:// URL on its command line. The rule fires when the Image ends in
+  one of those binaries (or carries the matching OriginalFileName) AND the CommandLine contains
+  a web URL. Office binaries accept a URL as a positional argument and fetch the remote file
+  into the Temporary Internet Files cache before attempting to render it, which lets an operator
+  pull an arbitrary payload through a signed, allowlisted binary even when the file type is not a
+  document. Legitimate cases exist (a user or add-in opening a document from an intranet URL), so
+  the investigation should decode the fetched URL, determine what landed in the cache, and check
+  whether the download was followed by execution of the downloaded content.
+type: detection
+detection_id: 4ae3e30b-b03f-43aa-87e3-b622f4048eed
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the alert show an Office binary (excel.exe, powerpnt.exe, or winword.exe) launched with an http:// or https:// URL on its command line?
+  context: The rule fires only when both conditions hold together — the Image is one of the three
+    Office binaries (or carries the matching OriginalFileName) AND the command line contains a web
+    URL. Confirm both before investing further. Reading a document from an intranet share over HTTP
+    is a benign explanation; a URL that ends in an executable, DLL, or script extension, or points to
+    an unfamiliar external host, is the pattern this rule targets.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to open documents from web URLs via an Office command line?
+  context: Standard interactive users on workstations rarely invoke Office binaries with a URL argument
+    from a shell; the usual path is opening a file from a browser or mail client. An interactive
+    standard-user account is more concerning than a server, CI agent, or admin workstation where
+    document-automation tooling may legitimately drive Office this way. Knowing the account role and
+    host function is often the fastest way to separate routine activity from abuse.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What is the full URL the Office binary was told to fetch, and what file type does it point to?
+  context: The command line carries the remote URL passed as a positional argument. Decode it to read
+    the scheme, host, path, and file extension. A URL ending in a document extension is consistent with
+    normal use; one ending in .exe, .dll, .scr, .hta, .ps1, or a query-string-obfuscated path is
+    consistent with pulling an arbitrary payload through the signed Office binary. Note whether the host
+    is internal or external.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|contains:
+          - 'http://'
+          - 'https://'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What is the destination the Office binary contacted, and what do DNS, registration age, and threat intel reveal about it?
+  context: The download lands wherever the URL resolves. Investigate the destination — DNS resolution
+    history, domain registration age, TLS certificate details, and known threat-intel hits. Recently
+    registered domains, raw IP literals, or infrastructure with no business relationship point to an
+    attacker-controlled endpoint; a known internal or vendor host points to legitimate document retrieval.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationHostname
+      - DestinationIp
+      - DestinationPort
+- question: What process spawned the Office binary, and is that parent chain expected?
+  context: A command-line invocation of Office with a URL usually comes from a shell, script host, or
+    automation framework rather than from the user double-clicking a file. Parents such as cmd.exe,
+    powershell.exe, wscript.exe, mshta.exe, or another Office process suggest scripted invocation or
+    macro-driven execution. A parent of explorer.exe or a login session is more consistent with
+    interactive use.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Did the Office binary spawn a high-risk child process such as a script host, rundll32, regsvr32, or a downloader after the fetch?
+  context: The fetch itself is only the delivery step; impact comes from executing what was downloaded.
+    Child processes such as powershell.exe, cmd.exe, rundll32.exe, regsvr32.exe, mshta.exe, msiexec.exe,
+    curl.exe, or bitsadmin.exe spawned by the Office binary indicate the downloaded content was run or
+    a second-stage transfer began. One documented variant loads a downloaded DLL via the Office COM
+    add-ins manager, producing an Office to rundll32 chain. A clean result with no risky children weakens
+    the case that the download was weaponized.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+        Image|endswith:
+          - \powershell.exe
+          - \cmd.exe
+          - \rundll32.exe
+          - \regsvr32.exe
+          - \mshta.exe
+          - \msiexec.exe
+          - \curl.exe
+          - \bitsadmin.exe
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Did the Office binary write an executable, DLL, or script file into the Temporary Internet Files cache around the time of the alert?
+  context: When an Office binary fetches a URL whose content is not a renderable document, the raw file
+    still lands on disk under %localappdata%\Microsoft\Windows\Temporary Internet Files (the Content.IE5
+    and Content.MSO subtrees) and can persist with its original extension after the application closes.
+    A non-document file written there by an Office binary is direct evidence the download channel was used
+    to stage a payload. Correlate the write time and writing process with the alerting event.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        TargetFilename|endswith:
+          - .exe
+          - .dll
+          - .scr
+          - .ps1
+          - .hta
+          - .vbs
+          - .js
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Does this host normally run this Office binary from the command line?
+  context: A first-time or rare command-line invocation of Office on a host is more notable than one
+    that recurs. Office launched interactively to open documents is routine, but command-line
+    invocations carrying a URL argument are uncommon outside specific automation. Zero or very low
+    historical counts indicate first-time or unusual use on this host.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: When this host has previously fired this rule's pattern, what parents and users normally drive it, and does the current alert fit?
+  context: Even routine document automation can match this rule. The query mirrors the rule's selection
+    (Office binary plus a web URL) scoped to this host, so the resulting parent and user distribution
+    reflects how this specific firing pattern has historically run here rather than generic Office usage.
+    A new parent process, an unexpected account, or an unusual command-line structure relative to that
+    baseline is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \EXCEL.EXE
+        - \POWERPNT.EXE
+        - \WINWORD.exe
+      - OriginalFileName:
+        - Excel.exe
+        - POWERPNT.EXE
+        - WinWord.exe
+      selection_http:
+        CommandLine|contains:
+        - http://
+        - https://
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Does this host normally communicate with this destination?
+  context: First-time connections to a destination are more notable than routine traffic. Establishing
+    whether this host has talked to the URL's destination before helps separate new attacker
+    infrastructure from an internal share or vendor host the environment already trusts. Known-good
+    egress to expected internal or business networks is the benign case.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationHostname
+      - DestinationPort
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \EXCEL.EXE
+        - \POWERPNT.EXE
+        - \WINWORD.exe
+      - OriginalFileName:
+        - Excel.exe
+        - POWERPNT.EXE
+        - WinWord.exe
+      selection_http:
+        CommandLine|contains:
+        - http://
+        - https://
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \EXCEL.EXE
+        - \POWERPNT.EXE
+        - \WINWORD.exe
+      - OriginalFileName:
+        - Excel.exe
+        - POWERPNT.EXE
+        - WinWord.exe
+      selection_http:
+        CommandLine|contains:
+        - http://
+        - https://
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the account's activity across all hosts reveals whether this is an isolated event
+    or part of broader hands-on activity. If the same user triggered similar Office command-line
+    activity or other notable actions on multiple endpoints, the scope of the investigation widens.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \EXCEL.EXE
+        - \POWERPNT.EXE
+        - \WINWORD.exe
+      - OriginalFileName:
+        - Excel.exe
+        - POWERPNT.EXE
+        - WinWord.exe
+      selection_http:
+        CommandLine|contains:
+        - http://
+        - https://
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What other tools ran on this host around the same time as the Office download?
+  context: A download via Office rarely stands alone in a real intrusion. Activity in the surrounding
+    window may reveal reconnaissance, additional transfers, persistence installation, or execution of
+    the downloaded content that gives broader context. A 10–30 minute window around the launch is the
+    typical correlation range for follow-on activity.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+- question: Have other hosts fired this rule's pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: The query mirrors the rule's selection with no host scope, so the result is a fleet-wide
+    count of this firing pattern rather than generic Office usage. Many hosts firing the same pattern
+    points to a deployment script, document-management workflow, or vendor automation; one host or a
+    small unrelated set points to manual operator activity. Use the host distribution and parent
+    consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \EXCEL.EXE
+        - \POWERPNT.EXE
+        - \WINWORD.exe
+      - OriginalFileName:
+        - Excel.exe
+        - POWERPNT.EXE
+        - WinWord.exe
+      selection_http:
+        CommandLine|contains:
+        - http://
+        - https://
+      condition: all of selection_*
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — reconnaissance,
+    phishing-document execution, or defense tampering — may reveal the stages that preceded this
+    download and help reconstruct the timeline that led an Office binary to fetch a remote file.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

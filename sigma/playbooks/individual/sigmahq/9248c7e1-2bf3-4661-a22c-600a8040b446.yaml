@@ -1,0 +1,318 @@
+name: Potential Rundll32 Execution With DLL Stored In ADS
+id: 288aeb32-335e-4f9b-a5e9-e0dbe4328461
+description: |
+  Detects rundll32.exe invoked with a command line that references a DLL stored in an NTFS Alternate Data Stream (ADS), identified by the colon-stream syntax (file:stream) in the command line. ADS-hosted DLLs hide payload bytes inside the metadata of an otherwise innocuous host file, so the malicious code does not appear as a standalone file on disk. Legitimate ADS use exists but is uncommon; investigate which host file carries the stream, what the stream content is, how the file and stream were created, and what rundll32 did once the stream's DllMain ran.
+type: detection
+detection_id: 9248c7e1-2bf3-4661-a22c-600a8040b446
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the rundll32 command line reference a DLL stored in an Alternate Data Stream?
+  context: Confirm the alert is a true positive by reviewing the exact command line and process details. The rule fires when the process is rundll32.exe (by Image path or original filename) AND the command line contains the colon-stream ADS syntax (a file path followed by a stream name and an entry point, e.g. file.ext:stream.dll,DllMain). Verify the colon-stream reference is genuinely present and points to an Alternate Data Stream rather than a drive-letter path artifact.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to load DLLs from Alternate Data Streams via rundll32?
+  context: ADS-hosted DLL execution is rare in normal operations. Knowing whether this user role and host function ever legitimately involve rundll32 invocations that reference stream syntax is often the fastest way to separate a true positive from an unusual but benign event.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Decode the full rundll32 command line — which host file carries the stream, what is the stream name, and what entry point is called?
+  context: The command line reveals the exact ADS target. Parse the colon-stream syntax to identify the host file path, the stream name (the part after the file's own extension, before the entry point), and the exported function rundll32 was told to call. The host file and its stream are the artifacts to retrieve and analyze next.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|re: '[Rr][Uu][Nn][Dd][Ll][Ll]32(?:\.[Ee][Xx][Ee])? \S+?\w:\S+?:'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What is the content of the host file and its Alternate Data Stream referenced on the command line?
+  context: Read and analyze the actual bytes in the named stream. ADS-hosted DLLs are real PE payloads hidden in the host file's metadata. Check the stream for PE headers, imports, embedded strings, packer signatures, and signing status, and compare the host file itself against its expected content. Stream content must be retrieved manually from the endpoint, as the colon-stream path does not appear as a normal file.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What is the hash of the DLL rundll32 loaded from the Alternate Data Stream?
+  context: A DLL's hash is recorded when it is loaded, and the malicious code here lives in a named Alternate Data Stream rather than a normal file, so hashing the host file's main contents would miss it. This reads the modules rundll32 loaded and returns their hashes -- the DLL pulled from the stream (its path shows the host-file:stream-name form) appears here; submit its hash to VirusTotal, Hybrid Analysis, or internal threat intel. If image_load telemetry is not ingested, treat an empty result as a visibility gap, extract the stream from the host file (see the content-decode and evidence-preservation steps), and hash it by hand.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Hashes
+- question: Was an Alternate Data Stream created on the host file shortly before rundll32 ran?
+  context: ADS creation is the staging step that precedes stream execution. Elastic Defend records that staging write as
+    an ordinary file-creation event, with the stream name embedded in the target path (host-file:stream-name) — there is
+    no hash recorded on the stream-creation event itself (the DLL's hash, once loaded, is recovered separately from
+    image_load telemetry). A stream created minutes before this rundll32 invocation ties the staging step to the
+    execution step and identifies the process that wrote the payload. If no matching write appears, treat that as a
+    visibility gap rather than evidence nothing was staged.
+  range: -24h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_ads:
+        TargetFilename|re: ':[^\\]'
+      condition: selection and selection_ads
+    fields:
+      - TargetFilename
+      - Image
+- question: Is the host file that carries the stream still on disk for analysis?
+  context: The colon-stream reference points at a host file whose metadata holds the payload. Confirming the host file still exists on disk enables stream extraction, hashing, and content review. Streams are removed when the host file is deleted, so preserving the file promptly matters.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What process spawned this rundll32 instance, and is that parent chain expected?
+  context: The parent reveals how the ADS-hosted DLL load was invoked. Legitimate rundll32 usually descends from explorer.exe, services.exe, or known installers. Parents like powershell.exe, cmd.exe, wscript.exe, mshta.exe, or an Office application point to scripted staging of the stream and execution, which is the pattern this rule is concerned with.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What child processes did this rundll32 instance spawn afterward?
+  context: The processes spawned after the stream's DllMain runs reveal the payload's actual impact. Legitimate rundll32 rarely spawns interactive shells or download tools; children like cmd.exe, powershell.exe, or certutil.exe point to post-exploitation following the hidden DLL load.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: When this host has previously fired the rule's pattern, what parents and users normally drive it, and does the current alert fit?
+  context: Even when ADS-via-rundll32 has fired here before, the parent and user distribution shows how that specific pattern has historically run on this host. A new parent process, an unexpected user account, or an unusual command-line structure is the deviation worth chasing. The query mirrors the rule's selection scoped to this host, so the result reflects the rule's firing pattern rather than generic rundll32 usage.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \rundll32.exe
+      - OriginalFileName: RUNDLL32.EXE
+      selection_cli:
+        CommandLine|re: '[Rr][Uu][Nn][Dd][Ll][Ll]32(?:\.[Ee][Xx][Ee])? \S+?\w:\S+?:'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \rundll32.exe
+      - OriginalFileName: RUNDLL32.EXE
+      selection_cli:
+        CommandLine|re: '[Rr][Uu][Nn][Dd][Ll][Ll]32(?:\.[Ee][Xx][Ee])? \S+?\w:\S+?:'
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \rundll32.exe
+      - OriginalFileName: RUNDLL32.EXE
+      selection_cli:
+        CommandLine|re: '[Rr][Uu][Nn][Dd][Ll][Ll]32(?:\.[Ee][Xx][Ee])? \S+?\w:\S+?:'
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the same user triggered similar staging-and-execution activity on other hosts, the scope may be larger than a single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \rundll32.exe
+      - OriginalFileName: RUNDLL32.EXE
+      selection_cli:
+        CommandLine|re: '[Rr][Uu][Nn][Dd][Ll][Ll]32(?:\.[Ee][Xx][Ee])? \S+?\w:\S+?:'
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance, credential access — may reveal the stages that preceded the hidden DLL load and help reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Was rundll32 executed from its expected System32 or SysWOW64 path?
+  context: rundll32 executed from outside C:\Windows\System32 or C:\Windows\SysWOW64 may indicate the binary was copied or renamed to evade path-based allowlists. Compare the Image path against the expected location and confirm the original filename is RUNDLL32.EXE.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- question: How often has this host fired the rule's rundll32 ADS pattern over the past 90 days, and what command-line structures are typical?
+  context: A LOLBin pattern with no prior history on a host is more suspicious than one used daily under stable parents. The query mirrors the rule's selection scoped to this host, so the count reflects the rule's specific ADS-execution pattern rather than generic rundll32 usage. The command-line projection lets the analyst compare typical invocation patterns against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \rundll32.exe
+      - OriginalFileName: RUNDLL32.EXE
+      selection_cli:
+        CommandLine|re: '[Rr][Uu][Nn][Dd][Ll][Ll]32(?:\.[Ee][Xx][Ee])? \S+?\w:\S+?:'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - CommandLine

@@ -1,0 +1,397 @@
+name: HackTool - DInjector PowerShell Cradle Execution
+id: 287bbd91-8916-4005-a3f0-4bbc616ed442
+description: |
+  Detects the DInjector PowerShell cradle by its characteristic command-line flags (/am51 and /password
+  present together). DInjector is a reflective .NET process-injection framework: the cradle decrypts an
+  embedded payload in memory and injects it into a target process, leaving little on disk. The /am51 flag
+  requests an in-memory AMSI bypass and /password supplies the key that decrypts the shellcode, so a match is
+  a high-confidence indicator of an offensive injection tool running — either an authorized red-team exercise
+  or an intrusion. Confirm the flags fired, decode what the cradle does, identify the injection target and
+  any in-memory module loads, and establish whether the activity is sanctioned.
+type: detection
+detection_id: d78b5d61-187d-44b6-bf02-93486a80de5a
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- question: Does the command line contain both the /am51 and /password flags this rule detects?
+  context: >-
+    Before investing investigation time, confirm the alert is a true positive by reviewing the exact command
+    line. The rule fires only when both ` /am51` (in-memory AMSI bypass) and ` /password` (the shellcode
+    decryption key) are present together, which is the DInjector cradle's distinctive invocation. Read the
+    full command line and confirm both flags are present and supplied as tool arguments rather than incidental
+    substrings.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Is this user and host expected to run an in-memory injection tool?
+  context: >-
+    A reflective injection cradle is not routine software. Knowing whether the account and host belong to a
+    red-team operator, a security tester, or a sanctioned automation context — versus a standard user or
+    server with no such role — is often the fastest way to separate an authorized exercise from an intrusion.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What does the cradle command decode to, and what payload does it carry?
+  context: >-
+    The cradle typically wraps an encoded or compressed blob plus the decryption key passed via /password.
+    Decode any base64/`-EncodedCommand` content and de-obfuscate string concatenation or escaping to recover
+    what the cradle actually executes — the embedded shellcode loader, the target it injects into, and any
+    download or callback the decoded script performs.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Which injection capability of the cradle was invoked, and what was the intended target?
+  context: >-
+    DInjector exposes several injection primitives (for example process hollowing, thread hijacking, and
+    module stomping). Read the flags and arguments alongside /am51 and /password to determine which technique
+    was selected and which process the operator intended to inject into. The chosen primitive narrows where to
+    look for the injected code and what side effects to expect.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did the cradle process call the Windows APIs reflective injection depends on to write and run code in a remote process?
+  context: >-
+    Reflective injection writes code into a remote process by calling WriteProcessMemory to place the shellcode,
+    then QueueUserAPC or a hook-installation routine such as SetWindowsHookEx to trigger execution. Review the
+    behavioral API events tied to the alerting process for these calls; the target process named alongside them
+    is the injection destination and should be treated as compromised. Their absence does not clear the
+    cradle — it can select from several injection primitives — but their presence confirms the injection landed
+    and identifies where.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        event.dataset: endpoint.events.api
+        process.Ext.api.name:
+          - WriteProcessMemory
+          - QueueUserAPC
+          - SetWindowsHookEx
+      condition: selection
+    fields:
+      - process.executable
+      - process.Ext.api.name
+      - Image
+- question: Did the .NET runtime and related modules load into the cradle process, consistent with in-memory assembly execution?
+  context: >-
+    A PowerShell cradle that reflectively loads a .NET assembly pulls in the CLR and supporting modules
+    (clr.dll, clrjit.dll, mscoree.dll, System.Management.Automation). Their presence in a process that has no
+    legitimate reason to host .NET — or loading from an unusual path — corroborates in-memory assembly
+    execution. Review the modules loaded by the alerting process around the injection time.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_modules:
+        ImageLoaded|endswith:
+          - \clr.dll
+          - \clrjit.dll
+          - \mscoree.dll
+          - \System.Management.Automation.dll
+      condition: selection and selection_modules
+    fields:
+      - ImageLoaded
+      - Signed
+- question: Did PowerShell script block logging capture the full deobfuscated cradle content?
+  context: >-
+    Script block logging records the deobfuscated script PowerShell actually executed, even when the command
+    line is encoded. Where these events are collected, they reveal the cradle's full logic — the decryption
+    routine, the shellcode, and the injection target — that the command line alone hides. If these events are
+    not collected in this environment, treat zero results as a visibility gap, not evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Were PowerShell security controls bypassed or weakened in the hour before this execution?
+  context: >-
+    Injection cradles usually disarm defenses first. The /am51 flag already requests an in-memory AMSI bypass;
+    look also for execution-policy bypass, Defender real-time-monitoring changes, AMSI patching references, or
+    a downgrade to PowerShell v2 in the prior hour. Populated results strengthen the case that this was a
+    deliberate operator sequence rather than an isolated event.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: Is this execution part of an authorized penetration test or red team engagement?
+  context: >-
+    Reflective injection frameworks are used in sanctioned security assessments. Before treating this as an
+    intrusion, check whether a pentest or red-team exercise is scheduled, whether the host and account are in
+    scope, and whether the operator is known. An authorized engagement explains the activity; absence of one
+    escalates it.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did the cradle process write any files to disk in the hour after execution?
+  context: >-
+    Although the cradle operates mostly in memory, the surrounding operation often drops files — a staged
+    payload, a downloaded second stage, or output collected from the injected code. Files written by the
+    alerting process shortly after execution are worth hashing and reviewing to recover what the operation
+    delivered.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: When this host has previously fired this cradle pattern, what parents and users drove it, and does this alert fit?
+  context: >-
+    The query mirrors the rule's /am51-plus-/password selection scoped to this host, so the resulting parent
+    and user distribution reflects how this specific tool pattern has run here before — not generic PowerShell
+    usage. A new parent process, an unexpected account, or a first-ever appearance is the deviation worth
+    chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - ' /am51'
+        - ' /password'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Have other hosts fired this cradle pattern in the past week, and does the spread look like a sweep or one-off activity?
+  context: >-
+    The query mirrors the rule's selection with no host scope, returning a fleet-wide count of this specific
+    cradle pattern rather than generic PowerShell usage. Several hosts firing the same pattern in a short
+    period points to a coordinated operation or a sanctioned exercise across a target set; a single host
+    points to isolated activity. Use the host spread to scope the response.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - ' /am51'
+        - ' /password'
+      condition: selection
+    fields:
+    - host.name
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - ' /am51'
+        - ' /password'
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - ' /am51'
+        - ' /password'
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the user's activity across all hosts in a tight window reveals whether the injection is part of
+    broader hands-on-keyboard movement. The same account running tools on multiple endpoints widens the
+    apparent scope and suggests an operator working through a target set.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - ' /am51'
+        - ' /password'
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Injection rarely occurs in isolation. Examining the activity surrounding the alert reveals what led up to
+    it and what followed — the cradle's parent, sibling tooling, and any post-injection processes — placing
+    the event in its immediate operational timeline.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    A critical injection alert often sits downstream of earlier stages. Detections on this host in the prior
+    hours — initial access, defense tampering, or credential access — may reveal how the operator arrived and
+    help reconstruct the full timeline leading to the injection.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

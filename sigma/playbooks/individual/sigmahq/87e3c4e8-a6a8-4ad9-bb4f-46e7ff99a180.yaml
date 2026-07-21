@@ -1,0 +1,427 @@
+name: Change PowerShell Policies to an Insecure Level
+id: 5ea079ff-9007-4674-b363-a27bcfb1ad8d
+description: |
+  Detects PowerShell (powershell.exe, powershell_ise.exe, or pwsh.exe, matched by image name or original filename) launched with an execution-policy switch (-ExecutionPolicy, -ep, or -exec) AND a permissive level of Bypass or Unrestricted, excluding the known-good msiexec-launched PowerShell 7 installer and the Avast updater patterns. The PowerShell execution policy is not a security boundary, but flipping it to Bypass or Unrestricted is a common preparatory step so that unsigned or downloaded scripts run without prompts — frequently as the leading switch of a one-liner that also carries -File, -Command, or -EncodedCommand. Administrators set permissive policies legitimately during deployment, so the investigation should decode what the session actually ran under the relaxed policy, confirm the parent chain that launched it, and determine whether this user and host normally invoke PowerShell this way.
+type: detection
+detection_id: 87e3c4e8-a6a8-4ad9-bb4f-46e7ff99a180
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-03
+questions:
+- question: Does this match the rule — PowerShell launched with an execution-policy switch set to Bypass or Unrestricted?
+  context: Confirm the alert before investing time. The rule requires all three conditions — the image (or original filename) is powershell.exe, powershell_ise.exe, or pwsh.exe; the command line carries an execution-policy switch (-executionpolicy, -ep, or -exec); and the level is Bypass or Unrestricted. The msiexec-launched PowerShell 7 installer and the Avast updater are filtered out. Read the full command line and confirm the policy switch and level, and note what else the line carries (a -File path, -Command, or -EncodedCommand), since that payload is the real subject of the investigation.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to set a permissive PowerShell execution policy?
+  context: Deployment tooling, packaging scripts, and some admin workflows legitimately pass -ExecutionPolicy Bypass to run an unsigned script. Knowing whether this account and host have a reason to do so — a build server or an IT admin versus a standard user workstation — is often the fastest way to separate routine automation from a hands-on bypass.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What did PowerShell run under the relaxed policy — decode the rest of the command line.
+  context: The execution-policy switch is rarely the whole command. Recover what accompanied it — a -File path, an inline -Command, or an -EncodedCommand blob — and the scope (Process, CurrentUser, or LocalMachine). A bypass paired with a script in a user-writable or temp path, a download cradle, or a hidden window is the pattern that matters; a bypass paired with a signed deployment script under Program Files is far more likely routine. Scoping to the policy-bypass invocations on this host in the window captures a multi-step sequence where one call sets policy and a later one runs the payload.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains:
+          - '-executionpolicy '
+          - ' -ep '
+          - ' -exec '
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Was the bypassed command encoded or obfuscated, and what does it decode to?
+  context: A permissive execution policy is often set precisely so an obfuscated payload can run. If the command line carries -EncodedCommand (-enc) or uses string concatenation, backticks, or variable substitution, decode it to recover the real script — a download cradle, a reverse shell, or in-memory execution of a .NET assembly. If the command is plain text, identify the cradle pattern directly and check any source URL's reputation.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did PowerShell script block logging capture what ran under the relaxed policy?
+  context: Windows Event ID 4104 records the deobfuscated script PowerShell actually executed, even when the command line is encoded or built from concatenated strings — the ground truth for what the bypassed session did. This is the natural follow-on to a policy-change alert, because the policy switch only enables execution; the 4104 content shows the result. If PowerShell operational logging is not collected in this environment, treat zero results as a visibility gap rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: What process spawned this PowerShell, and is that parent chain expected?
+  context: A bypass invocation launched from an interactive admin session or a deployment service is routine; the same invocation spawned by winword.exe or excel.exe (a macro), mshta.exe, wscript.exe, or another script host points to a delivery chain that handed off to PowerShell. The parent's own command line shows whether a loader or document drove the policy change, and walking up from there reconstructs how it started.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What did this PowerShell process spawn afterward?
+  context: The point of relaxing the policy is to run something. Children of this PowerShell process reveal what the unsigned script did — a new cmd.exe or another powershell.exe, csc.exe compiling code in memory, rundll32 or regsvr32 running a payload, or a dropped executable. A quiet bypass that spawns nothing reads very differently from one that immediately launches tooling.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Beyond the execution policy, were other PowerShell protections weakened on this host around this time?
+  context: The rule already caught the execution-policy change, so this looks for the other controls an operator commonly weakens alongside it — an AMSI patch, a downgrade to PowerShell v2 (which lacks script block logging), or known obfuscation-framework markers. Finding these clustered near the policy change strengthens the case that the bypass is preparation for malicious execution rather than a routine deployment switch.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: When this host has previously set a permissive PowerShell policy, what parents and users drove it, and does the current alert fit?
+  context: Even a policy bypass has a normal pattern on a given host. This mirrors the rule's pattern scoped to this host, so the parent/user distribution reflects how policy-bypass invocations have historically run here — a deployment service under a known account, an admin in an interactive session. A new parent process, an unexpected user, or an unusual command structure against that baseline is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_img:
+      - OriginalFileName:
+        - powershell_ise.exe
+        - PowerShell.EXE
+        - pwsh.dll
+      - Image|endswith:
+        - \powershell_ise.exe
+        - \powershell.exe
+        - \pwsh.exe
+      selection_option:
+        CommandLine|contains:
+        - '-executionpolicy '
+        - ' -ep '
+        - ' -exec '
+      selection_level:
+        CommandLine|contains:
+        - Bypass
+        - Unrestricted
+      filter_main_powershell_core:
+        ParentImage:
+        - C:\Windows\SysWOW64\msiexec.exe
+        - C:\Windows\System32\msiexec.exe
+        CommandLine|contains:
+        - -NoProfile -ExecutionPolicy Bypass -File "C:\Program Files\PowerShell\7\
+        - -NoProfile -ExecutionPolicy Bypass -File "C:\Program Files (x86)\PowerShell\7\
+      filter_optional_avast:
+        ParentImage|contains:
+        - C:\Program Files\Avast Software\Avast\
+        - C:\Program Files (x86)\Avast Software\Avast\
+        - \instup.exe
+        CommandLine|contains:
+        - -ExecutionPolicy ByPass -File "C:\Program Files\Avast Software\Avast
+        - -ExecutionPolicy ByPass -File "C:\Program Files (x86)\Avast Software\Avast\
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_* and not 1 of filter_main_* and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_img:
+      - OriginalFileName:
+        - powershell_ise.exe
+        - PowerShell.EXE
+        - pwsh.dll
+      - Image|endswith:
+        - \powershell_ise.exe
+        - \powershell.exe
+        - \pwsh.exe
+      selection_option:
+        CommandLine|contains:
+        - '-executionpolicy '
+        - ' -ep '
+        - ' -exec '
+      selection_level:
+        CommandLine|contains:
+        - Bypass
+        - Unrestricted
+      filter_main_powershell_core:
+        ParentImage:
+        - C:\Windows\SysWOW64\msiexec.exe
+        - C:\Windows\System32\msiexec.exe
+        CommandLine|contains:
+        - -NoProfile -ExecutionPolicy Bypass -File "C:\Program Files\PowerShell\7\
+        - -NoProfile -ExecutionPolicy Bypass -File "C:\Program Files (x86)\PowerShell\7\
+      filter_optional_avast:
+        ParentImage|contains:
+        - C:\Program Files\Avast Software\Avast\
+        - C:\Program Files (x86)\Avast Software\Avast\
+        - \instup.exe
+        CommandLine|contains:
+        - -ExecutionPolicy ByPass -File "C:\Program Files\Avast Software\Avast
+        - -ExecutionPolicy ByPass -File "C:\Program Files (x86)\Avast Software\Avast\
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_* and not 1 of filter_main_* and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_img:
+      - OriginalFileName:
+        - powershell_ise.exe
+        - PowerShell.EXE
+        - pwsh.dll
+      - Image|endswith:
+        - \powershell_ise.exe
+        - \powershell.exe
+        - \pwsh.exe
+      selection_option:
+        CommandLine|contains:
+        - '-executionpolicy '
+        - ' -ep '
+        - ' -exec '
+      selection_level:
+        CommandLine|contains:
+        - Bypass
+        - Unrestricted
+      filter_main_powershell_core:
+        ParentImage:
+        - C:\Windows\SysWOW64\msiexec.exe
+        - C:\Windows\System32\msiexec.exe
+        CommandLine|contains:
+        - -NoProfile -ExecutionPolicy Bypass -File "C:\Program Files\PowerShell\7\
+        - -NoProfile -ExecutionPolicy Bypass -File "C:\Program Files (x86)\PowerShell\7\
+      filter_optional_avast:
+        ParentImage|contains:
+        - C:\Program Files\Avast Software\Avast\
+        - C:\Program Files (x86)\Avast Software\Avast\
+        - \instup.exe
+        CommandLine|contains:
+        - -ExecutionPolicy ByPass -File "C:\Program Files\Avast Software\Avast
+        - -ExecutionPolicy ByPass -File "C:\Program Files (x86)\Avast Software\Avast\
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_* and not 1 of filter_main_* and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts in a tight window reveals lateral movement or activity spanning multiple endpoints. If the same user ran PowerShell or other tooling on other hosts in the same window, the scope is larger than a single machine. This pivot is meaningful only when a real user account fired the alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_img:
+      - OriginalFileName:
+        - powershell_ise.exe
+        - PowerShell.EXE
+        - pwsh.dll
+      - Image|endswith:
+        - \powershell_ise.exe
+        - \powershell.exe
+        - \pwsh.exe
+      selection_option:
+        CommandLine|contains:
+        - '-executionpolicy '
+        - ' -ep '
+        - ' -exec '
+      selection_level:
+        CommandLine|contains:
+        - Bypass
+        - Unrestricted
+      filter_main_powershell_core:
+        ParentImage:
+        - C:\Windows\SysWOW64\msiexec.exe
+        - C:\Windows\System32\msiexec.exe
+        CommandLine|contains:
+        - -NoProfile -ExecutionPolicy Bypass -File "C:\Program Files\PowerShell\7\
+        - -NoProfile -ExecutionPolicy Bypass -File "C:\Program Files (x86)\PowerShell\7\
+      filter_optional_avast:
+        ParentImage|contains:
+        - C:\Program Files\Avast Software\Avast\
+        - C:\Program Files (x86)\Avast Software\Avast\
+        - \instup.exe
+        CommandLine|contains:
+        - -ExecutionPolicy ByPass -File "C:\Program Files\Avast Software\Avast
+        - -ExecutionPolicy ByPass -File "C:\Program Files (x86)\Avast Software\Avast\
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_* and not 1 of filter_main_* and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - host.name
+- question: Have other hosts set a permissive PowerShell policy this way in the past week, and does the distribution look like automation or one-off activity?
+  context: This mirrors the rule's pattern with no host scope, giving a fleet-wide count of where the policy-bypass invocation fired. Many hosts at once points to a pushed deployment or packaging routine; one host or a small unrelated set points to manual operator activity. Use the distribution to judge how unusual this single alert is.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_img:
+      - OriginalFileName:
+        - powershell_ise.exe
+        - PowerShell.EXE
+        - pwsh.dll
+      - Image|endswith:
+        - \powershell_ise.exe
+        - \powershell.exe
+        - \pwsh.exe
+      selection_option:
+        CommandLine|contains:
+        - '-executionpolicy '
+        - ' -ep '
+        - ' -exec '
+      selection_level:
+        CommandLine|contains:
+        - Bypass
+        - Unrestricted
+      filter_main_powershell_core:
+        ParentImage:
+        - C:\Windows\SysWOW64\msiexec.exe
+        - C:\Windows\System32\msiexec.exe
+        CommandLine|contains:
+        - -NoProfile -ExecutionPolicy Bypass -File "C:\Program Files\PowerShell\7\
+        - -NoProfile -ExecutionPolicy Bypass -File "C:\Program Files (x86)\PowerShell\7\
+      filter_optional_avast:
+        ParentImage|contains:
+        - C:\Program Files\Avast Software\Avast\
+        - C:\Program Files (x86)\Avast Software\Avast\
+        - \instup.exe
+        CommandLine|contains:
+        - -ExecutionPolicy ByPass -File "C:\Program Files\Avast Software\Avast
+        - -ExecutionPolicy ByPass -File "C:\Program Files (x86)\Avast Software\Avast\
+      condition: all of selection_* and not 1 of filter_main_* and not 1 of filter_optional_*
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — a macro-spawned shell, a download cradle, defense tampering, or reconnaissance — may reveal the stages that preceded the policy change and help reconstruct the timeline. Setting a permissive policy is frequently an early preparatory step, so what came just before and just after is what tells the story.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

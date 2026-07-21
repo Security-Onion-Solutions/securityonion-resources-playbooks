@@ -1,0 +1,351 @@
+name: Potential Data Stealing Via Chromium Headless Debugging
+id: 658a2bbd-9d05-4e83-9e7e-d89e352841f4
+description: |
+  Detects a Chromium-based browser launched with headless mode, a remote-debugging endpoint, and a custom user-data directory all set on the same command line. This combination lets a process attach to the browser's DevTools protocol and read every cookie and authenticated session for the loaded profile without needing the user's password or decrypting the cookie store, and the headless plus custom-profile flags keep the victim's normal browser window undisturbed. Legitimate use is rare and usually tied to developer testing or automated browser tooling; malicious use is post-exploitation session-cookie theft, browser remote control, or staging for lateral movement. Determine who launched the browser, whether the debug endpoint was exposed beyond localhost, and whether cookies or session tokens were extracted.
+type: detection
+detection_id: 3e8207c5-fcd2-4ea6-9418-15d45b4890e4
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the command line carry all three of --remote-debugging-, --user-data-dir, and --headless together?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule fires only when the same command line contains a remote-debugging flag, a custom user-data directory, and the headless flag together. Review the exact command line for the debugging port value, the user-data-dir path, and which browser binary was launched.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Is this user and host expected to launch a browser in headless remote-debugging mode?
+  context: Headless remote-debugging launches are normal for a small set of developers, browser-automation testers, and CI tooling, and almost never for general business users. Knowing whether this account and endpoint have a legitimate reason to drive a browser this way is often the fastest path to distinguishing a true positive from routine automation.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What browser profile and debugging endpoint did the command target, and what session data would that expose?
+  context: The credential store at risk here is the browser profile referenced by --user-data-dir. Decode the full command line to recover the user-data-dir path (which profile's cookies, tokens, and saved logins it points to), the remote-debugging port or address, and whether --remote-debugging-address was set to a non-loopback value. The DevTools protocol can return every cookie and authenticated session for the loaded profile in plaintext, so the targeted profile determines which accounts may be compromised.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What process spawned this browser launch, and is that parent chain expected?
+  context: The parent process reveals how the browser was started. A user double-clicking a shortcut produces explorer.exe; an automation framework or operator more often launches through a shell, script host, or scheduler. A command interpreter, script host, or unknown parent driving a headless debugging launch points away from normal interactive browsing.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: When this host has previously launched a browser with these debugging flags, what parents and users normally drive that activity, and does the current alert fit?
+  context: Even legitimate developer tooling can run headless debugging launches. The query mirrors the rule's selection scoped to this host, so the resulting parent and user distribution reflects how this specific firing pattern has historically run here. A new parent process, an unexpected user account, or an unusual command-line structure is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - --remote-debugging-
+        - --user-data-dir
+        - --headless
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Did any process on this host invoke the Windows APIs used to write into and plant a remote thread
+    inside another process around this time?
+  context: Browser session hijacking by directly opening a live browser process with write or inject rights
+    is not observable here — this environment has no cross-process handle telemetry, so a process_access
+    event into chrome.exe, msedge.exe, firefox.exe, or iexplore.exe cannot be produced. What is recorded is
+    behavioral API-call telemetry — WriteProcessMemory, QueueUserAPC, and SetWindowsHookEx are the primitives
+    used to write a payload into a target process and start a remote thread. This channel does not identify
+    the target process, so a hit here is correlating evidence to weigh against the headless-debugging launch
+    and its timing, not standalone proof the browser process was the target. Zero rows is a visibility gap,
+    not evidence injection did not occur.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        event.dataset: endpoint.events.api
+        process.Ext.api.name:
+          - WriteProcessMemory
+          - QueueUserAPC
+          - SetWindowsHookEx
+      condition: selection
+    fields:
+      - process.executable
+      - process.Ext.api.name
+      - Image
+- question: Was an unsigned or unexpected module loaded into a browser process on this host around the alert?
+  context: An adversary inheriting a browser session may load a module into the browser to drive the DevTools protocol or harvest tokens in-process. Modules loaded into chrome.exe, msedge.exe, firefox.exe, or iexplore.exe that are unsigned or signed by anyone other than the browser vendor or Microsoft are worth scrutiny. Review the loaded image path and its signer against the expected browser-vendor allowlist.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_browser:
+        Image|endswith:
+        - \chrome.exe
+        - \msedge.exe
+        - \firefox.exe
+        - \iexplore.exe
+      filter_signed:
+        Signed: 'true'
+      condition: selection_host and selection_browser and not filter_signed
+    fields:
+      - Image
+      - ImageLoaded
+      - Signature
+      - Signed
+- question: Did this host accept or forward a connection to the browser debugging port, and was that port exposed beyond loopback?
+  context: The DevTools debugging endpoint binds to localhost by default. To reach it remotely an operator either points --remote-debugging-address at a non-loopback address or forwards the port with a tool such as netsh portproxy. Inbound or forwarded connections to the debugging port, or any listener on a non-loopback address, indicate the session was opened up for an external client rather than used locally for testing.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_browser:
+        Image|endswith:
+        - \chrome.exe
+        - \msedge.exe
+        - \firefox.exe
+        - \iexplore.exe
+      condition: selection_host and selection_browser
+    fields:
+      - Image
+      - Initiated
+      - SourceIp
+      - DestinationIp
+      - DestinationPort
+- question: After the browser launch, was the remote-controlled session driven to internal corporate addresses or intranet hosts?
+  context: A hijacked browser session can be navigated by the attacker to reach intranet resources using the victim's authenticated cookies, turning the browser into a pivot. Connections from the browser to enterprise-internal ranges shortly after the launch suggest the session was used to reach internal applications rather than to read a single external page. Tune the internal ranges to this environment's CIDR blocks and DNS suffixes.
+  range: +1h
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+        - \chrome.exe
+        - \msedge.exe
+        - \firefox.exe
+      filter_loopback:
+        DestinationIp|startswith:
+        - '127.'
+      condition: selection and not filter_loopback
+    fields:
+      - DestinationIp
+      - DestinationPort
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - --remote-debugging-
+        - --user-data-dir
+        - --headless
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - --remote-debugging-
+        - --user-data-dir
+        - --headless
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or staging on multiple endpoints. If the same user triggered similar browser-debugging activity or other hands-on-keyboard actions on multiple hosts, the scope may be broader than the alerting endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - --remote-debugging-
+        - --user-data-dir
+        - --headless
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance, or process termination of a running browser to free its profile lock — may reveal the stages that preceded this event and help reconstruct the timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Which accounts and sites are reachable through the targeted browser profile, and do any carry elevated access?
+  context: The severity of this activity depends on what the stolen session grants. Cross-reference the profile's user with Active Directory group memberships and identify which corporate applications, mail, or admin consoles the account stays signed into. Session tokens for administrative or service accounts require escalation; a standard user's web sessions may only need credential resets and monitoring.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What profile data was reachable through the targeted user-data directory?
+  context: The command line's --user-data-dir argument names the browser profile whose cookies, saved logins, and session tokens become reachable over the debugging endpoint. A path pointing at the user's live profile exposes their active authenticated sessions; a freshly created or copied profile directory may indicate staging. Decode the user-data-dir value and note whether it points at an existing profile or an attacker-chosen location.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Were outbound remote-access connections (RDP, SMB, WinRM, SSH) initiated from this host after
+    this event?
+  context: Credential theft is typically followed by lateral movement. The query returns outbound connections
+    from this host to remote-access ports -- 3389 (RDP), 445 (SMB/PsExec), 5985/5986 (WinRM), 22 (SSH)
+    -- in the hours after the event; the originating Image and User show what drove each connection. Two
+    limits to keep in mind -- credentials exfiltrated and replayed from another machine will not appear
+    here (check security 4624 logons on suspected targets for this account and any accounts with sessions
+    on this host), and the query requires Sysmon network telemetry (EID 3); if that is not collected from
+    this host, treat zero rows as a visibility gap, not as evidence no movement occurred.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User

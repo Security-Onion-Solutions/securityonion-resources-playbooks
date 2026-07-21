@@ -1,0 +1,414 @@
+name: Griffon Malware Attack Pattern
+id: 1b0beaf6-d9cf-44f3-8a32-aa57b976bde0
+description: |
+  Detects a command line that combines all three of the following: a path under the local Temp
+  directory, the batch-mode JScript engine switches `//b /e:jscript`, and a `.txt` argument. This
+  is the execution pattern of the Griffon JScript implant, which stages its script body in a
+  text file under the user's Temp directory and runs it through the Windows script host with the
+  scripting engine forced to JScript and interactive dialogs suppressed. The pattern is rare in
+  legitimate use, since normal JScript automation runs from `.js` files in an application
+  directory rather than a `.txt` file in Temp. The investigation should confirm the command line,
+  recover and read the staged text file, identify what spawned the script host, and look for the
+  follow-on stages this implant loads in memory — obfuscated PowerShell downloaders, screenshot
+  capture, and logon persistence written to the registry.
+type: detection
+detection_id: bcc6f179-11cd-4111-a9a6-0fab68515cf7
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-17
+questions:
+- question: >-
+    Does the command line contain all three of a local Temp path, the `//b /e:jscript` switch
+    pair, and a `.txt` argument?
+  context: >-
+    The rule requires all three elements together, so confirm each one is present rather than
+    assuming a partial match. Note the exact Temp path and the `.txt` filename — that file is the
+    script body and is the primary artifact to recover.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Is this user and host expected to run script-host commands out of the Temp directory?
+  context: >-
+    Packaged JScript automation normally ships as `.js` files inside an application or deployment
+    directory and is launched by an installer, a scheduled task, or a management agent. A user
+    session executing a text file from Temp under a forced JScript engine is outside that profile
+    for most roles. Check whether the account belongs to someone who develops or supports script
+    automation on this host.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: >-
+    Which script host ran the file, what is the full Temp path of the `.txt` script body, and were
+    any arguments passed to it?
+  context: >-
+    The `//b` switch runs the script in batch mode so errors and dialogs are suppressed, and
+    `/e:jscript` forces the JScript engine regardless of the file extension — which is what lets a
+    `.txt` file execute as code. Read the whole command line to recover the script path and any
+    trailing arguments, which this implant family uses to pass a callback address or campaign
+    identifier into the script. The working directory shows where the script host was launched
+    from.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains|all:
+          - \local\temp\
+          - //b /e:jscript
+          - .txt
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - CurrentDirectory
+- question: >-
+    Is the `.txt` script body still on disk under Temp, and which process wrote it there?
+  context: >-
+    The script host reads the text file at launch, so the file is written by whatever delivered
+    it — commonly a macro-enabled document handled by an Office application, or an archive
+    extracted by the user. Identifying the writing process links the execution back to its
+    delivery vector, and recovering the file itself gives the actual JScript body for review. This
+    implant family also writes its script back to disk immediately before each run, so repeated
+    writes to the same path indicate the logon-persistence stage rather than a one-time drop.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains: \Temp\
+        TargetFilename|endswith: .txt
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - ProcessGuid
+- question: What process spawned this script host, and is that parent chain expected?
+  context: >-
+    A script host started by winword.exe, excel.exe, or another document handler points to a
+    macro-driven delivery. A parent of explorer.exe points to a user double-clicking a dropped
+    file, and a parent of taskeng.exe or svchost.exe points to a scheduled task. This implant
+    family is delivered by password-protected macro documents that also schedule tasks for
+    persistence, so the parent identity narrows which stage of the operation this alert
+    represents.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What child processes did the script host spawn after it started?
+  context: >-
+    This implant runs its modules in memory and reaches out through child processes for anything
+    it cannot do in JScript alone — a PowerShell downloader for follow-on shellcode, a screenshot
+    script, or a scheduling utility for persistence. Children of the alerting process are the
+    clearest evidence of which modules were actually delivered and executed.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: >-
+    Did a PowerShell process run on this host with the `-NoP -NonI -ExecutionPolicy Bypass`
+    argument set?
+  context: >-
+    The downloader module of this implant family launches PowerShell with no profile, no
+    interactive prompt, and the execution policy bypassed, then fetches and decrypts shellcode in
+    memory with a single-byte XOR key. That argument combination is a consistent trait across the
+    related tooling. If any results come back, read the full command line for encoded or
+    concatenated payloads and treat the host as having reached the second stage.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains|all:
+          - -nop
+          - -noni
+          - bypass
+      condition: selection
+    fields:
+      - CommandLine
+      - ParentImage
+- question: >-
+    Was a logon persistence entry written to a Run or RunOnce key on this host around the alert?
+  context: >-
+    The implant has no persistence of its own and installs it as a separate module, storing a copy
+    of the script in the registry and re-executing it at each user logon. A Run or RunOnce value
+    whose data references a script host, a Temp path, or an encoded blob is the persistence
+    artifact. Record the value name and data before any remediation, since they identify the
+    script that will run at next logon.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains:
+          - \CurrentVersion\Run\
+          - \CurrentVersion\RunOnce\
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- question: >-
+    Has this host previously run any script-host command with the `/e:jscript` engine switch?
+  context: >-
+    Forcing the scripting engine on the command line is uncommon outside of packaged software that
+    ships JScript with a non-standard extension. A count of zero or near zero over the past 90
+    days means this is a first-time behavior on the host, which removes the most likely benign
+    explanation. A steady count grouped under one account suggests an installed application and
+    shifts the question to whether this particular invocation fits that pattern.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains: /e:jscript
+      condition: selection
+    fields:
+      - User
+- question: >-
+    When this host has previously fired the rule's pattern, what parents and users normally drive
+    that activity, and does the current alert fit that pattern?
+  context: >-
+    The query mirrors the rule's selection structure scoped to this host, so the resulting
+    parent/user distribution reflects how this exact Temp-plus-JScript-plus-text-file pattern has
+    historically run here rather than generic script-host usage. A new parent process, an
+    unexpected account, or a first occurrence in the window is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - \local\temp\
+        - //b /e:jscript
+        - .txt
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- always_include: true
+  question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: >-
+    The query mirrors the rule's selection structure scoped to this user, giving their 90-day
+    history of this specific execution pattern aggregated by host. A user who has never produced
+    it is a different proposition from one who does so routinely on a developer workstation. Weigh
+    the count against what the account is expected to do.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - \local\temp\
+        - //b /e:jscript
+        - .txt
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: >-
+    Has this parent process historically driven the rule's pattern here or across the environment,
+    or is the parent new for this activity?
+  context: >-
+    When the alert fires under a service principal, the user identity does not attribute the
+    behavior and the launch mechanism is the meaningful pivot. The query mirrors the rule's
+    selection structure scoped to the alerting parent process, giving the 90-day history of that
+    parent driving this specific pattern. A parent that already accounts for a large volume of
+    prior events is vendor or operating-system automation; a new or rare parent is the deviation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - \local\temp\
+        - //b /e:jscript
+        - .txt
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the account's activity on every host in the alert window shows whether the same
+    identity drove activity on more than one endpoint. Delivery by phishing usually lands on a
+    single workstation first, so the same user producing script-host or administrative tooling
+    elsewhere in the same hour widens the scope of the investigation.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- always_include: true
+  question: >-
+    Did this same parent-driven pattern fire on other hosts in the same window, or is the activity
+    isolated to this host?
+  context: >-
+    Under a service principal, a user-scoped sweep returns agent telemetry from every host and
+    answers nothing. The query mirrors the rule's selection structure scoped to the alerting
+    parent process, fleet-wide, within the alert window. Several hosts in the same window points
+    to pushed or scheduled automation; a single host points to a host-local trigger such as a
+    document a user opened.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - \local\temp\
+        - //b /e:jscript
+        - .txt
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: >-
+    Have other hosts fired the rule's pattern in the past week, and does the cross-host
+    distribution look like consistent automation or one-off activity?
+  context: >-
+    The query mirrors the rule's selection structure with no host scope, so the result is a
+    fleet-wide count of this exact execution pattern. Many hosts firing it points to scripted
+    deployment or vendor automation. One host, or a small set that share a mail recipient list or
+    business unit, points to targeted delivery and calls for the other recipients to be checked.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - \local\temp\
+        - //b /e:jscript
+        - .txt
+      condition: selection
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Aggregating parent/child pairs on the host in the alert window collapses routine agent
+    telemetry into high-count rows and leaves novel pairs standing out at low counts. Look for
+    document handlers spawning script hosts, script hosts spawning scheduling or download
+    utilities, and reconnaissance binaries running in sequence — this implant's first action after
+    validation is to enumerate the host.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections reconstruct the stages that preceded this execution. Macro-driven delivery
+    often leaves a trail of document-handler child processes, archive extraction, or scheduled
+    task creation before the script host runs. If nothing preceded it, the alerting execution is
+    the earliest visible point and the delivery vector must be recovered from mail and file
+    evidence instead.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

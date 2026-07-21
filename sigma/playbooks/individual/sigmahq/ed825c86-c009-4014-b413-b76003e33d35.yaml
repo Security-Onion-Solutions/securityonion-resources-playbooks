@@ -1,0 +1,472 @@
+name: Windows Binary Executed From WSL
+id: 8ae4028c-cb34-4215-ba77-04775afe04ca
+description: |
+  Detects a Windows binary executing with a working directory inside the WSL filesystem. Both conditions must
+  hold together: the process image is a Windows drive-letter path (matching [a-zA-Z]:\) AND the process
+  working directory contains \\wsl.localhost. That combination is produced by WSL interop, in which a command
+  typed inside a Linux distribution launches a Windows executable, and the launched process inherits the
+  distro path as its current directory. Interop is a supported feature and developers use it routinely, but it
+  also serves as an indirect execution path (T1202): the Windows process tree records the WSL interop
+  components as the launcher rather than the shell or script that actually issued the command, which breaks
+  parent-child reasoning and can carry execution past controls keyed on expected parents. Only the Windows
+  side of this is observable here — process events for the launched binary and its WSL launcher lineage.
+  What ran inside the Linux distribution, and the Linux shell history that issued the command, produce no
+  Windows process telemetry and must be recovered from the distro itself. The investigation should establish
+  which binary ran and what it did, whether WSL is expected on this host and for this user, and whether the
+  launched binary went on to write files, open network connections, or spawn further processes.
+type: detection
+detection_id: ed825c86-c009-4014-b413-b76003e33d35
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-17
+questions:
+- question: Does the alerting event show a Windows drive-letter image running with a working directory under \\wsl.localhost?
+  context: >-
+    The rule fires only when both parts hold together — the image path is a Windows drive-letter path and the
+    current directory contains \\wsl.localhost. Confirm both against the event. The working directory is also
+    the most informative field on the alert: it carries the distribution name and the path inside the distro
+    the command was issued from, so a directory such as a Linux user's home or a build tree reads very
+    differently from a temporary or web-writable path. Note which binary ran, because that determines which
+    follow-on questions carry weight.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CurrentDirectory
+  answer_sources:
+  - alert
+  - process_creation
+- question: Is this user and host expected to run Windows binaries from inside a WSL distribution?
+  context: >-
+    WSL is an optional Windows component that has to be enabled and provisioned with a distribution, so its
+    presence on a host is itself a fact worth explaining. On a developer workstation or a build agent, interop
+    execution is ordinary daily work. On a server, a kiosk, or a general office endpoint with no development
+    role, a Linux distribution and interop execution have no routine purpose. The account on the event and the
+    host's function are the fastest way to separate expected engineering activity from execution nobody
+    initiated.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: What exactly did the Windows binary do? Decode its command-line arguments.
+  context: >-
+    The full command line is the operation. Decode any base64, escaped, or concatenated arguments and identify
+    the concrete action — a file copy, a download, an in-memory load, a discovery command. Interop commands
+    are typed in a Linux shell, so arguments frequently mix conventions: forward-slash paths, /mnt/c style
+    references to Windows drives, and Linux-quoted strings all survive into the Windows command line and are
+    normal for this launch path rather than obfuscation on their own. The query returns every execution of
+    this same binary from a WSL working directory on this host in the window, so a multi-step operation issued
+    as several commands appears together instead of one command at a time.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        CurrentDirectory|contains: \\\\wsl.localhost
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: What does the Windows-side parent lineage of this process look like, and is that launcher expected here?
+  context: >-
+    This is the field the technique distorts. A binary launched through interop is created by the WSL
+    interop components rather than by the shell or script that issued the command, so the recorded parent
+    attributes the execution to a WSL host process instead of to the real initiator. Read the parent to
+    confirm the launch really came through interop and to establish when the WSL session started and under
+    which account. The -7d window is intentional: a distro session can stay running for days before a command
+    is typed into it. The chain stops at the WSL boundary — the Linux-side process that issued the command
+    produces no Windows process event, so treat the recorded parent as the launch mechanism, not as the origin
+    of the command.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: What other Windows binaries were launched from inside the WSL filesystem on this host around the same time?
+  context: >-
+    An interop session is a working session, not a single command, and the useful unit of analysis is the
+    sequence rather than the one execution that fired. Listing every Windows process on this host carrying a
+    WSL working directory in a 10-30 minute band around the alert reconstructs what was actually driven from
+    the distro — and the working directories in the results show whether one distro path or several were
+    involved. A single utility invocation reads very differently from a run of discovery commands followed by
+    a download and an execution.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CurrentDirectory|contains: \\\\wsl.localhost
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - CurrentDirectory
+      - User
+  answer_sources:
+  - process_creation
+- question: What child processes did this binary spawn afterward?
+  context: >-
+    The processes a binary spawns show its actual effect. Children created here run on the Windows side with
+    the alerting process as their parent, and they normally inherit the same WSL working directory, so the
+    interop origin propagates down the tree. Unexpected children — a command interpreter, a script host, a
+    download utility — indicate the interop call was a launch step rather than the whole operation.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Did a command interpreter, script host, or download utility run on this host around the alert, and did it carry a WSL working directory?
+  context: >-
+    Indirect execution is a means, not an end; the utilities that follow it are what indicate abuse. This
+    query lists executions of powershell.exe, cmd.exe, rundll32.exe, regsvr32.exe, mshta.exe, msiexec.exe,
+    curl.exe, and bitsadmin.exe on the host in the surrounding hour, with the working directory projected so
+    that interop-launched instances stand out from ordinary ones. Any of these carrying a \\wsl.localhost
+    directory is a Windows execution step driven from the distro. These binaries also run constantly for
+    legitimate reasons, so read the working directory and parent columns rather than the count.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+          - '\cmd.exe'
+          - '\rundll32.exe'
+          - '\regsvr32.exe'
+          - '\mshta.exe'
+          - '\msiexec.exe'
+          - '\curl.exe'
+          - '\bitsadmin.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - CurrentDirectory
+  answer_sources:
+  - process_creation
+- question: Did the binary launched from WSL open outbound network connections, and to where?
+  context: >-
+    Indirect execution is frequently used to reach the network from a context that is not being watched for
+    it — a download of a next stage, a callback, or a tunnel. Connections made by the alerting process are
+    recorded on the Windows side with the process identity intact, so they can be attributed directly. Judge
+    the destinations against the egress the host's role explains: package registries and internal mirrors fit
+    a developer workstation with a distro on it, while a direct connection to an unfamiliar address on a
+    non-standard port does not. Traffic originating from processes inside the Linux distribution is not
+    covered by this query.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Initiated
+  answer_sources:
+  - network_connection
+- question: What files did the binary launched from WSL write to the Windows filesystem?
+  context: >-
+    Interop crosses a filesystem boundary in both directions, and moving a payload out of the distro onto the
+    Windows filesystem — or staging collected data into it — is a common reason to invoke a Windows binary
+    from a Linux shell. File writes attributed to the alerting process show what crossed. Weigh the
+    destinations: writes into a project or build directory fit development work, while writes into a
+    startup folder, a service directory, or a user-writable temporary path are worth resolving before closing
+    the alert. Files created by processes running inside the distro do not appear here.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - TargetFilename
+  answer_sources:
+  - file_event
+- question: Does this host normally run this binary at all?
+  context: >-
+    A binary that has never executed on this host before is a different proposition from one that runs every
+    day. This 90-day count covers all executions of the binary regardless of how it was launched, so it
+    answers whether the program itself is part of the host's normal software, separately from whether the
+    interop launch path is normal. A well-established count grouped under the same accounts points at
+    installed tooling; a count of one is a first execution.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+  answer_sources:
+  - process_creation
+- question: When this host has previously run Windows binaries from a WSL directory, what parents and users drive that activity, and does the current alert fit?
+  context: >-
+    The query mirrors the rule's selection scoped to this host, so the result is how interop execution has
+    actually behaved here over two weeks rather than generic use of any one binary. A host where a developer
+    works this way daily produces a steady distribution concentrated on one account and one launcher. A new
+    account appearing in that distribution, or a first-ever result on a host with no history of interop, is
+    the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|re: '[a-zA-Z]:\\'
+        CurrentDirectory|contains: \\\\wsl.localhost
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+  answer_sources:
+  - process_creation
+- question: Have other hosts run Windows binaries from a WSL directory in the past week, and does the cross-host distribution look like consistent automation or one-off activity?
+  context: >-
+    The query mirrors the rule's selection with no host scope, giving a fleet-wide count of interop execution
+    rather than of any single binary. A stable population of engineering workstations and build agents is what
+    a sanctioned WSL deployment looks like, and the alerting host either belongs to that population or does
+    not. Interop appearing on one host outside it, or spreading to hosts with no development function, is the
+    result that changes the assessment. This distribution is also the practical basis for deciding which hosts
+    are permitted to use interop at all.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|re: '[a-zA-Z]:\\'
+        CurrentDirectory|contains: \\\\wsl.localhost
+      condition: selection
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- question: Has this user previously run Windows binaries from a WSL directory, and does that history fit their role?
+  context: >-
+    The query mirrors the rule's selection scoped to the account on the event, so the result is that user's
+    90-day history of interop execution grouped by host — not generic use of the binary. A user with an
+    established history across their own workstation is working the way they always have; a first result, or
+    the same account producing this on hosts it does not normally touch, is the deviation. Interop runs under
+    the interactive user who owns the distro session, so this pivot is usually meaningful for this rule, but
+    if the event's account is SYSTEM or a service identity the count says nothing about any person and the
+    launch-mechanism history is the better pivot.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|re: '[a-zA-Z]:\\'
+        CurrentDirectory|contains: \\\\wsl.localhost
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+  always_include: true
+- question: Has this parent process historically driven interop execution on this host or across the environment, or is the launcher new for this activity?
+  context: >-
+    When the alert fires under a service principal, user identity does not attribute the behavior; the launch
+    mechanism does. The query mirrors the rule's selection scoped to the alerting parent process, giving the
+    90-day history of that launcher driving this pattern, grouped by host. A launcher already accounting for
+    thousands of prior events across many hosts is the sanctioned interop path doing what it always does. A
+    parent that has never driven this before, or that appears on a small unrelated set of hosts, is the
+    result worth resolving.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|re: '[a-zA-Z]:\\'
+        CurrentDirectory|contains: \\\\wsl.localhost
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  always_include: true
+- question: What else did this user account do across the environment around this time?
+  context: >-
+    Tracking the account's activity on every host in the alert window shows whether the same identity drove
+    activity beyond this one process, and whether it reached hosts it has no reason to touch. If the event's
+    user is SYSTEM, a service identity, or a computer account, this returns routine service and agent
+    telemetry from across the fleet — read it for unfamiliar binaries rather than for volume, and rely on the
+    parent-scoped fleet question for the meaningful answer.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+  always_include: true
+- question: Did the same launcher-driven interop pattern fire on other hosts in the same window, or is the activity isolated to this host?
+  context: >-
+    Under a service principal, a user pivot returns fleet-wide agent noise. The meaningful question is whether
+    the same launch mechanism fired elsewhere, so the query mirrors the rule's selection scoped to the
+    alerting parent process, fleet-wide, in the alert window. Several hosts producing this at once points at
+    scheduled or pushed automation that uses interop; a single host points at someone working at that
+    keyboard.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|re: '[a-zA-Z]:\\'
+        CurrentDirectory|contains: \\\\wsl.localhost
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  always_include: true
+- question: What other process activity occurred on this host around the time of the alert?
+  context: >-
+    Aggregating every process creation on the host by image and parent collapses repetitive service and agent
+    telemetry into high-count rows, leaving novel parent-child pairs visible at low counts. Scan for discovery
+    commands, credential-access tooling, and persistence mechanisms in the same window, and for activity that
+    has no connection to the distro session at all.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+  answer_sources:
+  - process_creation
+  - file_event
+  - registry_event
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host help place this event in a sequence — how the operator arrived, what
+    they did before reaching for an indirect execution path, and whether defenses were weakened first.
+    Indirect execution is a means of getting a command past reasoning that keys on expected parents, so it
+    tends to sit in the middle of a sequence rather than at its start.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+  answer_sources:
+  - alert

@@ -1,0 +1,318 @@
+name: Renamed PsExec Service Execution
+id: 12eacc08-e697-4998-998b-b143c27625aa
+description: |
+  Detects a process whose PE metadata OriginalFileName is psexesvc.exe but whose image on disk is NOT the
+  canonical C:\Windows\PSEXESVC.exe. PSEXESVC.exe is the service stub that PsExec uploads to a target host over
+  the admin share, registers as a Windows service, and runs to execute commands remotely; renaming that stub
+  (or the service it installs) is the canonical way operators evade name-based detection of PsExec lateral
+  movement. Legitimate administrators occasionally rename the service, so the alert is not conclusive on its own.
+  The investigation should confirm the metadata mismatch, identify which remote operator drove the execution,
+  determine what the stub launched on this host, and establish whether the same renamed stub appears on other
+  hosts in a coordinated rollout.
+type: detection
+detection_id: 51ae86a2-e2e1-4097-ad85-c46cb6851de4
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the process metadata show OriginalFileName psexesvc.exe running from a path other than C:\Windows\PSEXESVC.exe?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule fires when the PE
+    OriginalFileName embedded in the binary is psexesvc.exe AND the image on disk is not the canonical
+    C:\Windows\PSEXESVC.exe path. Read the Image path and OriginalFileName from the triggering event and confirm
+    both conditions hold - a genuine PsExec service stub that has been renamed or relocated, not the stock binary
+    in its default location.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - OriginalFileName
+- question: Is this user and host expected to be the target of remote service-based execution?
+  context: PsExec installs and runs a service on the target host to execute commands remotely, so a renamed PSEXESVC
+    stub indicates this host was on the receiving end of a remote-execution session. Knowing whether the host
+    function and the account driving the activity are consistent with sanctioned remote administration is often the
+    fastest path to separating a true positive from routine operations. A server managed by an admin team using a
+    renamed service is a different disposition than an ordinary workstation suddenly hosting a renamed PsExec stub.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What is the actual identity of this binary based on its metadata and hash?
+  context: The rule matches on the PE OriginalFileName psexesvc.exe regardless of the name on disk, so a renamed copy
+    still triggers. Compare the Image path on disk against the embedded OriginalFileName to confirm the mismatch,
+    and check the signing chain - the genuine stub is Sysinternals-signed (Microsoft). The file hash enables
+    reputation lookups to determine whether this is the stock PsExec service stub, a known-tampered build, or a
+    novel binary that only carries the psexesvc.exe metadata as a lure.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Hashes
+- question: How did this renamed PsExec service stub arrive on the host?
+  context: The PsExec service stub does not appear spontaneously - the PsExec client writes it to the admin share of
+    the target host before registering it as a service. Tracing the file-creation event for the stub by basename
+    over a long window reveals the delivery mechanism and which process wrote it. A write originating from a service
+    host process or a remote session points to a PsExec push from another host; a local copy operation points to a
+    manually staged tool.
+  range: -30d
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains|expand: '%file_name%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: What command did the renamed PsExec stub run on this host? Decode the full command line.
+  context: The PsExec service stub executes the command the remote operator requested, so its command line and the
+    children it spawns reveal what was actually run on this host. Decode any flags and the target command - a SYSTEM
+    context (-s), an interactive console, or a payload path. Because the stub itself takes few arguments, the
+    operational intent is usually visible in what it launched rather than in the stub's own command line.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What did the renamed stub do after execution, and is the same renamed stub present on other hosts?
+  context: The purpose of renaming the service stub is to evade name-based detection while it performs its remote-execution
+    function. Examining the child processes the stub launched reveals its objective - an interactive shell,
+    credential access, reconnaissance, or onward lateral movement. The same renamed stub appearing on multiple hosts
+    points to a deliberate PsExec rollout across the environment rather than an isolated execution.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: What process spawned the renamed PsExec stub and is that parent chain expected?
+  context: The parent process reveals how the stub was invoked. A PsExec service stub is normally launched by the
+    service control manager (services.exe) after the PsExec client registered it. A parent other than services.exe -
+    a script host, an interactive shell, or another tool - points to a different invocation path and may indicate the
+    stub was staged and run manually rather than pushed through the standard PsExec service mechanism.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What child processes did the renamed stub spawn afterward?
+  context: The service stub exists to launch the command the remote operator requested, so its children are the actual
+    payload of the remote-execution session. Examining processes spawned by the stub reveals whether it opened an
+    interactive cmd.exe or powershell.exe shell, ran a credential-access or reconnaissance tool, or executed a dropped
+    binary. The children, not the stub itself, carry the operational intent.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        OriginalFileName: psexesvc.exe
+      filter:
+        Image: C:\Windows\PSEXESVC.exe
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        OriginalFileName: psexesvc.exe
+      filter:
+        Image: C:\Windows\PSEXESVC.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this account do across the network around this time?
+  context: Tracking the account's activity across all hosts reveals whether this is part of broader lateral movement.
+    PsExec is commonly used to run the same operation against many hosts in sequence, so the same account triggering
+    similar activity on multiple endpoints in the alert window widens the likely scope of the operation. Concentrated
+    same-account activity across several hosts reads very differently from a single isolated execution.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        OriginalFileName: psexesvc.exe
+      filter:
+        Image: C:\Windows\PSEXESVC.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - host.name
+- question: When this host has previously fired the rule's renamed-PSEXESVC pattern, what parents and users normally drive it, and does the current alert fit?
+  context: Even sanctioned remote administration can match this rule. The query mirrors the rule's selection structure
+    scoped to this host, so the resulting parent and user distribution reflects how the rule's specific firing
+    pattern (not generic process activity) has historically run here. Deviations - a new parent process, an
+    unexpected account, an unfamiliar stub path - are the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        OriginalFileName: psexesvc.exe
+      filter:
+        Image: C:\Windows\PSEXESVC.exe
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Have other hosts fired the rule's renamed-PSEXESVC pattern in the past week, and does the cross-host distribution look like consistent automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of
+    the renamed-PSEXESVC firing pattern rather than generic process activity. Many hosts firing the same pattern in a
+    short window points to a scripted PsExec deployment - a patch run, an inventory sweep, or an operator moving
+    laterally across the estate; a single host or a small unrelated set points to isolated activity. Use the host
+    distribution to calibrate scope and severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        OriginalFileName: psexesvc.exe
+      filter:
+        Image: C:\Windows\PSEXESVC.exe
+      condition: selection and not filter
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host - credential access, reconnaissance,
+    defense tampering, or an initial-access exploit - may reveal the stages that preceded this remote execution and
+    help reconstruct the timeline. A renamed PsExec service appearing after a credential-access or reconnaissance
+    alert reads very differently from one with no prior activity on the host.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

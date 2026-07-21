@@ -1,0 +1,397 @@
+name: Suspicious Desktopimgdownldr Command
+id: c123501b-fd54-4f39-a451-32e7d24a2ac1
+description: |
+  Detects abuse of the Microsoft-signed desktopimgdownldr.exe LOLBin, which can download arbitrary remote files via the BITS COM object as a stealthy alternative to certutil. The rule fires when a command line uses /lockscreenurl: to fetch a non-image file (the /lockscreenurl: flag is present and the URL does not end in .jpg, .jpeg, or .png), OR when a command line both runs reg delete and references the \PersonalizationCSP key (the admin cleanup variant that removes the registry artifact after execution). Legitimate use sets the lockscreen wallpaper as part of the Personalization CSP; malicious use redirects %SYSTEMROOT% to a writable directory to download a payload as a standard user. The actual transfer is performed by svchost.exe -k netsvcs -s BITS rather than desktopimgdownldr.exe itself, so confirming the download requires correlating the invocation with BITS network traffic and file creation. Determine whether the download retrieved a non-image payload, where it landed, and what ran next.
+type: detection
+detection_id: bb58aa4a-b80b-415a-a2c0-2f65a4c81009
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- question: Does the command line either use the /lockscreenurl flag to fetch a non-image file, or run reg delete against the \PersonalizationCSP key?
+  context: >-
+    Confirm the alert is a true positive before investing investigation time. The rule fires on one of two branches: a /lockscreenurl:
+    download whose URL does not end in .jpg/.jpeg/.png, or a reg delete that references \PersonalizationCSP (the cleanup variant
+    that removes the registry artifact after execution). Note which branch fired — the download branch points to payload retrieval
+    and the directory/network questions carry the weight, while the reg-delete branch points to post-download cleanup and the
+    artifact-removal context matters most.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Is this user and host expected to download files with command-line tools or modify the PersonalizationCSP registry key?
+  context: >-
+    Legitimate use of desktopimgdownldr.exe sets the lockscreen wallpaper through the Personalization CSP, typically via management
+    tooling on managed endpoints. A user or host with no business reason to fetch remote files from the command line or to delete
+    the PersonalizationCSP key is the faster path to distinguishing a true positive from routine administration.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Is the downloaded file still on disk for analysis?
+  context: >-
+    The default drop path for this LOLBin is under a \Personalization\LockScreenImage\ directory, but the standard-user variant
+    redirects %SYSTEMROOT% so the file can land under any writable volume (for example C:\Windows\Temp\Personalization\LockScreenImage\).
+    If the file still exists, it enables hash lookup, sandbox submission, or content review.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What exactly did this command do? Decode the /lockscreenurl URL, the destination path, and any %SYSTEMROOT% redirection or registry cleanup.
+  context: >-
+    The full command line reveals the operation. Extract the URL passed to /lockscreenurl: and check whether it ends in an image
+    extension or fetches a different file type. Look for a redirected %SYSTEMROOT% (set "SYSTEMROOT=...") that points the drop path
+    to a writable directory, for any /eventName: value, and for a trailing reg delete of \PersonalizationCSP that removes the
+    registry artifact. The query returns all matching invocations on this host in the surrounding window because the standard-user
+    technique chains a SYSTEMROOT set, the downloader call, and an optional registry delete across sequential commands.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains:
+          - ' /lockscreenurl:'
+          - \PersonalizationCSP
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What process spawned this command and is that parent chain expected?
+  context: >-
+    The parent process reveals how the download was invoked. The standard-user bypass typically wraps the call in cmd.exe with a
+    preceding SYSTEMROOT environment change, so a cmd.exe or script-host parent (wscript.exe, powershell.exe, mshta.exe) is worth
+    scrutiny, whereas a management or imaging tool parent fits the legitimate lockscreen-provisioning path.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: When this host has previously fired the rule's pattern, what parents and users normally drive that activity, and does the current alert fit that pattern?
+  context: >-
+    Even a signed binary can be abused. This query mirrors the rule's selection structure scoped to this host, so the resulting
+    parent/user distribution reflects how the rule's specific firing pattern — not generic desktopimgdownldr usage — has historically
+    run here. A new parent process, an unexpected user account, or an unusual command-line structure is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection1:
+        CommandLine|contains: ' /lockscreenurl:'
+      selection1_filter:
+        CommandLine|contains:
+        - .jpg
+        - .jpeg
+        - .png
+      selection_reg:
+        CommandLine|contains|all:
+        - reg delete
+        - \PersonalizationCSP
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (( selection1 and not selection1_filter ) or selection_reg) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Was the download successful? Check for file creation at the destination path.
+  context: >-
+    A /lockscreenurl: command does not guarantee the file was retrieved — network errors, blocked URLs, or security controls may
+    have stopped the transfer. Because the actual fetch is performed by svchost.exe (BITS), confirm the outcome by looking for file
+    creation under the LockScreenImage destination, which may be redirected to a writable volume rather than the default
+    C:\Windows\Personalization path.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Did a BITS-hosted svchost network connection to the download URL's host occur around the same time?
+  context: >-
+    desktopimgdownldr.exe does not perform the transfer itself — it hands the fetch to the BITS COM object, so the outbound
+    connection and file write are made by svchost.exe -k netsvcs -s BITS. Process- or netflow-based detection that watches only the
+    downloader's own activity will miss the transfer. Correlate the invocation with svchost BITS network traffic to the host parsed
+    from the /lockscreenurl: URL to confirm the download actually left the network. Tune by destination address class — an external
+    destination is more concerning than an internal mirror.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: \svchost.exe
+      condition: selection
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- question: If the file desktopimgdownldr downloaded was executed, what is its hash and reputation?
+  context: >-
+    The hash for a reputation lookup is recorded when the payload runs, not when desktopimgdownldr writes it to disk —
+    file-creation events carry no hash. This LOLBin pulls arbitrary file types behind an image-download facade, so a
+    non-image payload that then runs appears here as a sibling or child of the alerting process, with its hash. If it
+    was run later by an unrelated process, retrieve it from disk and hash it manually.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_children:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      selection_siblings:
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - Image
+      - Hashes
+- question: What other file activity occurred in the download target directory?
+  context: >-
+    Attackers often stage multiple files in the same directory, or the downloaded file triggers further writes (extraction,
+    decompression, additional downloads). Examining directory-level file activity around the LockScreenImage drop path reveals the
+    broader scope of the delivery operation.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection1:
+        CommandLine|contains: ' /lockscreenurl:'
+      selection1_filter:
+        CommandLine|contains:
+        - .jpg
+        - .jpeg
+        - .png
+      selection_reg:
+        CommandLine|contains|all:
+        - reg delete
+        - \PersonalizationCSP
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (( selection1 and not selection1_filter ) or selection_reg) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection1:
+        CommandLine|contains: ' /lockscreenurl:'
+      selection1_filter:
+        CommandLine|contains:
+        - .jpg
+        - .jpeg
+        - .png
+      selection_reg:
+        CommandLine|contains|all:
+        - reg delete
+        - \PersonalizationCSP
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (( selection1 and not selection1_filter ) or selection_reg) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the user's activity across all hosts reveals lateral movement or activity on multiple endpoints. If the same user
+    triggered similar download or registry-cleanup activity on more than one host, the scope of the operation may be larger than a
+    single endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection1:
+        CommandLine|contains: ' /lockscreenurl:'
+      selection1_filter:
+        CommandLine|contains:
+        - .jpg
+        - .jpeg
+        - .png
+      selection_reg:
+        CommandLine|contains|all:
+        - reg delete
+        - \PersonalizationCSP
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (( selection1 and not selection1_filter ) or selection_reg) and _pb_scope
+    fields:
+    - host.name
+- question: Have other hosts fired the rule's pattern in the past week, and does the cross-host distribution look like consistent automation or one-off activity?
+  context: >-
+    This query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of the rule's firing
+    pattern rather than generic usage of the binary. Many hosts firing the same pattern points to scripted deployment or
+    provisioning automation; one host or a small unrelated set points to manual operator activity. Use the host distribution to
+    calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection1:
+        CommandLine|contains: ' /lockscreenurl:'
+      selection1_filter:
+        CommandLine|contains:
+        - .jpg
+        - .jpeg
+        - .png
+      selection_reg:
+        CommandLine|contains|all:
+        - reg delete
+        - \PersonalizationCSP
+      condition: ( selection1 and not selection1_filter ) or selection_reg
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate context: what led to this event,
+    what happened after, and whether it is part of a larger sequence. Look for reconnaissance, privilege escalation, or persistence
+    mechanisms surrounding the download.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance, credential access —
+    may reveal the attack stages that preceded the download and help reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

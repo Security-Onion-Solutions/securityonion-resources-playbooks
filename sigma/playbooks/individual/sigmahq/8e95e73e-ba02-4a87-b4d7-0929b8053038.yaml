@@ -1,0 +1,363 @@
+name: Suspicious ArcSOC.exe Child Process
+id: a217cf42-49c9-459c-a072-82c1df902e8e
+description: |
+  Detects script interpreters and command-line tools spawned as child processes of ArcSOC.exe. ArcSOC.exe hosts ArcGIS Server REST service instances; its only expected children are a console host and a single cmd.exe for console services, plus a javaw.exe running from the ArcGIS install path. A child such as cmd.exe, powershell.exe, pwsh.exe, cscript.exe, wscript.exe, mshta.exe, regsvr32.exe, rundll32.exe, or wmic.exe indicates that crafted requests reached the service endpoint and drove code execution from the server process, consistent with a malicious Server Object Extension acting as a web shell. The rule fires when ArcSOC.exe is the parent AND the child is one of these interpreters, excluding a benign `cmd.exe /c "ver"` console probe. Investigation should determine what the child command did, what request drove it, and whether the same pattern reached other ArcGIS Server hosts.
+type: detection
+detection_id: 8e95e73e-ba02-4a87-b4d7-0929b8053038
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- question: Is the alerting process a script interpreter or command-line tool spawned directly by ArcSOC.exe?
+  context: Confirm the alert is a true positive by checking that the parent is ArcSOC.exe and the child Image is one of the
+    flagged interpreters (cmd.exe, powershell.exe, pwsh.exe, cscript.exe, wscript.exe, mshta.exe, regsvr32.exe, rundll32.exe,
+    or wmic.exe). The rule excludes a benign `cmd.exe /c "ver"` console probe, so verify the child is not that exact command.
+    ArcSOC.exe normally spawns only conhost.exe, one cmd.exe for console services, and a javaw.exe from the install path.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+- question: Is this ArcGIS Server host expected to spawn interpreters from ArcSOC.exe, and who owns the process?
+  context: ArcSOC.exe runs under the ArcGIS Server service account, not an interactive user. Legitimate geoprocessing and
+    publishing workflows do not require ArcSOC.exe to launch general-purpose interpreters. Knowing the host's role (production
+    map service vs. a development or staging box where an admin may run scripts) and the owning account is often the fastest
+    way to separate routine operation from server-side code execution.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What started the ArcSOC.exe parent, and is this interpreter a child it should ever spawn?
+  context: ArcSOC.exe is launched by the ArcGIS Server runtime to host a single service instance and is expected to spawn only
+    a console host, a console cmd.exe, and a javaw.exe from the install path. Tracing the parent's own origin and command line
+    confirms it is a genuine service-hosted ArcSOC.exe rather than a renamed or relocated binary, and establishes the chain
+    by which an inbound service request reached process execution.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What exactly did the spawned interpreter do? Decode its full command line and working directory.
+  context: The child command line reveals the operational intent driven through the server. Decode any flags, encoded content,
+    file paths, or an HTTP/HTTPS URL. Watch for directory creation under system paths, file writes, or staging of additional
+    binaries. The working directory indicates where the operator was operating from; a workspace created under a system
+    directory is a known web-shell staging pattern.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: If the child is PowerShell, was the command encoded or obfuscated, and what does it decode to?
+  context: When the spawned interpreter is powershell.exe or pwsh.exe, server-side operators frequently pass base64 via
+    -EncodedCommand (-enc) or use concatenation and backtick escaping to hide intent. Decoding reveals the real payload --
+    download cradles fetching from an HTTP/HTTPS URL, reverse shells, or in-memory loading of a .NET assembly. If the child
+    is not PowerShell, this question does not apply.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What service request reached ArcSOC.exe immediately before this child spawned?
+  context: Server-side exploitation of an ArcGIS Server begins with a crafted request to a public-facing service endpoint,
+    typically proxied through a web gateway to the internal server. Identifying the originating request, the operation name,
+    and the source address enables blocking at the perimeter and reveals whether a malicious Server Object Extension is
+    acting as a web shell. Correlate the alert time against web gateway and ArcGIS Server request logs; this query returns
+    the parent context to anchor that pivot.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+- question: Did this host make outbound network connections shortly after the interpreter ran?
+  context: After a client- or server-side exploit spawns an interpreter, a download cradle or command-and-control channel
+    commonly follows within minutes -- an outbound HTTPS connection to fetch a payload or establish a persistent tunnel.
+    Connections to an external address that are not part of normal ArcGIS Server operation, especially soon after the child
+    process, point to active operator control. Exclude known update and gateway endpoints when reviewing.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+      filter_local:
+        DestinationIp|cidr:
+          - '10.0.0.0/8'
+          - '172.16.0.0/12'
+          - '192.168.0.0/16'
+          - '127.0.0.0/8'
+      condition: selection and not filter_local
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+- question: Did the interpreter or its parent write or stage files in user-writable or system workspace paths?
+  context: Exploitation chains commonly drop or modify a file after gaining execution -- a script, a renamed legitimate tool,
+    or a workspace directory created under a system path. File creation under writable locations such as %TEMP%, %APPDATA%,
+    a public profile, or a newly created directory under a system folder, in the same window as the interpreter, indicates
+    payload staging rather than routine service activity.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains:
+          - '\Temp\'
+          - '\AppData\'
+          - '\Users\Public\'
+          - '\Windows\System32\'
+          - '\ProgramData\'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: What other child processes did this ArcSOC.exe instance spawn?
+  context: A compromised server process is often used to run several tools in sequence -- reconnaissance, credential access,
+    persistence setup. Listing every child of this ArcSOC.exe instance reveals the full scope of activity driven through the
+    service and shows whether the alerting interpreter was a single action or one step in a chain.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Has ArcSOC.exe spawned this interpreter on this host before?
+  context: ArcSOC.exe spawning a general-purpose interpreter should be rare to nonexistent on a healthy ArcGIS Server. Zero
+    or very low historical counts for this specific parent-child pairing indicate a novel spawning relationship and raise the
+    likelihood of server-side code execution; a steady historical baseline points to an unusual but established operational
+    workflow worth confirming with the server administrators.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \ArcSOC.exe
+        Image|endswith:
+        - \cmd.exe
+        - \cscript.exe
+        - \mshta.exe
+        - \powershell.exe
+        - \pwsh.exe
+        - \regsvr32.exe
+        - \rundll32.exe
+        - \wmic.exe
+        - \wscript.exe
+      filter_main_cmd:
+        Image|endswith: \cmd.exe
+        CommandLine: cmd.exe /c "ver"
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \ArcSOC.exe
+        Image|endswith:
+        - \cmd.exe
+        - \cscript.exe
+        - \mshta.exe
+        - \powershell.exe
+        - \pwsh.exe
+        - \regsvr32.exe
+        - \rundll32.exe
+        - \wmic.exe
+        - \wscript.exe
+      filter_main_cmd:
+        Image|endswith: \cmd.exe
+        CommandLine: cmd.exe /c "ver"
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did the owning account do across the network around this time?
+  context: Tracking the owning account's activity across all hosts in the alert window reveals lateral movement or activity
+    spanning multiple endpoints. If the same account drove similar activity elsewhere, the scope is larger than one server.
+    Under a service account this view returns broad agent-telemetry noise -- pair it with the launch-mechanism cross-host view.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \ArcSOC.exe
+        Image|endswith:
+        - \cmd.exe
+        - \cscript.exe
+        - \mshta.exe
+        - \powershell.exe
+        - \pwsh.exe
+        - \regsvr32.exe
+        - \rundll32.exe
+        - \wmic.exe
+        - \wscript.exe
+      filter_main_cmd:
+        Image|endswith: \cmd.exe
+        CommandLine: cmd.exe /c "ver"
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+- question: Did this same detection fire on other ArcGIS Server hosts recently?
+  context: Server exploitation campaigns rarely target a single host. Correlating this same detection across the environment
+    reveals how many ArcGIS Server systems show the suspicious ArcSOC.exe child pattern, identifying additional compromised
+    servers that need investigation and indicating campaign breadth.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        rule.uuid|expand: '%rule_uuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same ArcGIS Server host -- reconnaissance, defense
+    tampering, credential access -- may reveal the stages that preceded this execution and help reconstruct the timeline of
+    how the server was reached and what followed the initial code execution.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

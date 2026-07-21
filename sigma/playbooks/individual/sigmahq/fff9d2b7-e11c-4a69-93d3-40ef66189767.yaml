@@ -1,0 +1,444 @@
+name: Suspicious Copy From or To System Directory
+id: 0b2b87e3-79ac-43d0-91ff-8dd36cd248b6
+description: |
+  Detects a copy operation that reads a program out of a Windows system directory (System32, SysWOW64, or WinSxS) using cmd.exe, PowerShell copy cmdlets, robocopy, or xcopy. The rule fires when a copy target referencing one of those system paths appears AND the copy is driven by either cmd.exe with a copy verb, PowerShell with copy-item/copy/cpi/cp, OR robocopy/xcopy (by image name or OriginalFileName) -- with a known Avira maintenance pattern excluded. Relocating and renaming a signed system binary (for example moving certutil.exe or desktopimgdownldr.exe to a new path under a new name) is a common way to defeat detections that key on a tool's canonical name or path, so the investigation should determine whether the copy was routine administration or an attempt to stage a renamed living-off-the-land binary for later execution.
+type: detection
+detection_id: fff9d2b7-e11c-4a69-93d3-40ef66189767
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- question: Does the command line copy a binary out of a Windows system directory using one of the copy mechanisms this rule detects?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule fires when a copy target points at C:\Windows\System32, SysWOW64, or WinSxS AND the copy is driven by EITHER cmd.exe with a copy verb, OR PowerShell with copy-item/copy/cpi/cp, OR robocopy/xcopy (matched by image name or OriginalFileName). Note which branch fired -- a PowerShell cmdlet, a cmd copy, or a robocopy/xcopy invocation -- because the downstream encoding and script-block questions only carry weight on the PowerShell branch, while the OriginalFileName questions matter most when robocopy/xcopy is matched by metadata rather than name.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to copy binaries out of system directories?
+  context: Legitimate administrative activity, deployment scripts, and backup tooling can copy files from system directories. Knowing whether the user role and host function are consistent with this kind of operation is often the fastest path to distinguishing routine administration from an attempt to stage a renamed system binary.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What is the true identity of the alerting process, and does its OriginalFileName match the source binary being copied out of the system directory?
+  context: This rule fires on the copy operation itself, so the alerting Image is the copy tool (cmd.exe, powershell.exe, robocopy.exe, or xcopy.exe). Compare Image against OriginalFileName to confirm the copy tool is itself genuine, then read the command line for the source binary (a signed tool under System32/SysWOW64/WinSxS) and the destination. The masquerading signal is the destination -- a system binary being relocated under a new name or into a user-writable directory (Temp, AppData, Downloads, ProgramData) defeats name- and path-based detection. The destination name and hash are examined by the file-content and hash questions; record the destination here so those questions can target it.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Hashes
+- question: Decode the full copy command -- what source binary is being read, what destination name and path is it written to, and are recursive or overwrite flags set?
+  context: The full command line reveals which system binary is being relocated and under what new name. Decode the source argument (the System32/SysWOW64/WinSxS path), the destination, and any flags (/Y overwrite, /s recursive, robocopy mirror switches, PowerShell -Force). cmd.exe is far too common for image-only scoping, so this query is narrowed to copy-verb command lines on the host within the window rather than every cmd.exe execution.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_copy:
+        CommandLine|contains:
+          - 'copy '
+          - 'copy-item'
+          - 'cpi '
+          - ' cp '
+      condition: selection_host and selection_copy
+    fields:
+      - Image
+      - CommandLine
+      - CurrentDirectory
+- question: Was the command encoded or obfuscated? What does it decode to?
+  context: On the PowerShell branch (copy-item/copy/cpi/cp), the copy can be wrapped in -EncodedCommand (-enc), backtick escaping, string concatenation, or variable substitution to hide which binary is being relocated. Base64-encoded commands are the most common form. Decode the payload to confirm whether a benign-looking copy actually stages a system binary under a new name or chains into a download cradle or in-memory execution. On the cmd or robocopy/xcopy branch the command is already plain text and this question is informational.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What is the content of the copied destination file -- is it the unmodified system binary, or has it been altered, packed, or paired with a side-load DLL?
+  context: Read and analyze the actual content of the file written by the copy operation. For a relocated system binary, confirm whether it is a byte-identical copy of the source tool or has been modified, and check whether companion files (a side-load DLL, a config, an encoded payload) were dropped into the same directory. This content analysis is distinct from a hash/reputation lookup -- it answers what is in the file and its neighbors, not whether the hash is already known.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Where was the system binary copied to, and is it a faithful copy or a swapped binary?
+  context: The copy moves a binary out of a Windows system directory to a new name and path to dodge location-based detection, and a file-creation event records no hash. This locates the destination the copy wrote. Because the source is a signed Windows binary, a faithful copy should hash identically to the original -- compute the destination file's hash and compare it to the genuine system binary; a match under a new name and path confirms a rename-to-evade rather than a modification, while a mismatch means the binary was swapped or trojanized (see the binary-identity question). The evasion itself is this binary later running from its new path instead of a system directory -- when it executes, its hash is recorded as a process, so check process history for the binary running outside System32.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: When was the destination file first created on this host, and how long before any execution did the copy occur?
+  context: Tracing file-creation events for the destination establishes the time relationship between staging (the copy) and use (later execution of the renamed binary). A copy immediately followed by execution of the new path is a tight operator workflow; a copy that sits unused for days may be staging for later. The Image field on the file-creation event names the process that wrote the file -- confirm it is the alerting copy tool and not a separate dropper or installer.
+  range: -30d
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains|expand: '%file_name%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: Is the copied destination file still on disk for analysis?
+  context: The copy operation references a destination path. Checking whether that file still exists enables deeper analysis -- hash lookups, sandbox submission, or content review. If it was already deleted or moved, the file-creation and copy events may be the only surviving evidence of what was staged.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: After the copy, did the renamed binary execute, and what did it do?
+  context: The purpose of relocating and renaming a system binary is to run it later under an identity that evades name- and path-based detection. Examine processes launched on this host shortly after the copy -- child processes, command-line arguments, and follow-on activity reveal whether the staged binary was executed and to what end (download, decode, side-load, recon). Activity launched by the alerting copy tool itself also surfaces here.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Did PowerShell script block logging capture the full script content?
+  context: Script block logging records the deobfuscated script content PowerShell actually executes, even when the command line is encoded or obfuscated. On the PowerShell copy branch this provides ground truth about which binary was relocated and whether the copy was part of a larger script. If PowerShell operational logs are not ingested in this environment, treat zero results as a visibility gap rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Were PowerShell security controls bypassed or weakened before this copy ran?
+  context: Operators often disable or bypass PowerShell security controls before staging a payload. Common techniques include AMSI bypass (patching amsi.dll in memory), execution policy changes (Set-ExecutionPolicy or -ep bypass), constrained language mode escape, and downgrade to PowerShell v2 (which lacks logging). Finding these precursor events on the host strengthens the case that the copy is part of malicious staging rather than routine administration.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: What process spawned this copy tool, and is that parent chain expected?
+  context: The parent process reveals how the copy was invoked. A copy launched by explorer.exe or a known management agent is consistent with interactive or scripted administration; a copy launched by mshta.exe, wscript.exe, an Office application, or a script interpreter points to macro-driven or post-exploitation staging. Walk up the chain to see what spawned the parent and what else it launched.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: When this host has previously fired this copy-from-system-directory pattern, what parents and users normally drive it, and does the current alert fit that pattern?
+  context: Even routine tooling can copy from system directories. The query mirrors the rule's selection structure scoped to this host, so the resulting parent and user distribution reflects how this specific firing pattern has historically run here -- not generic copy usage. A new parent process, an unexpected user account, or an unusual command-line structure relative to that history is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img_cmd:
+        Image|endswith: \cmd.exe
+        CommandLine|contains: 'copy '
+      selection_img_pwsh:
+        Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        CommandLine|contains:
+        - copy-item
+        - ' copy '
+        - 'cpi '
+        - ' cp '
+      selection_img_other:
+      - Image|endswith:
+        - \robocopy.exe
+        - \xcopy.exe
+      - OriginalFileName:
+        - robocopy.exe
+        - XCOPY.EXE
+      selection_target:
+        CommandLine|re|i: \s['"]?C:\\Windows\\(?:System32|SysWOW64|WinSxS)
+      filter_optional_avira:
+        Image|endswith: \cmd.exe
+        CommandLine|contains|all:
+        - /c copy
+        - \Temp\
+        - \avira_system_speedup.exe
+        CommandLine|contains:
+        - C:\Program Files\Avira\
+        - C:\Program Files (x86)\Avira\
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (1 of selection_img_* and selection_target and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img_cmd:
+        Image|endswith: \cmd.exe
+        CommandLine|contains: 'copy '
+      selection_img_pwsh:
+        Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        CommandLine|contains:
+        - copy-item
+        - ' copy '
+        - 'cpi '
+        - ' cp '
+      selection_img_other:
+      - Image|endswith:
+        - \robocopy.exe
+        - \xcopy.exe
+      - OriginalFileName:
+        - robocopy.exe
+        - XCOPY.EXE
+      selection_target:
+        CommandLine|re|i: \s['"]?C:\\Windows\\(?:System32|SysWOW64|WinSxS)
+      filter_optional_avira:
+        Image|endswith: \cmd.exe
+        CommandLine|contains|all:
+        - /c copy
+        - \Temp\
+        - \avira_system_speedup.exe
+        CommandLine|contains:
+        - C:\Program Files\Avira\
+        - C:\Program Files (x86)\Avira\
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (1 of selection_img_* and selection_target and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img_cmd:
+        Image|endswith: \cmd.exe
+        CommandLine|contains: 'copy '
+      selection_img_pwsh:
+        Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        CommandLine|contains:
+        - copy-item
+        - ' copy '
+        - 'cpi '
+        - ' cp '
+      selection_img_other:
+      - Image|endswith:
+        - \robocopy.exe
+        - \xcopy.exe
+      - OriginalFileName:
+        - robocopy.exe
+        - XCOPY.EXE
+      selection_target:
+        CommandLine|re|i: \s['"]?C:\\Windows\\(?:System32|SysWOW64|WinSxS)
+      filter_optional_avira:
+        Image|endswith: \cmd.exe
+        CommandLine|contains|all:
+        - /c copy
+        - \Temp\
+        - \avira_system_speedup.exe
+        CommandLine|contains:
+        - C:\Program Files\Avira\
+        - C:\Program Files (x86)\Avira\
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (1 of selection_img_* and selection_target and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or staging across multiple endpoints. If the same user triggered similar copy or follow-on activity on several hosts, the scope of the operation may be larger than a single endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img_cmd:
+        Image|endswith: \cmd.exe
+        CommandLine|contains: 'copy '
+      selection_img_pwsh:
+        Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        CommandLine|contains:
+        - copy-item
+        - ' copy '
+        - 'cpi '
+        - ' cp '
+      selection_img_other:
+      - Image|endswith:
+        - \robocopy.exe
+        - \xcopy.exe
+      - OriginalFileName:
+        - robocopy.exe
+        - XCOPY.EXE
+      selection_target:
+        CommandLine|re|i: \s['"]?C:\\Windows\\(?:System32|SysWOW64|WinSxS)
+      filter_optional_avira:
+        Image|endswith: \cmd.exe
+        CommandLine|contains|all:
+        - /c copy
+        - \Temp\
+        - \avira_system_speedup.exe
+        CommandLine|contains:
+        - C:\Program Files\Avira\
+        - C:\Program Files (x86)\Avira\
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (1 of selection_img_* and selection_target and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - host.name

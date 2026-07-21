@@ -1,0 +1,345 @@
+name: Suspicious Download Via Certutil.EXE
+id: f5951ddd-5cdd-4694-84a5-e5b6ab081ce1
+description: |
+  Detects certutil.exe (or a renamed copy identified by OriginalFileName CertUtil.exe) invoked with a download verb -- urlcache, verifyctl, or URL -- together with an http reference on the command line. certutil is a Microsoft-signed certificate utility, so this is a living-off-the-land download primitive: the binary fetches an arbitrary HTTP/HTTPS URL into the local cache and copies it to disk, which lets an operator stage a payload using a trusted system binary. The rule fires only when the certutil-or-renamed image, one of the download flags, and an http string are ALL present. Legitimate use exists (administrators occasionally retrieve CRLs or certificates), so the investigation should confirm the full command, identify the URL and destination path, determine whether the file landed on disk, and decode any retrieved or encoded payload.
+type: detection
+detection_id: 19b08b1c-861d-4e75-a1ef-ea0c1baf202b
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the command line show certutil with a download flag (urlcache, verifyctl, or URL) and an http URL?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule fires only when the image is certutil.exe (or a renamed binary whose OriginalFileName is CertUtil.exe), one of the download verbs (urlcache, verifyctl, URL) is present, AND an http string appears on the command line -- all three together. Read the exact command line and process details and confirm each element is present.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to download files via certutil from the command line?
+  context: Legitimate administrative activity can trigger this detection -- certificate management and occasional CRL retrieval use certutil. Knowing whether the user role and host function are consistent with command-line file retrieval via a certificate utility is often the fastest path to separating a true positive from routine operations.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What exactly did this certutil command do? Decode the full command line -- identify the download verb, the source URL, and the destination file path.
+  context: The full command line reveals the specific download action. Identify which verb was used (urlcache typically with -split -f, verifyctl, or URL), the HTTP/HTTPS URL being fetched, and the output path the payload was written to. When no output path is supplied, certutil lands the file in the CryptnetUrlCache content directory under the user profile -- note that so the file artifact can be located. The host+binary scope surfaces any sequential certutil invocations that together form one logical download-then-decode operation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What process spawned this certutil execution, and is that parent chain expected?
+  context: The parent process reveals how certutil was invoked. Predictable parents (explorer.exe for interactive admin use, an enterprise management agent) differ sharply from script and document hosts -- cmd.exe orchestrating a batch script, wscript.exe, mshta.exe, or an Office application -- which point to macro-driven or scripted delivery rather than legitimate certificate work. Note whether the parent is a known-good updater versus an interactive shell or document host.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Is the retrieved file or any chained command encoded or obfuscated, and what does it decode to?
+  context: certutil downloads frequently feed an encoding step -- a payload wrapped in PEM-style certificate headers is decoded back to an executable via certutil -decode, or a downloaded file with a misleading extension is later run. Look on this command line and any sibling certutil invocations for -decode/-decodehex flags with named source and output files, and identify the decoded content's operation (download cradle, loader, script). If the retrieved file is base64- or hex-wrapped, decoding it reveals the true intent that the http fetch alone does not.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What external network connection did certutil make, and where did it connect?
+  context: A certutil download command issues an outbound HTTP/HTTPS connection to fetch the payload. Correlating the process with its network connection confirms the transfer actually reached out and reveals the destination address. An external destination consistent with the URL on the command line confirms ingress; an internal address may indicate staging from another compromised host. Distinguishing internal from external destinations helps calibrate whether this is a fetch from attacker infrastructure or lateral staging.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \certutil.exe
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationHostname
+      - DestinationPort
+      - Initiated
+- question: Is the downloaded file still on disk at the destination path for analysis?
+  context: If certutil wrote the retrieved file to disk (the output path on the command line, or the CryptnetUrlCache content directory when no path was supplied), checking whether it still exists enables deeper analysis -- hashing, sandbox submission, or content review. Operators commonly delete the staged file after running it, so absence does not rule out a successful transfer; presence enables direct examination.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Was the download successful? Check for file creation at the destination path.
+  context: A download command does not guarantee the file was retrieved -- network errors, blocked URLs, or security controls may have stopped the transfer. Confirming a file-creation event by certutil at the target path (commonly a user-writable staging location such as a Temp, Downloads, Public, or ProgramData directory) establishes whether the activity progressed past delivery into a usable on-disk payload.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: If the file certutil downloaded was executed, what is its hash and does it have known threat-intel detections?
+  context: The hash for a reputation lookup is recorded when the payload runs, not when certutil writes it to disk — file-creation events carry no hash. certutil only downloads, so the payload is usually run by the same shell as a sibling process; this query returns certutil's sibling and child processes with their executable hashes. Match the downloaded file name to find the payload, and pair its hash with the source URL from the command line to characterize the delivery. If it was run later by an unrelated process, retrieve it from disk and hash it manually.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_children:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      selection_siblings:
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - Image
+      - Hashes
+- question: What other file activity occurred in the target directory around the same time?
+  context: Operators often stage multiple files in one directory, or the downloaded file triggers further writes (extraction, decoding to a second file, additional fetches). Examining directory-level file activity -- excluding the known downloaded file -- surfaces the broader scope of the delivery and any follow-on payloads written into the same staging path.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: When this host has previously fired this certutil download pattern, what parents and users normally drive it, and does the current alert fit?
+  context: Even a system binary like certutil can be abused. This query mirrors the rule's selection structure scoped to this host, so the parent/user distribution reflects how the rule's specific download pattern -- not generic certutil usage -- has historically run here. A new parent process, an unexpected user account, or an unusual command-line structure against that baseline is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \certutil.exe
+      - OriginalFileName: CertUtil.exe
+      selection_flags:
+        CommandLine|contains:
+        - 'urlcache '
+        - 'verifyctl '
+        - 'URL '
+      selection_http:
+        CommandLine|contains: http
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Was certutil executed from its expected System32 or SysWOW64 path?
+  context: certutil normally runs from C:\Windows\System32\certutil.exe or C:\Windows\SysWOW64\certutil.exe. Execution from a user temp directory, Downloads, or another non-standard location -- or a renamed copy whose OriginalFileName is still CertUtil.exe -- suggests the binary was copied or renamed to evade path-based allowlists and is more suspicious than an in-place System32 invocation.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- question: Were any other download or transfer LOLBins used on this host recently?
+  context: Operators who use one download LOLBin often use several. If certutil fetched a file, check whether bitsadmin, curl, esentutl, expand, extrac32, makecab, or replace were also used to transfer content on the same host. Multiple download primitives performing the same objective strengthens the case for staged tooling rather than a one-off legitimate retrieval.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\bitsadmin.exe'
+          - '\curl.exe'
+          - '\esentutl.exe'
+          - '\expand.exe'
+          - '\extrac32.exe'
+          - '\makecab.exe'
+          - '\replace.exe'
+          - '\hh.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- question: How often has this host fired this certutil download pattern over the past 90 days, and what command-line structures are typical?
+  context: A download pattern with no prior history on a host is more suspicious than one used regularly under stable parents. This query mirrors the rule's selection structure scoped to this host, so the count reflects the rule's specific firing pattern rather than generic certutil usage. The command-line projection lets you compare typical invocation patterns -- URLs, output paths, verbs -- against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \certutil.exe
+      - OriginalFileName: CertUtil.exe
+      selection_flags:
+        CommandLine|contains:
+        - 'urlcache '
+        - 'verifyctl '
+        - 'URL '
+      selection_http:
+        CommandLine|contains: http
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \certutil.exe
+      - OriginalFileName: CertUtil.exe
+      selection_flags:
+        CommandLine|contains:
+        - 'urlcache '
+        - 'verifyctl '
+        - 'URL '
+      selection_http:
+        CommandLine|contains: http
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \certutil.exe
+      - OriginalFileName: CertUtil.exe
+      selection_flags:
+        CommandLine|contains:
+        - 'urlcache '
+        - 'verifyctl '
+        - 'URL '
+      selection_http:
+        CommandLine|contains: http
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Have other hosts fired this certutil download pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: This query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of the download pattern rather than generic certutil usage. Many hosts firing the same pattern points to scripted deployment or vendor automation; one host or a small unrelated set points to manual operator activity. Use the host distribution and parent/command-line consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \certutil.exe
+      - OriginalFileName: CertUtil.exe
+      selection_flags:
+        CommandLine|contains:
+        - 'urlcache '
+        - 'verifyctl '
+        - 'URL '
+      selection_http:
+        CommandLine|contains: http
+      condition: all of selection_*
+    fields:
+    - host.name

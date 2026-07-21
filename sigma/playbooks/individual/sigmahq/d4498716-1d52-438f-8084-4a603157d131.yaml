@@ -1,0 +1,552 @@
+name: Password Provided In Command Line Of Net.EXE
+id: b61b71d4-b6cb-443a-bd3c-79444016a6cd
+description: |
+  Detects net.exe or net1.exe mapping a remote share with a credential supplied inline on the command
+  line. The rule fires when the command line contains all of ` use `, a drive-letter-and-UNC path
+  fragment, and a `/USER:` switch followed by an argument, and does not end in a trailing space — and,
+  as a separate requirement, when the process is identified as net.exe or net1.exe by EITHER its Image
+  path ending in \net.exe or \net1.exe OR its OriginalFileName being net.exe or net1.exe. Either
+  identification branch alone is enough, so a copied or renamed net.exe still matches through the
+  OriginalFileName branch, and a file named net.exe whose version resource has been stripped still
+  matches through the Image branch. This invocation form is common in legacy logon scripts, backup
+  jobs, and hands-on administration, and it is also how an operator with a stolen password reaches an
+  administrative share on another host. Whichever it turns out to be, the password was rendered in
+  cleartext in process telemetry: the investigation should establish which account was supplied, how
+  privileged it is, where the credential came from (a person, or a script that stores it), what the
+  session was used for afterward, and whether the same account or launch mechanism has reached other
+  hosts.
+type: detection
+detection_id: d4498716-1d52-438f-8084-4a603157d131
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-17
+questions:
+- question: Does the alerting command line carry the ` use `, UNC path, and `/USER:` credential pattern this rule detects, and did the process match on Image path or on OriginalFileName?
+  context: >-
+    The rule requires two things at once, and the second of them has two alternative branches. First,
+    the command line must contain all of ` use `, a drive-letter-and-UNC path fragment, and a `/USER:`
+    switch with an argument after it, and must not end in a trailing space. Second, the process must be
+    identified as net.exe or net1.exe by EITHER its Image path ending in \net.exe or \net1.exe OR its
+    OriginalFileName being net.exe or net1.exe — either branch alone satisfies it. Read both fields in
+    the result and note which one matched, because the branch changes what carries weight downstream. A
+    match on OriginalFileName while the Image path is something else means the file on disk was renamed
+    or copied, and the binary-path and other-LOLBin questions become the load-bearing ones. A match on
+    the Image path while OriginalFileName is absent or different means the file is named net.exe but
+    its version resource does not say so, which points at a repacked or substituted binary. A match on
+    both branches is the ordinary case and shifts the investigation onto the account and the share.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+  answer_sources:
+  - alert
+  - process_creation
+- question: What did this net.exe invocation actually do — which remote path was mapped, to which drive letter, and was the mapping made persistent?
+  context: >-
+    The command line holds the whole operation: the target UNC path, the drive letter or wildcard it
+    was mapped to, the account handed to `/USER:`, and whether `/PERSISTENT:YES` was set so the mapping
+    survives logoff. An administrative share such as C$, ADMIN$, or IPC$ as the target means the
+    session reaches the remote host's file system or named-pipe interface rather than an ordinary file
+    share, which is what remote service creation and remote task scheduling run over. Multi-step net.exe
+    work usually spans several sequential invocations, so the host-scoped window surfaces the related
+    ` use ` calls — including any later `/DELETE` that unmaps the share and any repeated attempts that
+    suggest the credential was being tested. Record the account and the target host; the password value
+    itself is not an investigative artifact and does not belong in case notes.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|contains|all:
+          - ' use '
+          - '/USER:'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: Is passing credentials directly on a net.exe command line consistent with how this environment normally maps remote shares?
+  context: >-
+    Environments that map shares through group policy preferences, logon scripts backed by the
+    credential manager, or a deployment tool rarely need `/USER:` with an inline password at all.
+    Direct command-line credential passing is equally consistent with an administrator taking a
+    shortcut, a legacy script nobody has rewritten, and an operator working without access to the
+    normal tooling. Establishing which method is standard here separates those three faster than any
+    query does.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - organizational_knowledge
+- question: Which account was supplied to `/USER:`, and is it privileged, shared, or different from the account running the process?
+  context: >-
+    The account named after `/USER:` is the identity presented to the remote host, and it is frequently
+    not the account running net.exe — a mismatch means credentials for a second identity are being used
+    from this host. A domain administrator, a service account, or a break-glass account there widens the
+    impact, because the password was written in cleartext into process telemetry and is readable by
+    anyone who can read those records. Treat the supplied account as exposed regardless of the verdict,
+    and scope password rotation to it.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - User
+      - CommandLine
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+- question: Which remote servers did this account present explicit credentials to around the alert time?
+  context: >-
+    Supplying an account to `/USER:` produces an explicit-credential logon record (event 4648) on the
+    initiating host, naming the account that was passed and the server it was passed to. A single target
+    server is consistent with mapping one share. A run of different target servers under the same
+    supplied account inside a short window is the access pattern of an operator validating a credential
+    across the environment, and each server named there is in scope. The logon type the remote side
+    granted (network, or remote interactive) is recorded on the target server, not here — pivot to that
+    host's logon records if the distinction matters. If Security-channel events are not collected in
+    this environment, a zero result is a visibility gap rather than evidence nothing authenticated.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        EventID: 4648
+        SubjectUserName|expand: '%User%'
+      condition: selection
+    fields:
+      - TargetUserName
+      - TargetServerName
+      - IpAddress
+  answer_sources:
+  - active_directory
+  - manual_review
+- question: What process launched this net.exe command, and does that parent explain how a password reached the command line?
+  context: >-
+    cmd.exe under explorer.exe points at a person typing the command, in which case the password came
+    out of someone's head or a note and the follow-up is with that person. A script host, a deployment
+    agent, or a scheduled-task parent points at a stored script that carries the password in its own
+    source — the parent command line usually names the script file, and that file is then the credential
+    exposure to remediate rather than the net.exe run itself. Office applications, wmiprvse.exe, or
+    wsmprovhost.exe as the parent mean the command was pushed from somewhere else, and the host that
+    pushed it becomes part of the scope.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+  answer_sources:
+  - process_creation
+- question: Is the account running this command expected to map remote shares with explicit credentials?
+  context: >-
+    Administrators and help-desk staff reach remote systems this way routinely; standard users have
+    little reason to. A machine account or SYSTEM running the command means no person was at the
+    keyboard, which moves the question from the user's role to which task or script holds the
+    credential and who owns it.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - User
+  answer_sources:
+  - organizational_knowledge
+  - asset_inventory
+- question: Which endpoints exchanged SMB and RPC traffic with this host around the alert time, and did anything reach this host before it reached out?
+  context: >-
+    A share mapping produces an SMB session on 445, and administrative-share access is usually preceded
+    by RPC on 135. Records where this host is the source show where the credential was presented and
+    confirm the mapping completed rather than failing at the network layer. Records where a remote
+    address is the source show that someone reached this host first, which makes it a pivot in a chain
+    rather than the origin of one — that is the more consequential of the two findings, because it
+    means the credential exposure here may already have been read by whoever arrived.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationPort:
+          - 445
+          - 135
+      condition: selection
+    fields:
+      - SourceIp
+      - DestinationPort
+  answer_sources:
+  - network_connection
+  - process_creation
+- question: What processes ran on this host in the half hour after the share was mapped, and under which accounts?
+  context: >-
+    A mapped share is a means to an end — staging a payload, copying data off, or launching execution on
+    the remote host. Interpreters and copy tools appearing shortly after the mapping (cmd.exe,
+    powershell.exe, robocopy.exe, xcopy.exe, runonce.exe) indicate the session was used for something; a
+    mapping with no follow-on activity at all is more consistent with a connectivity or credential check.
+    Watch the account column for a change: activity running under the account that was supplied to
+    `/USER:` means the credential was used beyond the mapping itself, and the correlation window worth
+    reading is the 5 to 10 minutes immediately after the mapping, where remote copy and remote execution
+    normally sit back to back.
+  range: +30m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - User
+      - Image
+  answer_sources:
+  - process_creation
+- always_include: true
+  question: What else did this account do across the environment in the hour around the alert?
+  context: >-
+    Tracking the account across every host in the alert window shows whether the mapping was an isolated
+    action or one step in a sequence that touched several systems. The same account running tooling on
+    multiple hosts inside an hour is the pattern of an operator working through an environment rather
+    than an administrator finishing one task. If the alert fired under SYSTEM, LOCAL SERVICE, NETWORK
+    SERVICE, or a machine account, this returns routine agent telemetry from everywhere and answers
+    nothing — the parent-scoped variant of this question carries the answer instead.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+- always_include: true
+  question: Did the same parent process drive this credential-mapping pattern on other hosts in the same window?
+  context: >-
+    Under a service principal, the account attributes nothing and the launch mechanism attributes
+    everything. This query mirrors the rule's selection scoped to the alerting parent process,
+    fleet-wide, in the alert window. Several hosts producing the pattern from the same parent in the
+    same hour points to a scheduled or pushed rollout — a logon script or deployment job that carries a
+    stored password — and reframes the finding as a credential-hygiene problem across all of them. A
+    single host points to a host-local trigger and keeps the scope here.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \net.exe
+        - \net1.exe
+      - OriginalFileName:
+        - net.exe
+        - net1.exe
+      selection_cli:
+        CommandLine|contains|all:
+        - ' use '
+        - :*\\
+        - /USER:* *
+      filter_main_empty:
+        CommandLine|endswith: ' '
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_* and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- question: Was this binary executed from its expected System32 or SysWOW64 path?
+  context: >-
+    net.exe and net1.exe ship in System32 and SysWOW64. A copy running from a user-writable directory,
+    or a file whose name on disk differs from its OriginalFileName of net.exe, means the binary was
+    relocated or renamed to sidestep path- and name-based allowlists. This is where the identification
+    branch from the alert pays off: if the rule matched only on OriginalFileName, the Image path here is
+    the finding, and the file at that path should be treated as an attacker-placed copy until shown
+    otherwise.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+  answer_sources:
+  - process_creation
+- question: Were other remote-access or remote-execution binaries used on this host in the past day?
+  context: >-
+    Reaching another system by mapping a share with an explicit credential is one of several
+    interchangeable built-in methods, and an operator who tries one usually tries others. cmdkey.exe
+    storing a credential for later reuse, wmic or winrs invoking a process remotely, sc or schtasks
+    creating a service or task on a remote host, or psexec-family tools on this host in the same day all
+    indicate the mapping was part of a sequence rather than a one-off. The command lines returned name
+    the remote hosts that were targeted, which extends the scope beyond the one server in the alert.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\cmdkey.exe'
+          - '\wmic.exe'
+          - '\winrs.exe'
+          - '\psexec.exe'
+          - '\psexec64.exe'
+          - '\paexec.exe'
+          - '\mstsc.exe'
+          - '\ssh.exe'
+          - '\plink.exe'
+          - '\sc.exe'
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\reg.exe'
+          - '\robocopy.exe'
+          - '\xcopy.exe'
+          - '\rundll32.exe'
+          - '\mshta.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- always_include: true
+  question: Has this account produced the rule's pattern before, and does that history fit its role?
+  context: >-
+    The query mirrors the rule's selection scoped to this account, giving a 90-day history of this
+    specific pattern for this user, aggregated by host. An account that maps shares with inline
+    credentials every week belongs to someone whose job involves it, or to automation running as them,
+    and the alert is another instance of a standing practice worth fixing rather than investigating. An
+    account with no prior history producing it once, against a server it has never touched, is the case
+    that needs the credential traced. Weigh the count against the role the account is supposed to have.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \net.exe
+        - \net1.exe
+      - OriginalFileName:
+        - net.exe
+        - net1.exe
+      selection_cli:
+        CommandLine|contains|all:
+        - ' use '
+        - :*\\
+        - /USER:* *
+      filter_main_empty:
+        CommandLine|endswith: ' '
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_* and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+- always_include: true
+  question: Has this parent process historically driven the rule's pattern, or is the parent new for this activity?
+  context: >-
+    When the alert fires under a service principal, the meaningful pivot is the launch mechanism rather
+    than the account. This query mirrors the rule's selection scoped to the alerting parent process
+    across 90 days, aggregated by host. A parent that already accounts for a long, wide history of this
+    pattern is automation, and the finding becomes the stored password inside whatever that parent runs.
+    A parent that is new for this pattern is the deviation worth chasing, even when the account looks
+    ordinary.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \net.exe
+        - \net1.exe
+      - OriginalFileName:
+        - net.exe
+        - net1.exe
+      selection_cli:
+        CommandLine|contains|all:
+        - ' use '
+        - :*\\
+        - /USER:* *
+      filter_main_empty:
+        CommandLine|endswith: ' '
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_* and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- question: How often has this host produced the rule's pattern over the past 90 days, and what do those command lines have in common?
+  context: >-
+    The query mirrors the rule's selection scoped to this host, so the count reflects the rule's specific
+    firing pattern rather than generic net.exe usage. Compare the returned command lines against the
+    alerting one on the parts that matter — the same target server and share every time, the same drive
+    letter, the same supplied account — which is the signature of a recurring script. A pattern with no
+    prior history here, or one whose target server and account differ from every previous invocation, is
+    the deviation. Note that a long history does not make the credential exposure acceptable; it makes it
+    older.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \net.exe
+        - \net1.exe
+      - OriginalFileName:
+        - net.exe
+        - net1.exe
+      selection_cli:
+        CommandLine|contains|all:
+        - ' use '
+        - :*\\
+        - /USER:* *
+      filter_main_empty:
+        CommandLine|endswith: ' '
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_* and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - CommandLine
+  answer_sources:
+  - process_creation
+- question: Have other hosts fired the rule's pattern in the past week, and does the cross-host distribution look like consistent automation or one-off activity?
+  context: >-
+    The query mirrors the rule's selection with no host scope, giving a fleet-wide count of the pattern
+    rather than net.exe's generic footprint. Many hosts producing it points at a logon script, imaging
+    step, or backup job deployed everywhere with a password baked into it — the response is then a
+    credential-rotation and script-rewrite task across the fleet, not an incident on one endpoint. One
+    host, or a small set with nothing in common, points at manual operator activity and sets the
+    containment boundary around those hosts.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \net.exe
+        - \net1.exe
+      - OriginalFileName:
+        - net.exe
+        - net1.exe
+      selection_cli:
+        CommandLine|contains|all:
+        - ' use '
+        - :*\\
+        - /USER:* *
+      filter_main_empty:
+        CommandLine|endswith: ' '
+      condition: all of selection_* and not 1 of filter_main_*
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    A credential being typed at a remote share is rarely the first step. Earlier detections on the same
+    host — credential access against LSASS or the registry hives, account and group enumeration, defense
+    tampering, or a remote execution that put the operator on this host in the first place — reconstruct
+    where the password came from and how far the activity had already progressed. Credential access
+    followed by share mapping under a different account is the ordering worth looking for.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+  answer_sources:
+  - alert

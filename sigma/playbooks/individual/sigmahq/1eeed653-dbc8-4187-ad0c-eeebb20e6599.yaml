@@ -1,0 +1,363 @@
+name: Potential SPN Enumeration Via Setspn.EXE
+id: 476e6ecf-1b03-428f-9ced-fc013ede4ca8
+description: |
+  Detects setspn.exe run with a query flag ('-q' or '/q') AND identified as the
+  setspn binary (Image ending in setspn.exe, OriginalFileName setspn.exe, or a
+  matching Description) — both conditions must hold for the rule to fire.
+  setspn.exe is a built-in Active Directory tool, and administrators legitimately
+  use it to inspect service principal names, so its mere presence is not malicious.
+  Querying for SPN-enabled accounts is the reconnaissance prerequisite for
+  Kerberoasting: an authenticated user enumerates accounts with registered SPNs,
+  requests TGS tickets for them, and cracks the service-account passwords offline.
+  The investigation should determine which SPNs were targeted, whether the running
+  user and host normally perform AD administration, and whether the enumeration was
+  followed by a burst of TGS requests or LSASS access consistent with ticket
+  extraction.
+type: detection
+detection_id: 1eeed653-dbc8-4187-ad0c-eeebb20e6599
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Did setspn.exe run with a query flag ('-q' or '/q') and resolve to the real setspn binary?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule fires only when both conditions hold — the process identifies as setspn.exe (Image, OriginalFileName, or Description) AND the command line contains a query flag. Read the full command line to confirm the query flag is present and note the SPN scope requested (a broad '*/*' wildcard is far more aggressive than a single targeted SPN).
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+      - Description
+- question: Is this user and host expected to enumerate service principal names with setspn.exe?
+  context: setspn.exe is a domain administration tool. Enumeration from a domain controller or admin workstation under a known AD-admin account is routine; the same command from a standard workstation under a non-administrative user is the reconnaissance pattern that precedes Kerberoasting. SPN enumeration requires no special privileges, so any domain-authenticated user can run it.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Which SPNs and service accounts were targeted by this enumeration?
+  context: The scope of the query determines which accounts are at risk. A broad '*/*' wildcard enumerates every SPN-enabled account in the domain; a targeted query (for example MSSQLSvc/*, HTTP/*, or a single service account) points at specific high-value service accounts. Decode the command line to identify the SPN filter and domain scope ('-t <domain>') requested, since those accounts are the ones whose TGS tickets an attacker would request and crack offline.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Was there a burst of Kerberos service-ticket requests with weak encryption shortly after this enumeration?
+  context: Enumeration is only the prerequisite; the actual Kerberoasting step is requesting TGS tickets (Event ID 4769) for the enumerated SPNs. A short-window burst of requests from one account, especially with RC4-HMAC encryption (ticket encryption type 0x17) in an environment that should use AES, is the signal that enumeration turned into active ticket harvesting. The request count and correlation window are environment-tunable; compare against the normal rate for the requesting account. If Security event logs are not ingested in this environment, treat zero results as a visibility gap rather than evidence nothing ran.
+  range: +4h
+  query: |
+    aggregation: true
+    logsource:
+      service: security
+      product: windows
+    detection:
+      selection:
+        EventID: 4769
+        TicketEncryptionType: '0x17'
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - TargetUserName
+      - ServiceName
+      - IpAddress
+- question: Was a memory-dump-style file written to disk on this host in the hours after the SPN enumeration, consistent with LSASS-based ticket extraction?
+  context: After harvesting TGS tickets, an attacker may extract them from memory by reading LSASS, which holds Kerberos ticket material. The handle open that a read of LSASS memory requires has no equivalent telemetry in this environment, so a zero result there would not mean nothing happened. What is observable is the artifact a successful dump leaves on disk — a .dmp/.dump/.bin file, commonly written to a temp or user-writable path, in the window following the enumeration. Correlate the writing process and its account against the setspn invocation.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      filter_ext:
+        TargetFilename|endswith:
+          - '.dmp'
+          - '.dump'
+          - '.bin'
+      condition: selection and filter_ext
+    fields:
+      - Image
+      - TargetFilename
+      - EventType
+- question: Were outbound remote-access connections (RDP, SMB, WinRM, SSH) initiated from this host after
+    this event?
+  context: Credential theft is typically followed by lateral movement. The query returns outbound connections
+    from this host to remote-access ports -- 3389 (RDP), 445 (SMB/PsExec), 5985/5986 (WinRM), 22 (SSH)
+    -- in the hours after the event; the originating Image and User show what drove each connection. Two
+    limits to keep in mind -- credentials exfiltrated and replayed from another machine will not appear
+    here (check security 4624 logons on suspected targets for this account and any accounts with sessions
+    on this host), and the query requires Sysmon network telemetry (EID 3); if that is not collected from
+    this host, treat zero rows as a visibility gap, not as evidence no movement occurred.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
+- question: Which service accounts may be exposed, and do any have elevated privileges?
+  context: The severity depends on the privilege level of the SPN-enabled accounts that were enumerated. Service accounts with weak or non-rotated passwords are the practical targets, and any that hold domain-admin or otherwise broad rights require incident escalation rather than monitoring. Cross-reference the targeted SPNs against Active Directory to determine which accounts and group memberships are at risk.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What process spawned setspn.exe and is that parent chain expected?
+  context: The parent process reveals how the enumeration was launched. An interactive shell (cmd.exe, powershell.exe) or a script host (wscript.exe, mshta.exe) parent under a non-admin context fits hands-on reconnaissance; a management console or administrative wrapper fits routine AD work. Walk up from the parent to see what spawned it and what else that parent launched.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What child processes did setspn.exe spawn afterward?
+  context: setspn.exe itself only queries the directory; it does not normally spawn children. Follow-on processes such as powershell.exe, cmd.exe, or ticket-request tooling launched on this host after the enumeration would indicate the operator moved from reconnaissance into TGS requesting or extraction. Treat any unexpected children as the next stage to investigate.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Does this host normally run setspn.exe?
+  context: A binary that has never been seen on a host is more suspicious than one that runs regularly. On domain controllers and admin workstations setspn.exe may run often; on a standard endpoint, zero or very low historical counts indicate first-time or rare execution worth scrutinizing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: When this host has previously fired the rule's pattern, what parents and users normally drive setspn.exe queries, and does the current alert fit?
+  context: Even built-in admin tools have a normal usage pattern. The query mirrors the rule's selection structure scoped to this host — the resulting parent/user distribution reflects how this specific SPN-query pattern (not generic setspn.exe usage) has historically run here. A new parent process, an unexpected user account, or an unusual command-line structure is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_pe:
+      - Image|endswith: \setspn.exe
+      - OriginalFileName: setspn.exe
+      - Description|contains|all:
+        - Query or reset the computer
+        - SPN attribute
+      selection_cli:
+        CommandLine|contains:
+        - ' -q '
+        - ' /q '
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_pe:
+      - Image|endswith: \setspn.exe
+      - OriginalFileName: setspn.exe
+      - Description|contains|all:
+        - Query or reset the computer
+        - SPN attribute
+      selection_cli:
+        CommandLine|contains:
+        - ' -q '
+        - ' /q '
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_pe:
+      - Image|endswith: \setspn.exe
+      - OriginalFileName: setspn.exe
+      - Description|contains|all:
+        - Query or reset the computer
+        - SPN attribute
+      selection_cli:
+        CommandLine|contains:
+        - ' -q '
+        - ' /q '
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity across multiple endpoints. If the same user enumerated SPNs or ran other directory-reconnaissance or credential tooling on multiple hosts, the scope of the activity may be larger than this single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_pe:
+      - Image|endswith: \setspn.exe
+      - OriginalFileName: setspn.exe
+      - Description|contains|all:
+        - Query or reset the computer
+        - SPN attribute
+      selection_cli:
+        CommandLine|contains:
+        - ' -q '
+        - ' /q '
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Have other hosts fired the rule's pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of this SPN-query pattern (not generic setspn.exe usage). Many hosts firing the same pattern points to scripted deployment or vendor automation; one host or a small unrelated set points to manual operator activity. Use the host distribution and parent/binary consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_pe:
+      - Image|endswith: \setspn.exe
+      - OriginalFileName: setspn.exe
+      - Description|contains|all:
+        - Query or reset the computer
+        - SPN attribute
+      selection_cli:
+        CommandLine|contains:
+        - ' -q '
+        - ' /q '
+      condition: all of selection_*
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance, or other credential-access activity — may reveal the attack stages that preceded the SPN enumeration and help reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

@@ -1,0 +1,390 @@
+name: Potential PowerShell Downgrade Attack
+id: 46d7400c-5119-425f-8492-f7004c8a86b1
+description: |
+  Detects powershell.exe launched with a "-version 2" switch (and its abbreviated forms such as -ver 2 or -v 2),
+  which forces the host to load the PowerShell v2 engine assemblies. The v2 engine predates AMSI, script block
+  logging, and Constrained Language Mode, so running under it sidesteps those protections while still using the
+  signed, trusted PowerShell binary. Legitimate use is rare on modern systems because .NET Framework 2.0 is not
+  installed by default on Windows 10 and later; the investigation should determine what the downgraded session
+  executed, what spawned it, and whether the v2 engine assemblies were actually loaded.
+type: detection
+detection_id: b3512211-c67e-4707-bedc-66efc7848863
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the command line show powershell.exe launched with a -version 2 switch or one of its abbreviations?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the exact command
+    line. The rule fires when an image ending in powershell.exe carries a version-2 switch in any of its accepted
+    forms (-version 2 down to -v 2). Confirm the switch is present and that it requests the v2 engine, not a different
+    numeric argument that happens to contain a 2.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Is this user and host expected to run PowerShell pinned to the version 2 engine?
+  context: Legitimate administrative activity can trigger this detection, but deliberately requesting the v2 engine
+    on a modern system is uncommon outside specific legacy-compatibility scenarios. Knowing whether the user role and
+    host function involve maintaining or testing software that requires PowerShell v2 helps distinguish a routine
+    operation from an attempt to evade the v5 security controls.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What did this downgraded PowerShell session actually run? Decode the full command line.
+  context: The version-2 switch only sets the engine; the rest of the command line carries the payload. Decode any
+    -EncodedCommand or -enc base64, deobfuscate concatenation or backtick escaping, and identify download cradles,
+    reflective assembly loads, or file paths. Because powershell.exe is extremely common, this query is scoped to the
+    specific alerting process so the result is the exact downgraded invocation rather than every PowerShell launch on
+    the host.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Was the command encoded or obfuscated, and what does it decode to?
+  context: Pinning the engine to v2 is frequently paired with an encoded or obfuscated body so that neither the engine
+    nor the command line reveals intent. Base64 via -EncodedCommand is the most common form, but concatenation, backtick
+    escaping, and variable substitution also appear. Decoding reveals the actual payload -- download cradles, reverse
+    shells, or in-memory execution of .NET assemblies that the downgraded engine will run without AMSI inspection.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did this PowerShell process load the version 2 engine assemblies rather than the current ones?
+  context: The version switch is only a request; the engine that actually loads is the ground truth. The v2 engine lives
+    in the older System.Management.Automation assembly and its v2 native image, distinct from the v4 path used by v5.
+    Confirming a load of the v2 assembly or NativeImages_v2.0.50727 native image on this host within the alert window
+    establishes that the downgrade succeeded; absence may mean .NET 2.0 was unavailable and the request silently fell
+    back to the current engine.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_module:
+        ImageLoaded|contains:
+          - '\System.Management.Automation'
+      selection_v2:
+        ImageLoaded|contains:
+          - '\GAC_MSIL\System.Management.Automation\1.0.0.0__'
+          - '\NativeImages_v2.0.50727'
+      condition: selection and selection_module and selection_v2
+    fields:
+      - Image
+      - ImageLoaded
+- question: What process spawned this downgraded PowerShell, and is that parent chain expected?
+  context: The parent reveals how the downgraded session was invoked. Interactive use typically traces back to explorer.exe
+    or a console, while office applications, mshta.exe, wscript.exe, or a scripting host spawning a version-pinned
+    PowerShell points to macro or loader-driven execution. Walk up from the immediate parent to see what launched it and
+    what else that parent spawned.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What child processes did this downgraded PowerShell spawn afterward?
+  context: The processes spawned after the downgraded session reveal its actual impact. A v2 session that immediately
+    launches cmd.exe, another powershell.exe, certutil.exe, or a network utility suggests staging or post-exploitation,
+    whereas a session that exits without children may be a one-off compatibility test.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Did PowerShell script block logging capture what the downgraded session ran?
+  context: Script block logging records the deobfuscated content PowerShell actually executes, even when the command line
+    is encoded. This matters especially for a downgrade because the v2 engine itself does not emit this logging -- so any
+    4104 events for this host in the window would come from a separate v5 session, and their absence around the downgraded
+    process is expected. If these logs are not collected in this environment, treat zero results as a visibility gap rather
+    than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Were other PowerShell or endpoint security controls weakened in the hour before this downgrade?
+  context: The downgrade itself sidesteps AMSI and logging, but operators frequently stack additional evasions. Look for
+    execution-policy bypass flags, AMSI patching strings, real-time protection changes, or obfuscation tooling in the hour
+    preceding this event. Finding precursor tampering alongside the version downgrade strengthens the case that the session
+    was preparing to run something the v5 controls would otherwise have caught.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: When this host has previously fired the version-downgrade pattern, what parents and users drove it, and does
+    this alert fit?
+  context: Even when a host has run downgraded PowerShell before, the parent and user distribution shows how it normally
+    happens here. The query mirrors the rule's selection scoped to this host, so the result reflects the rule's specific
+    firing pattern rather than generic PowerShell usage. A new parent process, an unexpected user account, or an unusual
+    command-line structure is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \powershell.exe
+        CommandLine|contains:
+        - ' -version 2 '
+        - ' -versio 2 '
+        - ' -versi 2 '
+        - ' -vers 2 '
+        - ' -ver 2 '
+        - ' -ve 2 '
+        - ' -v 2 '
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Have other hosts fired the version-downgrade pattern in the past week, and does the spread look like automation
+    or one-off activity?
+  context: The query mirrors the rule's selection with no host scope, so the result is a fleet-wide count of the downgrade
+    pattern rather than generic PowerShell usage. Many hosts firing the same pattern points to scripted deployment or a
+    legacy-compatibility shim pushed widely; one host or a small unrelated set points to manual operator activity. Use the
+    host distribution to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \powershell.exe
+        CommandLine|contains:
+        - ' -version 2 '
+        - ' -versio 2 '
+        - ' -versi 2 '
+        - ' -vers 2 '
+        - ' -ver 2 '
+        - ' -ve 2 '
+        - ' -v 2 '
+      condition: selection
+    fields:
+    - host.name
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \powershell.exe
+        CommandLine|contains:
+        - ' -version 2 '
+        - ' -versio 2 '
+        - ' -versi 2 '
+        - ' -vers 2 '
+        - ' -ver 2 '
+        - ' -ve 2 '
+        - ' -v 2 '
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \powershell.exe
+        CommandLine|contains:
+        - ' -version 2 '
+        - ' -versio 2 '
+        - ' -versi 2 '
+        - ' -vers 2 '
+        - ' -ver 2 '
+        - ' -ve 2 '
+        - ' -v 2 '
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints.
+    If the same user triggered similar activity on other hosts, the scope of the investigation may be larger than the single
+    alerting endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \powershell.exe
+        CommandLine|contains:
+        - ' -version 2 '
+        - ' -versio 2 '
+        - ' -versi 2 '
+        - ' -vers 2 '
+        - ' -ver 2 '
+        - ' -ve 2 '
+        - ' -v 2 '
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining the process activity around the alert reveals what led to this event
+    and what followed, and whether the downgrade is part of a larger sequence. Look for reconnaissance, privilege escalation,
+    or persistence mechanisms in the surrounding window.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host -- defense tampering, reconnaissance,
+    credential access -- may reveal the attack stages that preceded the downgrade and help reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

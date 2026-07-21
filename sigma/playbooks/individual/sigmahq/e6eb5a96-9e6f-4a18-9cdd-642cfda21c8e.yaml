@@ -1,0 +1,592 @@
+name: Potential Dridex Activity
+id: 5c6f66b0-1416-4c57-a73c-6cfb2fe8c2e7
+description: |
+  Detects three independent process patterns associated with Dridex, any one of which fires the rule.
+  Branch one is svchost.exe whose command line carries both C:\Users\ and \Desktop\ while its parent is
+  NOT under C:\Windows\System32\ — a service-host name running from a user profile path rather than the
+  real service host. Branch two is excel.exe spawning regsvr32.exe with either ' -s ' or
+  \AppData\Local\Temp\ on the command line and no .dll string present — a document macro registering a
+  module whose extension hides that it is one. Branch three is svchost.exe spawning either whoami.exe
+  with ' /all' or net.exe/net1.exe with ' view' — host and network enumeration under a parent that
+  normally spawns neither, the pattern left when code runs inside an injected or spoofed service host.
+  Because the branches are OR'd, the branch that matched determines what the event means and which
+  follow-up carries weight: identify the branch, decode the full command line, establish what the parent
+  is and what started it, and check whether the surrounding activity shows module loads from
+  user-writable directories, injection-side API calls, additional enumeration, or SMB fan-out to other
+  hosts.
+type: detection
+detection_id: e6eb5a96-9e6f-4a18-9cdd-642cfda21c8e
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-17
+questions:
+- question: >-
+    Which of the rule's three patterns does this event match — relocated svchost.exe, Excel-spawned
+    regsvr32.exe, or svchost.exe spawning whoami or net?
+  context: >-
+    The rule fires when any ONE of three independent branches matches, so establish which one before
+    going further; the branch decides what the rest of the investigation is about. Branch one matches
+    svchost.exe with both C:\Users\ and \Desktop\ in the command line and a parent that is NOT under
+    C:\Windows\System32\ — here the binary identity and its on-disk origin are the load-bearing
+    questions, since the real service host is only ever started by services.exe from System32. Branch
+    two matches excel.exe as parent, regsvr32.exe as child, either ' -s ' or \AppData\Local\Temp\ in the
+    command line, and no .dll anywhere in it — here the delivery document and the registered module are
+    the load-bearing questions, and the missing .dll string is itself the signal that the module was
+    given an unrelated extension. Branch three matches svchost.exe as parent with either whoami.exe and
+    ' /all' or net.exe/net1.exe and ' view' as the child — here the enumeration burst, the network
+    fan-out, and whether the parent service host was injected into are the load-bearing questions.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+  answer_sources:
+  - alert
+  - process_creation
+- question: What exactly did this command do? Decode every argument and note the directory it ran from.
+  context: >-
+    Read the command line end to end rather than confirming the matched substring. For a regsvr32.exe
+    invocation, ' -s ' suppresses the registration dialog and the argument after it is the module path —
+    resolve that path and note the extension, since a module registered under a non-module extension is
+    the point of the pattern. For a svchost.exe invocation, the real service host is always started with
+    a -k switch naming a service group; a command line carrying a user profile path instead means the
+    name was reused rather than the service invoked. For whoami.exe or net.exe, ' /all' and ' view'
+    identify which enumeration was requested. The query returns every execution of this binary on the
+    host in the surrounding window, so sequential invocations that together form one operation stay
+    visible.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What is the hash of the alerting binary, and does it match the signed system file it claims to be?
+  context: >-
+    Two of the three branches key on a binary whose name implies a Microsoft system file. The hash on the
+    execution event answers whether the file on disk is that system file or a copy carrying its name —
+    submit it to a reputation service or internal threat intel, and compare it against the known-good
+    system copy of the same binary from another host. A svchost.exe or regsvr32.exe hash that does not
+    match the platform's own copy, or a working directory under C:\Users\ or \AppData\Local\Temp\, points
+    at a planted binary rather than the real one. File-write events carry no hash, so the execution event
+    is where the value lives; if the referenced module never executed, retrieve it from its on-disk path
+    and hash it manually.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - Hashes
+      - CurrentDirectory
+  answer_sources:
+  - process_creation
+  - external_threat_intel
+- question: Is this parent expected to spawn this child? What started the parent?
+  context: >-
+    The parent-child pairing is the core signal in all three branches, and this query walks one level up
+    to the parent's own creation event. For the excel.exe parent, the grandparent tells whether the
+    document was opened from a mail client, a browser download, or explorer.exe. For the svchost.exe
+    parent, the real service host is started by services.exe from C:\Windows\System32\ with a -k switch;
+    a svchost.exe started by anything else, or from anywhere else, is not the service host and its
+    children inherit that doubt. For the svchost.exe child branch, the parent NOT being under
+    C:\Windows\System32\ is what the rule's filter turns on, so name the grandparent explicitly.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+  answer_sources:
+  - process_creation
+- question: What document, email, or download drove the parent process to spawn this execution?
+  context: >-
+    The parent's command line often names the file it opened. For an excel.exe parent, the workbook path
+    in ParentCommandLine is the delivery artifact — recover it, note whether it arrived by mail, a link,
+    or a network share, and check whether legacy macro formats are permitted on this host. Delivery for
+    this family runs through spreadsheet macros that execute on open, so the workbook rather than the
+    child process is what gets blocked at the perimeter and what identifies other recipients. For a
+    svchost.exe parent, there is no document — the parent is itself the artifact and its own origin is
+    the delivery question.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+  answer_sources:
+  - manual_review
+  - edr_console
+- question: What other child processes did the same parent instance spawn?
+  context: >-
+    A parent that produced one branch of this rule frequently produces others. An excel.exe instance that
+    spawned regsvr32.exe may also have written a file to \AppData\Local\Temp\ and launched a second
+    loader. A svchost.exe instance that spawned whoami.exe with ' /all' is the same instance to check for
+    net.exe, nltest.exe, or a follow-on loader — several enumeration children from one service host is a
+    different picture from a single one. The query is anchored on the exact parent instance rather than
+    the parent binary name, so unrelated concurrent service hosts do not dilute the result.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Are the files this command line references still on disk for analysis?
+  context: >-
+    All three branches reference user-writable locations — C:\Users\...\Desktop\ in the svchost branch and
+    \AppData\Local\Temp\ in the regsvr32 branch — so there is usually a file to recover. This query
+    correlates file activity back to the alerting process and its direct children by process lineage,
+    which is how the referenced paths become visible; the alert itself carries no file path field. A file
+    still present can be hashed, submitted, and read; one already deleted narrows the window in which
+    recovery from shadow copies or backups is worth attempting. Note that deletion of the module is a
+    common cleanup step once registration has succeeded.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+  answer_sources:
+  - file_event
+  - manual_review
+- question: What modules did the alerting process load, and did any load from a user-writable directory?
+  context: >-
+    The later-stage behavior behind this rule is search-order hijacking — a legitimate Windows executable
+    is placed alongside a module in a user-writable directory such as AppData\Local, AppData\Roaming, or a
+    Desktop folder, and loads that module instead of the system copy. The abused executable is varied
+    deliberately so that name-based analytics miss it, which makes the load path and signer more
+    diagnostic than the binary name. Loads resolving under C:\Users\ or \AppData\ instead of
+    C:\Windows\System32\, unsigned modules, or modules whose signer does not match the loading process's
+    signer are what to look for. On the regsvr32 branch this is also where the module registered from
+    \AppData\Local\Temp\ appears, including one carrying a non-module extension.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+      - SignatureStatus
+      - Hashes
+  answer_sources:
+  - process_creation
+  - edr_console
+- question: Did any process on this host issue memory-write, APC-queue, or hook-installation calls against another process around the alert?
+  context: >-
+    A service host that spawns enumeration children is the residue of code running inside it, and the
+    injection that put it there is observable as cross-process API activity — a handle opened with
+    PROCESS_VM_WRITE-class rights followed by a memory write and a remote thread or queued APC, all
+    within a short window of the child process starting. The commonly abused destinations are long-lived
+    system processes such as svchost.exe, explorer.exe, and lsass.exe; a write into svchost.exe here would
+    tie the injection directly to the alerting parent. Blind spot to name up front: only the injection
+    side is collected. Read-side access — a process reading another process's memory, for example an
+    lsass.exe credential read — produces no telemetry here, so a zero result rules out the write path
+    only, not cross-process access in general.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        event.dataset: endpoint.events.api
+        process.Ext.api.name:
+          - WriteProcessMemory
+          - QueueUserAPC
+          - SetWindowsHookEx
+      condition: selection
+    fields:
+      - Image
+      - process.Ext.api.name
+  answer_sources:
+  - edr_console
+  - process_creation
+- question: Did other reconnaissance commands run on this host around the same time?
+  context: >-
+    A single whoami or net view can be troubleshooting; three or more distinct discovery binaries inside
+    fifteen minutes is the profile of scripted enumeration rather than a person at a keyboard. The
+    enumeration branch of this rule catches one command, and the value here is whether it sits alone or
+    inside a sequence — whoami /all for the account and its group memberships, net view for reachable
+    shares, then nltest, systeminfo, or tasklist filling in the rest. Check the User column as well as
+    the binaries: the same account across the whole sequence points at one automated run.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_recon:
+        Image|endswith:
+          - '\whoami.exe'
+          - '\systeminfo.exe'
+          - '\ipconfig.exe'
+          - '\net.exe'
+          - '\net1.exe'
+          - '\nltest.exe'
+          - '\dsquery.exe'
+          - '\nbtstat.exe'
+          - '\arp.exe'
+          - '\netstat.exe'
+          - '\tasklist.exe'
+          - '\qprocess.exe'
+          - '\query.exe'
+          - '\quser.exe'
+          - '\hostname.exe'
+          - '\nslookup.exe'
+          - '\adfind.exe'
+          - '\csvde.exe'
+          - '\ldifde.exe'
+          - '\dnscmd.exe'
+          - '\cmdkey.exe'
+          - '\setspn.exe'
+      condition: selection and selection_recon
+    fields:
+      - Image
+      - User
+  answer_sources:
+  - process_creation
+- question: Did this host open SMB or RPC sessions to multiple other hosts around the time of the alert?
+  context: >-
+    net view enumerates shares by querying remote hosts over SMB, so the command is only the first half of
+    the behavior — the second half is outbound traffic on 445 or 139. Reaching five or more distinct
+    destinations inside roughly ten minutes is the practical line between checking one file server and
+    sweeping the segment; a single destination is usually routine. Read the Image column alongside the
+    destinations, since management agents and backup software legitimately fan out over SMB and are worth
+    excluding by name before treating the pattern as enumeration. Endpoint-collected connections carry the
+    initiating process; connections observed only on the wire do not, so correlate on timing when the
+    process is absent.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationPort:
+          - 445
+          - 139
+      condition: selection
+    fields:
+      - DestinationIp
+      - Image
+  answer_sources:
+  - network_connection
+- question: Is this user expected to run administrative discovery commands?
+  context: >-
+    Network administrators and IT staff run whoami and net view as part of routine troubleshooting;
+    standard users almost never do, and service accounts running them under a service host almost never
+    have a reason to. Weigh the account against its role and its normal toolset. Where the alert fires
+    under SYSTEM, LOCAL SERVICE, NETWORK SERVICE, or a machine account, the identity attributes nothing —
+    treat the launching parent as the actor and judge that instead. Inventory scripts and management
+    agents that legitimately enumerate should be enumerable by name; if the account is not one of them,
+    the enumeration is unexplained.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - User
+  answer_sources:
+  - organizational_knowledge
+  - asset_inventory
+- question: Is the Office installation that spawned this execution patched and configured to restrict macros?
+  context: >-
+    Relevant on the excel.exe branch. Delivery for this family runs through legacy spreadsheet macros that
+    execute on open and need no vulnerability, so patch level alone does not explain whether the chain
+    could run — the configuration does. Establish whether macros from files originating outside the
+    organization are blocked, whether legacy macro formats are still permitted, and whether the
+    installation is current on updates addressing macro, OLE, and DDE handling. An installation that is
+    both unpatched and permissive means every other host with the same build is reachable by the same
+    workbook. On the svchost branches no application was exploited and this question does not apply.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+  answer_sources:
+  - asset_inventory
+  - edr_console
+- question: Did this same detection fire on other hosts or for other users?
+  context: >-
+    Macro-bearing workbooks are sent to many recipients at once, and the follow-on stages replay
+    identically on each host that opens one. Several hosts firing this rule within the same period points
+    at one delivery reaching multiple people rather than a host-local event, and the host and user list is
+    what scopes the mail search and the remediation. A single host points the other way — toward something
+    that started on this endpoint. Residual scheduled tasks from incomplete cleanup are a known reason this
+    activity resurfaces on hosts that were previously remediated, so check whether any listed host has
+    fired before.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        rule.uuid|expand: '%rule_uuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+  answer_sources:
+  - alert
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: >-
+    The query mirrors the rule's full three-branch selection structure scoped to this user, so the count is
+    this user's 90-day history of the rule's actual firing pattern rather than generic use of svchost.exe,
+    regsvr32.exe, or net.exe — binaries that every account touches constantly and that a naive baseline
+    would normalize away. Aggregated by host so repeat hosts are visible. A user with no prior history of
+    this pattern is a stronger finding than one who produces it regularly; weigh any non-zero count against
+    the account's role and typical toolset before treating it as normal.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_svchost:
+        Image|endswith: \svchost.exe
+        CommandLine|contains|all:
+        - C:\Users\
+        - \Desktop\
+      filter_svchost:
+        ParentImage|startswith: C:\Windows\System32\
+      selection_regsvr:
+        ParentImage|endswith: \excel.exe
+        Image|endswith: \regsvr32.exe
+        CommandLine|contains:
+        - ' -s '
+        - \AppData\Local\Temp\
+      filter_regsvr:
+        CommandLine|contains: .dll
+      selection_anomaly_parent:
+        ParentImage|endswith: \svchost.exe
+      selection_anomaly_child_1:
+        Image|endswith: \whoami.exe
+        CommandLine|contains: ' /all'
+      selection_anomaly_child_2:
+        Image|endswith:
+        - \net.exe
+        - \net1.exe
+        CommandLine|contains: ' view'
+      _pb_scope:
+        User|expand: '%User%'
+      condition: ((selection_svchost and not filter_svchost) or (selection_regsvr and not filter_regsvr) or (selection_anomaly_parent and 1 of selection_anomaly_child_*)) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+  always_include: true
+- question: >-
+    Has this parent process historically driven the rule's pattern on this host or across the environment,
+    or is the parent new for this activity?
+  context: >-
+    When the alert fires under a service principal, user identity attributes nothing and the meaningful
+    pivot is the launch mechanism. The query mirrors the rule's full three-branch selection structure scoped
+    to the alerting parent, so the count is the 90-day history of THIS parent driving THIS pattern, not
+    generic parent-and-binary co-occurrence. Aggregated by host, so a parent that already accounts for
+    thousands of prior events concentrated on managed hosts reads as vendor or platform automation, while a
+    parent that is new for this pattern is the deviation worth chasing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_svchost:
+        Image|endswith: \svchost.exe
+        CommandLine|contains|all:
+        - C:\Users\
+        - \Desktop\
+      filter_svchost:
+        ParentImage|startswith: C:\Windows\System32\
+      selection_regsvr:
+        ParentImage|endswith: \excel.exe
+        Image|endswith: \regsvr32.exe
+        CommandLine|contains:
+        - ' -s '
+        - \AppData\Local\Temp\
+      filter_regsvr:
+        CommandLine|contains: .dll
+      selection_anomaly_parent:
+        ParentImage|endswith: \svchost.exe
+      selection_anomaly_child_1:
+        Image|endswith: \whoami.exe
+        CommandLine|contains: ' /all'
+      selection_anomaly_child_2:
+        Image|endswith:
+        - \net.exe
+        - \net1.exe
+        CommandLine|contains: ' view'
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: ((selection_svchost and not filter_svchost) or (selection_regsvr and not filter_regsvr) or (selection_anomaly_parent and 1 of selection_anomaly_child_*)) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  always_include: true
+- question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the account across every host in the surrounding hour shows whether the activity stayed on one
+    endpoint or moved. The same account producing process activity on several hosts within the window is
+    what lateral movement looks like from the identity side, and it widens the set of endpoints that need
+    review. If the alert fired under SYSTEM, LOCAL SERVICE, NETWORK SERVICE, or a machine account, expect
+    this count to be dominated by routine platform and agent activity rather than anything the account
+    chose to do — in that case read the parent-scoped fleet question instead.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+  always_include: true
+- question: >-
+    Did this same parent-driven pattern fire on other hosts in the same window, or is the activity isolated
+    to this host?
+  context: >-
+    Under a service principal, asking what else the user did across the network returns platform and agent
+    activity that every host produces constantly. The meaningful question is whether the same launch
+    mechanism fired elsewhere, so the query mirrors the rule's full three-branch selection structure scoped
+    to the alerting parent, fleet-wide, inside the alert window. Multiple hosts in the same window points at
+    scheduled or pushed automation, or at one delivery landing on several endpoints at once; a single host
+    points at a host-local trigger and keeps the scope where it is.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_svchost:
+        Image|endswith: \svchost.exe
+        CommandLine|contains|all:
+        - C:\Users\
+        - \Desktop\
+      filter_svchost:
+        ParentImage|startswith: C:\Windows\System32\
+      selection_regsvr:
+        ParentImage|endswith: \excel.exe
+        Image|endswith: \regsvr32.exe
+        CommandLine|contains:
+        - ' -s '
+        - \AppData\Local\Temp\
+      filter_regsvr:
+        CommandLine|contains: .dll
+      selection_anomaly_parent:
+        ParentImage|endswith: \svchost.exe
+      selection_anomaly_child_1:
+        Image|endswith: \whoami.exe
+        CommandLine|contains: ' /all'
+      selection_anomaly_child_2:
+        Image|endswith:
+        - \net.exe
+        - \net1.exe
+        CommandLine|contains: ' view'
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: ((selection_svchost and not filter_svchost) or (selection_regsvr and not filter_regsvr) or (selection_anomaly_parent and 1 of selection_anomaly_child_*)) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  always_include: true

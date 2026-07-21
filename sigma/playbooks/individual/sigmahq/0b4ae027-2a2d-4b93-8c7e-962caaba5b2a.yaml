@@ -1,0 +1,287 @@
+name: Time Travel Debugging Utility Usage
+id: 8b53b550-335a-4e67-ae07-d4f087c06a5e
+description: |
+  Detects any process whose parent is tttracer.exe, the Windows Time Travel Debugging utility. tttracer.exe is a signed, system-resident binary that can proxy-execute an arbitrary executable as a child process or dump the memory of a target process (for example lsass.exe via the -dumpFull -attach syntax). Legitimate use comes from software developers and testers recording execution traces; malicious use abuses the trusted binary to run payloads or scrape credentials from LSASS. Investigation should establish what child tttracer.exe launched, whether the launch resembles credential dumping, and whether the launch is consistent with developer activity on this host.
+type: detection
+detection_id: 0b4ae027-2a2d-4b93-8c7e-962caaba5b2a
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- question: Did this process get spawned by tttracer.exe?
+  context: Confirm the alert is a true positive by reviewing the triggering event. The rule fires whenever a process has a parent whose image path ends in tttracer.exe. Verify the ParentImage value and note the child Image and its command line, since the child identity drives the rest of the investigation.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+- question: Is this user and host expected to run the Time Travel Debugging utility?
+  context: tttracer.exe is a developer and tester tool for recording execution traces. On a developer workstation it can be routine; on a server, a domain controller, or a general-purpose endpoint it is unexpected and weighs toward abuse of a trusted binary.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Did this tttracer.exe invocation proxy-execute a payload or dump process memory, and was LSASS the target?
+  context: tttracer.exe supports two abuse modes — spawning an arbitrary executable as a child, and dumping a target process by PID with the -dumpFull -attach syntax. Inspect the triggering command line and the child image to determine which mode this is. An LSASS PID as the dump target, or a credential-tool child, points to credential scraping; an unrelated executable points to proxy execution of a payload.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What command line did tttracer.exe itself run with, and what launched tttracer.exe?
+  context: The parent's own process_creation event carries the tttracer.exe command line, where the operational intent lives — a target path for proxy execution or -dumpFull -attach with a PID for memory dumping. The grandparent (what spawned tttracer.exe) shows whether this came from an interactive developer shell or from an unexpected launcher such as a script host or remote-execution tool.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- question: Did this specific tttracer-spawned process, or a process it launched in turn, write a dump-style file to disk?
+  context: Credential scraping from LSASS opens a handle with full access rights before reading or dumping
+    memory, but the handle open itself has no equivalent telemetry in this environment — a zero result on
+    that access alone is not evidence the dump did not happen. What can be observed is the artifact the
+    dump produces on disk. This question is scoped tightly to the process that triggered this alert and its
+    own children, rather than the broader host-wide file search below, so a hit here ties a written file
+    directly to this tttracer.exe launch rather than to unrelated activity elsewhere on the host.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Were any process memory dump files written on this host around the time of the alert?
+  context: A successful LSASS dump leaves a file on disk, commonly under %TEMP%, C:\Windows\Temp, or another user-writable location. Correlating a new dump-style file written shortly after the tttracer.exe execution confirms the credential-theft chain and identifies where the captured memory image was staged for exfiltration or offline parsing.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains:
+          - '\Temp\'
+          - '\Users\Public\'
+          - '\AppData\'
+      filter_ext:
+        TargetFilename|endswith:
+          - '.dmp'
+          - '.dump'
+          - '.bin'
+      condition: selection and filter_ext
+    fields:
+      - Image
+      - TargetFilename
+- question: What other child processes did tttracer.exe spawn on this host?
+  context: tttracer.exe used for proxy execution may launch more than the one child that triggered the alert. Enumerating every child of tttracer.exe on this host reveals the full set of binaries it ran in sequence — reconnaissance, credential tools, or additional payloads — and the scope of activity initiated through the trusted binary.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: '\tttracer.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Has tttracer.exe historically spawned this child binary on this host?
+  context: A parent-child pairing that has never been seen before is more suspicious than one that recurs. Zero or very low historical counts for tttracer.exe launching this specific child indicate a novel spawning relationship; a long-standing pairing is more consistent with routine developer tracing on this host.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: '\tttracer.exe'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        ParentImage|endswith: \tttracer.exe
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        ParentImage|endswith: \tttracer.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around the time of the alert?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the same user triggered similar activity on other hosts, the scope of compromise may be larger than this single detection.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        ParentImage|endswith: \tttracer.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Were outbound remote-access connections (RDP, SMB, WinRM, SSH) initiated from this host after
+    this event?
+  context: Credential theft is typically followed by lateral movement. The query returns outbound connections
+    from this host to remote-access ports -- 3389 (RDP), 445 (SMB/PsExec), 5985/5986 (WinRM), 22 (SSH)
+    -- in the hours after the event; the originating Image and User show what drove each connection. Two
+    limits to keep in mind -- credentials exfiltrated and replayed from another machine will not appear
+    here (check security 4624 logons on suspected targets for this account and any accounts with sessions
+    on this host), and the query requires Sysmon network telemetry (EID 3); if that is not collected from
+    this host, treat zero rows as a visibility gap, not as evidence no movement occurred.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
+- question: Which accounts may be compromised, and do any have elevated privileges?
+  context: If LSASS memory was dumped, every credential cached in that process is potentially exposed. The severity depends on what was logged on to the host — domain admin or service-account credentials require incident escalation, while a standard user account may only need monitoring. Cross-reference the accounts active on this host with directory group memberships.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance, or privilege escalation — may reveal the attack stages that preceded the use of tttracer.exe and help reconstruct the full timeline leading to credential access.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

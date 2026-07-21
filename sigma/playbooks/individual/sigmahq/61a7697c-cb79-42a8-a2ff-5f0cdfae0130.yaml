@@ -1,0 +1,352 @@
+name: Potential CobaltStrike Service Installations - Registry
+id: 7ec035e2-3819-4e97-8c2a-e181dac31ab2
+description: |
+  Detects a Windows service registry key being written (TargetObject under CurrentControlSet\Services or a numbered ControlSet ...\Services) whose value data (Details) matches one of two Cobalt Strike service-install patterns: a service binary path that references an ADMIN$ admin share and an .exe, or a %COMSPEC% command that uses start to launch powershell. These correspond to Cobalt Strike's remote service creation used for privilege escalation and lateral movement, where the service binary path or ImagePath value is the payload. Legitimate service management rarely writes a binPath that points at an admin share or a cmd-to-powershell one-liner, so the investigation should decode the value data, confirm whether the service binary was dropped and whether the service ran, identify the writing process and the source that reached this host, and check whether the same service was installed on other systems. Because registry key/value deletion is not observable in this telemetry, judge cleanup from the key's re-modification history and whether the configured payload executed, not from a delete event.
+type: detection
+detection_id: 61a7697c-cb79-42a8-a2ff-5f0cdfae0130
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-09
+questions:
+- question: Did this alert modify a Windows service registry key with value data matching a Cobalt Strike service-install pattern?
+  context: >-
+    The rule fires when a Services registry key is written (TargetObject under CurrentControlSet\Services or a numbered ControlSet ...\Services) AND its value data (Details) matches one of two service-install patterns: a service binary path that references an ADMIN$ admin share and an .exe, or a %COMSPEC% command that uses start to launch powershell. These correspond to Cobalt Strike's remote service creation for privilege escalation and lateral movement. Confirm the exact key path and value data, and note which of the two value patterns matched — the admin-share binary form and the cmd-to-powershell form lead the payload analysis in different directions.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this user and host expected to install or reconfigure Windows services?
+  context: >-
+    Legitimate service installation is normally performed by management tooling and administrators, and it rarely writes a service binary path that points at an admin share or a command interpreter. Knowing whether the account and host function fit service-management activity is often the fastest path to separating a true positive from routine operations. User attribution is present on roughly 94% of endpoint registry events; when it is a machine account (HOST$) or SYSTEM, pivot on the writing process (Image) instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: What service name and payload does the value data specify?
+  context: >-
+    The trailing segment of the service key path names the service; the Details value holds the service binary path or command it runs. For the admin-share form, the value is a path to an .exe reachable over an ADMIN$ share — a remote service binary staged on the target. For the %COMSPEC% form, the value is a cmd command that starts powershell, typically launching an encoded or downloaded in-memory beacon. Decode the full value and record the target binary or command line. Details is absent for binary or empty value data (roughly 79% of registry modifications carry it); missing data here does not clear the alert.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- question: Is the modified key a service-configuration location, and which process wrote it?
+  context: >-
+    Keys under CurrentControlSet\Services define installed services and their ImagePath or binPath, start type, and account. Writing a service binary path that points at an admin share or a command interpreter is not routine service management. Read the exact key path and the writing process (Image) here, and let the payload-analysis question carry the value decoding. Comparing the writing process against expected service-management tooling helps separate a deployment from a hands-on install.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Was the service's binary or payload dropped to disk on this host?
+  context: >-
+    A service is only effective if its configured binary exists at the referenced path. Correlating file activity by the registry-writing process and its children shows whether that binary landed in the same session as the key write — for example a drop into a Temp, Public, or admin-share-reachable path immediately before the service key was set. The file-write event carries no hash; if the payload is present, hash it from a later execution or retrieve it for a reputation lookup. If the file is absent, the service is staged but its binary is not yet present.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What processes executed on this host in the hours after the service key was written?
+  context: >-
+    Check whether the configured service binary or command ran. The query matches process starts
+    whose command line carries the value data recorded in the key, plus anything services.exe
+    spawned on this host - a starting service launches its binary path under services.exe, and
+    the cmd-to-powershell form expands COMSPEC so the raw value text may not appear verbatim.
+    A match confirms the service is live and its payload has run at least once. Absence means
+    the mechanism is installed but has not yet fired.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_value:
+        host.name|expand: '%hostname%'
+        CommandLine|contains|expand: '%Details%'
+      selection_service_child:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: '\services.exe'
+      condition: selection_value or selection_service_child
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- question: Is the installed service currently running, and under what account?
+  context: >-
+    A newly written service may be demand-start and not yet running, or it may have been stopped after detection. Verify current status directly on the host using the service name read from the value data. A service running as LocalSystem has full system privileges; the configured account reveals the access level the install achieved. The redisplayed event shows the writing process for reference.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Has this service registry key been written on this host before, and with what value?
+  context: >-
+    A first-time write to a service key is more notable than a value that changes routinely as software updates itself. Compare the historical Details values on this host: a key that has never been touched, or one whose value suddenly points to an admin share or a command interpreter, stands out. Zero history indicates a key that has never been modified before this event.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - Details
+      - Image
+- question: What other registry modifications were made on this host in the same window?
+  context: >-
+    An actor installing a service through the registry often makes several changes together — a second service, disabling a security policy, or altering start values and firewall settings. Clusters of registry writes from the same process within a short window reveal the full scope of the change and whether the service install landed alongside other objectives. The triggering key appears in the results; the signal is what else was modified. If the host is registry-noisy, narrow to the writing process from the alert or to security-relevant hive paths.
+  range: +/-30m
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - User
+- question: What process wrote the service key, and what started that writing process?
+  context: >-
+    The writing process (Image on the alert) is the immediate actor; tracing its own parent reveals whether the chain is legitimate — a management agent or an installer — or a beacon-hosting process such as rundll32, a script host, or an unexpected parent spawning the writer. If the parent process identifier resolves to NODATA, fall back to the writing process name and host with a time window.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - Image
+      - CommandLine
+- question: What host initiated the inbound remote-admin connection to this host around the alert?
+  context: >-
+    Service installs that reference an ADMIN$ share are typically delivered over SMB from a source host that has already authenticated. Identifying the originating address distinguishes a known admin jump box from an unexpected or compromised source used as a pivot point to reach this system. If the install was driven locally rather than remotely, the inbound connection may be absent.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationPort:
+          - 445
+          - 135
+          - 3389
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - SourceIp
+      - DestinationPort
+- question: Has this user account used remote-execution tools to reach other hosts?
+  context: >-
+    If the account tied to the service install is also running psexec, wmic, or remote-desktop
+    clients across multiple hosts within the window, the scope of compromise extends beyond this
+    system. Finding several destination hosts from one account in a short period indicates
+    active lateral movement. If the user attribution is NODATA, pivot on the source host or its
+    network connections on remote-admin ports instead. If this alert fired under SYSTEM, LOCAL
+    SERVICE, NETWORK SERVICE, or a machine account (name ending in $), this query intentionally
+    returns nothing — a user pivot on a service principal matches every host's background
+    automation, not an actor; assess movement through the host- and program-scoped questions
+    instead.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      selection_lateral:
+        Image|endswith:
+        - \psexec.exe
+        - \psexec64.exe
+        - \mstsc.exe
+        - \ssh.exe
+        - \plink.exe
+        - \wmic.exe
+      filter_svcprin_builtin:
+        User:
+        - SYSTEM
+        - LOCAL SERVICE
+        - NETWORK SERVICE
+      filter_svcprin_machine:
+        User|endswith: $
+      condition: (selection and selection_lateral) and not 1 of filter_svcprin_*
+    fields:
+    - host.name
+    - Image
+- question: Was the same service registry key written on other hosts in the environment?
+  context: >-
+    The identical service key and value across multiple hosts points to either a management push or an actor replicating the service install laterally; a single-host write is more consistent with a targeted foothold. Compare the Details values across hosts — the same value everywhere suggests common software or an installer, while differing payload paths per host point to attacker activity spreading the service.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+      - Details
+- question: Were other persistence mechanisms installed on this host around the same time?
+  context: >-
+    Actors rarely rely on a single foothold. Alongside a service install they may register scheduled tasks, additional services, registry Run keys, or BITS jobs. Surfacing other persistence-tool executions within the window shows whether this is one of several stacked mechanisms or an isolated action. Multiple persistence installations from the same timeframe indicate intentional stacking rather than routine administration.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- question: What other process activity occurred on this host around the time of the alert?
+  context: >-
+    The service install rarely stands alone. Aggregating process activity around it surfaces what preceded it — a beacon, a download, reconnaissance, or an inbound remote session — and what followed. Novel parent-child pairs stand out at low counts against the high-volume agent and OS telemetry that dominates the host.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host — defense tampering, reconnaissance, credential access, or a suspicious download — may reveal the stages that preceded the service install and help reconstruct the timeline. A service-install alert following an earlier execution or tampering alert reads very differently from one with no prior activity.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Does an administrator recall installing this service, or is this authorized testing?
+  context: >-
+    Direct confirmation from the responsible team is often the fastest legitimacy check. Authorized penetration testing or red-team exercises can reproduce this exact service-install pattern and should have corresponding rules of engagement; if no one recalls the action and no test is scheduled, treat the credentials or host as potentially compromised. When the action confirms, capture which service and binary were expected and why it was deployed this way.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine

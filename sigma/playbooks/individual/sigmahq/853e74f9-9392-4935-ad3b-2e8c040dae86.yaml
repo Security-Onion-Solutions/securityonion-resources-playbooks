@@ -1,0 +1,355 @@
+name: UAC Bypass Using DismHost
+id: de0eb29f-3241-4bd5-b420-5de7b22b1ab8
+description: |
+  Detects the DismHost.exe UAC bypass pattern (UACMe method 63): a DismHost.exe instance running from a
+  user Temp directory (C:\Users\...\AppData\Local\Temp\) acting as parent to a child process that runs at
+  High or System integrity. The technique abuses DLL hijacking of the auto-elevated DISM host to escalate a
+  split-token administrator from medium to high integrity without a consent prompt. The rule fires when all
+  conditions match together — the parent image path contains C:\Users\ AND \AppData\Local\Temp\ AND
+  \DismHost.exe, AND the child runs at an elevated integrity level. Investigation should confirm the
+  Temp-path DismHost parent and its child lineage, identify what the hijack staged, and determine what the
+  attacker did with the elevated privileges immediately afterward.
+type: detection
+detection_id: 853e74f9-9392-4935-ad3b-2e8c040dae86
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the alerting event match the DismHost UAC bypass pattern — a DismHost.exe parent under \AppData\Local\Temp\ spawning a child at High or System integrity?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the parent image path and the child's integrity level against the rule's detection criteria. A genuine match shows a ParentImage ending in \DismHost.exe located under C:\Users\...\AppData\Local\Temp\, and a child process carrying a High or System integrity token.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - IntegrityLevel
+- question: Is this user and host expected to perform privileged elevation or servicing-tool operations?
+  context: UAC bypass requires an administrator-group user with the default split-token configuration. Knowing whether the user role and host function involve legitimate elevated software servicing or DISM operations helps distinguish a sanctioned admin action from an attacker abusing the auto-elevate path.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What is the Temp-path DismHost.exe parent doing on this host, and what started DismHost.exe itself?
+  context: DismHost.exe is the DISM servicing host; legitimately it is launched by the system into a generated Temp working directory during servicing operations. Reviewing the parent's own process_creation event — its command line and what spawned it — shows whether it ran as part of a genuine servicing flow or was driven by an attacker-controlled process to drive the hijack.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- question: What is the exact Temp-path image of DismHost.exe and the child binary it spawned, and is the DismHost.exe at that path the legitimate signed system file?
+  context: The bypass relies on a DismHost.exe running from a user-writable Temp directory alongside a hijacked DLL, rather than the normal system-managed servicing flow. The exact image paths and the signature of the DismHost.exe at that location distinguish a legitimate transient servicing copy from a planted or DLL-hijacked binary used to escalate. The broader UACMe auto-elevate catalog (sdclt.exe, eventvwr.exe, fodhelper.exe, computerdefaults.exe) is context only; this rule pins DismHost.exe specifically.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+      - IntegrityLevel
+- question: What DLLs did the Temp-path DismHost.exe load, and were any loaded from the same user-writable Temp directory rather than System32?
+  context: UACMe method 63 hijacks the DLL search order of the auto-elevated DismHost.exe by planting a malicious DLL next to it in the Temp directory. A module loaded by DismHost.exe from a user-writable Temp path — rather than the signed copy under System32 — is the planted component that carries the elevated payload. An unsigned or Temp-located ImageLoaded entry confirms the hijack mechanism.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: '\DismHost.exe'
+        ImageLoaded|contains: '\AppData\Local\Temp\'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+- question: Were registry keys under the auto-elevate shell-handler or COM locations modified shortly before the bypass?
+  context: Some UAC bypasses write a command into an HKCU shell-handler or COM key that an auto-elevated process reads and executes (for example HKCU\Software\Classes\ms-settings\Shell\Open\command or DelegateExecute entries). Finding such a registry write in the registry_set log within the correlation window before the elevated child spawn confirms a handler-based bypass mechanism and reveals the payload that ran elevated.
+  range: -15m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains:
+          - 'Shell\Open\command'
+          - 'DelegateExecute'
+          - 'ms-settings'
+          - 'mscfile'
+          - 'Classes\exefile'
+          - 'Classes\Folder'
+          - 'Software\Classes'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- question: Did another process call injection-capable APIs around the time of the bypass — WriteProcessMemory, QueueUserAPC, or SetWindowsHookEx — consistent with direct manipulation of the DismHost.exe servicing host?
+  context: Some elevation abuses inject code into or hook the auto-elevated DismHost.exe process directly rather than relying solely on the planted DLL. Behavioral API-call telemetry for this host surfaces which process invoked these injection-capable calls; a source process other than DismHost.exe calling one of these APIs in this window points to direct manipulation of the servicing host rather than a benign servicing operation.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        event.dataset: endpoint.events.api
+        process.Ext.api.name:
+          - WriteProcessMemory
+          - QueueUserAPC
+          - SetWindowsHookEx
+      condition: selection
+    fields:
+      - process.executable
+      - process.Ext.api.name
+      - Image
+- question: Did reg.exe, powershell.exe, or cmd.exe write to a known UAC bypass shell-handler key before the elevated child spawned?
+  context: Many UAC bypass techniques set up the elevation by writing a command to a registry key via a command-line tool. Common targets include HKCU\Software\Classes\ms-settings\Shell, mscfile\shell, and exefile handlers. A command-line registry write just before the bypass confirms the mechanism and reveals the exact payload staged for elevated execution.
+  range: -15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\reg.exe'
+          - '\powershell.exe'
+          - '\cmd.exe'
+        CommandLine|contains:
+          - 'ms-settings'
+          - 'mscfile'
+          - 'Classes\exefile'
+          - 'Classes\Folder'
+          - 'Environment'
+          - 'Shell\Open\command'
+          - 'DelegateExecute'
+      condition: selection
+    fields:
+      - CommandLine
+      - Image
+- question: What action was performed at High or System integrity on this host shortly after the bypass?
+  context: 'UAC bypass is a means to an end -- attackers elevate to perform actions that require high integrity: installing persistence, dumping credentials, tampering with security tools, or accessing protected resources. Examining processes spawned at elevated integrity shortly after the DismHost child reveals the attacker''s objective.'
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        IntegrityLevel:
+          - 'High'
+          - 'System'
+          - 'S-1-16-16384'
+          - 'S-1-16-12288'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - IntegrityLevel
+- question: Were other privilege escalation or UAC bypass techniques attempted on this host?
+  context: Attackers who attempt one UAC bypass often try multiple methods until one succeeds, especially if the OS version or configuration blocks certain techniques. Finding multiple bypass or escalation detections from the same host confirms deliberate privilege escalation activity rather than a false positive.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - rule.name
+      - rule.uuid
+      - event.severity_label
+- question: What other child processes did this same Temp-path DismHost.exe instance spawn?
+  context: If DismHost.exe was driven to perform the bypass, it likely spawned additional processes beyond the one that triggered the alert. Seeing all children launched by this DismHost.exe instance reveals the full scope of activity orchestrated through the elevation chain — reconnaissance, persistence, or credential access tooling.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Has a Temp-path DismHost.exe spawning this child binary ever happened on this host before?
+  context: A DismHost.exe running from a user Temp directory and parenting a process at elevated integrity is not a routine relationship outside short-lived servicing windows. Zero or very low historical counts of this specific parent-child pairing indicate a novel spawning relationship consistent with bypass tooling rather than legitimate servicing behavior.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|contains|all:
+        - C:\Users\
+        - \AppData\Local\Temp\
+        - \DismHost.exe
+        IntegrityLevel:
+        - High
+        - System
+        - S-1-16-16384
+        - S-1-16-12288
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|contains|all:
+        - C:\Users\
+        - \AppData\Local\Temp\
+        - \DismHost.exe
+        IntegrityLevel:
+        - High
+        - System
+        - S-1-16-16384
+        - S-1-16-12288
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the same user triggered similar elevation activity on other hosts, the scope of compromise may be larger than this single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|contains|all:
+        - C:\Users\
+        - \AppData\Local\Temp\
+        - \DismHost.exe
+        IntegrityLevel:
+        - High
+        - System
+        - S-1-16-16384
+        - S-1-16-12288
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host -- defense tampering, reconnaissance, credential access -- may reveal the attack stages that preceded the bypass and help reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

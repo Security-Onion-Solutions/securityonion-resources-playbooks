@@ -1,0 +1,408 @@
+name: Time Travel Debugging Utility Usage - Image
+id: f5e1a558-6989-4f5f-a43f-5b246193f8ab
+description: |
+  Detects a Windows library load of one of the Time Travel Debugging (TTD) recorder modules — ttdrecord.dll,
+  ttdwriter.dll, or ttdloader.dll — which are pulled in whenever tttracer.exe records or dumps a process. tttracer.exe
+  is a signed, on-box Microsoft debugging utility that can proxy-execute an arbitrary executable (tttracer.exe
+  {path}.exe) and can attach to and full-dump a running process by PID (tttracer.exe -dumpFull -attach {PID});
+  because the recorder is injected into the target being traced, the process that loads the DLL IS the process being
+  recorded, and if that process is lsass.exe the trace becomes a credential-memory dump. Investigation should confirm
+  which module loaded and into which process, decode the tttracer command line to learn what was launched or attached,
+  identify the trace or dump output, and establish whether the activity is a developer debugging session or credential
+  theft staged through a trusted binary.
+type: detection
+detection_id: e76c8240-d68f-4773-8880-5c6f63595aaf
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-10
+questions:
+- question: Does the loaded module match what this rule detects — is it a TTD recorder DLL, and which process loaded it?
+  context: >-
+    Confirm the alert is a true positive by reviewing the exact module path (ImageLoaded) against the rule's criteria:
+    the load must end in ttdrecord.dll, ttdwriter.dll, or ttdloader.dll. These modules are legitimately Microsoft-signed,
+    so a valid signature is expected and is not itself the signal — the signal is that they are loading at all, and into
+    which process. Note the loading process (Image), because the TTD recorder is injected into the process being traced,
+    so the loading process is the target being recorded or dumped.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|endswith|expand: '%ImageLoaded%'
+      condition: selection
+    fields:
+      - ImageLoaded
+  answer_sources:
+  - alert
+  - image_load
+- question: Is this user and host expected to run Time Travel Debugging?
+  context: >-
+    TTD recording is a developer and reverse-engineering activity that is legitimate on engineering workstations but
+    unusual on servers, domain controllers, or standard user endpoints. Knowing whether this user role and host function
+    normally involve debugging is often the fastest way to separate a sanctioned trace from an operator abusing a signed
+    binary to record another process. tttracer.exe also requires administrator privileges, so confirm the acting account
+    is expected to hold them here.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: Is the trace or dump output file still on disk for analysis?
+  context: >-
+    A TTD recording writes a trace file (typically a .run/.out artifact) and a full dump writes a memory image; these
+    frequently land in the tracer's working directory or under %TEMP% or C:\Windows\Temp, and are usually created within
+    a few minutes of the recorder loading. If the target was lsass.exe, that output contains harvested credential
+    material and should be preserved and treated as sensitive. Correlating by the traced process lineage catches files
+    the target itself wrote; if the trace file was written by tttracer.exe rather than the traced process, pivot on the
+    tracer's own process to locate it.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+  answer_sources:
+  - file_event
+  - manual_review
+- question: What other modules did the recorded process load around this event, and are any from non-canonical or user-writable paths?
+  context: >-
+    The full set of modules the target process loaded around the TTD recorder tells the operator's story when the trace
+    is opaque. Look for DLLs from %TEMP%, AppData, ProgramData, or Public, unsigned modules where signed ones are
+    expected, and system DLL names loaded from non-system paths. A recorder loading alongside other injected or
+    side-loaded modules in the same process points to a broader tampering sequence rather than a benign debug session.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+      - SignatureStatus
+      - Hashes
+  answer_sources:
+  - image_load
+  - manual_review
+- question: What are the signing status, hash, and reputation of the TTD modules and any other suspicious modules loaded here?
+  context: >-
+    Genuine ttdrecord.dll, ttdwriter.dll, and ttdloader.dll are Microsoft-signed, so a Valid signature on those modules
+    confirms the real TTD toolchain rather than clearing the alert — the concern is the recording itself, not a forged
+    DLL. Use the Hashes field to pin the exact module versions and to check any co-loaded modules against threat
+    intelligence; an unsigned module with a system-style filename, or a SignatureStatus of Expired, Distrusted, or
+    Invalid, is a masquerading signal worth escalating.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Hashes
+      - Signed
+      - Signature
+      - SignatureStatus
+- question: What process was being traced or dumped, and was it a credential store such as lsass.exe?
+  context: >-
+    Pivot the loading process to its creation event to identify what is being recorded: the command line reveals whether
+    the target is lsass.exe or another sensitive process. tttracer.exe -dumpFull -attach {PID} dumps a running process by
+    PID, while tttracer.exe {path}.exe launches and records a new one; a full dump of lsass.exe yields credential material
+    the same way a memory-dumping tool would. The actual memory read happens through a debug attach, which leaves no
+    cross-process handle telemetry, so the tracer command line and the identity of the recorded process are the primary
+    evidence of intent.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - process_creation
+  - file_event
+- question: In what mode was tttracer.exe invoked on this host, and what did it attach to or launch?
+  context: >-
+    The recorder DLL load implies a tttracer.exe invocation; recovering that command line shows whether it ran in
+    dump/attach mode against an existing process or launched a new target, and what that target was. A -dumpFull -attach
+    against a PID that resolves to lsass.exe is credential dumping; -attach against an arbitrary running process is
+    covert recording; launching an executable is proxy execution of an unsigned payload through a trusted binary. The
+    query narrows to tttracer.exe runs carrying the record, dump, attach, or output flags so the mode and target are
+    explicit.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: \tttracer.exe
+        CommandLine|contains:
+          - -dumpFull
+          - -attach
+          - -out
+          - -children
+      condition: selection
+    fields:
+      - CommandLine
+      - User
+      - ProcessGuid
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: What process spawned the recorded target, and does that parent chain explain how tttracer got involved?
+  context: >-
+    When tttracer.exe launches a target, it is the parent of the recorded process, so an unexpected tttracer.exe parent
+    directly explains the DLL load. When tttracer.exe instead attaches to an already-running process, the recorded
+    target keeps its original parent and tttracer will not appear in this chain — in that case the launcher is found
+    among concurrent tttracer.exe executions rather than here. Unusual ancestry such as mshta.exe, wscript.exe, or an
+    Office application starting the chain points to exploitation or a malicious script driving the activity.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Which accounts may be exposed if this was an lsass.exe trace, and do any have elevated privileges?
+  context: >-
+    If tttracer dumped lsass.exe, every account with a session or cached credential on this host at the time is
+    potentially exposed, and the severity depends on their privilege. Domain admin, service, or other privileged
+    accounts logged on to this host require incident escalation and credential rotation; a lone standard-user session
+    may only need monitoring. Cross-reference the acting user and any interactive or service logons on this host against
+    directory group memberships.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - active_directory
+  - organizational_knowledge
+- question: Were outbound remote-access connections (RDP, SMB, WinRM, SSH) initiated from this host after this event?
+  context: >-
+    Credential theft is typically followed by lateral movement. The query returns outbound connections from this host to
+    remote-access ports — 3389 (RDP), 445 (SMB/PsExec), 5985/5986 (WinRM), 22 (SSH) — in the hours after the event, with
+    the originating Image and User showing what drove each connection. Two limits apply: credentials exfiltrated and
+    replayed from another machine will not appear here, so check logon events on suspected targets for the exposed
+    accounts; and if endpoint network telemetry is not collected from this host, treat zero rows as a visibility gap
+    rather than evidence no movement occurred.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
+  answer_sources:
+  - network_connection
+- question: What child processes did the recorded target or tttracer spawn afterward?
+  context: >-
+    Processes spawned around the recording reveal its actual impact. Legitimate debugging rarely spawns further tooling;
+    credential-theft or proxy-execution sequences often follow with cmd.exe, powershell.exe, certutil.exe, or archive
+    utilities used to stage and move the trace or dump output. Unexpected children shortly after the recorder loaded
+    extend the timeline into post-exploitation.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Has a TTD recorder module been loaded on this host before, and under which processes?
+  context: >-
+    A first-time recorder load on a host is a stronger anomaly than a recurring one. If ttdrecord.dll, ttdwriter.dll, or
+    ttdloader.dll has loaded repeatedly over the past 90 days under a consistent developer process, this load is probably
+    routine debugging. If this is the first occurrence, or prior loads were under entirely different processes than the
+    one recorded now, the current activity is anomalous and the recorded target deserves closer scrutiny.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|endswith|expand: '%ImageLoaded%'
+      condition: selection
+    fields:
+      - Image
+- question: When this host has previously loaded a TTD recorder, what processes and users normally drove it, and does this alert fit that pattern?
+  context: >-
+    Even a legitimate debugging utility can be abused. This query mirrors the rule's selection scoped to this host, so the
+    resulting process and user distribution reflects how the TTD recorder specifically has loaded here in the past, not
+    generic tool usage. A new loading process, an unexpected user account, or a recorded target that has never been
+    traced before is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: image_load
+    detection:
+      selection:
+        ImageLoaded|endswith:
+        - \ttdrecord.dll
+        - \ttdwriter.dll
+        - \ttdloader.dll
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - Image
+    - User
+  answer_sources:
+  - process_creation
+- question: Have other hosts loaded a TTD recorder in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: >-
+    This query mirrors the rule's selection with no host scope, giving a fleet-wide count of TTD recorder loads rather
+    than generic binary usage. Many hosts loading the recorder in a tight window can indicate a scripted deployment or a
+    sanctioned engineering rollout; a single host or a small unrelated set points to targeted, manual operator activity.
+    Use the host spread and the consistency of the recorded targets to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: image_load
+    detection:
+      selection:
+        ImageLoaded|endswith:
+        - \ttdrecord.dll
+        - \ttdwriter.dll
+        - \ttdloader.dll
+      condition: selection
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Alerts rarely occur in isolation. Examining activity around the recorder load reveals what led to it and what
+    followed — reconnaissance, privilege escalation, or persistence installation — and whether it is one step in a
+    larger sequence. Aggregating by process and parent collapses routine agent noise while novel parent-child pairs stand
+    out at low counts.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+  answer_sources:
+  - process_creation
+  - file_event
+  - registry_event
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance, or
+    privileged-process access — may reveal the stages that preceded the recording and help reconstruct the full
+    timeline. Defense tampering or credential access firing shortly before a TTD dump strengthens the case that this is
+    staged credential theft rather than a debugging session.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+  answer_sources:
+  - alert

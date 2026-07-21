@@ -1,0 +1,364 @@
+name: Suspicious TSCON Start as SYSTEM
+id: 3cc48f1b-7167-4301-9772-bda00af23b4e
+description: |
+  Detects tscon.exe running under the LOCAL SYSTEM identity (User containing AUTHORI/AUTORI). When tscon runs as
+  SYSTEM it can reconnect to any user's active or disconnected terminal-services session without supplying that
+  user's password, silently taking over the session and inheriting its process tree, drive mappings, and cached
+  credentials. Legitimate SYSTEM-context tscon is rare and usually tied to a service or scheduled task; the
+  investigation should determine which session was targeted, what spawned tscon, and whether a service or task was
+  created to obtain the SYSTEM context.
+type: detection
+detection_id: 9847f263-4a81-424f-970c-875dab15b79b
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Did tscon.exe run under a LOCAL SYSTEM identity?
+  context: Before investing investigation time, confirm the alert is a true positive by checking that Image ends in
+    tscon.exe and User resolves to a SYSTEM/AUTHORITY principal. SYSTEM-context tscon is the heuristic this rule
+    fires on, so this pairing is the core verification.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - User
+- question: Is this host expected to run terminal-services session-connect operations as SYSTEM?
+  context: SYSTEM-context tscon is uncommon outside of session brokers, RDS hosts, or specific service automation.
+    Knowing whether this host brokers remote desktop sessions and whether SYSTEM-owned tscon fits its normal role
+    is often the fastest path to separating a true positive from routine terminal-services maintenance.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Is SYSTEM-context use of tscon.exe sanctioned for remote session management on this host?
+  context: tscon is a native Windows terminal-services binary, so software allowlisting will not flag it. The
+    relevant question is whether an approved administrative process on this host is supposed to switch terminal
+    sessions as SYSTEM. Unsanctioned SYSTEM-context tscon, even from a built-in tool, can represent session
+    hijacking or an operator moving laterally through an existing desktop session.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+- question: Is there a helpdesk ticket or maintenance window explaining a SYSTEM session reconnect on this host?
+  context: Legitimate remote session management typically correlates with an active support ticket, a scheduled
+    maintenance window, or a documented administrative procedure. If no support context exists, a SYSTEM-context
+    session reconnect may be an attacker taking over another user's session without their credentials.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What session did tscon reconnect to? Decode the session ID and /dest target in the command line.
+  context: The full command line reveals which session was hijacked and where it was redirected. tscon takes a
+    source session ID or name and a /dest target (for example "tscon 2 /dest:console" or "tscon 1
+    /dest:rdp-tcp#55"); the /dest value identifies the session that received control. Map the source session ID to
+    a user via the session-inventory tooling to learn whose desktop was taken over.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+      - User
+- question: What process spawned tscon.exe, and is that parent chain expected?
+  context: The parent reveals how the SYSTEM context was obtained. tscon launched by services.exe indicates a
+    service whose image path runs the reconnect command (a common way to gain LocalSystem); a cmd.exe or
+    powershell.exe parent points to an interactive SYSTEM shell. Examine what spawned the parent and what else the
+    parent launched to reconstruct how SYSTEM was reached.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Was a new Windows service created or started on this host shortly before tscon ran as SYSTEM?
+  context: A frequent route to SYSTEM-context tscon is creating a service whose binary path runs the reconnect
+    command, then starting it (for example "sc create" with a binpath calling tscon, followed by "sc start"); the
+    service inherits LocalSystem. Service-control activity in the window before the alert suggests the SYSTEM
+    context was manufactured for the hijack rather than arising from routine session brokering.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_sc:
+        CommandLine|contains:
+          - 'sc create'
+          - 'sc  create'
+          - 'sc start'
+          - 'sc  start'
+          - 'New-Service'
+          - 'net start '
+      condition: selection_host and selection_sc
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- question: What network connections did tscon.exe make around the reconnect?
+  context: A reconnected terminal session may carry outbound activity tied to the binary or feed a remote operator.
+    Connections to internal RDP listeners or to unexpected external addresses around the reconnect help distinguish
+    a local console switch from remote operator control. tscon often makes no outbound connections of its own; if
+    this returns nothing, fall back to the /dest target and session-name parameters in the reconnect command line.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationHostname
+      - DestinationPort
+- question: What child processes did the reconnected session spawn afterward?
+  context: After a session takeover, the inherited or newly spawned process tree reveals the operator's intent.
+    Reconnaissance commands, credential-access tooling, or lateral-movement utilities launched on this host shortly
+    after the reconnect indicate hands-on activity inside the hijacked session rather than a benign session switch.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: When this host has previously fired the rule's pattern, what parents and users normally drive it, and
+    does the current alert fit?
+  context: Even native tools have a baseline. The query mirrors the rule's selection structure scoped to this host,
+    so the resulting parent/user distribution reflects how SYSTEM-context tscon has historically run here. A new
+    parent process such as services.exe, an unfamiliar SYSTEM-derived account, or an unusual command-line structure is
+    the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|contains:
+        - AUTHORI
+        - AUTORI
+        Image|endswith: \tscon.exe
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Have other hosts fired the rule's pattern in the past week, and does the cross-host distribution look
+    like automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, giving a fleet-wide count of
+    SYSTEM-context tscon executions rather than generic tscon usage. Many hosts firing the same pattern can point
+    to a session broker or a management product behaving consistently; one host or a small unrelated set points to
+    manual operator activity worth prioritising.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|contains:
+        - AUTHORI
+        - AUTORI
+        Image|endswith: \tscon.exe
+      condition: selection
+    fields:
+    - host.name
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|contains:
+        - AUTHORI
+        - AUTORI
+        Image|endswith: \tscon.exe
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|contains:
+        - AUTHORI
+        - AUTORI
+        Image|endswith: \tscon.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user identity do across the network around this time?
+  context: Tracking the firing identity's activity across all hosts reveals lateral movement following a session
+    takeover. If the same identity triggered similar activity on multiple hosts, the scope may extend beyond this
+    endpoint. When the alert fires under SYSTEM this pivot returns broad agent telemetry, so weigh it together with
+    the parent+binary cross-host view.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|contains:
+        - AUTHORI
+        - AUTORI
+        Image|endswith: \tscon.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Session hijacking rarely happens in isolation. Earlier detections on the same host — privilege
+    escalation, service creation, or credential access — may reveal how the operator reached SYSTEM and help
+    reconstruct the timeline leading up to the reconnect.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Were any executables or remote-access agent files written to this host around the time of the alert?
+  context: Beyond native session takeover, remote-access tradecraft often drops an agent or helper binary to
+    establish persistent control. Files written to user-writable or temp locations around the reconnect — service
+    binaries, remote-control agents, or staged tooling — indicate the operator is installing follow-on access
+    rather than only switching sessions. Scope to the written file paths so the result is not the host's full file
+    activity.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith:
+          - '.exe'
+          - '.dll'
+          - '.sys'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - User

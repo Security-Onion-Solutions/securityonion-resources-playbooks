@@ -1,0 +1,406 @@
+name: Potential PowerShell Execution Via DLL
+id: 7ed9ac63-e1f8-4a0f-8b74-01db1e8ec4a9
+description: |
+  Detects a Microsoft-signed proxy-execution binary (rundll32.exe, regsvr32.exe, installutil.exe, regasm.exe, or regsvcs.exe, identified by Image or OriginalFileName) invoked with a command line that carries PowerShell execution primitives such as Invoke-Expression, Invoke-Command, IEX, ICM, DownloadString, FromBase64String, or Default.GetString. This is the PowerShdll pattern: PowerShell is hosted inside a DLL and run through a trusted LOLBin instead of powershell.exe, which sidesteps application allowlisting and PowerShell-process-based monitoring. The rule fires only when both the proxy-binary selection AND the PowerShell-token selection match together. Legitimate use of these binaries does not normally include PowerShell-language tokens on the command line, so the investigation should decode what the hosted command actually does, identify the DLL mapped into the proxy binary, and confirm whether the parent, user, and host are consistent with sanctioned automation or point to operator-driven proxy execution.
+type: detection
+detection_id: 6812a10b-60ea-420c-832f-dfcc33b646ba
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- question: Does the alerting event match what this rule detects, with a proxy-execution binary running a command line that carries PowerShell-language tokens?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the exact command line and process details against the rule's criteria. The rule fires only when both halves are present together, a proxy binary (rundll32.exe, regsvr32.exe, installutil.exe, regasm.exe, or regsvcs.exe by Image or OriginalFileName) AND a command line containing one of the PowerShell primitives such as Invoke-Expression, Invoke-Command, IEX, ICM, DownloadString, FromBase64String, or Default.GetString. Confirm both the binary identity and the token are in the actual event.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to run a signed proxy-execution binary that carries PowerShell command tokens?
+  context: Legitimate use of rundll32.exe, regsvr32.exe, installutil.exe, regasm.exe, and regsvcs.exe is common, but those tools do not normally receive PowerShell-language arguments on the command line. Knowing whether the user role and host function involve developer tooling or sanctioned automation that drives these binaries this way is often the fastest path to distinguishing routine activity from hosted PowerShell proxy execution.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Decode the PowerShell command hosted inside this proxy binary. What does the full command line do?
+  context: The command line carries the actual operation hidden behind a trusted binary. Reconstruct and read the PowerShell expression passed through the proxy, decoding any FromBase64String blob, resolving DownloadString or Default.GetString sources, and identifying what IEX, ICM, Invoke-Expression, or Invoke-Command ultimately runs. The decoded content reveals the intent, whether a download cradle, an in-memory loader, a reverse shell, or staging for follow-on execution.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|contains:
+          - Default.GetString
+          - DownloadString
+          - FromBase64String
+          - 'ICM '
+          - 'IEX '
+          - Invoke-Command
+          - Invoke-Expression
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What cradle or encoding does the hosted command use, and what does the fully decoded content fetch or execute?
+  context: 'These PowerShell primitives are most often the front of a fetch-and-run cradle. IEX(Net.WebClient.DownloadString(...)) and Invoke-Expression download a script and run it directly in memory; FromBase64String and Default.GetString reconstruct an encoded payload before execution. Follow each layer: resolve the source URL or IP for any DownloadString call, base64-decode any FromBase64String blob, and identify the in-memory assembly or script that finally executes. Note embedded URLs, IP addresses, file paths, or child binary names.'
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What DLL was mapped into the proxy binary, and is it a module these tools normally load?
+  context: The PowerShdll pattern hosts the PowerShell engine inside a DLL that the proxy binary loads into memory, so the loaded module is the payload carrier. Compare the modules this binary mapped against the small set of DLLs these tools legitimately load. A DLL loaded from a user-writable or temporary path, an unsigned module, or a module that hosts the .NET or PowerShell automation runtime under a proxy binary is the artifact that confirms hosted execution rather than ordinary tool use. If image-load events are not ingested in this environment, treat zero results as a visibility gap rather than evidence nothing loaded.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+- question: What process spawned this proxy binary, and is that parent chain expected?
+  context: The parent process reveals how the proxy binary was invoked. Routine use of these tools typically descends from explorer.exe for user actions, services.exe or a trusted installer for system tasks. Parents like winword.exe, an Office application, mshta.exe, wscript.exe, cmd.exe, or an archive tool indicate macro-driven or staged execution rather than sanctioned tooling. Walk up the tree to see what spawned the parent.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Did this proxy binary make outbound network connections, and to what destinations?
+  context: A DownloadString or download-cradle command line means the hosted PowerShell reaches out to fetch a script or payload. Trusted proxy binaries reaching external destinations are anomalous on their own. Review the destination IPs and ports for connections that resolve to non-enterprise infrastructure, raw IP literals, or uncommon ports; correlate the destination with any URL recovered from the decoded command line. If the connection went to internal infrastructure only, the cradle may be staging from an already-compromised internal host.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- question: Did PowerShell script block logging capture the deobfuscated content of what ran?
+  context: Script block logging records the actual script content the PowerShell engine executes, even when that engine is hosted inside a DLL and run through a proxy binary rather than powershell.exe. This is the ground-truth view of what ran, bypassing command-line encoding and the proxy-execution wrapper. If PowerShell operational logging is not ingested in this environment, treat the absence of these events as a visibility gap rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Were PowerShell or endpoint security controls weakened on this host before this execution?
+  context: Operators commonly weaken protections before running a hosted payload. Common precursors include AMSI bypass (patching amsi.dll in memory), execution-policy changes, and constrained-language-mode escapes. Because this technique already routes execution around powershell.exe to evade process-based monitoring, a paired AMSI or AV-tamper event in the hour before the alert strengthens the case for deliberate evasion.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: Were any other proxy-execution living-off-the-land binaries used on this host recently?
+  context: Operators who use one proxy-execution binary often reach for several. If rundll32.exe hosted a PowerShell DLL, check whether regsvr32.exe, mshta.exe, installutil.exe, msbuild.exe, or other proxy-execution tools were also used to run arbitrary code on this host. Finding multiple proxy-execution binaries achieving the same in-memory-code objective strengthens the case for deliberate defense evasion.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\mshta.exe'
+          - '\msbuild.exe'
+          - '\cmstp.exe'
+          - '\msiexec.exe'
+          - '\wmic.exe'
+          - '\forfiles.exe'
+          - '\pcalua.exe'
+          - '\presentationhost.exe'
+          - '\control.exe'
+          - '\infdefaultinstall.exe'
+          - '\msdt.exe'
+          - '\mavinject.exe'
+          - '\ie4uinit.exe'
+          - '\xwizard.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- question: Was this proxy binary executed from its expected system path, and does its OriginalFileName match its on-disk name?
+  context: These proxy binaries normally run from System32 or SysWOW64. A rundll32.exe or regsvr32.exe launched from a user temp directory, profile path, or other non-standard location may have been copied or renamed to evade path-based allowlists. Compare the on-disk Image path and name against the OriginalFileName recorded in the binary's metadata, since the rule itself matches on both and a mismatch points to a renamed signed binary.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- question: How often has this host fired the rule's proxy-execution pattern over the past 90 days, and what command-line structures are typical?
+  context: A proxy binary carrying PowerShell tokens with no prior history on a host is more suspicious than one seen regularly under stable parents. The query mirrors the rule's selection structure scoped to this host, so the count reflects the rule's specific firing pattern, not generic use of these binaries. The command-line projection lets the analyst compare typical invocation patterns against the alerting one to spot a new cradle or token.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \InstallUtil.exe
+        - \RegAsm.exe
+        - \RegSvcs.exe
+        - \regsvr32.exe
+        - \rundll32.exe
+      - OriginalFileName:
+        - InstallUtil.exe
+        - RegAsm.exe
+        - RegSvcs.exe
+        - REGSVR32.EXE
+        - RUNDLL32.EXE
+      selection_cli:
+        CommandLine|contains:
+        - Default.GetString
+        - DownloadString
+        - FromBase64String
+        - 'ICM '
+        - 'IEX '
+        - Invoke-Command
+        - Invoke-Expression
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \InstallUtil.exe
+        - \RegAsm.exe
+        - \RegSvcs.exe
+        - \regsvr32.exe
+        - \rundll32.exe
+      - OriginalFileName:
+        - InstallUtil.exe
+        - RegAsm.exe
+        - RegSvcs.exe
+        - REGSVR32.EXE
+        - RUNDLL32.EXE
+      selection_cli:
+        CommandLine|contains:
+        - Default.GetString
+        - DownloadString
+        - FromBase64String
+        - 'ICM '
+        - 'IEX '
+        - Invoke-Command
+        - Invoke-Expression
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \InstallUtil.exe
+        - \RegAsm.exe
+        - \RegSvcs.exe
+        - \regsvr32.exe
+        - \rundll32.exe
+      - OriginalFileName:
+        - InstallUtil.exe
+        - RegAsm.exe
+        - RegSvcs.exe
+        - REGSVR32.EXE
+        - RUNDLL32.EXE
+      selection_cli:
+        CommandLine|contains:
+        - Default.GetString
+        - DownloadString
+        - FromBase64String
+        - 'ICM '
+        - 'IEX '
+        - Invoke-Command
+        - Invoke-Expression
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the same user triggered similar activity on multiple hosts, the scope of the operation may be larger than a single endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \InstallUtil.exe
+        - \RegAsm.exe
+        - \RegSvcs.exe
+        - \regsvr32.exe
+        - \rundll32.exe
+      - OriginalFileName:
+        - InstallUtil.exe
+        - RegAsm.exe
+        - RegSvcs.exe
+        - REGSVR32.EXE
+        - RUNDLL32.EXE
+      selection_cli:
+        CommandLine|contains:
+        - Default.GetString
+        - DownloadString
+        - FromBase64String
+        - 'ICM '
+        - 'IEX '
+        - Invoke-Command
+        - Invoke-Expression
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate context: what led to this event, what happened after, and whether it is part of a larger sequence. Look for reconnaissance, privilege escalation, persistence installation, or data staging in the surrounding window.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage

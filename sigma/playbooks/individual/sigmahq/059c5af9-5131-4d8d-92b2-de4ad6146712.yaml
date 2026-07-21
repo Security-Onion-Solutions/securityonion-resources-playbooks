@@ -1,0 +1,433 @@
+name: LiveKD Driver Creation By Uncommon Process
+id: a5d21c1a-66fa-4702-8ed8-71aaea240d06
+description: |
+  Detects the creation of C:\Windows\System32\drivers\LiveKdD.SYS when the responsible process is not livekd.exe or
+  livek64.exe. LiveKD ships a signed kernel driver and installs it into the system driver directory so it can read live
+  kernel memory and write full memory dumps; when a different program drops that same driver, the driver is being staged
+  by something other than the utility that owns it — a repackaged or renamed copy, an installer bundling the driver, or
+  tooling that wants kernel memory access without carrying its own driver. Kernel memory access reads credential material
+  and process memory that user-mode dumping cannot reach, so the investigation should establish which process wrote the
+  file, whether the bytes on disk are the driver LiveKD normally installs, whether the driver was subsequently loaded or
+  started, and whether the writing program and the user account behind it have any history of this activity.
+type: detection
+detection_id: 059c5af9-5131-4d8d-92b2-de4ad6146712
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-16
+questions:
+- question: Was LiveKdD.SYS written to the system driver directory, and is the responsible process something other than
+    livekd.exe or livek64.exe?
+  context: The rule fires only when both conditions hold together — the target path is the LiveKD driver under
+    System32\drivers and the writing image is neither livekd.exe nor livek64.exe. Confirm the exact path, the operation
+    performed, and the responsible process before investing further time; an administrator who renamed the LiveKD
+    executable produces this same event. The signer columns are context for judging whether the writing process is a
+    coherent owner of a kernel driver, not a verdict.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+  answer_sources:
+  - alert
+  - file_event
+- question: Is this user and host expected to install a kernel debugging driver?
+  context: Kernel driver installation is a narrow activity with a small legitimate population — crash-dump and debugging
+    work by an engineer, a vendor installer, or a support engagement running LiveKD under a renamed executable. If the
+    user is a machine or service account, judge by the writing process and the host's role instead of the account name.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: Is the driver still on disk, or was it deleted or renamed after the alert?
+  context: The file's post-alert lifecycle drives the next steps. A driver still in System32\drivers can be retrieved,
+    hashed, and compared against the copy LiveKD ships; a driver removed shortly after creation points to a tool that
+    installs, loads, and cleans up in one pass, which shifts the question to what ran in between.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+  answer_sources:
+  - file_event
+  - manual_review
+- question: What process wrote the driver, and what spawned it?
+  context: The alert names the writing process but not its origin. Retrieving that process's own start event reveals the
+    parent and the full command line it was launched with. A parent such as an installer, a remote-management agent, or a
+    service account context tells a different story than an interactive shell or a script host launching the writer.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+  answer_sources:
+  - process_creation
+- question: What did the writing program do around the time it dropped the driver — decode its command line and working
+    directory.
+  context: LiveKD-style tooling is driven entirely by arguments — the target dump file, the debugger path, whether a full
+    kernel dump or a live session was requested. Scoping to every run of this binary on the host in the surrounding window
+    catches sequential invocations that together form one operation rather than the single triggering event alone.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: Is the file at this path the driver LiveKD normally installs, or a different binary carrying its name?
+  context: The path and filename are the only things the detection sees; the bytes on disk are not. Retrieve the file and
+    compare its size, signature, version resources, and strings against a known copy of the LiveKD driver. A mismatch
+    means the name is being borrowed to place an arbitrary kernel driver in a directory where drivers are expected to
+    live. File-creation events carry no hash, so this comparison is a manual retrieval from the endpoint.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+  answer_sources:
+  - file_event
+  - manual_review
+  - safe_environment
+  - external_threat_intel
+- question: If the driver has been loaded into the kernel, what is its hash and signer, and does threat intel know it?
+  context: A driver's hash and signing details are recorded on the load event, not on the file write, so the load is where
+    verification happens. Submit the hash to reputation and threat-intel sources and read the signer — LiveKD's driver
+    carries a known signature, while a re-signed or differently signed driver at this path is a different binary. If the
+    file was written but never loaded, retrieve it from disk and hash it manually.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: driver_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+      - Hashes
+  answer_sources:
+  - external_threat_intel
+  - manual_review
+- question: Did any process reference the driver file on its command line to register, start, or remove it?
+  context: A driver written to disk does nothing until a service is created and started for it. Service-control and
+    installer invocations that name the driver path show the transition from staging to kernel execution, and a removal
+    call in the same window shows the install-load-uninstall cycle that leaves the driver on disk only briefly.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_direct:
+        Image|endswith|expand: '%TargetFilename%'
+      selection_interpreter:
+        CommandLine|contains|expand: '%TargetFilename%'
+      condition: selection and 1 of selection_*
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: What other files did the responsible process write or delete around the alert?
+  context: A program that stages a kernel driver usually writes more than the driver — its own executable, a debugger or
+    symbol payload, or the dump file the driver exists to produce. The breadth and location of the process's other file
+    activity, including writes by its direct children, enumerate what else needs review and can reveal the output the
+    operation was after.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+  answer_sources:
+  - file_event
+- question: What else has been written to the System32 drivers directory on this host recently, and by which processes?
+  context: The system driver directory has a small set of processes that legitimately write there — the servicing stack,
+    signed vendor installers, and management agents. Other recent arrivals in the same directory show whether this is an
+    isolated drop or a location under active use, and a single unfamiliar writer across several driver files is the
+    pattern worth pulling on.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains: '\Windows\System32\drivers\'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+  answer_sources:
+  - file_event
+- question: Has this driver file been written on this host before?
+  context: A host where LiveKD has been used previously for crash analysis will show prior writes to this path, usually
+    from the utility's own executable. Zero prior events make this the first appearance of the driver on the host and
+    remove the "routine debugging workflow" explanation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+  answer_sources:
+  - file_event
+- question: Does this host normally run the program that wrote the driver?
+  context: A writer binary with months of execution history on this host is more likely a resident tool or agent whose
+    behavior changed; a binary first seen at the time of the alert is a fresh arrival, and the question becomes how it got
+    there. The 90-day counts grouped by user also show whether the program normally runs under this account.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+  answer_sources:
+  - process_creation
+- question: What other activity occurred on this host around the time of the alert?
+  context: Kernel memory access is a means, not an end. Aggregating the host's process activity by binary and parent in
+    the surrounding window collapses routine agent traffic into high-count rows and leaves novel parent-child pairs
+    standing out at low counts — archive utilities, credential tooling, or transfer clients near the driver write indicate
+    what the dump was for.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+  answer_sources:
+  - process_creation
+  - file_event
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host help place this event in a sequence — defense tampering or privileged
+    execution before a driver drop reads differently than a driver drop with nothing around it. Read the preceding alerts
+    for the stages that led here rather than treating this event in isolation.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+  answer_sources:
+  - alert
+- always_include: true
+  question: Has this user previously produced this driver-write pattern, and does that history fit their role?
+  context: The query mirrors the rule's own selection scoped to this user, so the result is the user's 90-day history of
+    this specific pattern — the LiveKD driver written by something other than the LiveKD executable — aggregated by host,
+    not generic file activity. A user who has never produced it is a deviation; weigh any count against whether kernel
+    debugging is part of their role. When the alert fires under a machine or service account, this pivot attributes
+    nothing and the acting-program history is the meaningful one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        TargetFilename: C:\Windows\System32\drivers\LiveKdD.SYS
+      filter_main_legit_name:
+        Image|endswith:
+        - \livekd.exe
+        - \livek64.exe
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - file_event
+  - organizational_knowledge
+- always_include: true
+  question: Has this program historically produced this driver-write pattern on this host or across the environment, or is
+    it new for this activity?
+  context: When the alert fires under a service principal, user identity does not attribute behavior, and a file event
+    carries no parent to pivot on. The acting program is the meaningful pivot — the query mirrors the rule's selection
+    scoped to the alerting binary, giving the 90-day history of this program producing this specific pattern. A program
+    new or rare for this pattern is the deviation to chase; one already accounting for many prior events is a vendor or
+    servicing component with a naming collision worth confirming.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        TargetFilename: C:\Windows\System32\drivers\LiveKdD.SYS
+      filter_main_legit_name:
+        Image|endswith:
+        - \livekd.exe
+        - \livek64.exe
+      _pb_scope:
+        Image|endswith|expand: '%Image%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - file_event
+- always_include: true
+  question: What else did this user do across the network around this time?
+  context: Tracking the account's activity across all hosts in the alert window shows whether the driver write is one step
+    of a wider session — the same user touching several endpoints points to lateral movement rather than a host-local
+    task. When the alert fires as SYSTEM, LOCAL SERVICE, NETWORK SERVICE, or a computer account, this returns
+    agent-telemetry volume and the acting-program clustering carries the answer instead.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+- always_include: true
+  question: Did this same program produce this driver-write pattern on other hosts in the same window, or is the activity
+    isolated to this host?
+  context: Under a service principal the user pivot returns agent noise, and a file event carries no parent to pivot on.
+    The query mirrors the rule's selection scoped to the alerting binary fleet-wide in the alert window. Several hosts in
+    the same window points to scheduled or pushed automation staging the driver; a single host points to a host-local
+    trigger and narrows the scope of the response.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        TargetFilename: C:\Windows\System32\drivers\LiveKdD.SYS
+      filter_main_legit_name:
+        Image|endswith:
+        - \livekd.exe
+        - \livek64.exe
+      _pb_scope:
+        Image|endswith|expand: '%Image%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - file_event

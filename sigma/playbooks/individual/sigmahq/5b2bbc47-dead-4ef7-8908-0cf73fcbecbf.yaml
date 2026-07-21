@@ -1,0 +1,441 @@
+name: Potential PrintNightmare Exploitation Attempt
+id: bd82c0b9-2c95-475d-b7c2-b9896e3ac732
+description: |
+  Detects the Print Spooler service process (spoolsv.exe) deleting files under the Windows print-driver store
+  C:\Windows\System32\spool\drivers\x64\3\. Legitimate printer-driver installs and upgrades churn this directory —
+  the spooler stages incoming driver files, moves them into the store, and displaces or removes prior versions.
+  The same file motion is produced when the driver-install path is abused (CVE-2021-1675 / CVE-2021-34527,
+  PrintNightmare) to make the spooler install and load an attacker-supplied DLL as a printer driver executing as
+  SYSTEM, so the investigation should establish whether a documented driver deployment explains the deletion, which
+  DLLs the spooler loaded from the store afterward and whether they are signed, and whether spoolsv.exe spawned
+  unexpected child processes.
+type: detection
+detection_id: 5b2bbc47-dead-4ef7-8908-0cf73fcbecbf
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-09
+questions:
+- question: Does the alert show spoolsv.exe deleting a file under the print-driver store?
+  context: Before investing investigation time, confirm the alert is a true positive — the deleted path should sit under
+    C:\Windows\System32\spool\drivers\x64\3\ and the responsible process should be the Print Spooler service binary at
+    C:\Windows\System32\spoolsv.exe (a same-named binary at any other path is not the service and changes the
+    investigation). The query returns every operation on this path around the alert with its operation type and
+    responsible process.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - Image
+      - TargetFilename
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+  answer_sources:
+  - alert
+  - file_event
+- question: Is printer-driver maintenance expected on this host right now?
+  context: Driver-store deletions accompany routine printer-driver installs and upgrades pushed by print servers,
+    endpoint-management tooling, or vendor updaters. Check whether this host serves printing (a print server, a domain
+    controller with the spooler enabled, or a workstation receiving a driver rollout) and whether a change ticket or
+    documented deployment covers driver changes in this window. The deleting process runs as a service, so judge by
+    host role and deployment records rather than the user field.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: Which driver file was deleted, and does the deletion fit a driver install or upgrade cycle?
+  context: The alert is a deletion — the file's content can no longer be read from disk. During a driver install the
+    spooler stages incoming files in the store's \new subdirectory, moves them into the store, and displaces prior
+    versions (backups land under \old\), so deletions here occur in both legitimate upgrades and exploit-driven driver
+    installs. Note the exact file name and extension — printer drivers are DLLs plus configuration and data files —
+    and whether the deletion sits inside a coherent install transaction or stands alone.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_delete
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+  answer_sources:
+  - file_event
+  - manual_review
+- question: Was the deleted DLL loaded by the spooler before it was removed, and can its hash still be recovered?
+  context: A deletion event carries no hash. If the spooler loaded this file as a printer driver before it was deleted,
+    the load event recorded the DLL's hash and code signature, which can still be looked up for reputation. For on-disk
+    recovery, check Volume Shadow Copies, backups, and the driver store's backup subdirectories — displaced driver
+    versions are copied under \old\ before removal.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Hashes
+      - Signed
+      - Signature
+      - SignatureStatus
+  answer_sources:
+  - edr_console
+  - external_threat_intel
+  - manual_review
+- question: Was the deleted driver file recreated or replaced after the alert?
+  context: For a deletion alert the lifecycle question runs forward — a driver upgrade deletes the old copy and writes
+    a replacement with the same name moments later, which reads as normal driver churn. Interpret by operation type. A
+    replacement written by spoolsv.exe as part of an install transaction fits upgrade motion; no recreation at all, or
+    a new file the spooler then loads without a valid signature, shifts the reading toward an unsolicited driver
+    install.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+  answer_sources:
+  - file_event
+  - manual_review
+- question: What other files did the spooler write or delete around the alert?
+  context: A printer-driver install is a multi-file transaction — the spooler writes the driver's DLLs and support
+    files into the staging subdirectory, moves them into the store, and displaces old versions. A coherent burst
+    confined to the driver store fits an install or upgrade; spooler file activity landing outside the print paths
+    (user directories, Temp, web roots) does not belong to driver management and needs its own explanation. The
+    correlation covers the spooler process and its direct children.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+  answer_sources:
+  - file_event
+- question: What else has been written to the print-driver store recently, and by which processes?
+  context: Only a small set of processes legitimately writes under the print-driver store — the spooler itself and
+    driver-deployment tooling. The week's view shows whether the directory is under routine driver-rollout churn (many
+    files, a consistent writer, activity spread over maintenance windows) or received a small number of arrivals right
+    before the deletion. A single unfamiliar writer across many files, or driver files written by something other than
+    the spooler, is the signal.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains: 'C:\Windows\System32\spool\drivers\x64\3\'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+  answer_sources:
+  - file_event
+- question: Which DLLs did the spooler load from the print-driver store around the alert, and are they signed?
+  context: The driver-install flow ends with spoolsv.exe loading the new driver DLL into its own process, so the load
+    event is where hijacked execution becomes visible. Printer-driver DLLs from mainstream vendors are code-signed; an
+    unsigned DLL, a signature that fails validation, or a load timed exactly with the store churn and the deletion is
+    the load-side artifact to examine. Directories outside the driver store — and UNC paths — are not valid origins
+    for spooler driver loads.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: '\spoolsv.exe'
+        ImageLoaded|contains: '\spool\drivers\'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+      - SignatureStatus
+      - Hashes
+  answer_sources:
+  - edr_console
+  - external_threat_intel
+  - manual_review
+- question: Were Point and Print policy values modified on this host recently?
+  context: The driver-install path stays open to non-administrators when the Point and Print policy values are
+    weakened — RestrictDriverInstallationToAdministrators set to 0 together with NoWarningNoElevationOnInstall set to
+    1 under HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint allows printer-driver installs without
+    elevation even on patched hosts. A recent modification of these values, especially by something other than group
+    policy processing, is an enabler artifact that precedes the driver install.
+  range: -30d
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains: '\Policies\Microsoft\Windows NT\Printers\PointAndPrint'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+  answer_sources:
+  - manual_review
+  - organizational_knowledge
+- question: What child processes did spoolsv.exe spawn around the alert?
+  context: The spooler rarely spawns children beyond occasional printer-support utilities. Driver code executing inside
+    the spooler that starts cmd.exe, powershell.exe, rundll32.exe, or other general-purpose binaries — running as
+    SYSTEM — is the execution-side artifact of a hijacked driver load, and any child appearing after the store churn
+    deserves a full command-line review.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Aggregating parent-child process pairs around the deletion collapses
+    repetitive agent noise into high-count rows while novel pairs stand out at low counts. Look for reconnaissance,
+    credential access, or persistence setup near the driver-store churn — surrounding activity frames whether the
+    deletion is one step in a longer sequence or an isolated maintenance event.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+  answer_sources:
+  - process_creation
+  - file_event
+- question: When this host has previously fired the rule's pattern, what programs and users normally drive that activity,
+    and does the current alert fit that pattern?
+  context: On a host that regularly receives printer-driver updates this pattern has history. The query mirrors the
+    rule's selection structure scoped to this host — the resulting program/user distribution reflects how driver-store
+    deletions by the spooler have historically occurred here, not generic spooler activity. Expect the Image column to
+    show spoolsv.exe itself; a first-ever firing, or a deviation in the usual account, is the anomaly worth examining.
+    File-delete events carry no parent lineage — pivot to the spoolsv.exe start event if ancestry matters.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_delete
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \spoolsv.exe
+        TargetFilename|contains: C:\Windows\System32\spool\drivers\x64\3\
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - Image
+    - User
+  answer_sources:
+  - file_event
+- always_include: true
+  question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user over 90 days, aggregated by host.
+    Spooler-driven deletions normally fire under SYSTEM, so a named user account here is itself unusual and any history
+    should be weighed against the account's role. When the user is a service principal, identity carries no
+    attribution — the parent-process baseline question is the meaningful pivot.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_delete
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \spoolsv.exe
+        TargetFilename|contains: C:\Windows\System32\spool\drivers\x64\3\
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - file_event
+  - organizational_knowledge
+- always_include: true
+  question: Has this program historically driven the rule's pattern on this host or across the environment?
+  context: When the alert fires under SYSTEM, user identity does not attribute behavior — the launch mechanism does.
+    The query mirrors the rule's selection structure scoped to the alerting program (for a genuine spooler that
+    is services.exe) over 90 days, aggregated by host. A program that already accounts for driver-store deletions across
+    many hosts reads as OS or vendor automation; a new or rare program for this pattern is the deviation worth
+    examining.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_delete
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \spoolsv.exe
+        TargetFilename|contains: C:\Windows\System32\spool\drivers\x64\3\
+      _pb_scope:
+        Image|endswith|expand: '%Image%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - file_event
+- always_include: true
+  question: What else did this user do across the network around this time?
+  context: Tracking the account's activity across hosts in the alert window reveals whether the same identity touched
+    other systems. If the alert fired under a named user, similar activity on multiple hosts widens the scope of the
+    investigation. When it fired under SYSTEM or a machine account this view returns agent noise — the parent-scoped
+    fleet question carries the meaningful answer.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+- always_include: true
+  question: Did the same program-driven pattern fire on other hosts in the same window?
+  context: Under a service principal the meaningful clustering pivot is the launch mechanism — the query mirrors the
+    rule's selection structure scoped to the alerting program, fleet-wide, in the alert window. Several hosts
+    firing together points to a coordinated driver rollout reaching many spoolers at once; a single host points to a
+    host-local trigger such as a driver-install request aimed at this machine alone.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: file_delete
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \spoolsv.exe
+        TargetFilename|contains: C:\Windows\System32\spool\drivers\x64\3\
+      _pb_scope:
+        Image|endswith|expand: '%Image%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - file_event
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. For driver-install abuse the preceding hours may hold the setup stages —
+    new network logons to this host, service installation events, spooler-related detections, or defense tampering.
+    The alert timeline helps reconstruct whether the deletion is one step in a longer sequence.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+  answer_sources:
+  - alert
+- question: Have other hosts fired the rule's pattern in the past week, and does the cross-host distribution look like
+    consistent automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of
+    spooler deletions in the print-driver store. Many hosts firing during maintenance windows points to routine driver
+    rollouts; a single print server or domain controller firing alone — the hosts whose spoolers are most exposed to
+    remote driver-install calls — deserves a closer look. Use the host distribution to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_delete
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \spoolsv.exe
+        TargetFilename|contains: C:\Windows\System32\spool\drivers\x64\3\
+      condition: selection
+    fields:
+    - host.name
+  answer_sources:
+  - file_event

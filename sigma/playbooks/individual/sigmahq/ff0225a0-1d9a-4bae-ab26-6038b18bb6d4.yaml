@@ -1,0 +1,505 @@
+name: Commvault QLogin Argument Injection Authentication Bypass (CVE-2025-57791)
+id: 5442f375-761c-4776-ae1c-ef2dd71b21bc
+description: |
+  Detects a Commvault qlogin command line that carries all of `qlogin`, ` -cs `, ` -localadmin`,
+  ` -clp `, and a username ending in `_localadmin__` together in one invocation (CVE-2025-57791).
+  The login endpoint builds this command line by interpolating caller-supplied username, password,
+  and commserver values without sanitisation, so a caller who embeds ` -cs <hostname>` in the
+  commserver field and ` -localadmin` in the password field makes the login utility parse those
+  strings as its own arguments and authenticate as the local administrator identity rather than as
+  the account whose credentials were presented. The result is a valid privileged API token issued
+  without a password check. The parameter combination has no benign form — an operator running
+  qlogin by hand supplies a password to `-clp`, not a flag, and does not append `_localadmin__` to a
+  username — so the investigation is about consequence rather than verification: establish which
+  identity the resulting session ran as, what that identity did next, whether the process that drove
+  the invocation spawned shells or wrote into a webroot, and whether the host called out. The backup
+  service is a credential store with broad file access across the environment, so a session that
+  holds its administrative token can read backup contents and register further access.
+type: detection
+detection_id: ff0225a0-1d9a-4bae-ab26-6038b18bb6d4
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-17
+questions:
+- question: Does the alerting command line carry qlogin together with -cs, -clp, -localadmin, and a username ending in _localadmin__?
+  context: >-
+    The rule requires all five strings in a single command line, so read the argument order rather
+    than scanning for any one of them. The signature of the injection is that ` -localadmin` sits
+    where a password value belongs, immediately after ` -clp `, and that the username argument has
+    `_localadmin__` appended to a hostname. If ` -localadmin` appears as a normal standalone flag
+    supplied by an operator and no `_localadmin__` username is present, the rule would not have
+    fired; confirm what the alerting line actually contains before proceeding.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - alert
+  - process_creation
+- question: Is this host expected to run the backup product's login utility, and is the account it ran under the one that normally drives it?
+  context: >-
+    A backup CommServe host runs qlogin routinely, so the host being a legitimate one is expected and
+    is not exculpatory. The account is the part worth reading: this invocation is normally spawned by
+    the backup application's own backend, so the User on the event is typically the backup service
+    account rather than a person. That value tells you which principal launched the utility, not
+    which identity the resulting session ended up holding — the injection makes those two different.
+    Record the account here and use it as the launch-side fact for the identity questions.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: What web request drove this invocation, and what parent process handed the arguments to the login utility?
+  context: >-
+    This command line is assembled server-side from values that arrived in a login request body, so
+    the parent process and its own command line show which application component performed the
+    interpolation and under what identity it runs. The originating request is the delivery vector:
+    application request logs for the login and command endpoints around the alert time carry the
+    source address, the supplied username and commserver fields, and any adjacent probing. Exploit-
+    like input patterns worth reading in those logs include path traversal sequences (`../`), command
+    parameters (`cmd=`), template injection (`${jndi:`, `${env:}`), serialized Java (`rO0AB`), and
+    null bytes (`%00`); the source address that sent them is what gets blocked at the perimeter.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+  answer_sources:
+  - manual_review
+  - edr_console
+- question: Is this backup installation patched against CVE-2025-57791, and are other installations in the environment on the same version?
+  context: >-
+    The unsanitised interpolation that makes this injection possible is fixed in 11.32.102, 11.36.60,
+    and 11.38.32; the affected ranges are 11.32.0-11.32.101, 11.36.0-11.36.59, and 11.38.20-11.38.25.
+    An unpatched version confirms the bypass would succeed rather than merely be attempted, which
+    changes the response from blocking a probe to assuming a privileged token was issued. The parent
+    application identified here is the component to check, and the same version check applies to every
+    other installation reachable from the same network position.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+  answer_sources:
+  - asset_inventory
+  - edr_console
+- question: Were other backup servers hit by the same argument-injection pattern in the last 24 hours?
+  context: >-
+    Exploitation of an internet-facing service is usually sprayed across every reachable instance
+    rather than aimed at one. Counting this same detection across hosts and accounts shows how many
+    installations were reached and which ones need the same identity and follow-on review. Several
+    hosts within a short window points to scanning of a published vulnerability; a single host points
+    to a targeted attempt, which raises the value of the source-address pivot from the request logs.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        rule.uuid|expand: '%rule_uuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+  answer_sources:
+  - alert
+- question: Which identity did this qlogin invocation authenticate as, and what did the rest of the argument list request?
+  context: >-
+    This is the load-bearing read. Parse the full argument list of every qlogin invocation on the host
+    in the window: the value passed to `-u`, the hostname given to `-cs` and `-csn`, whether a token
+    was requested (`-gt`), and what sat in the `-clp` password position. The injected ` -localadmin`
+    is what redirects the login to the local administrator identity, so the account named in `-u` is
+    not the account the resulting session holds — the session identity is administrative regardless of
+    what credential was presented. Multiple qlogin lines in the same window indicate repeated attempts
+    or a successful attempt followed by token use.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains: 'qlogin'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - CurrentDirectory
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: What process spawned the login utility, and what spawned that parent in turn?
+  context: >-
+    The login utility is normally invoked by the backup product's own backend service, which is itself
+    hosted under a web application front-end. Walking one level up shows whether the parent is that
+    expected backend or something else — a command interpreter, a script host, or a process started
+    from a webroot directory. A parent that is the legitimate backend confirms the arguments arrived
+    through the application's request path rather than from an operator at a console, which is the
+    distinction between an injected login and a manual one.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: What child processes did the alerting invocation spawn afterward?
+  context: >-
+    A token obtained this way is used, not collected. Children of the alerting process, or of the
+    backend that drove it, are where that use becomes visible: command interpreters, script hosts, and
+    download or archive utilities are the usual post-exploitation set, and a compiler or Java process
+    starting shortly after can indicate a script file was dropped into a webroot and then requested.
+    Known-good children of an application pool on this host — build or maintenance tooling deployed by
+    the vendor or by internal automation — should be enumerated first so the unexpected ones stand out.
+    No children at all is consistent with either a failed attempt or with token use that happened over
+    the API rather than on the host.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Did this host make outbound connections to external addresses in the hours after the alert?
+  context: >-
+    Exploitation of a public-facing service is commonly followed by an outbound callback from the
+    server, either from the application process itself or from a process it spawned. A backup server
+    has a narrow and predictable egress profile, which makes a new external destination easy to read
+    against it. Note the process that owns each connection — a connection from the application front-
+    end or from a command interpreter running under the application's account is materially different
+    from one owned by the backup product's own update client. Scope the review to the addresses that
+    front this application publicly, since traffic to and from those is where the exploitation path
+    runs.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+      filter_internal:
+        DestinationIp|cidr:
+          - '10.0.0.0/8'
+          - '172.16.0.0/12'
+          - '192.168.0.0/16'
+          - '127.0.0.0/8'
+      condition: selection and not filter_internal
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationPort
+  answer_sources:
+  - network_connection
+  - process_creation
+- question: Did any process on this host load an unsigned module around the time of the alert?
+  context: >-
+    The other half of the exploitation pattern for an internet-facing application is the server
+    process loading code it does not normally load. Unsigned module loads by the application front-
+    end, by the backend service, or by any process running under the application's account point at
+    code introduced through the request path rather than shipped with the product. Loads from a
+    webroot, from a reports or upload directory, or from a temporary path are the ones worth reading;
+    unsigned loads by in-house or niche software already resident on the host are the routine
+    explanation and should be checkable against the host's normal profile.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Signed: 'false'
+      condition: selection
+    fields:
+      - Image
+      - ImageLoaded
+      - Signature
+      - SignatureStatus
+  answer_sources:
+  - process_creation
+  - manual_review
+- always_include: true
+  question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: >-
+    The query mirrors the rule's selection scoped to the account on the alert, giving a 90-day history
+    of this exact parameter combination for that account, aggregated by host. Because the invocation is
+    spawned by the backup backend, the account here is usually the backup service account rather than a
+    person, and this history then measures whether the service account has produced the combination
+    before. Any non-zero prior count is worth reading closely rather than treating as a baseline: the
+    parameter combination has no legitimate form, so prior occurrences are prior attempts, not routine
+    activity.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - qlogin
+        - ' -cs '
+        - ' -localadmin'
+        - ' -clp '
+        - _localadmin__
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+- always_include: true
+  question: Has this parent process historically driven the rule's pattern, or is the parent new for this activity?
+  context: >-
+    When the alert fires under a service principal the account does not attribute the behaviour, and
+    here it usually does — the backup backend runs as a service account. The launch mechanism is the
+    meaningful pivot instead. This query mirrors the rule's selection scoped to the alerting parent
+    process across 90 days, aggregated by host, so it answers whether that component has produced the
+    combination before. A parent that is new for the pattern is the deviation worth chasing; a parent
+    with prior history means the same request path has been exercised before and the earlier instances
+    need the same identity review.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - qlogin
+        - ' -cs '
+        - ' -localadmin'
+        - ' -clp '
+        - _localadmin__
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- always_include: true
+  question: What else did the account on this alert run across the environment around this time?
+  context: >-
+    Tracking the account across all hosts in the alert window shows whether it is active anywhere other
+    than the alerting host. If that account is the backup service account, this returns its routine
+    workload on every host it reaches and the launch-mechanism questions carry the answer instead. Read
+    it for the exception: the backup service account appearing on a host outside its normal set, or
+    running a command interpreter rather than backup tooling, is the case where the account itself has
+    been picked up and reused.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+- always_include: true
+  question: Did the same parent-driven pattern fire on other hosts in the same window?
+  context: >-
+    Under a service principal, asking what else the account did returns routine agent and application
+    telemetry; asking whether the same launch mechanism fired elsewhere does not. This query mirrors
+    the rule's selection scoped to the alerting parent process, fleet-wide, in the alert window. Several
+    backup installations producing the pattern from the same component in the same window points at a
+    sweep across every reachable instance; a single host points at a host-local trigger and narrows the
+    containment boundary to this installation.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - qlogin
+        - ' -cs '
+        - ' -localadmin'
+        - ' -clp '
+        - _localadmin__
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- question: When this host has previously produced the rule's pattern, what parents and accounts drove it?
+  context: >-
+    The query mirrors the rule's selection scoped to this host, so the resulting parent and account
+    distribution reflects the rule's specific parameter combination rather than generic use of the
+    login utility. Because that combination is not something an operator or an installer produces, prior
+    history on this host is a record of earlier attempts against the same installation and each one
+    needs its own follow-on review. No prior history means this is the first time the pattern has
+    reached this host, which makes the request-log source address the starting point.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - qlogin
+        - ' -cs '
+        - ' -localadmin'
+        - ' -clp '
+        - _localadmin__
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+  answer_sources:
+  - process_creation
+- question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Aggregating process activity in a 15-minute window either side of the alert collapses routine agent
+    and backup telemetry into high-count rows and leaves novel parent-child pairs standing out at low
+    counts. Fifteen minutes is the horizon over which the request, the login, any spawned process, and
+    any callback normally land together for this pattern. Look for a command interpreter or script host
+    under an application parent, and for file or archive utilities running under the backup account.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+  answer_sources:
+  - process_creation
+  - file_event
+  - registry_event
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    An authentication bypass against an application is rarely the whole of what was attempted against
+    it. Earlier detections on the same host — path traversal or file writes into an application
+    directory, unauthenticated uploads, other exploitation attempts against the same service — show
+    what else the same request path carried and whether an earlier stage already succeeded. The
+    sequence across those alerts is what establishes whether this login was the entry point or one step
+    in an attempt that started before it.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+  answer_sources:
+  - alert
+- question: Have other hosts produced the rule's pattern in the past week, and does the cross-host distribution look like a sweep or isolated activity?
+  context: >-
+    The query mirrors the rule's selection with no host scope, giving a fleet-wide count of the exact
+    parameter combination over a week. Because the combination has no benign producer, every host
+    returned here is an installation the pattern reached, and the count sets the scope of the version
+    check and the identity review rather than calibrating false-positive likelihood. A spread across
+    unrelated installations points at scanning of a published vulnerability; a single host points at a
+    targeted attempt against that one instance.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - qlogin
+        - ' -cs '
+        - ' -localadmin'
+        - ' -clp '
+        - _localadmin__
+      condition: selection
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation

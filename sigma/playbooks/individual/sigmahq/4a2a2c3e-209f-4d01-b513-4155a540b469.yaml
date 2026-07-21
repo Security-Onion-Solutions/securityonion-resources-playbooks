@@ -1,0 +1,346 @@
+name: Suspicious MsiExec Embedding Parent
+id: 7eef10b0-57af-4c0e-8065-c489e3e8cb56
+description: |
+  Detects powershell.exe, pwsh.exe, or cmd.exe spawned by a parent whose command line contains both MsiExec.exe and the -Embedding flag. msiexec.exe running with -Embedding is the COM out-of-process server mode that Windows Installer uses during package installation; a script interpreter launched from that context is a known proxy-execution pattern where an MSI package carries an embedded payload that shells out to the command line. Legitimate installers occasionally invoke command interpreters this way (the rule already excludes the DismFoDInstall and Splunk forwarder cases), so the investigation should determine what the parent MSI was, what the interpreter actually ran, and whether the package was retrieved from a remote or untrusted source.
+type: detection
+detection_id: 4a2a2c3e-209f-4d01-b513-4155a540b469
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- question: Does the parent command line contain both MsiExec.exe and the -Embedding flag, with a script interpreter child?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule fires when the child Image ends in powershell.exe, pwsh.exe, or cmd.exe AND the parent command line contains both MsiExec.exe and -Embedding, and none of the installer exclusions match. Read the full event and verify both parent tokens are present and the child is the expected interpreter.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentCommandLine
+      - Image
+- question: Is this user and host expected to install MSI packages that shell out to command interpreters?
+  context: Legitimate software installation through Windows Installer can spawn command interpreters, especially during custom action steps. Knowing whether this host routinely receives MSI-packaged software and whether the user is performing an expected install is often the fastest path to distinguishing a routine deployment from proxy execution.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What is the full parent MsiExec.exe command line, and what started msiexec?
+  context: The parent-child relationship is the core signal for this detection. The -Embedding flag means msiexec is running as a COM server during an installation; tracing the parent's own command line and its grandparent reveals whether this was a user-initiated install (double-clicked MSI, software deployment agent) or an unexpected chain where msiexec was driven by another process to proxy execution.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What other child processes did this same MsiExec.exe parent spawn?
+  context: An installer that legitimately runs one custom action often runs several. If the msiexec parent spawned only a single script interpreter that performed download or execution behavior, that is more suspicious than a parent that spawned a coherent set of install-related helpers. Multiple suspicious children from the same parent points to an MSI carrying a payload rather than a benign package.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: What MSI package was msiexec installing, and what triggered it to run in -Embedding COM-server mode?
+  context: The -Embedding flag indicates msiexec was launched as a COM out-of-process server by another process or by the installer service. Identifying the MSI package path or product, and what process drove msiexec into this mode, reveals whether the interpreter child came from a legitimate install custom action or from a package staged to proxy execution.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- question: What did the interpreter child actually run? Decode any encoded or obfuscated command line.
+  context: The interpreter's command line reveals what the MSI's custom action executed. Decode any -EncodedCommand or -enc base64, deobfuscate backtick or concatenation tricks, and identify download cradles, reverse shells, or in-memory .NET assembly loads. A package that legitimately needs an interpreter usually runs short, readable setup commands; encoded or staged payloads are the deviation.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Does the interpreter command line reference remote MSI packages, UNC paths, HTTP/HTTPS URLs, or DLL execution flags?
+  context: Proxy execution through a trusted signed binary typically carries the payload reference on the command line. Look for UNC paths, http or https URLs, raw IP destinations, .dll entrypoints, or remote .msi references in the interpreter's arguments. These argument patterns distinguish a package retrieving and executing external content from a self-contained local install step.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - ParentCommandLine
+- question: What modules or DLLs did the interpreter and msiexec load shortly after this execution?
+  context: Msiexec proxy execution frequently completes by loading an unsigned or attacker-supplied DLL, or by the interpreter side-loading a payload module. Reviewing image-load events for these processes around the alert surfaces module loads from user-writable or temporary directories and unsigned modules that indicate malicious installation rather than a benign package. If image-load telemetry is not collected in this environment, treat zero results as a visibility gap rather than evidence nothing loaded.
+  range: +/-10m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+- question: Did the interpreter or msiexec make network connections to previously unseen or external destinations around this time?
+  context: The msiexec abuse chain links process creation with network retrieval of a payload to previously unseen destinations. Correlating outbound connections from these processes in the alert window with the time of execution shows whether external content was fetched. Connections to external domains or raw IP addresses, especially ones the host has not contacted before, point toward remote payload retrieval rather than a local install.
+  range: +/-10m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- question: Did PowerShell script block logging capture the full deobfuscated script content?
+  context: Script block logging records the deobfuscated script content PowerShell actually executed, even when the command line was encoded or obfuscated by the MSI custom action. This is ground truth about what ran. If PowerShell operational logs are not ingested in this environment, treat the absence of results as a visibility gap rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Were PowerShell security controls bypassed or weakened before this execution?
+  context: A package that proxies execution often weakens controls first. Look for AMSI bypass, execution policy changes, or a PowerShell v2 downgrade in the hour before the interpreter ran. These precursor events strengthen the case that the MSI carried a payload rather than performing a benign install step.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: Has this msiexec parent normally spawned this interpreter on this host before?
+  context: Some installers routinely shell out to command interpreters during custom actions, while others never do. Historical frequency of an msiexec-in-embedding parent spawning this specific interpreter on this host distinguishes a recurring deployment pattern from a first-time, novel spawning relationship worth chasing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        - \cmd.exe
+        ParentCommandLine|contains|all:
+        - MsiExec.exe
+        - '-Embedding '
+      filter_splunk_ufw:
+        Image|endswith: :\Windows\System32\cmd.exe
+        CommandLine|contains: C:\Program Files\SplunkUniversalForwarder\bin\
+      filter_vs:
+      - CommandLine|contains: \DismFoDInstall.cmd
+      - ParentCommandLine|contains|all:
+        - '\MsiExec.exe -Embedding '
+        - Global\MSI0000
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection and not 1 of filter*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        - \cmd.exe
+        ParentCommandLine|contains|all:
+        - MsiExec.exe
+        - '-Embedding '
+      filter_splunk_ufw:
+        Image|endswith: :\Windows\System32\cmd.exe
+        CommandLine|contains: C:\Program Files\SplunkUniversalForwarder\bin\
+      filter_vs:
+      - CommandLine|contains: \DismFoDInstall.cmd
+      - ParentCommandLine|contains|all:
+        - '\MsiExec.exe -Embedding '
+        - Global\MSI0000
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not 1 of filter*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the same user triggered similar msiexec-driven execution on multiple hosts, the scope may be a wider software-push or a multi-host operation rather than an isolated install.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        - \cmd.exe
+        ParentCommandLine|contains|all:
+        - MsiExec.exe
+        - '-Embedding '
+      filter_splunk_ufw:
+        Image|endswith: :\Windows\System32\cmd.exe
+        CommandLine|contains: C:\Program Files\SplunkUniversalForwarder\bin\
+      filter_vs:
+      - CommandLine|contains: \DismFoDInstall.cmd
+      - ParentCommandLine|contains|all:
+        - '\MsiExec.exe -Embedding '
+        - Global\MSI0000
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not 1 of filter*) and _pb_scope
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host, such as defense tampering, reconnaissance, or credential access, may reveal the attack stages that preceded this execution and help reconstruct the timeline around the msiexec proxy event.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

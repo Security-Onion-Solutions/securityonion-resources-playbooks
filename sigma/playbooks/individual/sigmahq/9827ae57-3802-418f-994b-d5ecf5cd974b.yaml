@@ -1,0 +1,395 @@
+name: Potential Registry Persistence Attempt Via DbgManagedDebugger
+id: 42fa8f40-5273-4d83-aa3b-5d4f6dbf0064
+description: |
+  Detects a registry write that sets the Debugger value under the .NET Framework key
+  HKLM\SOFTWARE\Microsoft\.NETFramework\DbgManagedDebugger (or its Wow6432Node variant) to a command
+  other than the legitimate just-in-time debugger launcher. The .NET runtime invokes this configured
+  debugger when a managed application faults, so pointing the value at an attacker-controlled executable
+  yields code execution each time a managed process crashes - a debugger-style execution-flow hijack that
+  survives reboot. The rule fires when the DbgManagedDebugger value is set AND the value data does not
+  match the expected vsjitdebugger.exe launch string; investigate what command was written, which process
+  wrote it and what launched that process, whether the referenced binary exists on disk and subsequently
+  executed, and whether the value was later reverted.
+type: detection
+detection_id: 9827ae57-3802-418f-994b-d5ecf5cd974b
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-10
+questions:
+- question: Does the alerting write set the .NET DbgManagedDebugger value to something other than the expected JIT debugger launcher?
+  context: >-
+    Before investing investigation time, confirm the alert is a true positive. The rule fires when a value
+    whose path ends in \Microsoft\.NETFramework\DbgManagedDebugger is written AND the value data does not
+    match the legitimate just-in-time debugger launch string (the vsjitdebugger.exe form with PID, APPDOM,
+    EXTEXT, and EVTHDL arguments). Review the exact TargetObject on the triggering event, then read the
+    value data on the mechanism-decode question to confirm the written command is not the expected
+    debugger launcher.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this user and host expected to configure the .NET managed debugger?
+  context: >-
+    The DbgManagedDebugger value effectively never changes outside of a developer machine that has a
+    just-in-time debugger installed. Knowing whether the writing account and host function are consistent
+    with legitimate development or debugging work is often the fastest way to separate a developer tool
+    from a persistence implant. User attribution is present on roughly 94% of endpoint registry events;
+    when it is a machine account or SYSTEM, pivot on the writing process instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Which DbgManagedDebugger value was written, and why is this key an execution-hijack location?
+  context: >-
+    The key HKLM\SOFTWARE\Microsoft\.NETFramework\DbgManagedDebugger holds the command the .NET runtime
+    launches when a managed application faults. Because the runtime invokes this configured debugger
+    automatically, a command placed here runs whenever any managed process on the host crashes - a
+    debugger-style execution-flow hijack in the same family as the AeDebug and Image File Execution Options
+    debugger values. Confirming the exact key path and writing process establishes that this is the managed
+    debugger key rather than an unrelated .NET Framework edit, and sets up decoding the planted command.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: What command or executable path was written to the DbgManagedDebugger value?
+  context: >-
+    The Details field holds the command the runtime will launch at the next managed-application fault.
+    Decode it: the legitimate value is a vsjitdebugger.exe launch string, whereas a hijack points the value
+    at an attacker binary, a script host such as powershell.exe or cmd.exe with an inline or encoded
+    payload, or a path to a dropped executable. If the value references a file path, that path becomes a
+    lead for confirming a payload on disk. Details is present on roughly 79% of registry modifications and
+    should be populated for this string value.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- question: What process wrote this value, and what launched that process?
+  context: >-
+    The registry event carries no command line, so pivot by ProcessGuid to the writing process to read its
+    Image, full command, and parent. A reg.exe, powershell.exe, or cmd.exe write launched from an Office
+    application, a script host such as wscript.exe or mshta.exe, or an unsigned binary points to the
+    persistence being staged programmatically rather than a deliberate developer edit. The parent chain
+    distinguishes a scripted hijack from an interactive console action.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: Did the configured debugger binary subsequently execute on this host?
+  context: >-
+    The hijack only yields execution when a managed application faults and the runtime launches the
+    configured debugger, which may be minutes or hours after the value is set. Searching process activity on
+    the host after the write for execution of the binary named in the Details value confirms whether the
+    persistence became active and what the payload did. The query is anchored on the written Details value
+    itself, so any row is the configured debugger command running; if a row appears, the hijack has fired.
+    A zero within the window means the persistence is armed but no managed process has faulted yet.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains|expand: '%Details%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Is the executable referenced by the DbgManagedDebugger value present on disk near the time of the write?
+  context: >-
+    A managed debugger hijack is only effective if the binary the value points to exists at that path. The
+    registry write carries no hash, so correlate file activity by the writing process and its children to
+    confirm whether the referenced executable or a supporting payload was created in the same session. If
+    the file is present, retrieve it or hash it from a later execution for a reputation lookup; reboot
+    durability itself is judged from the value data and its re-modification history rather than a delete
+    event.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: After this write, was the DbgManagedDebugger value restored to the legitimate launcher or changed again?
+  context: >-
+    Registry key and value deletions are not observable in this telemetry, so durability is judged from the
+    key's re-modification history rather than from a delete event. A later write that restores the value to
+    the vsjitdebugger.exe launch string indicates the hijack was reverted to hide it, while the value
+    remaining a non-standard command leaves the debugger primed to run again at the next managed-application
+    fault. Compare the Details values written over the following window.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- question: What other registry modifications were made on this host in the same window?
+  context: >-
+    An actor who plants one persistence mechanism often makes other configuration changes in the same
+    session - additional debugger or autostart keys, Defender or firewall policy edits, or Run keys.
+    Clustering the registry writes on this host in a short window around the alert reveals the full scope of
+    changes and which process made them. The triggering key appears in the results; the signal is what else
+    was modified and by which process.
+  range: +/-30m
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - User
+- question: Has the DbgManagedDebugger value been modified before on this host?
+  context: >-
+    The managed debugger value should change rarely and only through deliberate action, so a history with
+    no prior writes makes this a first-time change and raises its weight. A history of periodic writes to
+    the same value points instead to an installed just-in-time debugger or a management process. Compare the
+    historical Details values to see whether a non-standard command was set before or whether this is new -
+    the expected keys and paths for this host form the baseline for that comparison.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - Details
+      - Image
+- question: Was this same DbgManagedDebugger value modified on other hosts in the environment?
+  context: >-
+    The same write across many hosts suggests a broad tool run, a mis-scoped deployment, or a developer
+    image; the same write confined to one host suggests a targeted persistence attempt. Compare the Details
+    values across hosts to see whether they all set the same command and whether the writing process is
+    consistent, which separates a single hands-on operation from repeated use of the technique across the
+    environment.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+      - Details
+- question: What other process activity occurred on this host around the time of the alert?
+  context: >-
+    A persistence write rarely happens in isolation. Aggregating process activity in a tight window around
+    the alert surfaces what led up to the registry change and what ran immediately after it. Novel
+    parent-child pairs stand out at low counts against high-count routine telemetry, which is what points to
+    the tool that staged the hijack and any follow-on actions.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host - reconnaissance, execution of scripting tools, or defense tampering
+    - may reveal the stages that preceded this persistence change and help reconstruct the timeline.
+    Establishing a debugger hijack is typically one step in a longer operation, so prior alerts help place
+    this write within a larger sequence.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Were other process-based persistence mechanisms installed on this host in the same window?
+  context: >-
+    Attackers rarely rely on a single persistence mechanism and commonly install backups using different
+    techniques. Scheduled tasks, services, registry Run keys, BITS jobs, or WMI subscriptions created by
+    schtasks.exe, sc.exe, reg.exe, bitsadmin.exe, or wmic.exe near the debugger write indicate intentional
+    stacking of footholds rather than an isolated administrative action.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- question: Were files dropped to Startup or scheduled-task locations on this host in the same window?
+  context: >-
+    File-based persistence bypasses command-line detection entirely - dropping an executable or script into
+    a Startup folder or a path referenced by a registry Run key achieves persistence without invoking
+    schtasks, sc, or reg. File writes to these locations near the debugger hijack indicate the payload
+    established a parallel persistence mechanism on disk.
+    Run-key persistence itself is a registry write, not a file drop, so it does not appear in file telemetry; this query covers Startup folders and scheduled-task definition files, and Run-key writes surface in registry questions instead.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist_paths:
+        TargetFilename|contains:
+          - '\Start Menu\Programs\Startup\'
+          - '\Windows\System32\Tasks\'
+          - '\Windows\Tasks\'
+      condition: selection and selection_persist_paths
+    fields:
+      - TargetFilename
+      - Image
+- question: Was there a change ticket, maintenance window, or documented approval for this debugger configuration?
+  context: >-
+    Configuring a just-in-time debugger is a deliberate development-environment action that a mature
+    organization would normally document. A corresponding ticket or an approved developer-tooling deployment
+    suggests authorized activity; absence of one on a host with no development role suggests the value was
+    set outside sanctioned change management and should be treated as suspicious.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Does the user or an administrator recall configuring a managed debugger on this host?
+  context: >-
+    Direct confirmation from the account owner is a fast way to resolve the alert. If a developer installed a
+    just-in-time debugger or an administrator was performing maintenance that would set this value, that
+    closes it; if no one recalls the action, the account may be compromised or the change was made by
+    automated tooling, and the investigation should continue into the writing process and the referenced
+    payload.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine

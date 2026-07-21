@@ -1,0 +1,387 @@
+name: Suspicious RDP Redirect Using TSCON
+id: 631bae2b-3bef-463a-bced-5f160d1de717
+description: |
+  Detects a command line containing ' /dest:rdp-tcp#', the syntax tscon.exe uses to
+  redirect an existing Terminal Services session onto another session. When the calling
+  process holds SYSTEM-level access, tscon attaches to any user's active or disconnected
+  RDP session without supplying that user's password and without notifying them, letting
+  an operator inherit the hijacked user's identity, drive mappings, and onward RDP sessions.
+  Legitimate use of /dest: session redirection is rare; the most common abuse path is a
+  Windows service or scheduled task whose binpath wraps "cmd.exe /k tscon <id> /dest:rdp-tcp#<n>"
+  so the redirect runs as LocalSystem. Determine which session was redirected to which, what
+  spawned the tscon process, whether the account context is SYSTEM, and what activity followed
+  in the hijacked session.
+type: detection
+detection_id: f72aa3e8-49f9-4c7d-bd74-f8ab84ff9bbb
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- question: Does the command line contain a tscon session redirect to an rdp-tcp# session?
+  context: Before investing investigation time, confirm the alert is a true positive by reading
+    the full command line. Look for the ' /dest:rdp-tcp#' redirect argument and a source session
+    identifier, and confirm the binary is tscon.exe rather than an unrelated process that merely
+    contains the same substring.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Is this user and host expected to redirect Terminal Services sessions with tscon?
+  context: Session redirection with the tscon /dest:rdp-tcp# argument is an administrative operation
+    almost never seen in routine endpoint use. Knowing whether this host is a Remote Desktop Session Host or jump
+    server, and whether the account context is a known administrator versus a service principal,
+    is often the fastest way to separate sanctioned remote-admin work from a session hijack.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Decode the full tscon command -- which source session was redirected to which destination session?
+  context: The redirect arguments reveal the hijack target. tscon takes a source session ID or
+    name followed by ' /dest:rdp-tcp#<n>' naming the destination (the operator's own session).
+    A SYSTEM-context tscon attaching one user's session ID onto a different interactive session
+    is the hijack; note both endpoints so the affected user and the receiving session can be
+    identified. The query returns tscon redirect invocations on this host in the surrounding window.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains: ' /dest:rdp-tcp#'
+      condition: selection
+    fields:
+      - CommandLine
+      - User
+      - ParentImage
+- question: What process spawned tscon, and was it a service or scheduled task running as SYSTEM?
+  context: The launch mechanism is the strongest disposition signal. tscon parented by services.exe
+    indicates a service binpath wrapping the redirect so it executes as LocalSystem -- the canonical
+    no-password hijack path. A parent of taskeng.exe or svchost.exe points to a scheduled task as
+    SYSTEM. An interactive parent such as explorer.exe or a normal cmd.exe under an administrator
+    is more consistent with sanctioned session management. Walk the parent chain to see what
+    installed or started the launcher.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What host initiated the inbound RDP connection to this system, and is it an expected administrative source?
+  context: A session hijack reassigns an existing RDP session, so the originating endpoint matters.
+    Inbound connections on RDP and remote-admin ports show whether the operator reached this host
+    from a known jump box or from an unexpected workstation being used as a pivot. Correlate the
+    source against the account that owns the redirected session.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationPort:
+          - 445
+          - 135
+          - 3389
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - SourceIp
+      - DestinationPort
+- question: What account context ran tscon, and does a hijack leave a session reassignment without a matching new logon?
+  context: A tscon hijack succeeds only because the calling process holds SYSTEM-level access, which
+    bypasses the password prompt tscon otherwise enforces against another user's session. A redirect
+    that reassigns a session with no corresponding interactive logon for the receiving operator is
+    the anomaly -- the hijacked user remains the identity in onward logs while the operator inherits
+    the session. Confirm whether the process ran as SYSTEM versus an interactive administrator.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - User
+      - CommandLine
+- question: What RDP logon and session reconnect events surround this redirect on this host?
+  context: Session reassignment correlates with Terminal Services logon and reconnect events.
+    Successful and failed logons (4624, 4625) and session reconnect or disconnect activity around
+    the redirect time show which sessions were active, which account owned each, and whether the
+    receiving session had a legitimate prior logon. A redirect with no preceding authentication for
+    the operator account, against a session owned by a different user, indicates a non-consensual
+    takeover. If Security logs are not collected in this environment, treat empty results as a
+    visibility gap rather than evidence nothing occurred.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        EventID:
+          - 4624
+          - 4625
+          - 4778
+          - 4779
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - host.name
+      - IpAddress
+      - EventID
+      - LogonType
+- question: What processes ran in the redirected session shortly after the hijack?
+  context: A session takeover is a means to an end. The operator inherits the hijacked user's
+    desktop, drive mappings, cached application credentials, and any onward RDP sessions, then acts
+    under that identity. Process activity in the minutes after the redirect reveals the objective --
+    onward RDP launches, credential tooling, file access, or further lateral movement under the
+    hijacked account.
+  range: +30m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - User
+      - Image
+- question: What other activity occurred on this host around the time of the redirect?
+  context: A session hijack rarely stands alone. Activity surrounding the redirect frequently
+    includes the service or scheduled-task creation that staged the SYSTEM context, session
+    enumeration with query user or quser, and follow-on tooling. Aggregating parent-child pairs
+    collapses routine agent noise while novel pairs -- a new service launcher, an unexpected cmd.exe
+    parent -- stand out at low counts.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains: ' /dest:rdp-tcp#'
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains: ' /dest:rdp-tcp#'
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user account do across the network around this time?
+  context: Tracking the account's activity across all hosts reveals whether the redirect is isolated
+    or part of broader movement. A hijacked or attacker-controlled account often shows session
+    enumeration, onward RDP, or tooling on additional endpoints in the same window. If the alert
+    fired under a service principal, this view returns broad agent telemetry and the parent-binary
+    rollout view is the meaningful answer.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains: ' /dest:rdp-tcp#'
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Does this host normally see tscon session redirects?
+  context: A redirect pattern that has never been seen on a host is more suspicious than one that
+    recurs as part of a documented Remote Desktop Session Host workflow. Zero or very low historical
+    counts over the trailing window indicate first-time or rare use of the /dest:rdp-tcp# redirect here.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains: ' /dest:rdp-tcp#'
+      condition: selection
+    fields:
+      - User
+- question: When this host has previously fired the tscon redirect pattern, what parents and users drove it, and does this alert fit?
+  context: Even on a host where the redirect occurs occasionally, the historical parent and user
+    distribution reflects how the pattern normally runs here. Deviations -- a services.exe parent
+    where prior redirects ran interactively, a new user account, or a SYSTEM context where prior
+    ones were administrator-driven -- are the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains: ' /dest:rdp-tcp#'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user account used remote-access tooling against other hosts in the environment?
+  context: Attackers rarely stop at one target. If the account driving the redirect is also running
+    psexec, mstsc, ssh, or wmic against additional systems, the scope of compromise is larger.
+    A single account reaching many hosts with remote-access tooling in a short window indicates
+    active lateral movement.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      selection_lateral:
+        Image|endswith:
+          - '\psexec.exe'
+          - '\psexec64.exe'
+          - '\mstsc.exe'
+          - '\ssh.exe'
+          - '\plink.exe'
+          - '\wmic.exe'
+      condition: selection and selection_lateral
+    fields:
+      - host.name
+      - Image
+- question: Have other hosts fired the tscon redirect pattern in the past week, and does the distribution look like automation or one-off activity?
+  context: The query counts the rule's redirect pattern fleet-wide with no host scope. Many hosts
+    firing the same pattern points to scripted deployment or a session-management product; one host
+    or a small unrelated set points to manual operator activity. Use the host distribution to
+    calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains: ' /dest:rdp-tcp#'
+      condition: selection
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before the redirect?
+  context: Session hijacking is usually a mid-chain step. Earlier detections on the same host --
+    service creation, scheduled-task creation, accessibility-feature or image-file-execution-options
+    tampering, or session enumeration -- may reveal how the SYSTEM context was staged and help
+    reconstruct the timeline leading to the redirect.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

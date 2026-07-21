@@ -1,0 +1,353 @@
+name: Potential Provisioning Registry Key Abuse For Binary Proxy Execution - REG
+id: cf194d36-4851-4ad8-98dd-dc563b571679
+description: |
+  Detects a registry write under HKLM\SOFTWARE\Microsoft\Provisioning\Commands\ (the rule fires
+  when a TargetObject contains that key path). This branch of the provisioning hive is read by the
+  Microsoft-signed launcher provlaunch.exe: an actor builds a three-level key structure and sets a
+  Commandline value to an arbitrary command, then runs provlaunch.exe with the top-level key name so
+  the trusted binary reads the value and proxy-executes the command. The keys are deleted after a
+  successful run, so the registry write is often the only durable artifact. Legitimate use of this
+  path is rare outside OS provisioning; investigate what command was staged in the value, which
+  process wrote the key and what launched it, whether provlaunch.exe subsequently ran and what it
+  spawned, and whether the staged command reached out to the network.
+type: detection
+detection_id: 7021255e-5db3-4946-a8b9-0ba7a4644a69
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-10
+questions:
+- question: Does the alerting registry write target a subkey under the Provisioning Commands key path?
+  context: >-
+    Before investing investigation time, confirm the alert is a true positive. The rule fires when a
+    written value's path contains \SOFTWARE\Microsoft\Provisioning\Commands\. Review the exact
+    TargetObject and Details on the triggering event: the abuse pattern is a three-level structure
+    below Commands\ ending in a value such as Commandline or altitude, where Commandline holds the
+    command provlaunch.exe will run. A write directly to this path outside an OS provisioning flow is
+    the staging step of the proxy execution.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this user and host expected to write under the provisioning Commands registry key?
+  context: >-
+    The Provisioning\Commands hive is touched by OS provisioning and MDM enrollment, not by routine
+    user or administrator activity, so a normal interactive account writing here is unusual. Knowing
+    whether the writing account and host function match any sanctioned provisioning or imaging workflow
+    is the fastest way to separate a management process from a hands-on abuse of the launcher. User
+    attribution is present on roughly 94% of endpoint registry events; when it is a machine account or
+    SYSTEM, pivot on the writing process instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Which subkey and value under Provisioning Commands were written, and why is this a proxy-execution location?
+  context: >-
+    The launcher provlaunch.exe walks a three-level key structure under
+    HKLM\SOFTWARE\Microsoft\Provisioning\Commands\<name>\<sub> and executes whatever is stored in the
+    Commandline value at run time. Confirming the exact subkey name and the value name (Commandline
+    carries the payload; altitude is an ordering DWORD) establishes that this is the launcher's
+    command-staging location rather than an unrelated provisioning edit, and identifies the writing
+    process.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: What command was staged in the Commandline value under this key?
+  context: >-
+    The Details field of the Commandline value holds the command provlaunch.exe will proxy-execute.
+    Decode it: a benign provisioning entry references OS setup binaries, while abuse stages an
+    interpreter invocation (powershell.exe or cmd.exe with an inline or encoded payload), a path to a
+    dropped binary, or a downloader with a URL. If the value references a file path, that path becomes
+    a lead for confirming a payload on disk. Details is present on roughly 79% of registry
+    modifications and should be populated for this string value.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- question: What process wrote this key, and what launched that process?
+  context: >-
+    The registry event carries no command line, so pivot by ProcessGuid to the writing process to read
+    its Image, full command, and parent. A reg.exe, powershell.exe, or cmd.exe write launched from an
+    Office application, a script host such as wscript.exe or mshta.exe, or an unsigned binary points to
+    the key structure being staged programmatically rather than by a provisioning service. The parent
+    chain distinguishes a scripted setup from a legitimate enrollment process.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: Did provlaunch.exe run on this host after the key was staged?
+  context: >-
+    The staged command only executes when provlaunch.exe is invoked with the top-level key name, so a
+    provlaunch.exe process starting shortly after the write is the proxy execution taking effect. The
+    query lists provlaunch.exe executions on this host in the window after the alert; its command line
+    carries the key name it was asked to run, which ties the launch back to the staged structure.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '\provlaunch.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- question: What child processes did provlaunch.exe spawn?
+  context: >-
+    When provlaunch.exe reads the Commandline value it launches that command as its own child, so the
+    children of provlaunch.exe are the proxied payload running under the cover of a Microsoft-signed
+    parent. Listing them reveals whether an interpreter, a dropped binary, or a living-off-the-land
+    tool executed and what arguments it carried. A non-provisioning child such as powershell.exe,
+    cmd.exe, or an arbitrary executable confirms arbitrary code execution through the launcher.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: '\provlaunch.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - User
+- question: Did the host make external network connections around the time of the launcher activity?
+  context: >-
+    Commands proxied through a trusted launcher are frequently downloaders that pull a second-stage
+    payload from an external host. Reviewing outbound connections to non-internal addresses around the
+    alert window shows whether the staged command reached the network and which process initiated the
+    traffic. Correlate the initiating process with the launcher's children; an external connection from
+    the proxied payload indicates retrieval or command-and-control rather than a purely local action.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+      filter_internal:
+        DestinationIp|cidr:
+          - '10.0.0.0/8'
+          - '172.16.0.0/12'
+          - '192.168.0.0/16'
+          - '127.0.0.0/8'
+          - '169.254.0.0/16'
+      condition: selection and not filter_internal
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+- question: Has provlaunch.exe run on this host before?
+  context: >-
+    provlaunch.exe is a rarely used provisioning launcher, so a host with no prior history of running
+    it makes the current activity a first-time event and raises its weight. A history of periodic
+    executions points instead to a management or imaging process that legitimately drives the
+    provisioning hive. Grouping historical executions by user helps distinguish a service-driven
+    pattern from an interactive one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '\provlaunch.exe'
+      condition: selection
+    fields:
+      - User
+- question: After the write, was this key modified again, and did the staged command execute?
+  context: >-
+    Registry key and value deletions are not observable in this telemetry, and the launcher deletes its
+    keys after a successful run, so durability is judged from the key's re-modification history rather
+    than from a delete event. A follow-up write that re-stages a Commandline value, combined with a
+    provlaunch.exe execution, indicates the structure was used and rebuilt; the value persisting with no
+    launch suggests staging that has not yet fired. Compare the Details values written over the
+    following window.
+  range: +24h
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - Details
+      - Image
+- question: Has this provisioning key been modified before on this host?
+  context: >-
+    Writes to the Provisioning\Commands hive should be rare and tied to enrollment or imaging, so a
+    history with no prior modifications makes this a first-time change and raises its weight. A history
+    of periodic writes to the same path points instead to a provisioning service or a repeatedly run
+    tool. Compare the historical Details values to see whether the same command was staged before or
+    whether this is new.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - Details
+      - Image
+- question: Was this provisioning key modified on other hosts in the environment?
+  context: >-
+    The same write across many hosts suggests a broad provisioning push or a management deployment; the
+    same write confined to one host suggests a targeted abuse of the launcher. Compare the Details
+    values across hosts to see whether they all stage the same command and whether the writing process
+    is consistent, which separates an authorized rollout from repeated hands-on use of the technique.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+      - Details
+- question: What other registry modifications were made on this host in the same window?
+  context: >-
+    An actor staging a launcher command often makes other configuration changes in the same session -
+    additional provisioning subkeys, persistence keys, or defense-tampering edits. Clustering the
+    registry writes on this host in a short window around the alert reveals the full scope of changes
+    and which process made them. The triggering key appears in the results; the signal is what else was
+    modified and by which process.
+  range: +/-30m
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - User
+- question: What other process activity occurred on this host around the time of the alert?
+  context: >-
+    The launcher abuse rarely happens in isolation. Aggregating process activity in a tight window
+    around the alert surfaces what led up to the key write and what ran immediately after it. Novel
+    parent-child pairs stand out at low counts against high-count routine telemetry, which is what
+    points to the tool that staged the structure and any follow-on execution once the command ran.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host - reconnaissance, execution of scripting tools, or defense
+    tampering - may reveal the stages that preceded this change and help reconstruct the timeline.
+    Proxy execution through a trusted binary is typically a means to run a payload while evading
+    application controls, so prior alerts help place this key write within a larger sequence.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

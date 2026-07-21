@@ -1,0 +1,431 @@
+name: Potentially Suspicious Usage Of Qemu
+id: a74a4915-7565-47f2-a7f8-1ef32dc3a405
+description: |
+  Detects a qemu-system process launched with the argument structure used to turn the
+  hardware emulator into a network-tunneling primitive: a tiny RAM allocation (-m 1M/2M/3M),
+  a netdev backend with restrict=off, a socket netdev with connect=, and headless -nographic,
+  while the normal-virtualization markers (-cdrom, type=virt, -blockdev) are absent. A diskless
+  QEMU instance with this argument combination boots no operating system; it exists only to
+  bridge a host-side network stack to an outbound socket, relaying traffic between the internal
+  network and an external endpoint. Legitimate QEMU use almost always supplies a disk image,
+  CD-ROM, or kernel and a meaningful memory size, so this combination is the abuse signature.
+  Investigation should confirm the exact argument string, identify the external endpoint the
+  socket netdev connects to, establish whether this host and user have any business running an
+  emulator, and look for the discovery and credential-access tooling that commonly accompanies
+  this access method.
+type: detection
+detection_id: 5fc297ae-25b6-488a-8f25-cc12ac29b744
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the command line match the diskless QEMU tunnel pattern this rule detects?
+  context: Confirm the alert is a true positive by reviewing the exact command line. The rule
+    fires only when the selection matches AND the normal-usecase filter does not, so all of
+    these must be present together - a small memory size (-m 1M, -m 2M, or -m 3M) AND all of
+    restrict=off, -netdev, connect=, and -nographic - while none of -cdrom, type=virt, or
+    -blockdev appears. Verify each marker is on the command line rather than assuming the
+    detector was right.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Is this user and host expected to run a hardware emulator at all?
+  context: A hardware emulator running on a typical workstation or server is unusual outside
+    of development, CI, or specialized testing roles. Knowing whether the user's role and the
+    host's function involve virtualization or emulation is often the fastest way to separate a
+    sanctioned use from operator-deployed tunneling. An emulator on a host with no virtualization
+    mandate is a strong reason to keep investigating.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Is QEMU on the organization's approved software list for this host?
+  context: Organizations typically sanction a defined set of virtualization and tunneling tools
+    for specific roles. QEMU running on a host with no documented emulation or development purpose
+    may represent shadow IT or operator-deployed access, regardless of QEMU being a legitimate,
+    widely used open-source project. An unsanctioned emulator should be reviewed even though the
+    binary itself is benign.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+- question: Is there an approved development, testing, or maintenance use case explaining this
+    QEMU run?
+  context: Sanctioned emulator use usually maps to a change ticket, a development or test task,
+    or a documented maintenance window. The diskless tunnel pattern - tiny RAM, no disk image,
+    headless, paired socket and user netdevs - has no legitimate development purpose, so the
+    absence of any supporting record shifts the disposition toward operator-deployed access.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Decode the full QEMU command line - what netdev backends are wired together and
+    where does the socket connect?
+  context: The argument string defines the tunnel. Resolve each -netdev entry - user (host
+    network stack, restrict=off lifts inbound/outbound limits), socket (connect= is the outbound
+    tunnel egress, the host:port after connect= is the external endpoint), and hubport (the
+    virtual hub that splices the user backend to the socket backend). The connect= target is the
+    external IP and port traffic is being relayed to; record it for the destination and
+    cross-host questions. Multiple hubport entries plus a socket netdev confirm bridging rather
+    than ordinary emulation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains|all:
+        - '-netdev '
+        - connect=
+        - -nographic
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Does the socket netdev connect= target use port 443 or another common port to blend
+    the tunnel into normal traffic?
+  context: The tunnel wraps raw Ethernet frames inside an arbitrary outbound TCP stream, so the
+    encapsulated traffic is plaintext on the wire but carried over whatever port the operator
+    picks. Port 443 is commonly chosen for cover; high or non-standard ports also occur. Read the
+    host:port after connect= in the command line and check whether that port is consistent with
+    the host's expected outbound traffic. A 4-byte big-endian length prefix ahead of each frame
+    is the on-wire signature if network capture is available.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains: connect=
+      condition: selection
+    fields:
+      - CommandLine
+- question: What external endpoint did the QEMU process actually connect to on the network?
+  context: The socket netdev opens an outbound TCP connection to the operator's server, so the
+    destination on the wire reveals where internal traffic is being relayed. Compare the observed
+    destination IP and port against the connect= target parsed from the command line and against
+    the host's normal outbound peers. A connection to an unfamiliar external address - especially
+    one matching the connect= value - is the externally visible tunnel egress.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationHostname
+      - DestinationPort
+- question: What process spawned this QEMU instance, and is that parent chain expected for an
+    emulator launch?
+  context: The parent process shows how the emulator was started. An interactive launch from
+    explorer.exe or a terminal differs from a launch by a script host, a remote-execution
+    service, or a system process that does not normally start emulators. A parent such as
+    rundll32.exe, svchost.exe, wscript.exe, powershell.exe, or a freshly dropped binary points
+    to operator staging rather than sanctioned use.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What other processes ran on this host alongside the QEMU instance, including network
+    discovery or credential-access tooling?
+  context: This access method is commonly co-staged with network discovery utilities that scan
+    for reachable internal hosts and with credential-extraction tooling, because the tunnel's
+    value is reaching and authenticating to additional systems. This is an aggregated survey
+    of process starts on the host - repetitive agent and system binaries collapse into high
+    counts, so scan for low-count novel entries such as scanner-like tools, LSASS-touching
+    utilities, or unfamiliar archive and transfer programs running near the emulator, any of
+    which broaden the scope of the incident.
+  range: +4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - User
+- question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining process activity in the window around the
+    emulator launch reveals what led up to it and what followed - the tool being dropped,
+    discovery sweeps, privilege escalation, or staging - and whether the tunnel is one step in a
+    larger sequence. Novel parent-child pairs at low counts stand out against repetitive
+    agent telemetry.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - -m 1M
+        - -m 2M
+        - -m 3M
+        CommandLine|contains|all:
+        - restrict=off
+        - '-netdev '
+        - connect=
+        - -nographic
+      filter_main_normal_usecase:
+        CommandLine|contains:
+        - ' -cdrom '
+        - ' type=virt '
+        - ' -blockdev '
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - -m 1M
+        - -m 2M
+        - -m 3M
+        CommandLine|contains|all:
+        - restrict=off
+        - '-netdev '
+        - connect=
+        - -nographic
+      filter_main_normal_usecase:
+        CommandLine|contains:
+        - ' -cdrom '
+        - ' type=virt '
+        - ' -blockdev '
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals whether the same account drove
+    activity on multiple endpoints, which would enlarge the scope of compromise. Look for the
+    user appearing on hosts they do not normally touch in the window around the alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - -m 1M
+        - -m 2M
+        - -m 3M
+        CommandLine|contains|all:
+        - restrict=off
+        - '-netdev '
+        - connect=
+        - -nographic
+      filter_main_normal_usecase:
+        CommandLine|contains:
+        - ' -cdrom '
+        - ' type=virt '
+        - ' -blockdev '
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+- question: When this host has previously fired this QEMU tunnel pattern, what parents and users
+    drove it, and does the current alert fit?
+  context: Even legitimate emulators can be abused. This query mirrors the rule's selection
+    scoped to this host, so the resulting parent and user distribution reflects how the rule's
+    specific firing pattern - not generic QEMU use - has historically run here. A new parent
+    process, an unexpected user account, or an unusual command-line structure relative to that
+    history is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - -m 1M
+        - -m 2M
+        - -m 3M
+        CommandLine|contains|all:
+        - restrict=off
+        - '-netdev '
+        - connect=
+        - -nographic
+      filter_main_normal_usecase:
+        CommandLine|contains:
+        - ' -cdrom '
+        - ' type=virt '
+        - ' -blockdev '
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Have other hosts fired this QEMU tunnel pattern in the past week, and does the
+    cross-host distribution look like automation or one-off activity?
+  context: This query mirrors the rule's selection with no host scope, giving a fleet-wide count
+    of the tunnel pattern rather than generic QEMU usage. Many hosts firing the same pattern
+    points to scripted deployment or vendor automation; one host or a small unrelated set points
+    to manual operator activity. Use the host distribution to calibrate severity and to spot
+    additional bridged hosts.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - -m 1M
+        - -m 2M
+        - -m 3M
+        CommandLine|contains|all:
+        - restrict=off
+        - '-netdev '
+        - connect=
+        - -nographic
+      filter_main_normal_usecase:
+        CommandLine|contains:
+        - ' -cdrom '
+        - ' type=virt '
+        - ' -blockdev '
+      condition: selection and not 1 of filter_main_*
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host - reconnaissance, credential access, defense
+    tampering, or tool drops - may reveal the attack stages that preceded the tunnel and help
+    reconstruct the timeline. A discovery or credential-access alert shortly before the emulator
+    launch is consistent with this access method being established to reach further into the
+    network.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

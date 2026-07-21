@@ -1,0 +1,511 @@
+name: Suspicious Creation of .library-ms File — Potential CVE-2025-24054 Exploit
+id: 21fa8365-cfea-4c8a-8d6e-12e73b21435e
+description: |
+  Detects creation of a .library-ms file by 7z.exe, winrar.exe, or explorer.exe — the file-write
+  pattern produced when a user extracts an archive or handles an attachment carrying a crafted
+  Windows library definition file (CVE-2025-24054). A malicious .library-ms embeds a
+  searchConnectorDescription whose simpleLocation URL points at an attacker-controlled UNC path;
+  when Explorer processes the file, the host automatically initiates SMB (or WebDAV)
+  authentication to that server, exposing the user's Net-NTLMv2 response for offline cracking or
+  relay — on unpatched systems this requires minimal interaction (selecting or right-clicking the
+  file is sufficient), with no code execution. Legitimate library files are rare outside
+  %APPDATA%\Microsoft\Windows\Libraries\, so the investigation should read the file's embedded
+  UNC target, identify the delivery archive, confirm whether outbound SMB authentication left the
+  host in the surrounding window, and assess the privileges of the exposed account.
+type: detection
+detection_id: 5a7132c0-86db-4e6b-95c0-f0e9d7f461aa
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-09
+questions:
+- question: Does the alert show a .library-ms file written by 7z.exe, winrar.exe, or explorer.exe?
+  context: |
+    Before investing investigation time, confirm the alert is a true positive. The rule fires when
+    the written path (TargetFilename) ends with .library-ms AND the writing process (Image) ends
+    with \7z.exe, \winrar.exe, or \explorer.exe. Note which writer produced the event — an archive
+    tool means the file came out of an archive being extracted, while explorer.exe covers
+    drag-and-drop from a zip folder view or direct handling of a file that arrived unarchived.
+  range: +/-5m
+  answer_sources:
+  - alert
+  - file_event
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - Image
+      - TargetFilename
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this user or host expected to create Windows library definition files?
+  context: |
+    Legitimate .library-ms files normally live under %APPDATA%\Microsoft\Windows\Libraries\ and
+    are rarely created by end users; some organizations generate them through provisioning or
+    login scripts. A library file landing in Downloads, Desktop, Temp, Public, a browser or mail
+    cache, Start Menu, or an archive-extraction folder does not fit that profile — those are the
+    locations where a mailed or downloaded lure would appear. When the user is a machine or
+    service account, judge by the writing process and the host's role instead.
+  range: +/-5m
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is the .library-ms file still on disk, or was it deleted or renamed after the alert?
+  context: |
+    The file's post-alert lifecycle drives next steps. If it is still present it can be collected
+    and its embedded UNC target read — retrieve it through endpoint tooling or a command-line
+    copy rather than by browsing to it, because Explorer merely rendering the file or its folder
+    can itself trigger the outbound authentication. A deletion shortly after creation suggests
+    cleanup and shifts the investigation to the outbound-connection and companion-file questions.
+  range: +4h
+  answer_sources:
+  - file_event
+  - manual_review
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What does the .library-ms file contain — does its location URL point to a remote UNC path?
+  context: |
+    A .library-ms file is a small XML document; the element that matters is the simpleLocation
+    url inside searchConnectorDescription. Benign libraries point at local folders or sanctioned
+    internal file servers; the exploit form points at a remote UNC path such as
+    \\ATTACKER_IP\SHARE, which is what drives Explorer to authenticate outward when it processes
+    the file. Collect the file through endpoint tooling (not by opening it), read the XML, and
+    record the exact UNC or URL target — that value is the pivot for the outbound-connection
+    question. While the file is in hand, hash it and compare against threat intelligence for
+    known exploit samples.
+  range: +/-5m
+  answer_sources:
+  - file_event
+  - manual_review
+  - safe_environment
+  - external_threat_intel
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: Which account's credentials are exposed by this file?
+  context: |
+    This technique does not touch LSASS, SAM, or NTDS — the material at risk is the Net-NTLMv2
+    response of whichever account's session processes the file, sent automatically when Explorer
+    initiates SMB or WebDAV authentication to the embedded UNC target. That response supports
+    offline cracking and NTLM relay against services that accept the account's authentication.
+    The alert's User field and the writing process shown here identify the session that handled
+    the file; on a shared or multi-session host, every interactive account that later views the
+    folder is also exposed.
+  range: +/-30d
+  answer_sources:
+  - process_creation
+  - file_event
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What archive was the tool processing, and was it password-protected?
+  context: |
+    For the 7z.exe or winrar.exe branch, the writing process's command line names the archive
+    being extracted; the archive's own location (Downloads, a mail client's attachment cache, a
+    browser cache) points at the delivery vector. Check for password flags such as -p — lure
+    archives are often password-protected so mail and antivirus scanning cannot inspect the
+    contents, with the password supplied in the message body. If the writer is explorer.exe,
+    there is no extraction command line; the file was copied out of a zip folder view or arrived
+    unarchived, and delivery should be established from the user's mail and download activity.
+  range: +/-30d
+  answer_sources:
+  - process_creation
+  - manual_review
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What spawned the process that wrote the .library-ms file, and is that chain expected?
+  context: |
+    The parent chain reveals how the writer was invoked. An archive tool spawned by explorer.exe
+    fits a user manually extracting a file they received; a parent that is a mail client or
+    browser strengthens the phishing-delivery reading; script hosts or unfamiliar parents point
+    to automated staging. When the writer is explorer.exe itself, its parent is normally the
+    logon machinery (userinit.exe), so establish delivery from the archive and mail evidence
+    instead. This retrieves the writer's own creation event with its parent details.
+  range: +/-30d
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - Image
+      - CommandLine
+- question: What other files did the responsible process write or delete around the alert?
+  context: |
+    Archives built around this exploit typically carry companion lure files alongside the
+    .library-ms — .url, .website, .lnk, and .scf files pointing at the same remote server, each
+    an independent trigger for the outbound authentication. Enumerating everything the writer
+    and its direct children wrote in the window shows whether such companions landed, where the
+    extraction unpacked to, and what else needs to be collected or removed. Several lure-type
+    extensions appearing together in one write burst corroborate a purpose-built archive rather
+    than an isolated file.
+  range: +/-30m
+  answer_sources:
+  - file_event
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Did this host initiate outbound SMB connections after the .library-ms file appeared?
+  context: |
+    Processing the lure drives the host to authenticate to the UNC target embedded in it —
+    outbound TCP 445 or 139 carrying NTLM negotiation, typically within 15-30 minutes of the file
+    event and often within seconds. Compare destinations against the environment's known file
+    servers and suppress sanctioned ones; a connection from a workstation to an external or
+    otherwise unrecognized address in this window means the authentication attempt happened and
+    the session's Net-NTLMv2 response should be treated as exposed. The connecting Image may be
+    the System process rather than explorer.exe, since the SMB client runs in the kernel. WebDAV
+    variants fall back to HTTP on 80/443 — if nothing appears on the SMB ports, review the
+    host's web egress for WebDAV verbs (PROPFIND, OPTIONS) or NTLM authorization toward the
+    UNC target read from the file. Workstation-to-workstation SMB is itself unusual in most
+    environments and worth explaining even when the destination is internal.
+  range: +/-30m
+  answer_sources:
+  - network_connection
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 445
+          - 139
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
+- question: Were outbound remote-access connections (RDP, SMB, WinRM, SSH) initiated from this host after this event?
+  context: |
+    Credential exposure is typically followed by reuse. The query returns outbound connections
+    from this host to remote-access ports — 3389 (RDP), 445 (SMB/PsExec), 5985/5986 (WinRM), 22
+    (SSH) — in the hours after the event; the originating Image and User show what drove each
+    connection. Two limits to keep in mind — a hash captured by this technique is usually cracked
+    or relayed from the attacker's own infrastructure, so movement may originate elsewhere (check
+    4624 logons for the exposed account on other systems), and this query requires endpoint
+    network telemetry from this host; if that is not collected, treat zero rows as a visibility
+    gap rather than evidence no movement occurred.
+  range: +4h
+  answer_sources:
+  - network_connection
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
+- question: Does the exposed account hold elevated privileges, and which systems accept its authentication?
+  context: |
+    The severity of the exposure depends on the privilege level of the account whose session
+    processed the file. Cross-reference the user with directory group memberships: a domain
+    administrator or broadly privileged service account requires escalation and an immediate
+    credential reset, because a captured Net-NTLMv2 response can be cracked offline at the
+    attacker's leisure — patching or deleting the file does not un-expose the hash. A standard
+    user account narrows the blast radius to the systems and shares that account can reach.
+  range: +/-30d
+  answer_sources:
+  - active_directory
+  - organizational_knowledge
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- always_include: true
+  question: Has this user previously produced .library-ms writes matching the rule, and does that history fit their role?
+  context: |
+    The query mirrors the rule's selection structure scoped to this user — the result is the
+    user's 90-day history of the rule's specific firing pattern (not generic use of the archive
+    tools), aggregated by host. Most users never create library definition files at all, so a
+    first-ever event under an archive tool fits a mailed lure better than routine work; a user
+    whose scripts or tooling regularly emit this pattern matches the rule's stated
+    false-positive case.
+  range: -90d
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        TargetFilename|endswith: .library-ms
+        Image|endswith:
+        - \7z.exe
+        - \winrar.exe
+        - \explorer.exe
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: Has this program historically driven .library-ms writes matching the rule, or is the program new for this activity?
+  context: |
+    When the alert fires under a service principal or machine account, user identity does not
+    attribute the behavior. The meaningful pivot is the launch mechanism: the query mirrors the
+    rule's selection structure scoped to the alerting program, giving the 90-day history
+    of this program driving this specific pattern. A program that already accounts for many prior
+    events across hosts reads as provisioning or vendor automation; a new or rare program for
+    this pattern is the deviation worth chasing.
+  range: -90d
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        TargetFilename|endswith: .library-ms
+        Image|endswith:
+        - \7z.exe
+        - \winrar.exe
+        - \explorer.exe
+      _pb_scope:
+        Image|endswith|expand: '%Image%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: What else did this user do across the network around this time?
+  context: |
+    Tracking the user's activity across all hosts in the hour around the alert reveals whether
+    the same session handled lure files on other endpoints or moved between machines. If the
+    user account is a service principal, this view degenerates into agent noise — the
+    parent-scoped clustering question is the meaningful companion in that case.
+  range: +/-1h
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- always_include: true
+  question: Did the same program-driven .library-ms pattern fire on other hosts in the same window?
+  context: |
+    A mass-mailed lure reaches many recipients, so several hosts producing the rule's pattern in
+    a short window points to a distribution wave in progress and widens the response to every
+    affected mailbox and host. The query mirrors the rule's selection structure scoped to the
+    alerting program, fleet-wide, in the alert window; a single host points to a
+    host-local trigger, while many hosts with a management-tool program instead suggests a
+    scripted rollout that generates library files legitimately.
+  range: +/-1h
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        TargetFilename|endswith: .library-ms
+        Image|endswith:
+        - \7z.exe
+        - \winrar.exe
+        - \explorer.exe
+      _pb_scope:
+        Image|endswith|expand: '%Image%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: When this host has previously produced writes matching the rule's pattern, what programs and users drove them, and does this alert fit?
+  context: |
+    Even common tools can be abused. The query mirrors the rule's selection structure scoped to
+    this host — the resulting program/user distribution reflects how the rule's specific firing
+    pattern (not generic archive-tool usage) has historically run here. A host whose scripts
+    regularly regenerate library files will show a stable archive tool and user; a first-ever
+    occurrence, a new writing program, or an unexpected account is the anomaly worth chasing.
+    File events carry no parent lineage — pivot to the archive tool's process-start event if
+    ancestry matters.
+  range: -14d
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        TargetFilename|endswith: .library-ms
+        Image|endswith:
+        - \7z.exe
+        - \winrar.exe
+        - \explorer.exe
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - Image
+    - User
+- question: Did other detections fire on this host in the hours before this alert?
+  context: |
+    Earlier detections on the same host may reveal the delivery chain that preceded this event —
+    mail-attachment or download alerts, archive-tool detections, or other credential-access
+    activity — and help reconstruct the timeline from message arrival to file extraction. Forced
+    authentication is an initial credential-harvesting step, so preceding alerts usually tell
+    the delivery story rather than the post-compromise one.
+  range: -6h
+  answer_sources:
+  - alert
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Have other hosts produced writes matching the rule's pattern in the past week?
+  context: |
+    The query mirrors the rule's selection structure with no host scope, so the result is a
+    fleet-wide count of the rule's firing pattern rather than generic archive-tool usage. Many
+    hosts firing with the same parent and timing points to either a distribution wave hitting
+    multiple recipients or a corporate script that legitimately generates library files —
+    distinguish the two by the parent process, the file's location, and its embedded target.
+    One host or a small unrelated set points to a single delivery. Use the distribution to
+    decide whether the response covers one mailbox or many.
+  range: -7d
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        TargetFilename|endswith: .library-ms
+        Image|endswith:
+        - \7z.exe
+        - \winrar.exe
+        - \explorer.exe
+      condition: selection
+    fields:
+    - host.name

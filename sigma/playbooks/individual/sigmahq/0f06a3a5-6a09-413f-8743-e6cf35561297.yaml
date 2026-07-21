@@ -1,0 +1,497 @@
+name: WMI Event Subscription
+id: 3b28b51e-237d-4f14-97cc-a0e4e87ff526
+description: |
+  Detects creation of the objects that make up a permanent WMI event subscription: an event
+  filter (the WQL condition that decides when the subscription fires), an event consumer (the
+  command line, script, or file action it performs), and the filter-to-consumer binding that
+  wires the two together and activates the subscription. Permanent subscriptions survive
+  reboots, execute under the WMI provider host rather than a normal parent-child process
+  chain, and leave no scheduled task or autorun key, so this telemetry is one of the few
+  places the mechanism is visible. Management, inventory, and backup tooling registers
+  subscriptions too, so the investigation should determine which of the three object types
+  was created, what the consumer is configured to execute, who registered it, and whether the
+  filter/consumer naming and cadence match tooling that is deployed consistently across the
+  fleet or appears once on a single host.
+type: detection
+detection_id: 0f06a3a5-6a09-413f-8743-e6cf35561297
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-16
+questions:
+- question: Does the alerting event record a WMI event filter, event consumer, or filter-to-consumer binding being created?
+  context: >-
+    The rule fires on any of the three WMI subscription objects being registered, and the three
+    mean different things. A filter alone defines a trigger condition with nothing attached to it,
+    a consumer alone defines a payload that nothing fires, and a binding is the step that makes
+    the pair live and reboot-persistent. Confirm which object type the alert carries before
+    investing further time.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - EventID
+  answer_sources:
+  - alert
+  - process_creation
+- question: Is this user and host expected to register WMI event subscriptions?
+  context: >-
+    Registering a permanent WMI subscription is a narrow administrative act. On most workstations
+    no human ever performs it, and on servers it is usually done by a deployment or monitoring
+    agent under a machine or service account rather than interactively. A subscription registered
+    by an interactive user account, or on a host with no management role, is worth carrying
+    forward; one registered by the account a known agent runs under on a host it manages is
+    routine.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: What launched the process that registered the WMI subscription object?
+  context: >-
+    The registering process is named in the alert but its lineage is not. Looking that process up
+    by its own identifier returns the parent that started it, which separates a deployment agent
+    or installer chain from an interactive shell, a script host, or an application spawned by a
+    macro or exploit. A subscription registered by tooling that was itself launched from a user
+    shell is a different situation from one registered by a service that starts at boot.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+  answer_sources:
+  - process_creation
+- question: What other processes did the registering process spawn?
+  context: >-
+    A process that registers a WMI subscription rarely stops there. Listing the children it
+    launched shows whether the registration was an isolated configuration change or one step in a
+    longer chain — payload staging, a second persistence mechanism, or follow-on tooling. Note
+    this shows what the registering process started, not what started alongside it.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: What WMI subscription and provider activity did the host's own WMI activity log record around the alert?
+  context: >-
+    The native WMI activity operational log records permanent subscription registration under
+    event code 5861, temporary subscription registration under 5860, and provider loads under
+    5857. The 5861 record carries the consumer body in winlog.user_data.CONSUMER and the filter
+    and binding in ESS, which is where the trigger condition and the payload become readable;
+    the message column narrates each record. This channel is not collected on
+    every host; if this host does not ship it, an empty result is a visibility gap rather than
+    evidence that no subscription exists, and the subscription objects should be enumerated on
+    the host directly against the root\subscription namespace.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: wmi
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID:
+          - 5861
+          - 5860
+          - 5857
+      condition: selection
+    fields:
+      - EventID
+      - winlog.user_data.CONSUMER
+      - winlog.user_data.ESS
+      - winlog.user_data.Query
+      - winlog.user_data.NamespaceName
+      - winlog.user_data.ProviderName
+      - message
+  answer_sources:
+  - manual_review
+  - edr_console
+- question: Did WMI subscription tooling or a MOF compilation run on this host around the alert?
+  context: >-
+    Subscription objects reach the WMI repository through a small set of paths — compiling a MOF
+    file with mofcomp.exe, wmic.exe, or PowerShell calls that create __EventFilter,
+    __EventConsumer, and __FilterToConsumerBinding instances under root\subscription. Seeing
+    which of those ran, with what arguments, identifies the operator and often names the MOF or
+    script that carries the payload. Absence of any of them alongside a subscription change points
+    at a process that used the WMI API directly rather than a command-line utility.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_tooling:
+        - Image|endswith:
+            - '\mofcomp.exe'
+            - '\wmic.exe'
+        - CommandLine|contains:
+            - 'Register-WmiEvent'
+            - 'Set-WmiInstance'
+            - 'New-CimInstance'
+            - '__EventFilter'
+            - '__EventConsumer'
+            - '__FilterToConsumerBinding'
+            - 'CommandLineEventConsumer'
+            - 'ActiveScriptEventConsumer'
+            - 'root\subscription'
+      condition: selection and selection_tooling
+    fields:
+      - Image
+      - CommandLine
+      - User
+  answer_sources:
+  - process_creation
+- question: What processes did the WMI provider host spawn on this host around the alert?
+  context: >-
+    When a bound subscription fires, the consumer's action runs as a child of the WMI provider
+    host rather than under the process that registered it, so triggered execution is only visible
+    through that lineage. The provider host legitimately spawns a small, repetitive set of
+    children on a managed host — inventory scripts, agent helpers. Anything outside that set, and
+    in particular a command interpreter, a script host, or a binary from a user-writable path,
+    is the execution half of the subscription and should be read as the payload.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: '\WmiPrvSE.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - User
+  answer_sources:
+  - process_creation
+- question: Did a command interpreter or script host execute on this host within minutes of the subscription change?
+  context: >-
+    A subscription that was registered to run immediately, or on a short interval timer, produces
+    its first execution close behind the registration; correlating the two within roughly a
+    five-minute window is what links the configuration change to the payload. A consumer
+    destination that invokes powershell.exe with an encoded command, cscript or wscript running a
+    script from a temp or user-writable path, mshta, rundll32, or regsvr32 is the pattern to look
+    for. An interpreter running here with no relationship to the subscription is common on
+    workstations, so read the parent and the arguments rather than the count.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_interpreters:
+        Image|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+          - '\cscript.exe'
+          - '\wscript.exe'
+          - '\mshta.exe'
+          - '\rundll32.exe'
+          - '\regsvr32.exe'
+          - '\cmd.exe'
+      condition: selection and selection_interpreters
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+  answer_sources:
+  - process_creation
+- question: Which processes loaded the scripting and WMI client modules on this host around the alert?
+  context: >-
+    An ActiveScriptEventConsumer runs inline VBScript or JScript, which pulls scrobj.dll,
+    vbscript.dll, or jscript.dll into whatever process hosts it, and code that talks to the WMI
+    repository loads the WMI client modules. Module loads therefore expose the consumer type and
+    the hosting process even when the command line is empty, which is the normal case for a
+    consumer whose payload is embedded script rather than an argument. An unsigned or
+    unexpectedly-signed loader of these modules narrows the investigation to the process that
+    carries the payload.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_modules:
+        ImageLoaded|endswith:
+          - '\scrobj.dll'
+          - '\vbscript.dll'
+          - '\jscript.dll'
+          - '\jscript9.dll'
+          - '\wbemdisp.dll'
+          - '\wbemprox.dll'
+          - '\fastprox.dll'
+      condition: selection and selection_modules
+    fields:
+      - Image
+      - ImageLoaded
+      - Signed
+      - Signature
+  answer_sources:
+  - process_creation
+- question: Do other hosts register WMI event subscriptions, and does the cross-host distribution look like deployed tooling or a one-off?
+  context: >-
+    This is the discriminator that separates a management agent from an operator. Deployment,
+    inventory, and backup products register the same filter and consumer names, in the same
+    namespace, on every host they manage, and they do it repeatedly over time. A subscription
+    whose filter or consumer name appears on one host, or on a small unrelated set of hosts inside
+    a short window, has no fleet pattern behind it. Names that are randomized, generic, or that
+    imitate a service name while matching no deployed product belong in the second group. Use the
+    recurring pairs this returns as the allowlist for future alerts on this rule.
+  range: -30d
+  query: |
+    aggregation: true
+    logsource:
+      category: wmi
+      product: windows
+    detection:
+      selection:
+        EventID:
+          - 5861
+          - 5860
+      condition: selection
+    fields:
+      - winlog.user_data.CONSUMER
+      - winlog.user_data.Query
+      - host.name
+  answer_sources:
+  - organizational_knowledge
+  - asset_inventory
+- question: Was there a change ticket, maintenance window, or documented approval for this WMI subscription?
+  context: >-
+    Persistence mechanisms are the class of change most organizations require a ticket for. A
+    corresponding ticket, or an agent deployment scheduled for this window, closes the alert
+    quickly. Absence of one where policy requires it, on a host that is not part of a rollout,
+    is what escalates it.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - organizational_knowledge
+  - manual_review
+- question: Does the administrator or service owner recall registering this WMI subscription?
+  context: >-
+    Direct confirmation from the human behind the account is often the fastest route to
+    legitimacy. If the subscription was registered under a service account, ask the team that owns
+    that service whether the action was theirs; if under a user account and the user does not
+    recall it, treat the credentials as a candidate for compromise. When someone does confirm it,
+    ask what the filter is meant to trigger on and what the consumer is meant to run.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - organizational_knowledge
+  - manual_review
+- question: Does the timing of this subscription registration align with normal work hours and maintenance windows?
+  context: >-
+    Agent-driven subscription registration clusters at imaging, install, or upgrade time and
+    repeats predictably. A one-off registration outside business hours, on a host with no
+    maintenance window open and no rollout in flight, has no such explanation. Check the host's
+    local time rather than the collector's, and for servers check whether the timing matches a
+    scheduled job.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - organizational_knowledge
+  - asset_inventory
+- question: Is registering a WMI event subscription consistent with how your organization normally schedules recurring actions?
+  context: >-
+    Most environments schedule recurring work through group policy, a deployment product, or the
+    task scheduler, and reach for WMI event subscriptions only inside vendor tooling that ships
+    them. Direct registration outside that tooling may be an administrator taking a shortcut past
+    normal channels, or an operator picking a mechanism that leaves no scheduled task or autorun
+    key behind. Knowing the local norm decides which reading applies.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - organizational_knowledge
+- question: Were other process-based persistence mechanisms installed on this host around the subscription change?
+  context: >-
+    Operators rarely rely on a single persistence mechanism. After wiring one foothold, backup
+    mechanisms commonly follow using a different technique — scheduled tasks, services, registry
+    Run keys, or BITS jobs. Several persistence installations inside the same window point at
+    intentional stacking rather than an isolated administrative action.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Were files dropped to persistence locations (Startup folders, scheduled-task definitions) on this host?
+  context: >-
+    File-based persistence bypasses command-line detection entirely. Dropping an executable or
+    script into a Startup folder, or writing a scheduled-task XML definition directly, achieves
+    persistence without running schtasks, sc, or reg. This is also where a MOF file staged for
+    compilation or a script referenced by an event consumer would land, so the paths returned here
+    may name the payload the subscription executes.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist_paths:
+        TargetFilename|contains:
+          - '\Start Menu\Programs\Startup\'
+          - '\Windows\System32\Tasks\'
+          - '\Windows\Tasks\'
+      condition: selection and selection_persist_paths
+    fields:
+      - TargetFilename
+      - Image
+  answer_sources:
+  - file_event
+- question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Alerts rarely occur in isolation. Aggregating process activity around the registration shows
+    what led to it and what followed — reconnaissance, privilege escalation, or a second
+    persistence mechanism. Repetitive agent telemetry collapses into a few high-count rows;
+    the novel parent-child pairs sitting at low counts are what to read.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+  answer_sources:
+  - process_creation
+  - file_event
+  - registry_event
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Persistence is usually installed after access is already established, so earlier detections on
+    the same host — defense tampering, reconnaissance, credential access — often name the stages
+    that preceded this registration and help reconstruct the timeline. The order of those alerts
+    is what indicates whether this is the tail of an intrusion or a standalone administrative act.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+  answer_sources:
+  - alert

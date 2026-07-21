@@ -1,0 +1,472 @@
+name: Suspicious PowerShell Download - Powershell Script
+id: 53af0dfd-a8db-44c1-86ee-1040fca05107
+description: |
+  Fires when PowerShell script-block content (EID 4104) instantiates System.Net.WebClient
+  and calls one of its download methods (DownloadFile, DownloadString, or their async
+  variants). DownloadString feeds a remote resource straight into memory — classically
+  piped to Invoke-Expression as a download cradle — while DownloadFile stages a payload on
+  disk for a later execution step; the same methods also appear in legitimate
+  administrative, deployment, and update scripts that fetch content from the Internet.
+  Investigation should read the complete script for the URL, the destination, and what is
+  done with the retrieved content, establish whether the transfer succeeded and what was
+  written or executed afterward, and weigh the pattern against the user's and fleet's
+  history of producing it. Script-block capture is policy-gated per host — default
+  installs log only content matching built-in suspicious-strings checks — so absence of
+  surrounding 4104 evidence is not absence of activity.
+type: detection
+detection_id: 403c2cc0-7f6b-4925-9423-bfa573bed7eb
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-17
+questions:
+- question: Does the script block contain System.Net.WebClient combined with one of its download methods?
+  context: >-
+    Confirm the alert is a true positive by reading the complete script. The rule fires
+    only when both parts are present — a WebClient reference and one of the four download
+    calls (DownloadFile, DownloadFileAsync, DownloadString, DownloadStringAsync) — so
+    check that the two belong to the same operation rather than unrelated fragments of a
+    large script. Long scripts are split across multiple 4104 events; this retrieves every
+    chunk of the alerting block in sequence/total order so the match is judged on the
+    whole script.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - ScriptBlockText
+- question: Is this user or host expected to run scripts that download content from the Internet?
+  context: >-
+    Administrative tooling, software deployment, and update automation legitimately pull
+    content with WebClient — the rule's main benign class. The query shows the alerting
+    block's host, user, and on-disk script path (blank for interactive or in-memory
+    execution). A SYSTEM user usually means deployment tooling or a vendor agent — judge
+    by the host role and the script path; an ordinary user account on a host with no such
+    duties removes the routine explanation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - host.name
+      - user.name
+      - Path
+- question: Is the script still on disk for analysis?
+  context: >-
+    A file-based script block records its on-disk path, and retrieving the file enables
+    hashing, sandboxing, and full content review beyond what the 4104 events captured.
+    Preserve the downloaded content too — the destination path named in the script text is
+    a second artifact worth collecting before cleanup removes it. Interactive or in-memory
+    execution records no path at all; for a download cradle, fileless execution is a
+    deliberate evasion choice rather than a logging gap.
+  range: +/-24h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What does the complete script do, and which URL and destination does the WebClient download use?
+  context: >-
+    Script-block content is logged after decoding, so any -EncodedCommand wrapper is
+    already unwrapped; only string-level obfuscation inside the script (concatenation,
+    format operators, backticks) still needs manual work. Read the reassembled script for
+    the download call's URL and destination path, and for what happens to the retrieved
+    content — DownloadString handed to Invoke-Expression executes a remote script entirely
+    in memory, while DownloadFile writes a payload to disk for a later execution step.
+    Paths and URLs named in the script are the artifacts the file, network, and payload
+    questions chase.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - powershell.sequence
+      - powershell.total
+      - ScriptBlockText
+- question: Which parent process launched the PowerShell host that ran this script?
+  context: >-
+    Script-block events carry no process identity, so this pivots by host and user over
+    the preceding day to list the user's PowerShell launches with their parents. An
+    interactive session typically descends from explorer.exe, a terminal, or a
+    remote-administration client; a PowerShell host descending from an Office application,
+    a browser, mshta, or an unexpected service points to a delivery step — such as a
+    document macro fetching a second stage — that should be chased before accepting a
+    routine explanation.
+  range: -24h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        User|expand: '%User%'
+        Image|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+          - '\powershell_ise.exe'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - CommandLine
+- question: Did a process other than a standard PowerShell host load the PowerShell engine assembly?
+  context: >-
+    Download cradles are frequently run through unmanaged runners that host the PowerShell
+    engine inside another .NET process, sidestepping controls and logging aimed at
+    powershell.exe. System.Management.Automation loading into a binary that is not a
+    recognized PowerShell host establishes that indirect invocation happened on this host
+    and names the hosting process. Rare or never-before-seen hosting binaries deserve
+    signature and origin checks.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|endswith:
+          - '\System.Management.Automation.dll'
+          - '\System.Management.Automation.ni.dll'
+      filter_hosts:
+        Image|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+          - '\powershell_ise.exe'
+      condition: selection and not filter_hosts
+    fields:
+      - Image
+      - ImageLoaded
+      - SignatureStatus
+- question: Were PowerShell security controls bypassed or weakened before this execution?
+  context: >-
+    Operators often weaken controls just before pulling a payload — AMSI tampering
+    (AmsiUtils, amsiInitFailed), an execution-policy bypass flag, antivirus preference
+    changes, or a downgrade to PowerShell v2 which lacks script-block logging. For a
+    download-cradle alert, any of these on the same host in the preceding hour reads as
+    preparation for the fetched payload and belongs in the timeline alongside the alerting
+    script.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: Did PowerShell processes on this host make outbound connections around the alert?
+  context: >-
+    The WebClient call runs inside the PowerShell process itself, so the download's
+    network side appears as a connection owned by a PowerShell host. Connections to rare
+    or newly seen external destinations around the alert corroborate the fetch and
+    identify the remote server; additional transfers shortly after can be a second stage
+    retrieved by the payload. Endpoint-recorded connections carry the owning process,
+    while network-sensor records of the same traffic may not.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+          - '\powershell_ise.exe'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+- question: Was the download successful — did a file get written at the destination?
+  context: >-
+    A download command does not guarantee retrieval; network errors, blocked URLs, or
+    security controls may have stopped the transfer. The destination path lives in the
+    script text rather than in any alert field, so this surveys file activity for the
+    alerting user on this host in the minutes after the block — look for the destination
+    named in the script, and for writes into staging locations such as Temp, AppData,
+    ProgramData, or the public profile. A confirmed write means the delivery progressed
+    past the fetch stage; an in-memory DownloadString cradle may legitimately write
+    nothing.
+  range: +15m
+  query: "aggregation: false\nlogsource:\n  category: file_activity\n  product: windows\ndetection:\n  selection_self:\n\
+    \    host.name|expand: '%hostname%'\n    User|expand: '%User%'\n  selection_child:\n    host.name|expand: '%hostname%'\n\
+    \    User|expand: '%User%'\n  condition: 1 of selection_*\nfields:\n- TargetFilename\n- Image\n- EventType\n"
+- question: If the downloaded payload ran, what did the PowerShell session spawn — and with what hashes?
+  context: >-
+    The hash needed for a reputation lookup or sandbox detonation is recorded when a
+    payload executes, not when it is written, so this lists processes spawned by the
+    user's PowerShell hosts in the hour after the block along with their executable
+    hashes — for a download-and-execute chain, that is the payload. It also serves as the
+    session's follow-on view, since script-block events carry no process link to pivot on.
+    A payload launched later or by an unrelated process will not appear here; retrieve the
+    file from the destination path read out of the script, hash it manually, and submit
+    the hash to threat intelligence to determine whether it is known.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        User|expand: '%User%'
+        ParentImage|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+          - '\powershell_ise.exe'
+      condition: selection
+    fields:
+    - Image
+    - Hashes
+- question: Is full script block logging enabled on this host, or is only suspicious-content logging active?
+  context: >-
+    PowerShell logs every script block at verbose level only when the Script Block Logging
+    policy is enabled; by default it logs only content matching built-in
+    suspicious-strings checks, at warning level. On a warning-only host the alerting block
+    is a fragment of the host's PowerShell activity, and surrounding benign-looking blocks
+    may simply not have been logged. Use the level distribution here to calibrate how
+    complete every other script-channel result in this investigation is.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - log.level
+- question: What other PowerShell script activity occurred on this host around the alert?
+  context: >-
+    Attacker PowerShell rarely runs as a single block — reconnaissance, staging, and
+    follow-on tooling produce a cluster of script blocks in a short window, and
+    surrounding blocks from the same session often contain the plaintext URL, destination,
+    or next-stage content the alerting fragment lacks. The log.level column shows whether
+    the host logs all blocks (verbose) or only automatically flagged content (warning) —
+    on a warning-only host this view is partial by design, and absence of surrounding
+    blocks is not evidence nothing else ran.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - user.name
+      - log.level
+      - Path
+      - ScriptBlockText
+- question: Has this exact script block run on this host before?
+  context: >-
+    A script that has run routinely for months reads very differently from one appearing
+    for the first time — and scheduled download automation recurs byte-identically, which
+    makes this history one of the fastest benign discriminators for this rule's main
+    falsepositive class. The script block hash matches byte-identical content only; zero
+    history means this exact content is new to the host, though any edit to the URL or
+    destination produces a new hash. On hosts without full Script Block Logging the
+    history contains only auto-flagged blocks, so an empty result is weaker evidence
+    there.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_hash|expand: '%script_block_hash%'
+      condition: selection
+    fields:
+      - user.name
+      - Path
+- always_include: true
+  question: Has this user produced this WebClient download pattern before, and does that history fit their role?
+  context: >-
+    The query mirrors the rule's own selection scoped to this user — a 90-day history of
+    the WebClient-plus-download pattern aggregated by host, not generic PowerShell use. An
+    administrator or engineer whose tooling regularly fetches content reads differently
+    from an account emitting the pattern for the first time; weigh the count against the
+    user's role. History covers only hosts logging the PowerShell channel, and non-flagged
+    content appears only where full script-block logging is enabled, so zero history is
+    weaker evidence on a default-logging fleet.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: ps_script
+      definition: 'Requirements: Script Block Logging must be enabled'
+    detection:
+      webclient:
+        ScriptBlockText|contains: System.Net.WebClient
+      download:
+        ScriptBlockText|contains:
+        - .DownloadFile(
+        - .DownloadFileAsync(
+        - .DownloadString(
+        - .DownloadStringAsync(
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (webclient and download) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: Which hosts have produced this script pattern in the last 90 days, and is the alerting host among them?
+  context: >-
+    When the alert fires under a service principal, user identity does not attribute the
+    behavior, and script-block events carry no process identity to pivot on — the pattern
+    itself is the pivot. This mirrors the rule's selection fleet-wide over 90 days,
+    aggregated by host. A pattern appearing routinely across many hosts suggests
+    deployment or update automation; one that has never appeared before, or only on this
+    host, is the deviation worth chasing. Only hosts shipping the PowerShell channel (and,
+    for non-flagged content, with full logging enabled) can appear, so absence elsewhere
+    is weak evidence.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: ps_script
+      definition: 'Requirements: Script Block Logging must be enabled'
+    detection:
+      webclient:
+        ScriptBlockText|contains: System.Net.WebClient
+      download:
+        ScriptBlockText|contains:
+        - .DownloadFile(
+        - .DownloadFileAsync(
+        - .DownloadString(
+        - .DownloadStringAsync(
+      condition: webclient and download
+    fields:
+    - host.name
+- always_include: true
+  question: What else did this user do across the network around this time?
+  context: >-
+    The same account acting on several hosts in the alert window widens the scope — a
+    download on one host paired with logons or tooling on others is how staged intrusions
+    spread. Hosts this account does not normally touch matter as much as the commands run
+    there. If the alert fired under SYSTEM or another service principal, this view
+    degrades to agent-telemetry noise; the fleet-wide pattern question is the meaningful
+    substitute in that case.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- always_include: true
+  question: Did this same script pattern fire on other hosts in the same window?
+  context: >-
+    The query mirrors the rule's selection fleet-wide in the alert window, aggregated by
+    host — the service-principal-safe version of the cross-network view, since these
+    events carry no process identity to pivot on. Several hosts producing the pattern in
+    the same window points to pushed automation or a scheduled rollout; a single host
+    points to a host-local trigger. Coverage is policy-gated per host, so absence
+    elsewhere remains weak evidence on a default-logging fleet.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: ps_script
+      definition: 'Requirements: Script Block Logging must be enabled'
+    detection:
+      webclient:
+        ScriptBlockText|contains: System.Net.WebClient
+      download:
+        ScriptBlockText|contains:
+        - .DownloadFile(
+        - .DownloadFileAsync(
+        - .DownloadString(
+        - .DownloadStringAsync(
+      condition: webclient and download
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host — initial-access activity, defense tampering,
+    reconnaissance — may reveal how an actor reached the position to pull a payload at
+    all. A download is typically a mid-chain delivery step rather than the start, so the
+    preceding alert timeline helps reconstruct the sequence that led to this script
+    instead of treating it as an isolated event.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

@@ -1,0 +1,341 @@
+name: Suspicious Kerberos Ticket Request via CLI
+id: 25f918c0-cd8c-42f6-8409-1696d59f0dc3
+description: |
+  Detects powershell.exe or pwsh.exe invocations whose command line contains both the
+  System.IdentityModel.Tokens.KerberosRequestorSecurityToken class reference and a .GetRequest() call.
+  Requesting a Kerberos service ticket through this .NET class from the command line is the native,
+  tool-free form of Kerberoasting: the returned TGS service ticket carries an RC4-encrypted blob derived
+  from the service account password, which can be cracked offline, and the same primitive supports silver-ticket
+  abuse. The rule fires only when the binary/OriginalFileName selection AND the command-line selection both match.
+  Legitimate use is rare and usually limited to identity developers or security tooling; determine whether the
+  user and host are expected to request service tickets this way, what SPN was targeted, and whether ticket
+  requests, encryption downgrade, or lateral movement followed.
+type: detection
+detection_id: caa9a802-8bd8-4b9e-a5cd-4d6221670219
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-09
+questions:
+- question: Does the command line match what this rule detects — a PowerShell process referencing KerberosRequestorSecurityToken and calling .GetRequest()?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule fires only when the process is powershell.exe or pwsh.exe AND the command line contains both System.IdentityModel.Tokens.KerberosRequestorSecurityToken and .GetRequest(). Read the full command line and process details and confirm both conditions are present, and note the targeted service principal name (SPN) passed as the ArgumentList.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to request Kerberos service tickets from the command line?
+  context: Requesting a service ticket through the KerberosRequestorSecurityToken class is rarely part of routine administration. Identity or application developers and some security tooling do it deliberately; a general workstation or server account doing it is unusual. Knowing whether the user role and host function fit this behavior is often the fastest way to separate a true positive from sanctioned activity.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Which service principal name (SPN) was targeted by the ticket request?
+  context: The SPN passed to the KerberosRequestorSecurityToken constructor (the ArgumentList value, e.g. HTTP/host.fqdn or MSSQLSvc/...) identifies the service account whose password hash is exposed by the returned ticket. Requests targeting high-privilege service accounts, or many SPNs requested in quick succession, indicate automated Kerberoasting rather than a single legitimate token request. Read the full command line and extract the SPN string.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Was the command encoded or obfuscated, and what does it decode to?
+  context: The KerberosRequestorSecurityToken request is often delivered inside a larger script that may be base64-encoded (-EncodedCommand / -enc) or obfuscated with backticks, concatenation, or variable substitution to hide the SPN and surrounding logic. Decode the command line to recover the actual SPN, any loop that enumerates multiple SPNs, and whether the script also exports or formats the resulting tickets for offline cracking.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did PowerShell script block logging capture the full script content of this ticket request?
+  context: Script block logging (Event ID 4104) records the deobfuscated script PowerShell actually executed, even when the command line is encoded. This is ground truth for what ran — the full Add-Type / New-Object KerberosRequestorSecurityToken sequence, any SPN enumeration loop, and whether output was piped to a file. If PowerShell operational logs are not ingested in this environment, treat zero results as a visibility gap rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Were PowerShell security controls bypassed or weakened before this execution?
+  context: Operators frequently weaken PowerShell defenses before running credential-access tooling. Common precursors include AMSI bypass (patching amsi.dll in memory), execution-policy changes (-ExecutionPolicy Bypass / -ep bypass), and a version-2 downgrade that lacks logging. Finding these in the hour before the ticket request strengthens the case that the activity is operator-driven rather than a sanctioned identity test.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: What process spawned this PowerShell instance, and is that parent chain expected?
+  context: The parent process reveals how the ticket request was launched. Interactive use under explorer.exe or a console host differs from invocation by wscript.exe, mshta.exe, an Office application, or a remote-execution service, which point to a scripted or remotely driven Kerberoasting run. Examine the parent and, where possible, what spawned the parent.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - powershell.exe
+        - pwsh.dll
+      selection_cli:
+        CommandLine|contains|all:
+        - System.IdentityModel.Tokens.KerberosRequestorSecurityToken
+        - .GetRequest()
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - powershell.exe
+        - pwsh.dll
+      selection_cli:
+        CommandLine|contains|all:
+        - System.IdentityModel.Tokens.KerberosRequestorSecurityToken
+        - .GetRequest()
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts in the surrounding window reveals whether the ticket request is isolated or part of broader hands-on-keyboard activity such as reconnaissance, additional credential access, or lateral movement onto other endpoints.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - powershell.exe
+        - pwsh.dll
+      selection_cli:
+        CommandLine|contains|all:
+        - System.IdentityModel.Tokens.KerberosRequestorSecurityToken
+        - .GetRequest()
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Did Kerberos service-ticket requests (Event ID 4769) spike for this account, and were any returned with RC4 (etype 0x17) encryption?
+  context: The command-line request culminates in a TGS request the domain controller logs as Event ID 4769. A burst of 4769 events for one account in a short window, or requests answered with RC4 (ticket encryption type 0x17) in an environment that otherwise uses AES, is the server-side signature of Kerberoasting. Compare the count against the account's normal ticket-request rate; correlate the 4769 timing to this process event.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        EventID: 4769
+      condition: selection
+    fields:
+      - TargetUserName
+      - ServiceName
+      - TicketEncryptionType
+      - IpAddress
+- question: Did this PowerShell process, or a child it spawned, write a memory-dump artifact consistent with extracting tickets or key material from LSASS?
+  context: Kerberos ticket theft and forgery frequently pair command-line ticket requests with extraction of tickets or
+    key material from LSASS memory, but the handle open that a dumper makes against lsass.exe is not observable in
+    this environment — there is no process-access telemetry here, so a zero result below does not prove no LSASS
+    access occurred. What is observable is the resulting artifact -- a dump file written by this PowerShell process or
+    a process it spawned is the corroborating evidence that the ticket request was paired with wholesale credential
+    extraction rather than a single targeted service ticket.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Were outbound remote-access connections (RDP, SMB, WinRM, SSH) initiated from this host after
+    this event?
+  context: Credential theft is typically followed by lateral movement. The query returns outbound connections
+    from this host to remote-access ports -- 3389 (RDP), 445 (SMB/PsExec), 5985/5986 (WinRM), 22 (SSH)
+    -- in the hours after the event; the originating Image and User show what drove each connection. Two
+    limits to keep in mind -- credentials exfiltrated and replayed from another machine will not appear
+    here (check security 4624 logons on suspected targets for this account and any accounts with sessions
+    on this host), and the query requires Sysmon network telemetry (EID 3); if that is not collected from
+    this host, treat zero rows as a visibility gap, not as evidence no movement occurred.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
+- question: Which service account was targeted, and does it hold elevated privileges?
+  context: The severity depends on the privilege of the targeted service account. An SPN tied to a domain-admin-equivalent or broadly delegated service account requires escalation; a low-privilege application service account may only need a password rotation and monitoring. Cross-reference the SPN's underlying account against directory group memberships and delegation settings.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Credential access rarely happens in isolation. Earlier detections on the same host — reconnaissance, SPN enumeration, defense tampering, or other credential-access activity — may reveal the stages that preceded the ticket request and help reconstruct the timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

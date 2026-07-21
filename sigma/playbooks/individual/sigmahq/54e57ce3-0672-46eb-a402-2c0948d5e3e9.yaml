@@ -1,0 +1,474 @@
+name: Potential Emotet Rundll32 Execution
+id: b90c0f2b-bdd4-46b9-9cb9-728ce4b72d88
+description: |
+  Fires when a process is identified as rundll32.exe by either of two alternative signals — an image path ending in
+  \rundll32.exe, or PE metadata whose OriginalFileName is RUNDLL32.EXE — and its command line ends in ,RunDLL or
+  ,Control_RunDLL. Command lines ending in the ordinary .dll,Control_RunDLL form and invocations parented by tracker.exe
+  are excluded, so what remains is an export name with no .dll extension immediately before the comma. Emotet loader DLLs
+  are executed through rundll32.exe against an exported entry point, most often Control_RunDLL, after being dropped by a
+  document macro or a downloader, and persistence is then written under a Run key. The investigation should establish which
+  module rundll32 loaded, where that module came from, what launched rundll32, and whether the process made outbound
+  connections after the load.
+type: detection
+detection_id: 54e57ce3-0672-46eb-a402-2c0948d5e3e9
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-16
+questions:
+- question: >-
+    Does the alerting process match this rule's criteria — is it rundll32.exe either by image path or by OriginalFileName,
+    and does its command line end in ,RunDLL or ,Control_RunDLL?
+  context: >-
+    Confirm the alert before investing further time. The rule identifies rundll32 through either of two alternative
+    branches, so note which one fired. An image path ending in \rundll32.exe means the binary sits at a rundll32 path; an
+    OriginalFileName of RUNDLL32.EXE means the PE metadata says rundll32 even where the file has been renamed or copied
+    elsewhere, which makes the origin of that binary the load-bearing follow-up. Then confirm the trailing token is a bare
+    export name with no .dll extension before the comma, since invocations ending in .dll,Control_RunDLL are filtered out
+    as ordinary control-panel and shell-handler usage.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+  answer_sources:
+  - alert
+  - process_creation
+- question: Is this user and host expected to run rundll32.exe against a named DLL export?
+  context: >-
+    Legitimate rundll32 export invocation is common on Windows, but it is almost always driven by the shell, control-panel
+    applets, or installers rather than by a person. A user or host with no software-deployment or troubleshooting role has
+    little reason to produce a bare-export rundll32 command line, and role knowledge is often the fastest way to separate
+    routine operation from something worth pursuing.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: What module and entry point did this rundll32 command line name, and from what directory did it run?
+  context: >-
+    Everything before the comma is the module rundll32 was told to load and everything after it is the exported function to
+    call. Read the module argument in full, including quoting and any trailing arguments passed to the export, and resolve
+    relative paths against the working directory. A module argument with no .dll extension, an ordinal instead of a name, or
+    a path under a user-writable directory such as %TEMP%, %APPDATA%, %PROGRAMDATA% or a user profile folder is the detail
+    that distinguishes loader execution from a control-panel applet.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|endswith:
+          - ',RunDLL'
+          - ',Control_RunDLL'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: Which modules did this rundll32 process map into memory, and are any unsigned or loaded from a user-writable path?
+  context: >-
+    The command line names a module, but the load event is what proves which file was actually mapped. Module load records
+    carry the path, signature status, signer name and hash on the event itself, so the module can be identified and its hash
+    checked against reputation sources without waiting for a separate execution. Compare the loaded set against the modules
+    rundll32 loads routinely in this environment — the operating system, driver and control-panel modules will dominate that
+    baseline, and an unsigned or invalidly signed module outside %WINDIR% within a few minutes of the invocation is the
+    entry worth pulling.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+      - SignatureStatus
+      - Hashes
+  answer_sources:
+  - process_creation
+  - external_threat_intel
+- question: Did the process that launched rundll32 write the module to disk shortly beforehand, and where did it land?
+  context: >-
+    Loader DLLs in this family are staged by a document macro, a script host or a downloader and are then handed to
+    rundll32, so the write and the execution are usually minutes apart under the same process lineage. Look for writes into
+    %TEMP%, %APPDATA%, %PROGRAMDATA%, C:\Users\Public or a randomly named subdirectory, and for a Zone.Identifier stream on
+    the file, which indicates it arrived over the network. File write events carry no hash, so take the path from here and
+    obtain the hash from the module load or execution record for that path.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+  answer_sources:
+  - file_event
+  - process_creation
+- question: Did this rundll32 process open outbound connections after the module loaded, and to which addresses and ports?
+  context: >-
+    rundll32 hosting an operating-system module rarely originates external traffic of its own. Loader DLLs in this family
+    beacon to hard-coded address and port pairs immediately after loading, mixing 80 and 443 with non-standard high ports
+    such as 7080 and 8080, and will cycle through a list until one answers. Treat connections to addresses outside the
+    ranges this environment normally reaches as the anomaly, and carry any destination forward for reputation checking and
+    for a search of which other hosts reached the same address.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Initiated
+  answer_sources:
+  - network_connection
+  - external_threat_intel
+- question: What process spawned this rundll32 instance, and is that parent chain expected?
+  context: >-
+    The parent is the strongest available statement about how the invocation was produced. Shell-driven and installer-driven
+    rundll32 has a predictable set of parents such as explorer.exe, svchost.exe, control.exe and setup binaries. An Office
+    application, a script host such as wscript.exe or cscript.exe, mshta.exe, a browser, or a process running from a
+    user-writable directory points at a document or download chain rather than at operating-system behaviour. Walk one level
+    further up where the immediate parent is itself unexpected.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: What child processes did this rundll32 instance spawn afterward?
+  context: >-
+    Children reveal what the loaded module went on to do. A control-panel applet generally spawns nothing. A loader commonly
+    produces reg.exe or a scripting host for persistence, another rundll32 or regsvr32 for the next stage, or command
+    interpreters for discovery. Any child at all from a bare-export rundll32 invocation is worth reading in full.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Does this host normally run rundll32.exe with a DLL entry point named on the command line?
+  context: >-
+    rundll32 itself runs constantly, so counting the binary alone says nothing. This count is restricted to export-style
+    invocation and deliberately includes the ordinary .dll,Control_RunDLL form the rule filters out, so it measures how much
+    routine export-driven rundll32 activity this host produces over 90 days and which accounts produce it. A host with a
+    substantial history under a service or installer account has an established baseline; a host with almost none, or a
+    count concentrated under an interactive account, makes the current invocation the outlier.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|contains: 'RunDLL'
+      condition: selection
+    fields:
+      - User
+  answer_sources:
+  - process_creation
+- question: When this host has previously fired this rundll32 export pattern, which parents and users drove it, and does the current alert fit that history?
+  context: >-
+    The query mirrors the rule's selection structure scoped to this host, so the resulting parent and user distribution
+    reflects how the rule's own firing pattern has historically run here rather than generic rundll32 usage. A new parent
+    process, an account that has never produced the pattern, or a first-ever hit over the window is the deviation worth
+    chasing; a stable parent and account repeating over 14 days points at local software behaviour.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \rundll32.exe
+      - OriginalFileName: RUNDLL32.EXE
+      selection_cli:
+        CommandLine|endswith:
+        - ',RunDLL'
+        - ',Control_RunDLL'
+      filter_legitimate_dll:
+        CommandLine|endswith:
+        - .dll,Control_RunDLL
+        - .dll",Control_RunDLL
+        - .dll',Control_RunDLL
+      filter_ide:
+        ParentImage|endswith: \tracker.exe
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_* and not 1 of filter_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+  answer_sources:
+  - process_creation
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: >-
+    The query mirrors the rule's selection structure scoped to this user, so the result is the account's 90-day history of
+    this specific export-style rundll32 invocation rather than generic use of the binary, aggregated by host. An account
+    that has never produced the pattern is a stronger finding than one that produces it routinely; weigh the count and the
+    host spread against what this person's role and toolset would explain.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \rundll32.exe
+      - OriginalFileName: RUNDLL32.EXE
+      selection_cli:
+        CommandLine|endswith:
+        - ',RunDLL'
+        - ',Control_RunDLL'
+      filter_legitimate_dll:
+        CommandLine|endswith:
+        - .dll,Control_RunDLL
+        - .dll",Control_RunDLL
+        - .dll',Control_RunDLL
+      filter_ide:
+        ParentImage|endswith: \tracker.exe
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_* and not 1 of filter_*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+  always_include: true
+- question: Has this parent process historically driven the rule's pattern here or across the environment, or is the parent new for this activity?
+  context: >-
+    When the alert fires under SYSTEM, a service principal or a computer account, user identity attributes nothing and the
+    launch mechanism is the meaningful pivot. The query mirrors the rule's selection structure scoped to the alerting parent
+    process, so the result is the 90-day history of that parent driving this specific pattern rather than generic
+    parent-and-binary co-occurrence. A parent already accounting for thousands of prior events is vendor or operating-system
+    automation; a parent that is new or rare for this pattern is the deviation to chase.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \rundll32.exe
+      - OriginalFileName: RUNDLL32.EXE
+      selection_cli:
+        CommandLine|endswith:
+        - ',RunDLL'
+        - ',Control_RunDLL'
+      filter_legitimate_dll:
+        CommandLine|endswith:
+        - .dll,Control_RunDLL
+        - .dll",Control_RunDLL
+        - .dll',Control_RunDLL
+      filter_ide:
+        ParentImage|endswith: \tracker.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_* and not 1 of filter_*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  always_include: true
+- question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the account's activity across all hosts in the surrounding hour shows whether the same person drove comparable
+    activity elsewhere, which widens the scope of the investigation. When the alert fires under a service principal this view
+    fills with routine agent telemetry and the parent-driven view is the one that answers the question instead.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+  always_include: true
+- question: Did this same parent-driven pattern fire on other hosts in the same window, or is the activity isolated to this host?
+  context: >-
+    Under a service principal, asking what else the user did across the network returns agent telemetry from every host. The
+    meaningful question is whether the same launch mechanism produced the pattern elsewhere in the alert window. Several
+    hosts in the same window points at scheduled or pushed automation; a single host points at a host-local trigger such as
+    a document or download on that endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \rundll32.exe
+      - OriginalFileName: RUNDLL32.EXE
+      selection_cli:
+        CommandLine|endswith:
+        - ',RunDLL'
+        - ',Control_RunDLL'
+      filter_legitimate_dll:
+        CommandLine|endswith:
+        - .dll,Control_RunDLL
+        - .dll",Control_RunDLL
+        - .dll',Control_RunDLL
+      filter_ide:
+        ParentImage|endswith: \tracker.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_* and not 1 of filter_*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  always_include: true
+- question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Aggregating every process start on the host by binary and parent in the surrounding half hour collapses repetitive agent
+    and service noise into high-count rows while novel parent-child pairs stand out at low counts. Scan for the document or
+    download that preceded the invocation, and for discovery, credential access or persistence steps that followed it.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+  answer_sources:
+  - process_creation
+  - file_event
+  - registry_event
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host frequently mark the stages that led here — a macro-spawned script host, a downloader
+    reaching an external site, or defense tampering. Reading them in order reconstructs the timeline and shows whether this
+    invocation is the first observed stage or a later one.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+  answer_sources:
+  - alert
+- question: Have other hosts fired the rule's pattern in the past week, and does the cross-host distribution look like consistent automation or one-off activity?
+  context: >-
+    The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of the rule's
+    firing pattern rather than generic rundll32 usage. Many hosts firing the same pattern points at scripted deployment or
+    vendor automation; one host or a small unrelated set points at operator or malware-driven activity. Use the host
+    distribution together with parent consistency to calibrate how far the investigation should widen.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \rundll32.exe
+      - OriginalFileName: RUNDLL32.EXE
+      selection_cli:
+        CommandLine|endswith:
+        - ',RunDLL'
+        - ',Control_RunDLL'
+      filter_legitimate_dll:
+        CommandLine|endswith:
+        - .dll,Control_RunDLL
+        - .dll",Control_RunDLL
+        - .dll',Control_RunDLL
+      filter_ide:
+        ParentImage|endswith: \tracker.exe
+      condition: all of selection_* and not 1 of filter_*
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation

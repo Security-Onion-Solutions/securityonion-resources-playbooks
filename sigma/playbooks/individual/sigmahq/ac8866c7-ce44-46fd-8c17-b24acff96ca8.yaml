@@ -1,0 +1,464 @@
+name: HybridConnectionManager Service Installation - Registry
+id: 45e3c5f8-ee1a-433d-9ece-6038060995c6
+description: |
+  Detects registry activity associated with installation of the Azure Hybrid Connection Manager (HCM) service, which fires when
+  either a registry key path under \Services\HybridConnectionManager is written, or a registry value's data names
+  Microsoft.HybridConnectionManager.Listener.exe. HCM is genuine Microsoft software that runs as a Windows service and opens an
+  outbound TLS relay to an Azure Relay namespace so an Azure App Service can reach a resource inside the network; because the
+  connection is egress-initiated to Microsoft infrastructure it traverses perimeter controls that would block an inbound listener.
+  That same property is what makes it usable as a durable tunnel and remote-execution path terminating in an operator-controlled
+  Azure tenant, so signature and reputation checks on the binary settle nothing here. The investigation should establish which
+  process installed the service, whether this host has any business bridging to an App Service, and above all which Azure Relay
+  namespace and tenant the listener is configured against.
+type: detection
+detection_id: ac8866c7-ce44-46fd-8c17-b24acff96ca8
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-16
+questions:
+- question: Does the alerting registry write land either on a key path under \Services\HybridConnectionManager or on value
+    data naming Microsoft.HybridConnectionManager.Listener.exe?
+  context: >-
+    The rule has two independent branches and only one may have fired, so note which. A key-path match means a service was
+    registered under the vendor's own service name, and the remaining work is authorization and relay configuration. A value-data
+    match without the vendor key path means the listener executable is referenced from somewhere else in the registry, most
+    commonly a service registered under a different name, which is the more interesting outcome because it suggests the install
+    was made deliberately inconspicuous. Read the writing process and its signer for coherence with the key being written rather
+    than as a verdict.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - EventType
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+  answer_sources:
+  - alert
+  - registry_event
+- question: Is this host expected to run the Azure Hybrid Connection Manager at all, and is this user expected to install it?
+  context: >-
+    HCM belongs on a host that is deliberately bridging an on-premises resource to an Azure App Service, normally a designated
+    relay or application server owned by a cloud or application team. On an arbitrary workstation, a domain controller, or a
+    server with no App Service relationship it has no business being installed, and that mismatch is a faster discriminator
+    than anything about the binary itself. Service installation runs under a privileged context, so the user or machine account
+    recorded here identifies who invoked the installer rather than who authorized it.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: Which registry key and value were written, and is this location a service-persistence location?
+  context: >-
+    Keys under HKLM\SYSTEM\CurrentControlSet\Services define Windows services and are a persistence location by construction
+    -- a service definition survives reboot and starts without a logged-on user. The value name identifies what was set,
+    with ImagePath naming the executable the service runs, Start controlling automatic startup, and ObjectName the account
+    it runs as. Judge whether the writing process and its signer plausibly own this service key, since a service-control
+    utility or an installer writing its own service key is self-consistent while an unrelated process writing it is not.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+  answer_sources:
+  - registry_event
+- question: What is the full service definition written under the HybridConnectionManager service key on this host?
+  context: >-
+    A single alert shows one value, but a service install writes a set of them, and the set read together is the service
+    definition. Pull every value under the service subtree and read ImagePath for the on-disk location of the listener
+    executable, Start for whether the service launches automatically at boot, ObjectName for the account it runs under, and
+    any Description or DisplayName that may have been set to something other than the vendor default. An ImagePath pointing
+    outside the vendor's installation directory, or a StartType of automatic on a host with no App Service relationship, is
+    what to carry forward.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains: \Services\HybridConnectionManager
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+  answer_sources:
+  - registry_event
+  - manual_review
+- question: Is there a service installation record on the System channel around the time of this registry write?
+  context: >-
+    The System channel records service installation under event 7045 with the service name, image path, service type, and
+    the account the service runs as, which is an independent record of the same act the registry write represents. It also
+    names the service as registered rather than as inferred from a key path, so it reveals a service installed under a
+    display name that does not match the vendor's. If the System channel is not collected in this environment, treat zero
+    results as a visibility gap rather than as evidence no service was installed.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: system
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 7045
+      condition: selection
+    fields:
+      - ServiceName
+      - ImagePath
+      - ServiceType
+      - StartType
+      - AccountName
+  answer_sources:
+  - organizational_knowledge
+  - manual_review
+- question: Which process wrote this registry key, and what launched that process?
+  context: >-
+    The registry alert names the writing process but not its origin, and the origin is the spine of this investigation because
+    it separates a packaged install from a hands-on one. Retrieving the writing process's own start event supplies its command
+    line and its parent. An MSI or vendor installer launched from services.exe or explorer.exe under a change window reads
+    very differently from sc.exe, reg.exe, or powershell.exe invoked under a remote-execution parent such as wsmprovhost.exe,
+    wmiprvse.exe, or a remote service handler.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+  answer_sources:
+  - process_creation
+- question: Has the process that wrote this key run on this host before, and under which accounts?
+  context: >-
+    A service-control or installer binary that runs routinely on this host as part of software management looks different
+    from one appearing for the first time alongside a service registration. Zero or very low historical counts point to a
+    first-time or rare execution. The account breakdown matters as much as the count, since the same binary run interactively
+    by a person and run by a management agent are different events.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+  answer_sources:
+  - process_creation
+- question: Which Azure Relay namespace and tenant is this Hybrid Connection Manager configured against?
+  context: >-
+    This is the discriminating question for this detection and it is not answerable from registry telemetry. HCM stores its
+    connection strings in its own configuration alongside the installed listener, and the relay namespace embedded there names
+    the Azure tenant the tunnel terminates in. A namespace belonging to a subscription the organization owns and can account
+    for is consistent with a sanctioned App Service bridge, while a namespace nobody recognizes means the host is relaying to
+    an external tenant, which is the finding. Read the listener's configuration on the host or through an endpoint console,
+    and reconcile the namespace against the organization's own Azure subscriptions.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+  answer_sources:
+  - manual_review
+  - organizational_knowledge
+  - edr_console
+- question: Is there a change record, deployment, or ticket that accounts for installing this service on this host now?
+  context: >-
+    Cloud and application teams do deploy HCM deliberately, and because the software is genuine and the endpoint is Microsoft
+    infrastructure, an authorization record is the cheapest way to close this out. Look for a change ticket, a deployment
+    pipeline run, or an application-team owner who expected a hybrid connection from this host in this window. The absence
+    of any record on a host with no App Service relationship leaves an unaccounted-for outbound relay, which is what the
+    remaining questions are there to characterize.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+  answer_sources:
+  - organizational_knowledge
+  - manual_review
+- question: Does the service configuration stay in place after the install, or is it modified again?
+  context: >-
+    A service definition under HKLM\SYSTEM\CurrentControlSet\Services persists across reboots without further action, so the
+    question is whether the configuration written here was subsequently retuned -- an ImagePath repointed, a Start value
+    changed to automatic, or connection settings rewritten. Registry value and key deletions are not recorded by endpoint
+    telemetry, so a key removed later will not appear as an event, and the re-modification history over a longer window is
+    the observable evidence of whether the install was left in place, adjusted, or supplanted.
+  range: +7d
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+  answer_sources:
+  - registry_event
+  - manual_review
+- question: Did the Hybrid Connection Manager listener actually execute on this host after the service was registered?
+  context: >-
+    Registering the service is configuration, not effect. The relay exists only once Microsoft.HybridConnectionManager.Listener.exe
+    is running, so its execution is what turns a registry entry into a live path into the network. Confirming the listener
+    started, and under which account, establishes that the tunnel was actually stood up rather than merely staged, and the
+    start time bounds the window in which the relay has been reachable.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: \Microsoft.HybridConnectionManager.Listener.exe
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+  answer_sources:
+  - process_creation
+  - registry_event
+- question: Where does the listener process connect outbound, and does that destination match the expected relay endpoint?
+  context: >-
+    The listener establishes an outbound TLS session to an Azure Relay endpoint and holds it open, so the connection profile
+    is a small number of long-lived egress sessions on 443 to Microsoft-hosted infrastructure rather than the intermittent
+    traffic of ordinary client software. The destination will look like ordinary cloud traffic no matter whose tenant the
+    relay belongs to, so the value here is establishing that the relay is live and pinning down when it started and how
+    continuously it has been held, which bounds the exposure window. Resolved destination hostnames are recorded on separate
+    lookup events, so anchor on the addresses and pivot to the name resolution if a name is needed.
+  range: +24h
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: \Microsoft.HybridConnectionManager.Listener.exe
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Initiated
+  answer_sources:
+  - network_connection
+- question: Did any process spawn under wsmprovhost.exe on this host around or after the service installation?
+  context: >-
+    The reason to install a relay is to reach something through it, and remote execution arriving over the relay lands as
+    WinRM activity, where wsmprovhost.exe hosts the remote session and every command run through it appears as a child of
+    that process. Children of wsmprovhost.exe therefore enumerate what was actually executed from the far side of the tunnel.
+    Correlate their timing against the listener's outbound sessions, and treat command interpreters, credential tooling, or
+    reconnaissance binaries under that parent as the operational payload rather than as the install itself.
+  range: +/-24h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: \wsmprovhost.exe
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentCommandLine
+  answer_sources:
+  - process_creation
+- question: What other registry modifications were made on this host in the same window?
+  context: >-
+    An install that is only a service registration looks different from one landing in a cluster of configuration changes.
+    Grouping every registry modification on the host in the window by key path and writing process shows what else moved
+    alongside it, and firewall, proxy, or security-policy keys changed by the same process in the same minutes point to a
+    hands-on session rather than a packaged deployment. The alerting key will appear in these results, so the signal is what
+    accompanies it.
+  range: +/-30m
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - User
+  answer_sources:
+  - registry_event
+- question: What other registry activity occurred on this host around the time of the alert?
+  context: >-
+    Aggregating registry writes on the host by key path and writing process collapses the routine churn into a few high-count
+    rows and leaves novel key-and-writer pairs standing out at low counts, which is what is worth reading. Look for the
+    surrounding activity that would place this install in a sequence, such as account or service configuration written before
+    it and autostart or policy keys touched after it.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+  answer_sources:
+  - registry_event
+- question: Has this registry key ever been modified on this host before?
+  context: >-
+    A service key that has never been touched in the retained history means the software is new to this host, which is the
+    normal picture for a first install and gives a clean starting timestamp for the relay's existence. Recurring modifications
+    to the same key instead point to software already deployed here and only reconfigured, which shifts the investigation
+    toward what changed in the value data rather than toward the install itself.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - Details
+      - Image
+  answer_sources:
+  - registry_event
+- question: Have other hosts in the environment registered the Hybrid Connection Manager or referenced its listener executable?
+  context: >-
+    Matching either branch of this detection across the fleet distinguishes a sanctioned deployment from an isolated one. A
+    consistent set of hosts owned by a cloud or application team, installed by the same process, is a deployment pattern that
+    an owner can confirm. A single host, or a group with no common function, means the install was targeted, and comparing
+    the value data across hosts shows whether they were all pointed at the same relay configuration or at different ones.
+  range: -30d
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection_key:
+        TargetObject|contains: \Services\HybridConnectionManager
+      selection_details:
+        Details|contains: Microsoft.HybridConnectionManager.Listener.exe
+      condition: selection_key or selection_details
+    fields:
+      - host.name
+      - TargetObject
+      - Details
+      - Image
+  answer_sources:
+  - registry_event
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    A relay install is a means of access rather than a first step, so earlier detections on the same host may show how the
+    operator arrived and what privileges they had before registering a service. Remote-execution, credential-access, or
+    service-manipulation detections in the preceding hours help establish whether this was reached through an existing
+    foothold, and their absence on a host with no other signal makes the installer's own origin the thread to pull.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+  answer_sources:
+  - alert

@@ -1,0 +1,336 @@
+name: WebDav Client Execution Via Rundll32.EXE
+id: 8bf900ec-8ba3-4458-be01-2029461fad9a
+description: |
+  Detects svchost.exe spawning rundll32.exe that loads davclnt.dll and calls DavSetCookie, the WebDAV client redirector entry point used to establish an authenticated session with a WebDAV (HTTP/WebDAV) server. The rule fires only when all three conditions match: the parent is svchost.exe, the child is rundll32.exe (by Image or OriginalFileName), and the command line contains the davclnt.dll,DavSetCookie call. This call is part of normal WebDAV mounting, but it also appears when data is exfiltrated to an attacker-controlled WebDAV share or when remote code is launched from a WebDAV-hosted path, so the investigation should determine which WebDAV server was contacted, whether the access was expected, and whether file collection or outbound transfer surrounded the event.
+type: detection
+detection_id: 2dbd9d3d-9e27-42a8-b8df-f13825c6c3d5
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- question: Does the alerting event show svchost.exe spawning rundll32.exe with the davclnt.dll,DavSetCookie call?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the exact command line and process lineage. The rule fires only when the parent is svchost.exe AND the child resolves to rundll32.exe (by Image or OriginalFileName) AND the command line contains davclnt.dll,DavSetCookie. Confirm all three are present in this event.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to mount or access WebDAV shares?
+  context: Legitimate WebDAV use does occur (SharePoint web folders, document management systems, some backup tooling), and it triggers the same davclnt.dll redirector call. Knowing whether the user role and host function normally involve WebDAV access is often the fastest path to distinguishing routine activity from exfiltration or remote payload staging.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Which svchost.exe instance spawned this rundll32.exe, and what service group was it hosting?
+  context: The WebDAV redirector runs as a service inside svchost.exe, so svchost is the expected parent for a legitimate DavSetCookie call. Tracing the specific parent instance and its own origin confirms whether this is the WebClient service or an svchost masquerade, and whether the parent chain is consistent with normal service hosting rather than an injected or spoofed parent.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: Decode the full rundll32.exe command line — which WebDAV server, share path, or cookie value was passed to DavSetCookie?
+  context: The DavSetCookie call carries the target WebDAV endpoint and session details. Read the full command line to identify the remote server or UNC/HTTP path being contacted and whether it resolves to an internal document system or an external or unfamiliar host. An external or rare destination is the discriminator between routine WebDAV mounting and exfiltration or remote payload staging.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|contains: 'davclnt.dll,DavSetCookie'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What outbound connections did this rundll32.exe make, and to which WebDAV server and protocol?
+  context: WebDAV transfers run over HTTP or HTTPS to the server named in the DavSetCookie call. Pivoting from the alerting process to its network connections reveals the actual destination address, port, and whether the channel is unencrypted (port 80 WebDAV) — the unencrypted non-C2 protocol pattern this technique describes. An external destination or large sustained outbound flow points to exfiltration rather than an internal share mount.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+      - Initiated
+- question: What files were collected, archived, or accessed on this host shortly before the WebDAV call?
+  context: Exfiltration over WebDAV is usually preceded by staging — files copied into one
+    location, archived, or compressed before transfer. The query is an aggregated survey of
+    file activity in the hour before the redirector call, grouped by the acting process, so
+    steady agent and system writers collapse into high-count rows; an archiver such as 7z,
+    WinRAR, tar, or makecab, a script host, or an unfamiliar binary touching files at a low
+    count is the staging indicator. Drill into that process's file events for the staged paths
+    — the set of files and directories determines the severity of potential data loss and
+    which business units are affected.
+  range: -1h
+  query: |
+    aggregation: true
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+- question: Are the files referenced in the command line or its working directory still on disk for analysis?
+  context: If the WebDAV session moved or referenced local files (a staged archive, a payload pulled from the share), checking whether they still exist on disk enables hash lookups, reputation checks, and content review. The working directory captured at execution time often points at the staging or download location.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Did any process execute from a remote WebDAV or UNC path on this host, and what is its hash?
+  context: A payload pulled over WebDAV is fetched across the network and runs from the mounted share path, so this alert's command line names only the benign Windows WebDAV client (davclnt.dll), not the payload — and a hash is recorded when a file runs, not when it is fetched. This finds processes on the host whose image path is a UNC or WebDAV location (\\server\..., often \\...@SSL\... or a DavWWWRoot path) and reads their hashes; submit any to VirusTotal, Hybrid Analysis, or internal threat intel. If the payload was copied to a local path before running, it instead shows up in the staging-files and evidence-preservation steps — hash it from that on-disk path.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|startswith: '\\'
+      condition: selection
+    fields:
+      - Image
+      - Hashes
+- question: What other child processes did this same svchost.exe instance spawn around the alert?
+  context: If the parent svchost instance is hosting the WebClient service legitimately, its children are predictable service work. If it spawned additional command interpreters, script hosts, or transfer tools alongside this rundll32, that broadens the picture toward orchestrated activity rather than a single WebDAV mount.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Was this rundll32.exe executed from its expected System32 or SysWOW64 path?
+  context: rundll32.exe executed from outside System32 or SysWOW64 may indicate the binary was copied or renamed to evade path-based allowlists. The OriginalFileName field confirms the real binary identity even if the on-disk name was changed; a rundll32 running from a user-writable directory is more suspicious than one in System32.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- question: Were any other transfer or download LOLBins used on this host in the recent window?
+  context: An operator who uses the WebDAV redirector for transfer often uses several living-off-the-land tools for the same objective. Finding certutil, bitsadmin, curl, or cabinet-extraction tools running on the same host in the same window strengthens the case that this is a deliberate transfer operation rather than an isolated WebDAV mount.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\certutil.exe'
+          - '\bitsadmin.exe'
+          - '\curl.exe'
+          - '\esentutl.exe'
+          - '\expand.exe'
+          - '\extrac32.exe'
+          - '\makecab.exe'
+          - '\replace.exe'
+          - '\hh.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent:
+        ParentImage|endswith: \svchost.exe
+      selection_img:
+      - Image|endswith: \rundll32.exe
+      - OriginalFileName: RUNDLL32.EXE
+      selection_cli:
+        CommandLine|contains: C:\windows\system32\davclnt.dll,DavSetCookie
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent:
+        ParentImage|endswith: \svchost.exe
+      selection_img:
+      - Image|endswith: \rundll32.exe
+      - OriginalFileName: RUNDLL32.EXE
+      selection_cli:
+        CommandLine|contains: C:\windows\system32\davclnt.dll,DavSetCookie
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around the time of the alert?
+  context: Tracking the user's activity across all hosts reveals lateral movement or staging across multiple endpoints. If the same user triggered similar WebDAV or transfer activity on other hosts, the scope of the operation may be larger than this single event.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent:
+        ParentImage|endswith: \svchost.exe
+      selection_img:
+      - Image|endswith: \rundll32.exe
+      - OriginalFileName: RUNDLL32.EXE
+      selection_cli:
+        CommandLine|contains: C:\windows\system32\davclnt.dll,DavSetCookie
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: How often has this host fired the WebDAV rundll32 DavSetCookie pattern over the past 90 days, and what command-line structures are typical?
+  context: A WebDAV redirector pattern with no prior history on a host is more suspicious than one seen regularly under stable parents. The query mirrors the rule's selection structure scoped to this host, so the count reflects this specific firing pattern rather than generic rundll32 usage. The command-line projection lets the analyst compare typical WebDAV destinations against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent:
+        ParentImage|endswith: \svchost.exe
+      selection_img:
+      - Image|endswith: \rundll32.exe
+      - OriginalFileName: RUNDLL32.EXE
+      selection_cli:
+        CommandLine|contains: C:\windows\system32\davclnt.dll,DavSetCookie
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - CommandLine
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — reconnaissance, credential access, defense tampering, or data collection — may reveal the attack stages that preceded the WebDAV transfer and help reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

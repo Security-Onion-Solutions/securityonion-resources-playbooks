@@ -1,0 +1,507 @@
+name: Kapeka Backdoor Execution Via RunDLL32.EXE
+id: 0e7e8e5c-f728-4daa-b1e9-b591f32326e9
+description: |
+  Detects the Kapeka backdoor loader pattern: a process that is rundll32.exe by image name or by
+  original filename, run with a command line referencing a module under :\ProgramData or
+  \AppData\Local, and calling that module by ordinal. The ordinal call fires on either of two
+  branches — a command line containing .wll and '#1' and ' -d' together, or a command line
+  containing .wll that ends in '#1'. Executing a DLL-format payload with a .wll extension by
+  export ordinal from a user-writable directory is proxy execution through a signed system
+  binary: the loader supplies both the payload path and the entry point, and rundll32.exe carries
+  the resulting code. The investigation should confirm which branch of the ordinal call matched,
+  identify the module on disk and who wrote it, establish what launched rundll32.exe, and
+  determine whether the loaded module made outbound connections or spawned further processes.
+type: detection
+detection_id: e98f741c-6a5b-4c83-bc2a-1f4e58d07b12
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-17
+questions:
+- question: >-
+    Does the command line show rundll32.exe calling a .wll module from ProgramData or AppData\Local
+    by ordinal, and which of the two ordinal branches matched?
+  context: >-
+    The rule fires only when the process is rundll32.exe by image name or by original filename, the
+    command line references :\ProgramData or \AppData\Local, and the ordinal call matches either the
+    branch requiring .wll and '#1' and ' -d' together, or the branch requiring .wll with the command
+    line ending in '#1'. Note which branch matched. The ' -d' branch means the loader passed an
+    argument to the export, so the argument value itself is a decode target and the module's
+    behaviour may be parameterised by it; the trailing-'#1' branch means the export was called with
+    no argument, so the module's behaviour is fixed at load and the disk artefact carries more of the
+    answer than the command line does.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+  answer_sources:
+  - alert
+  - process_creation
+- question: Is this user and host expected to load modules from ProgramData or AppData\Local via rundll32.exe?
+  context: >-
+    Installers, software updaters, and some vendor agents do stage code under ProgramData and
+    AppData\Local, so rundll32.exe reading from those directories is not unique to this pattern. The
+    .wll extension is an Office add-in format and has no routine reason to be loaded by rundll32.exe
+    by ordinal. Establish whether the account is one that runs installers or developer tooling on
+    this host, and whether the host has a role that explains module loads from user-writable paths.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: What module path, export ordinal, and trailing arguments did rundll32.exe receive?
+  context: >-
+    Parse the command line into its parts: the full path of the .wll module, the ordinal or export
+    name after the comma, and anything following it. An ordinal reference such as '#1' means the
+    export was resolved by index rather than by name, which is a common way to call an entry point
+    that carries no meaningful symbol. A ' -d' argument is passed through to the export and often
+    selects a mode or supplies a key or path; record its exact value. The query is scoped to
+    rundll32.exe executions on this host referencing a .wll module within the alert window, so a
+    multi-step loader that invokes the module more than once appears as multiple rows.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|contains: .wll
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: Is the .wll module loaded on this host signed, and what is its hash?
+  context: >-
+    Module-load events carry the loaded file's path, signature state, signer, and hash directly, so
+    the module can be identified without waiting for it to be executed as a process. A .wll under
+    ProgramData or AppData\Local that is unsigned, or signed with a status other than valid, is the
+    payload the loader supplied. Take the hash to reputation sources and to any retained copy of the
+    file. Legitimate Office add-ins in this format are loaded by Office applications, not mapped into
+    rundll32.exe by ordinal.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|endswith: .wll
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+      - SignatureStatus
+      - Hashes
+  answer_sources:
+  - process_creation
+  - external_threat_intel
+  - manual_review
+- question: What process wrote the .wll module to disk, and when?
+  context: >-
+    The loader must place the module before rundll32.exe can call it. Identify the writing process
+    and the write time to separate the delivery step from the execution step, and to find the parent
+    of the delivery — an archive utility, a browser, a mail client, or a script host each point at a
+    different initial access path. A write that precedes the alert by seconds indicates a single
+    dropper run; a write days earlier indicates the module was staged and later invoked, which widens
+    the window that needs review.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith: .wll
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - ProcessGuid
+  answer_sources:
+  - file_event
+  - process_creation
+- question: What process spawned this rundll32.exe, and is that parent expected to launch it?
+  context: >-
+    The parent is the dropper or the mechanism that ran it. rundll32.exe launched by explorer.exe,
+    services.exe, or an installer has a routine explanation; rundll32.exe launched by a script host,
+    an Office application, an archive tool, or a binary that itself lives under a user-writable
+    directory does not. Retrieve the parent's own image and command line, then walk one level further
+    up if the parent is itself unexpected.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Did rundll32.exe make outbound connections on this host around the alert?
+  context: >-
+    Once a module is mapped into rundll32.exe, any network activity the module performs is attributed
+    to rundll32.exe, which is signed and commonly allowed outbound. Backdoor modules typically reach
+    a command-and-control endpoint shortly after load. Compare destination addresses and ports
+    against what this host normally contacts, and treat direct connections to addresses outside the
+    organisation's ranges, or to non-standard ports, as the addresses to pivot on. Zero results are
+    meaningful only if endpoint network telemetry is collected on this host.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: \rundll32.exe
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Initiated
+  answer_sources:
+  - network_connection
+- question: What child processes did rundll32.exe spawn afterward?
+  context: >-
+    A loaded backdoor module frequently runs further tooling through the hosting process — command
+    interpreters, script hosts, or utilities for reconnaissance, credential access, or persistence.
+    rundll32.exe has few legitimate reasons to spawn children. Anything appearing here is a second
+    stage and extends the investigation beyond the initial load.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Has this host previously run rundll32.exe against a .wll module?
+  context: >-
+    rundll32.exe itself runs constantly on Windows, so its raw execution count carries no signal. The
+    query narrows to rundll32.exe invocations that reference a .wll module and aggregates the last 90
+    days by user, which is the distribution that separates a first-time load from an established
+    pattern. Zero prior events means this module format has never been loaded this way on the host;
+    a non-zero count grouped under one service or vendor account points at software that routinely
+    stages add-in files.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|contains: .wll
+      condition: selection
+    fields:
+      - User
+  answer_sources:
+  - process_creation
+- question: >-
+    When this host has previously fired this rule's pattern, what parents and users drove it, and
+    does the current alert fit that history?
+  context: >-
+    The query mirrors the rule's selection structure scoped to this host, so the parent and user
+    distribution reflects how this specific ordinal-load pattern has run here rather than generic
+    rundll32.exe usage. An empty result means the pattern is new to the host. A result dominated by
+    one parent and one account, with the current alert matching neither, is the deviation worth
+    chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \rundll32.exe
+      - OriginalFileName: RUNDLL32.EXE
+      selection_backdoor_path:
+        CommandLine|contains:
+        - :\ProgramData
+        - \AppData\Local
+      selection_backdoor_exec_1:
+        CommandLine|contains|all:
+        - .wll
+        - '#1'
+        - ' -d'
+      selection_backdoor_exec_2:
+        CommandLine|contains: .wll
+        CommandLine|endswith: '#1'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection_img and selection_backdoor_path and 1 of selection_backdoor_exec_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+  answer_sources:
+  - process_creation
+- question: Has this user previously produced this rule's pattern, and does that history fit their role?
+  context: >-
+    The query mirrors the rule's selection structure scoped to this user, so the result is their
+    90-day history of this ordinal-load pattern aggregated by host, not their general use of
+    rundll32.exe. A user who has never produced it warrants more weight than one who does so
+    regularly. Read the count against the account's role: a packaging or software-distribution
+    account with prior history is a different finding from a standard user account with none.
+  range: -90d
+  always_include: true
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \rundll32.exe
+      - OriginalFileName: RUNDLL32.EXE
+      selection_backdoor_path:
+        CommandLine|contains:
+        - :\ProgramData
+        - \AppData\Local
+      selection_backdoor_exec_1:
+        CommandLine|contains|all:
+        - .wll
+        - '#1'
+        - ' -d'
+      selection_backdoor_exec_2:
+        CommandLine|contains: .wll
+        CommandLine|endswith: '#1'
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection_img and selection_backdoor_path and 1 of selection_backdoor_exec_*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+- question: >-
+    Has this parent process historically driven this rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: >-
+    When the alert fires under SYSTEM, a service account, or a computer account, the user field does
+    not attribute the behaviour and the launch mechanism is the meaningful pivot. The query mirrors
+    the rule's selection structure scoped to the alerting parent process name, so the result is the
+    90-day history of this parent driving this specific pattern, aggregated by host. A parent that
+    already accounts for many prior events across many hosts is automation; a parent with no history
+    is the deviation.
+  range: -90d
+  always_include: true
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \rundll32.exe
+      - OriginalFileName: RUNDLL32.EXE
+      selection_backdoor_path:
+        CommandLine|contains:
+        - :\ProgramData
+        - \AppData\Local
+      selection_backdoor_exec_1:
+        CommandLine|contains|all:
+        - .wll
+        - '#1'
+        - ' -d'
+      selection_backdoor_exec_2:
+        CommandLine|contains: .wll
+        CommandLine|endswith: '#1'
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection_img and selection_backdoor_path and 1 of selection_backdoor_exec_*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- question: What else did this user do across the environment around this time?
+  context: >-
+    Tracking the account's activity across every host in the alert window shows whether the same
+    identity was active elsewhere, which separates a single-host load from movement across
+    endpoints. If the alert fired under a service principal, expect this to return routine agent and
+    OS telemetry from many hosts and rely on the parent-scoped view instead.
+  range: +/-1h
+  always_include: true
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+- question: >-
+    Did this same parent-driven pattern fire on other hosts in the same window, or is the activity
+    isolated to this host?
+  context: >-
+    Under a service principal, a user-scoped sweep returns agent telemetry from every host and
+    answers nothing. The query mirrors the rule's selection structure scoped to the alerting parent
+    process name, fleet-wide, within the alert window. Several hosts in the same window points to
+    scheduled or pushed automation; a single host points to a host-local trigger and keeps the scope
+    narrow.
+  range: +/-1h
+  always_include: true
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \rundll32.exe
+      - OriginalFileName: RUNDLL32.EXE
+      selection_backdoor_path:
+        CommandLine|contains:
+        - :\ProgramData
+        - \AppData\Local
+      selection_backdoor_exec_1:
+        CommandLine|contains|all:
+        - .wll
+        - '#1'
+        - ' -d'
+      selection_backdoor_exec_2:
+        CommandLine|contains: .wll
+        CommandLine|endswith: '#1'
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection_img and selection_backdoor_path and 1 of selection_backdoor_exec_*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Aggregating every process launch on the host by binary and parent in the surrounding window
+    collapses repetitive agent and OS telemetry into high-count rows and leaves novel parent-child
+    pairs standing out at low counts. Scan for the delivery step before the load and for
+    reconnaissance, credential access, or persistence after it.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+  answer_sources:
+  - process_creation
+  - file_event
+  - registry_event
+- question: >-
+    Have other hosts fired this rule's pattern in the past week, and does the cross-host distribution
+    look like automation or one-off activity?
+  context: >-
+    The query mirrors the rule's selection structure with no host scope, so the result is a
+    fleet-wide count of this ordinal-load pattern rather than the binary's general footprint. Many
+    hosts firing it points at scripted deployment or vendor packaging that stages add-in files; one
+    host or a small unrelated set points at operator-driven activity. Every host returned here needs
+    the same module identification and network review as the alerting one.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \rundll32.exe
+      - OriginalFileName: RUNDLL32.EXE
+      selection_backdoor_path:
+        CommandLine|contains:
+        - :\ProgramData
+        - \AppData\Local
+      selection_backdoor_exec_1:
+        CommandLine|contains|all:
+        - .wll
+        - '#1'
+        - ' -d'
+      selection_backdoor_exec_2:
+        CommandLine|contains: .wll
+        CommandLine|endswith: '#1'
+      condition: selection_img and selection_backdoor_path and 1 of selection_backdoor_exec_*
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Proxy execution of a staged module is rarely the first observable step. Earlier detections on the
+    same host covering delivery, script execution, or defence tampering help place this load in a
+    sequence and set the start of the timeline that needs review.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+  answer_sources:
+  - alert

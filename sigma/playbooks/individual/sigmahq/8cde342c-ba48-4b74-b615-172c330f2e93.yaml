@@ -1,0 +1,420 @@
+name: Suspicious Renamed Comsvcs DLL Loaded By Rundll32
+id: 89a5bec5-8414-4892-b761-55d3eb403a69
+description: |
+  Detects rundll32.exe loading a module whose import hash matches comsvcs.dll while the module's on-disk
+  filename is not comsvcs.dll — a renamed copy of the DLL. comsvcs.dll exports MiniDump, so
+  rundll32 comsvcs.dll, MiniDump <pid> <outfile> full writes a full memory dump of a target process
+  (typically lsass.exe) to disk without bringing a separate dumper binary; renaming the DLL defeats
+  detections keyed on the comsvcs.dll filename while the import hash stays the same. The rule fires when
+  the loading process ends in rundll32.exe AND the loaded module carries a comsvcs.dll import hash AND the
+  loaded module name is not comsvcs.dll. Investigate the rundll32 command line for the exported function,
+  target process id, and output path, confirm whether lsass.exe was the target, establish where the
+  renamed DLL came from and who wrote it, locate the dump file on disk, and check for follow-on use of any
+  credentials that were exposed.
+type: detection
+detection_id: 8cde342c-ba48-4b74-b615-172c330f2e93
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-09
+questions:
+- question: Does the loaded module match this rule's detection criteria — a renamed comsvcs.dll loaded by rundll32?
+  context: >-
+    Confirm the alert is a true positive by reviewing the loaded module and the loading process. The rule
+    fires when rundll32.exe loads a module whose import hash matches a known comsvcs.dll build AND the
+    module's filename does not end in comsvcs.dll. That combination is the signal: the import hash proves
+    the module is functionally comsvcs.dll while the mismatched filename shows it was renamed to evade
+    name-based detection. DLL loads carry a hash on the load event itself, so verify the load hash and note
+    the on-disk name and path of the module here.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|endswith|expand: '%ImageLoaded%'
+      condition: selection
+    fields:
+      - Image
+      - Hashes
+- question: Is this user and host expected to run rundll32 loading modules from this location?
+  context: >-
+    Legitimate administrative or software activity rarely loads a renamed comsvcs.dll through rundll32.
+    Knowing whether the host function and the user account are consistent with the observed activity is
+    often the fastest way to separate a true positive from a benign edge case, such as a packaged
+    third-party tool that ships its own copy of the DLL.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Was LSASS memory accessed or dumped — what exported function, target process id, and output path did the rundll32 command line specify?
+  context: >-
+    The rundll32 command line names the exported function, the target process id, and the output path.
+    comsvcs.dll exports MiniDump; an invocation of the form MiniDump <pid> <path> full writes a full memory
+    dump of the process at that id. Resolve the target process id to a process — if it is lsass.exe, the
+    operation is an LSASS credential dump. The handle-open and memory-read that back the dump are not
+    observable on this endpoint telemetry (read-side access to another process has no event), so the
+    command line and the resulting file are the primary evidence that the dump occurred. This view is
+    scoped to the exact loading process, so it re-displays the triggering rundll32 invocation.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: For the flagged module, what is its import hash, file hash, and signing status?
+  context: >-
+    Module identity separates a renamed comsvcs.dll from an unrelated file. The import hash on the load
+    event is what the rule matched against — it stays constant across renames because it is derived from
+    the module's import table, not its name. Compare the load hash and signing details against a known-good
+    comsvcs.dll to confirm the module is a copy of the system DLL rather than a coincidental match, and use
+    the hash for reputation lookups. A module that is functionally comsvcs.dll but carries an arbitrary
+    filename and loads from a user-writable path is the masquerade this rule targets.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+        ImageLoaded|endswith|expand: '%dll_basename%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Hashes
+      - Signed
+      - Signature
+      - SignatureStatus
+- question: What other modules did this rundll32 process load, and are any of them the dump machinery or additional side-loaded DLLs?
+  context: >-
+    The full set of modules a process loads corroborates what it did. comsvcs.dll MiniDump routes through
+    the debugging-helper libraries dbghelp.dll and dbgcore.dll, so seeing those load alongside the renamed
+    module supports an active memory dump. Also look for additional modules pulled from %TEMP%, AppData,
+    ProgramData, or Public, and for unsigned modules where signed ones are expected — a cluster of
+    non-canonical loads points to a staged working directory rather than a one-off.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+      - SignatureStatus
+      - Hashes
+- question: Where did the renamed module come from, and which process wrote it to disk?
+  context: >-
+    A renamed copy of comsvcs.dll does not appear on its own — it was copied, downloaded, or dropped by
+    another process. Tracing the file-creation event for the module by its on-disk name over a long window
+    reveals the writing process and the delivery path: a download utility, an archive extractor, a remote
+    admin tool, or a dropper. A module written into a user-writable directory shortly before the load is
+    consistent with staging for this technique; a module present since a software install is more likely
+    benign. The name match is on the module filename because the alerting artifact is a loaded library, not
+    the loading process.
+  range: -30d
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%ImageLoaded%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: What files did the loading process write to disk around the alert, and is any of them a memory dump?
+  context: >-
+    A successful MiniDump writes the target process memory to an output file, commonly a .dmp under %TEMP%,
+    C:\Windows\Temp, or another user-writable path. Correlating file writes to the loading process locates
+    that dump while it is still on disk, which enables content review, sizing (an LSASS dump is typically
+    tens to hundreds of megabytes), and containment before the file is exfiltrated or deleted. The output
+    path may also be visible in the command line; use this to confirm the file was actually produced.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What process spawned this rundll32, and is that parent chain expected?
+  context: >-
+    The parent process reveals how rundll32 was launched. A legitimate parent such as explorer.exe or
+    services.exe reads differently from a script host (wscript.exe, mshta.exe), an Office application, or a
+    command shell running an operator's tooling. Allowlisting known-legitimate parents for this activity is
+    the main tuning lever for this technique, so an unexpected parent that invoked rundll32 against a
+    renamed module is the anomaly to pursue.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - Image
+      - CommandLine
+- question: What child processes did this rundll32 spawn afterward?
+  context: >-
+    The processes spawned after the load show what followed the dump. Credential-access activity is often
+    chained with a shell (cmd.exe, powershell.exe), an archive utility to compress the dump, or a transfer
+    tool to move it off-host. Children that stage, compress, or exfiltrate a file shortly after the load
+    strengthen the case that a dump was produced and is being handled.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Were LSASS-protection or credential-caching registry values modified on this host around the alert?
+  context: >-
+    Memory dumping is often preceded by registry changes that make credentials easier to recover. Setting
+    the WDigest UseLogonCredential value forces plaintext credentials back into LSASS memory; clearing the
+    LSA RunAsPPL value removes the protected-process guard that would otherwise block a dump; Credential
+    Guard configuration flags serve a similar purpose. Modifications to these values near the load time
+    indicate deliberate preparation for credential theft. Value deletion is not observable on this
+    telemetry, so treat re-modification history and the payload activity as the cleanup signal instead.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_keys:
+        TargetObject|contains:
+          - '\Control\SecurityProviders\WDigest\UseLogonCredential'
+          - '\Control\Lsa\RunAsPPL'
+          - '\Control\Lsa\LsaCfgFlags'
+      condition: selection and selection_keys
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- question: Which accounts may be exposed by this dump, and do any have elevated privileges?
+  context: >-
+    A memory dump of LSASS exposes every credential cached in that process — interactive users, service
+    accounts, and any privileged sessions on the host. The severity depends on what was logged on: domain
+    administrator or service-account credentials require incident escalation and password rotation, while a
+    single standard-user session is more contained. Enumerate the accounts with recent sessions on this
+    host and cross-reference their privileges.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Were outbound remote-access connections (RDP, SMB, WinRM, SSH) initiated from this host after the dump?
+  context: >-
+    Credential theft is typically followed by lateral movement. This returns outbound connections from the
+    host to remote-access ports — 3389 (RDP), 445 (SMB), 5985/5986 (WinRM), 22 (SSH) — in the hours after
+    the event, with the originating process and user for each. Two limits apply: credentials replayed from a
+    different machine will not appear here, so also review logon activity for the exposed accounts on
+    suspected targets; and if endpoint network telemetry is not collected from this host, treat zero rows as
+    a visibility gap rather than evidence no movement occurred.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
+- question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Alerts rarely occur in isolation. Examining activity in the minutes around the load reveals what led to
+    it and what followed, and whether the module load, a dump-file write, and any registry change fall
+    inside a single correlation window. Look for reconnaissance, additional credential access, or
+    persistence established close to the same time.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Were other proxy-execution LOLBins used on this host recently?
+  context: >-
+    Operators who reach for rundll32 to run code from a library often use other signed system binaries the
+    same way. Finding regsvr32, mshta, msbuild, installutil, or similar proxy-execution utilities running
+    around the same time points to a broader hands-on-keyboard operation rather than an isolated event.
+    rundll32 itself is excluded here because it is already the alerting binary.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\regsvr32.exe'
+          - '\mshta.exe'
+          - '\msbuild.exe'
+          - '\installutil.exe'
+          - '\cmstp.exe'
+          - '\msiexec.exe'
+          - '\forfiles.exe'
+          - '\pcalua.exe'
+          - '\control.exe'
+          - '\mavinject.exe'
+          - '\xwizard.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- question: When this host has previously fired this rule's pattern, what programs and users drove it, and does the current alert fit?
+  context: >-
+    Even a rare pattern can have a benign explanation on a given host. This query mirrors the
+    rule's selection scoped to this host, so the resulting program and user distribution
+    reflects how this specific firing pattern — rundll32 loading a renamed comsvcs.dll — has
+    historically run here, not generic rundll32 usage. A new acting program process or an
+    unexpected user account against this pattern is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: image_load
+    detection:
+      selection:
+        Image|endswith: \rundll32.exe
+        Hashes|contains:
+        - IMPHASH=eed93054cb555f3de70eaa9787f32ebb
+        - IMPHASH=5e0dbdec1fce52daae251a110b4f309d
+        - IMPHASH=eadbccbb324829acb5f2bbe87e5549a8
+        - IMPHASH=407ca0f7b523319d758a40d7c0193699
+        - IMPHASH=281d618f4e6271e527e6386ea6f748de
+      filter:
+        ImageLoaded|endswith: \comsvcs.dll
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - Image
+    - User
+- question: Have other hosts fired this rule's pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: >-
+    This query mirrors the rule's selection with no host scope, so the result is a fleet-wide count of the
+    renamed-comsvcs load pattern rather than generic rundll32 usage. Many hosts firing the same pattern can
+    point to scripted deployment or a shared tool; one host or a small unrelated set points to hands-on
+    operator activity. Use the host distribution together with the parent and user consistency to calibrate
+    severity and scope.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: image_load
+    detection:
+      selection:
+        Image|endswith: \rundll32.exe
+        Hashes|contains:
+        - IMPHASH=eed93054cb555f3de70eaa9787f32ebb
+        - IMPHASH=5e0dbdec1fce52daae251a110b4f309d
+        - IMPHASH=eadbccbb324829acb5f2bbe87e5549a8
+        - IMPHASH=407ca0f7b523319d758a40d7c0193699
+        - IMPHASH=281d618f4e6271e527e6386ea6f748de
+      filter:
+        ImageLoaded|endswith: \comsvcs.dll
+      condition: selection and not filter
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host — defense tampering, reconnaissance, or process-access anomalies —
+    may reveal the stages that preceded this load. Credential dumping is usually a mid-chain step, so a
+    preceding delivery or discovery alert changes how this event should be triaged and where to look next.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

@@ -1,0 +1,455 @@
+name: New DLL Added to AppCertDlls Registry Key
+id: 8317cf0c-83ad-48b4-8679-5782dae56a35
+description: |
+  Detects a registry modification that lands on the AppCertDlls key under HKLM\SYSTEM\CurrentControlSet\Control\Session
+  Manager — firing when either the modified value's own path (TargetObject) is that key or a key rename produces a new name
+  (NewName) matching it. Every DLL registered there is mapped into any process that calls a CreateProcess-family API
+  (CreateProcess, CreateProcessAsUser, CreateProcessWithLogon, WinExec), so a single value write places the named module
+  inside a large share of the processes started on the machine and inherits whatever privileges those processes hold; the
+  affected scope is the whole host and the DLL path in the value data is the artifact to run down. Unlike the related
+  AppInit_DLLs mechanism, this key has essentially no legitimate installed base, so the presence of a value is itself the
+  finding: the investigation should establish which DLL was registered and who published it, which process wrote the value
+  and what launched that process, whether the DLL subsequently appeared as a library load across unrelated processes, and
+  whether other footholds were established in the same session.
+type: detection
+detection_id: 6aa1d992-5925-4e9f-a49b-845e51d1de01
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-16
+questions:
+- question: Does the alerting registry event land on the AppCertDlls key, and which of the rule's two branches fired?
+  context: >-
+    The rule fires when either the modified value's path (TargetObject) is HKLM\SYSTEM\CurrentControlSet\Control\Session
+    Manager\AppCertDlls or a key rename produces a new name (NewName) matching that path. Note which branch fired, because
+    the branch decides which downstream questions can be answered from telemetry: a TargetObject value write carries the
+    registered DLL path in Details, so the value-decode, payload-on-disk, and library-load questions are all load-bearing,
+    whereas a rename branch carries no value data and the registered DLL must be read off the host before those questions
+    mean anything. Details is populated on roughly 79% of endpoint registry modifications and is absent for binary or empty
+    value data; if it is missing, read the key's values directly on the host. Read the signer columns for coherence with the
+    key rather than as a verdict — essentially every alerting process is trusted-signed.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - NewName
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+  answer_sources:
+  - alert
+  - registry_event
+- question: Is this user or host expected to register a DLL for system-wide injection through AppCertDlls?
+  context: >-
+    This key has no meaningful legitimate population — it is not a configuration surface that products, administrators, or
+    management tooling normally write, so there is rarely a routine explanation tied to a user role or host function.
+    Establish whether the account holds administrative rights (the key sits under HKLM and requires them), whether the host
+    was undergoing software installation or servicing, and whether the writing process belongs to a product the organization
+    actually deploys. User attribution is present on roughly 94% of endpoint registry events; when it resolves to SYSTEM, a
+    machine account, or is missing, pivot on the writing process instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: Was this registry change part of a documented deployment, change ticket, or maintenance window?
+  context: >-
+    A DLL registered for load into every process that starts another process is the kind of change that would have to ride
+    in with a software package rather than an ad-hoc action, so a matching deployment record is the fastest way to close the
+    alert. Check whether any package was pushed to this host in the window and whether the product named by the writing
+    process's signer is one the organization licenses. Because this key has no routine installed base, the absence of a
+    record supports treating the write as unauthorized rather than as an undocumented but ordinary change.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - organizational_knowledge
+  - manual_review
+- question: What launched the process that wrote the AppCertDlls value?
+  context: >-
+    The registry event names the writing process but not its origin. Looking that process up by its own identifier returns
+    its command line and the parent that started it, which is what separates an installer or servicing chain from an
+    interactive shell, script host, or document-spawned process. An msiexec.exe or vendor setup binary under a deployment
+    framework points one way; reg.exe, powershell.exe, or a script interpreter under a browser, archive tool, or Office
+    application points the other. Long-running parents can start days before the write, which is why the lookup window is
+    wide.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+  answer_sources:
+  - process_creation
+- question: What other processes did the AppCertDlls writer spawn?
+  context: >-
+    A process that registers a system-wide injection DLL rarely stops there. Listing the children it launched shows whether
+    the write was an isolated configuration change or one step in a longer chain — dropping the DLL, staging additional
+    persistence, or running follow-on tooling. Any child started after the write is also the first opportunity for the
+    registered module to be injected, since the mechanism activates on CreateProcess-family calls. Note this shows what the
+    writing process started, not what started alongside it, because registry telemetry does not record the writing process's
+    own parent.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: What was written under the AppCertDlls key, and why is this key a machine-wide injection point?
+  context: >-
+    AppCertDlls is read by the loader when a process calls a CreateProcess-family API, and every DLL named under the key is
+    mapped into the resulting process. That makes one value write equivalent to injecting the named module across a large
+    share of the processes started on the host, with no Run key, service, or scheduled-task artifact to find, and the
+    injected code inherits the privileges of whatever process picked it up. The value data and the writing process shown
+    here define what would be injected and who planted it; judge the signer for coherence with a key that no mainstream
+    product registers, rather than treating a trusted signature as exculpatory.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+  answer_sources:
+  - registry_event
+- question: Which DLL path does the value data name, and does that location look attacker-controlled?
+  context: >-
+    Read the Details field as a DLL path — it is the module that will be injected, and it is the hunt target. User-writable
+    directories (AppData, Temp, ProgramData, Users\Public), UNC paths, short or random file names, and names that imitate
+    system libraries while sitting outside System32 all point to a planted module. A path inside a licensed product's own
+    install directory is less alarming but still unusual here, because unlike the related AppInit_DLLs mechanism this key
+    has no history of accessibility, input-method, or endpoint-security registrants to explain it — any entry deserves the
+    DLL's signer and hash to be checked directly. Details is absent on roughly 21% of endpoint registry modifications; if it
+    is empty here, enumerate the key's values on the host to recover the configured path.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+  answer_sources:
+  - registry_event
+  - manual_review
+- question: Was the registered DLL actually loaded, and what are its signer status and hash?
+  context: >-
+    An AppCertDlls registration activates as a library load inside other processes — the module never appears as a process
+    of its own, so library-load telemetry is the direct evidence that the injection took effect. A load event for the
+    configured path carries the module's signer, signature status, and hash, which is where the verdict usually lands:
+    unsigned, expired, distrusted, or a signer unrelated to any product installed on the host. Take the hash from here for a
+    reputation lookup, since file-write events carry none. If the value data was absent on the alert, review library loads
+    on the host in the same window for modules outside System32 instead.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|endswith|expand: '%Details%'
+      condition: selection
+    fields:
+      - Image
+      - ImageLoaded
+      - Signed
+      - Signature
+      - SignatureStatus
+      - Hashes
+  answer_sources:
+  - image_load
+  - external_threat_intel
+- question: How many distinct processes loaded the registered DLL after the registry write, and which ones?
+  context: >-
+    The registration takes effect for each process created through a CreateProcess-family call after the write, which on an
+    active host is within seconds to minutes — so correlating the write with library loads over the following hours is what
+    distinguishes a planted value from an active injection. The same module appearing under many unrelated processes is the
+    technique working as intended and means every one of those processes is now carrying the module's code and must be
+    treated accordingly; note whether any of them run with elevated privileges, since the injected code inherits them. Loads
+    confined to a single vendor's own processes point instead to that product's own component. Zero loads means the
+    registration has not activated yet, or that no new processes have been created since the write.
+  range: +4h
+  query: |
+    aggregation: true
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|endswith|expand: '%Details%'
+      condition: selection
+    fields:
+      - Image
+  answer_sources:
+  - image_load
+- question: Was the DLL named in the value written to disk in the same session, and is it still present?
+  context: >-
+    The registration only injects anything if a loadable DLL exists at the configured path, and the module commonly lands
+    moments before or after the value is written. This query correlates file activity from the registry-writing process and
+    its children — look for a file creation matching the path decoded from the value data. File-write events carry no hash;
+    if the module is present, take its hash from a library-load event or retrieve the file for a reputation lookup. Note
+    that value deletion is not observable in this telemetry, so judge whether the mechanism is still configured from the
+    key's later modification history and from whether the module kept loading, not from the absence of a cleanup event.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+  answer_sources:
+  - file_event
+  - manual_review
+- question: Were other registry modifications made on this host in the same session?
+  context: >-
+    An actor who registers an AppCertDlls entry often makes several registry changes in one sitting — adding a Run key or
+    service as a backup foothold, adjusting other Session Manager values, or disabling security tooling. Clusters of
+    modifications from the same writing process within a short window show the full scope of the configuration change. The
+    triggering key will appear in these results; the signal is what else was touched. If the host is registry-noisy, narrow
+    to the alerting write's process or to the Run, Services, Policies, Winlogon, and IFEO paths.
+  range: +/-30m
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - User
+  answer_sources:
+  - registry_event
+- question: What other process activity occurred on this host around the time of the alert?
+  context: >-
+    The registry write rarely happens alone — a dropper staging the DLL, a script host driving the change, or hands-on
+    follow-up typically executes in the same window. Aggregating by image and parent image collapses repetitive agent
+    telemetry into high-count rows while novel low-count pairs stand out; scan those for loaders, archive extractors, script
+    interpreters, and unfamiliar binaries. Because the technique injects into processes created after the write, also watch
+    for ordinary applications spawning children they normally never launch.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+  answer_sources:
+  - process_creation
+  - registry_event
+- question: Has the AppCertDlls key been modified before on this host?
+  context: >-
+    This key is not touched by ordinary software installation or servicing, so on most hosts it should have no modification
+    history at all, and zero prior events make the alerting write a first-touch event. If prior modifications exist, compare
+    their value data and writing processes with the alerting one — a repeated write of the same path from the same process
+    suggests a fixture of this host's build worth resolving against asset records, while a new DLL path from a different
+    writer indicates fresh tampering. Because value deletion is not observable in this telemetry, this history is also the
+    best available read on whether the registration was later changed or removed.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - Details
+      - Image
+  answer_sources:
+  - registry_event
+- question: Was the AppCertDlls key modified on other hosts in the environment?
+  context: >-
+    The same modification across many hosts points to a group policy push, a software deployment, or a widely distributed
+    implant, while a single-host write is more consistent with targeted activity. Compare the value data between hosts —
+    identical DLL paths on many machines suggest one distribution mechanism and shift the question to what pushed it, while
+    differing paths suggest independent tampering. Given how rarely this key is written at all, any fleet-wide pattern here
+    is worth resolving to a named deployment before it is dismissed.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+      - Details
+  answer_sources:
+  - registry_event
+- question: Were other persistence mechanisms installed on this host around the same time?
+  context: >-
+    Actors rarely rely on a single foothold. After registering an AppCertDlls entry they commonly add backup mechanisms
+    through different techniques — scheduled tasks, services, Run keys, BITS jobs, or WMI subscriptions — using tools such
+    as schtasks, at, sc, reg, bitsadmin, or wmic. Several persistence installations inside the same window indicate
+    deliberate stacking rather than an isolated administrative action, and each one needs its own remediation.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Were files dropped to Startup folders or scheduled-task definition paths on this host?
+  context: >-
+    File-based persistence complements a registry registration without touching persistence tooling — dropping an
+    executable or script into a Startup folder, or writing a task definition file directly, achieves execution at logon with
+    no schtasks, sc, or reg invocation to detect. File-event monitoring captures these drops even when the actor avoids the
+    standard utilities, so this check widens coverage beyond the detected registry change. Run-key persistence is a registry
+    write rather than a file path and does not appear here; it surfaces in the registry questions instead.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist_paths:
+        TargetFilename|contains:
+          - '\Start Menu\Programs\Startup\'
+          - '\Windows\System32\Tasks\'
+          - '\Windows\Tasks\'
+      condition: selection and selection_persist_paths
+    fields:
+      - TargetFilename
+      - Image
+  answer_sources:
+  - file_event
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host — initial access, defense tampering, reconnaissance, or credential access — may
+    reveal the stages that preceded this registration and help reconstruct the timeline. Persistence of this kind normally
+    follows code execution and administrative access, since the key sits under HKLM, so a preceding privilege-escalation or
+    execution alert indicates how the actor reached the point of writing it, and its absence raises the question of how they
+    got there unobserved.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+  answer_sources:
+  - alert

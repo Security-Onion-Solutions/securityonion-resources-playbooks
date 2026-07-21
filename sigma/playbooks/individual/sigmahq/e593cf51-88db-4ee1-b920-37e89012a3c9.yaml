@@ -1,0 +1,643 @@
+name: Potentially Suspicious Rundll32 Activity
+id: 14979751-ef73-447d-b72b-f76257fb801b
+description: |
+  Detects a command line that matches one of a set of known rundll32 living-off-the-land patterns — a DLL-and-export combination that proxies execution through the signed rundll32 binary. The set spans URL handlers (url.dll OpenURL, ieframe/shdocvw OpenURL), arbitrary execution (shell32 Control_RunDLL and ShellExec_RunDLL, pcwutl LaunchApplication), INF-driven install (advpack/ieadvpack LaunchINFSection, setupapi InstallHinfSection, syssetup), remote scriptlets (scrobj GenerateTypeLib over http, shimgvw ImageView_Fullscreen over http), Excel XLL registration (javascript: .RegisterXLL), and — notably — comsvcs.dll MiniDump, which dumps process memory and is the standard way to capture LSASS for credential theft. Benign screensaver and Control Panel (.cpl) invocations are excluded. Because the matched pattern determines the behavior, the investigation hinges on decoding which DLL-and-export combination fired and its target, then tracing the parent, any network fetch, files written (a memory dump or INF-dropped files), and what ran next.
+type: detection
+detection_id: e593cf51-88db-4ee1-b920-37e89012a3c9
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-03
+questions:
+- question: Does the command line match one of the rundll32 DLL-and-export abuse patterns this rule detects?
+  context: Confirm the alert before investing time. The rule fires when the command line contains one of the listed DLL-and-export combinations (for example url.dll OpenURL, shell32.dll Control_RunDLL or ShellExec_RunDLL, advpack.dll LaunchINFSection, scrobj.dll GenerateTypeLib with http, or comsvcs.dll MiniDump), with the benign screensaver and Control Panel .cpl cases excluded. Read the full command line and identify which pattern fired — that classification drives the rest of the investigation, and a comsvcs.dll MiniDump match in particular is process-memory dumping consistent with LSASS credential theft and should be treated as high priority.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Is this user and host expected to run rundll32 with these arguments?
+  context: rundll32 runs constantly for legitimate purposes, but the specific DLL-and-export combinations this rule matches are unusual outside particular software or admin actions. Knowing whether this user's role and host function involve the matched behavior — opening URLs programmatically, installing via INF, or dumping process memory — helps separate a niche legitimate use from proxied execution or credential theft.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Which DLL and export was invoked, and what is its target?
+  context: Decode the full command line and classify the matched pattern. Identify the DLL and exported function and the argument it acts on — a URL (url.dll/ieframe OpenURL, scrobj over http), an .inf path (LaunchINFSection, InstallHinfSection), an application or command (ShellExec_RunDLL, pcwutl LaunchApplication), or a process id and output path (comsvcs MiniDump, which dumps memory — capture the target process and the dump file path). The classification tells you whether this is a proxy-execution, remote-fetch, or credential-dumping action and sets the priority.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What process spawned this rundll32, and is that parent chain expected?
+  context: rundll32 launched by an installer, Control Panel, or an interactive admin session can be routine; the same invocation spawned by winword.exe or excel.exe (a macro), mshta.exe, a script host, or a download cradle points to a delivery chain proxying execution through rundll32. The parent's command line shows whether a document or loader drove it, and walking up reconstructs how the activity began.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Did this process make outbound network connections, and to what host or IP?
+  context: Several of the matched patterns fetch remote content — scrobj.dll GenerateTypeLib and shimgvw ImageView_Fullscreen pull a scriptlet or image over http, and the URL-handler exports open arbitrary addresses. Correlating the process to its network connections recovers the destination host, IP, and port. Compare them against known-good endpoints; an external or newly seen address confirms the rundll32 invocation reached out, while no connection points to a local action such as an INF install or a memory dump.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+      - Initiated
+- question: What files did this process write to disk?
+  context: The matched pattern often leaves a file artifact. A comsvcs.dll MiniDump writes a memory dump (frequently a .dmp under a temp or public path, sometimes renamed) that is the captured LSASS data; an INF-driven install drops and stages payload files; a remote scriptlet may write a downloaded component. Reviewing what this process wrote confirms the action and gives concrete paths to pivot on — a dump file is direct evidence of credential theft.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - EventType
+- question: What child processes did this rundll32 spawn afterward?
+  context: Some matched patterns hand off to another process — ShellExec_RunDLL and pcwutl LaunchApplication launch an application, an INF install can run an embedded command, and a remote scriptlet can spawn an interpreter. The children reveal what the proxied execution actually ran. A pattern such as comsvcs MiniDump typically spawns nothing, so the absence of children is itself informative about which behavior fired.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: When this host has previously matched a rundll32 abuse pattern, what parents and users drove it, and does the current alert fit?
+  context: Even rundll32 LOLBin patterns can have a normal pattern on a given host driven by specific software. This mirrors the rule's pattern set scoped to this host, so the parent/user distribution reflects how these invocations have historically run here. A new parent process, an unexpected user, or a pattern never seen before on this host is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - CommandLine|contains|all:
+        - 'javascript:'
+        - .RegisterXLL
+      - CommandLine|contains|all:
+        - url.dll
+        - OpenURL
+      - CommandLine|contains|all:
+        - url.dll
+        - OpenURLA
+      - CommandLine|contains|all:
+        - url.dll
+        - FileProtocolHandler
+      - CommandLine|contains|all:
+        - zipfldr.dll
+        - RouteTheCall
+      - CommandLine|contains|all:
+        - shell32.dll
+        - Control_RunDLL
+      - CommandLine|contains|all:
+        - shell32.dll
+        - ShellExec_RunDLL
+      - CommandLine|contains|all:
+        - mshtml.dll
+        - PrintHTML
+      - CommandLine|contains|all:
+        - advpack.dll
+        - LaunchINFSection
+      - CommandLine|contains|all:
+        - advpack.dll
+        - RegisterOCX
+      - CommandLine|contains|all:
+        - ieadvpack.dll
+        - LaunchINFSection
+      - CommandLine|contains|all:
+        - ieadvpack.dll
+        - RegisterOCX
+      - CommandLine|contains|all:
+        - ieframe.dll
+        - OpenURL
+      - CommandLine|contains|all:
+        - shdocvw.dll
+        - OpenURL
+      - CommandLine|contains|all:
+        - syssetup.dll
+        - SetupInfObjectInstallAction
+      - CommandLine|contains|all:
+        - setupapi.dll
+        - InstallHinfSection
+      - CommandLine|contains|all:
+        - pcwutl.dll
+        - LaunchApplication
+      - CommandLine|contains|all:
+        - dfshim.dll
+        - ShOpenVerbApplication
+      - CommandLine|contains|all:
+        - dfshim.dll
+        - ShOpenVerbShortcut
+      - CommandLine|contains|all:
+        - scrobj.dll
+        - GenerateTypeLib
+        - http
+      - CommandLine|contains|all:
+        - shimgvw.dll
+        - ImageView_Fullscreen
+        - http
+      - CommandLine|contains|all:
+        - comsvcs.dll
+        - MiniDump
+      filter_main_screensaver:
+        CommandLine|contains: shell32.dll,Control_RunDLL desk.cpl,screensaver,@screensaver
+      filter_main_parent_cpl:
+        ParentImage: C:\Windows\System32\control.exe
+        ParentCommandLine|contains: .cpl
+        CommandLine|contains|all:
+        - Shell32.dll
+        - Control_RunDLL
+        - .cpl
+      filter_main_startmenu:
+        ParentImage: C:\Windows\System32\control.exe
+        CommandLine|startswith: '"C:\Windows\system32\rundll32.exe" Shell32.dll,Control_RunDLL "C:\Windows\System32\'
+        CommandLine|endswith: .cpl",
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - CommandLine|contains|all:
+        - 'javascript:'
+        - .RegisterXLL
+      - CommandLine|contains|all:
+        - url.dll
+        - OpenURL
+      - CommandLine|contains|all:
+        - url.dll
+        - OpenURLA
+      - CommandLine|contains|all:
+        - url.dll
+        - FileProtocolHandler
+      - CommandLine|contains|all:
+        - zipfldr.dll
+        - RouteTheCall
+      - CommandLine|contains|all:
+        - shell32.dll
+        - Control_RunDLL
+      - CommandLine|contains|all:
+        - shell32.dll
+        - ShellExec_RunDLL
+      - CommandLine|contains|all:
+        - mshtml.dll
+        - PrintHTML
+      - CommandLine|contains|all:
+        - advpack.dll
+        - LaunchINFSection
+      - CommandLine|contains|all:
+        - advpack.dll
+        - RegisterOCX
+      - CommandLine|contains|all:
+        - ieadvpack.dll
+        - LaunchINFSection
+      - CommandLine|contains|all:
+        - ieadvpack.dll
+        - RegisterOCX
+      - CommandLine|contains|all:
+        - ieframe.dll
+        - OpenURL
+      - CommandLine|contains|all:
+        - shdocvw.dll
+        - OpenURL
+      - CommandLine|contains|all:
+        - syssetup.dll
+        - SetupInfObjectInstallAction
+      - CommandLine|contains|all:
+        - setupapi.dll
+        - InstallHinfSection
+      - CommandLine|contains|all:
+        - pcwutl.dll
+        - LaunchApplication
+      - CommandLine|contains|all:
+        - dfshim.dll
+        - ShOpenVerbApplication
+      - CommandLine|contains|all:
+        - dfshim.dll
+        - ShOpenVerbShortcut
+      - CommandLine|contains|all:
+        - scrobj.dll
+        - GenerateTypeLib
+        - http
+      - CommandLine|contains|all:
+        - shimgvw.dll
+        - ImageView_Fullscreen
+        - http
+      - CommandLine|contains|all:
+        - comsvcs.dll
+        - MiniDump
+      filter_main_screensaver:
+        CommandLine|contains: shell32.dll,Control_RunDLL desk.cpl,screensaver,@screensaver
+      filter_main_parent_cpl:
+        ParentImage: C:\Windows\System32\control.exe
+        ParentCommandLine|contains: .cpl
+        CommandLine|contains|all:
+        - Shell32.dll
+        - Control_RunDLL
+        - .cpl
+      filter_main_startmenu:
+        ParentImage: C:\Windows\System32\control.exe
+        CommandLine|startswith: '"C:\Windows\system32\rundll32.exe" Shell32.dll,Control_RunDLL "C:\Windows\System32\'
+        CommandLine|endswith: .cpl",
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - CommandLine|contains|all:
+        - 'javascript:'
+        - .RegisterXLL
+      - CommandLine|contains|all:
+        - url.dll
+        - OpenURL
+      - CommandLine|contains|all:
+        - url.dll
+        - OpenURLA
+      - CommandLine|contains|all:
+        - url.dll
+        - FileProtocolHandler
+      - CommandLine|contains|all:
+        - zipfldr.dll
+        - RouteTheCall
+      - CommandLine|contains|all:
+        - shell32.dll
+        - Control_RunDLL
+      - CommandLine|contains|all:
+        - shell32.dll
+        - ShellExec_RunDLL
+      - CommandLine|contains|all:
+        - mshtml.dll
+        - PrintHTML
+      - CommandLine|contains|all:
+        - advpack.dll
+        - LaunchINFSection
+      - CommandLine|contains|all:
+        - advpack.dll
+        - RegisterOCX
+      - CommandLine|contains|all:
+        - ieadvpack.dll
+        - LaunchINFSection
+      - CommandLine|contains|all:
+        - ieadvpack.dll
+        - RegisterOCX
+      - CommandLine|contains|all:
+        - ieframe.dll
+        - OpenURL
+      - CommandLine|contains|all:
+        - shdocvw.dll
+        - OpenURL
+      - CommandLine|contains|all:
+        - syssetup.dll
+        - SetupInfObjectInstallAction
+      - CommandLine|contains|all:
+        - setupapi.dll
+        - InstallHinfSection
+      - CommandLine|contains|all:
+        - pcwutl.dll
+        - LaunchApplication
+      - CommandLine|contains|all:
+        - dfshim.dll
+        - ShOpenVerbApplication
+      - CommandLine|contains|all:
+        - dfshim.dll
+        - ShOpenVerbShortcut
+      - CommandLine|contains|all:
+        - scrobj.dll
+        - GenerateTypeLib
+        - http
+      - CommandLine|contains|all:
+        - shimgvw.dll
+        - ImageView_Fullscreen
+        - http
+      - CommandLine|contains|all:
+        - comsvcs.dll
+        - MiniDump
+      filter_main_screensaver:
+        CommandLine|contains: shell32.dll,Control_RunDLL desk.cpl,screensaver,@screensaver
+      filter_main_parent_cpl:
+        ParentImage: C:\Windows\System32\control.exe
+        ParentCommandLine|contains: .cpl
+        CommandLine|contains|all:
+        - Shell32.dll
+        - Control_RunDLL
+        - .cpl
+      filter_main_startmenu:
+        ParentImage: C:\Windows\System32\control.exe
+        CommandLine|startswith: '"C:\Windows\system32\rundll32.exe" Shell32.dll,Control_RunDLL "C:\Windows\System32\'
+        CommandLine|endswith: .cpl",
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts in a tight window reveals lateral movement or activity spanning multiple endpoints. If the same user drove proxied execution or other tooling on other hosts in the same window, the scope is larger than a single machine. This pivot is meaningful only when a real user account fired the alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - CommandLine|contains|all:
+        - 'javascript:'
+        - .RegisterXLL
+      - CommandLine|contains|all:
+        - url.dll
+        - OpenURL
+      - CommandLine|contains|all:
+        - url.dll
+        - OpenURLA
+      - CommandLine|contains|all:
+        - url.dll
+        - FileProtocolHandler
+      - CommandLine|contains|all:
+        - zipfldr.dll
+        - RouteTheCall
+      - CommandLine|contains|all:
+        - shell32.dll
+        - Control_RunDLL
+      - CommandLine|contains|all:
+        - shell32.dll
+        - ShellExec_RunDLL
+      - CommandLine|contains|all:
+        - mshtml.dll
+        - PrintHTML
+      - CommandLine|contains|all:
+        - advpack.dll
+        - LaunchINFSection
+      - CommandLine|contains|all:
+        - advpack.dll
+        - RegisterOCX
+      - CommandLine|contains|all:
+        - ieadvpack.dll
+        - LaunchINFSection
+      - CommandLine|contains|all:
+        - ieadvpack.dll
+        - RegisterOCX
+      - CommandLine|contains|all:
+        - ieframe.dll
+        - OpenURL
+      - CommandLine|contains|all:
+        - shdocvw.dll
+        - OpenURL
+      - CommandLine|contains|all:
+        - syssetup.dll
+        - SetupInfObjectInstallAction
+      - CommandLine|contains|all:
+        - setupapi.dll
+        - InstallHinfSection
+      - CommandLine|contains|all:
+        - pcwutl.dll
+        - LaunchApplication
+      - CommandLine|contains|all:
+        - dfshim.dll
+        - ShOpenVerbApplication
+      - CommandLine|contains|all:
+        - dfshim.dll
+        - ShOpenVerbShortcut
+      - CommandLine|contains|all:
+        - scrobj.dll
+        - GenerateTypeLib
+        - http
+      - CommandLine|contains|all:
+        - shimgvw.dll
+        - ImageView_Fullscreen
+        - http
+      - CommandLine|contains|all:
+        - comsvcs.dll
+        - MiniDump
+      filter_main_screensaver:
+        CommandLine|contains: shell32.dll,Control_RunDLL desk.cpl,screensaver,@screensaver
+      filter_main_parent_cpl:
+        ParentImage: C:\Windows\System32\control.exe
+        ParentCommandLine|contains: .cpl
+        CommandLine|contains|all:
+        - Shell32.dll
+        - Control_RunDLL
+        - .cpl
+      filter_main_startmenu:
+        ParentImage: C:\Windows\System32\control.exe
+        CommandLine|startswith: '"C:\Windows\system32\rundll32.exe" Shell32.dll,Control_RunDLL "C:\Windows\System32\'
+        CommandLine|endswith: .cpl",
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+- question: Have other hosts matched a rundll32 abuse pattern in the past week, and does the distribution look like automation or one-off activity?
+  context: This mirrors the rule's pattern set with no host scope, giving a fleet-wide count of where these rundll32 invocations fired. Many hosts at once points to software or a pushed routine that uses these exports; one host or a small unrelated set points to manual or targeted activity. Use the distribution to judge how unusual this single alert is.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - CommandLine|contains|all:
+        - 'javascript:'
+        - .RegisterXLL
+      - CommandLine|contains|all:
+        - url.dll
+        - OpenURL
+      - CommandLine|contains|all:
+        - url.dll
+        - OpenURLA
+      - CommandLine|contains|all:
+        - url.dll
+        - FileProtocolHandler
+      - CommandLine|contains|all:
+        - zipfldr.dll
+        - RouteTheCall
+      - CommandLine|contains|all:
+        - shell32.dll
+        - Control_RunDLL
+      - CommandLine|contains|all:
+        - shell32.dll
+        - ShellExec_RunDLL
+      - CommandLine|contains|all:
+        - mshtml.dll
+        - PrintHTML
+      - CommandLine|contains|all:
+        - advpack.dll
+        - LaunchINFSection
+      - CommandLine|contains|all:
+        - advpack.dll
+        - RegisterOCX
+      - CommandLine|contains|all:
+        - ieadvpack.dll
+        - LaunchINFSection
+      - CommandLine|contains|all:
+        - ieadvpack.dll
+        - RegisterOCX
+      - CommandLine|contains|all:
+        - ieframe.dll
+        - OpenURL
+      - CommandLine|contains|all:
+        - shdocvw.dll
+        - OpenURL
+      - CommandLine|contains|all:
+        - syssetup.dll
+        - SetupInfObjectInstallAction
+      - CommandLine|contains|all:
+        - setupapi.dll
+        - InstallHinfSection
+      - CommandLine|contains|all:
+        - pcwutl.dll
+        - LaunchApplication
+      - CommandLine|contains|all:
+        - dfshim.dll
+        - ShOpenVerbApplication
+      - CommandLine|contains|all:
+        - dfshim.dll
+        - ShOpenVerbShortcut
+      - CommandLine|contains|all:
+        - scrobj.dll
+        - GenerateTypeLib
+        - http
+      - CommandLine|contains|all:
+        - shimgvw.dll
+        - ImageView_Fullscreen
+        - http
+      - CommandLine|contains|all:
+        - comsvcs.dll
+        - MiniDump
+      filter_main_screensaver:
+        CommandLine|contains: shell32.dll,Control_RunDLL desk.cpl,screensaver,@screensaver
+      filter_main_parent_cpl:
+        ParentImage: C:\Windows\System32\control.exe
+        ParentCommandLine|contains: .cpl
+        CommandLine|contains|all:
+        - Shell32.dll
+        - Control_RunDLL
+        - .cpl
+      filter_main_startmenu:
+        ParentImage: C:\Windows\System32\control.exe
+        CommandLine|startswith: '"C:\Windows\system32\rundll32.exe" Shell32.dll,Control_RunDLL "C:\Windows\System32\'
+        CommandLine|endswith: .cpl",
+      condition: selection and not 1 of filter_main_*
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — a download cradle, a macro-spawned shell, defense tampering, or reconnaissance — may reveal how this rundll32 invocation came about and help reconstruct the timeline. If the matched pattern was comsvcs MiniDump, look especially for the access and lateral-movement activity that typically surrounds credential dumping.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

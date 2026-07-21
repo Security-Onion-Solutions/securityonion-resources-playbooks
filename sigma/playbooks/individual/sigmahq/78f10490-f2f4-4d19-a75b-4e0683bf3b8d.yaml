@@ -1,0 +1,313 @@
+name: Suspicious Speech Runtime Binary Child Process
+id: 7b2e8b99-caae-4985-8e4d-af0989c8697c
+description: |
+  Detects any child process spawned by SpeechRuntime.exe (ParentImage ending in \SpeechRuntime.exe).
+  SpeechRuntime.exe is instantiated by a Speech-related COM class that, when configured as INTERACTIVE
+  USER, runs in the session of the currently logged-on user; if that COM class is also vulnerable to
+  COM hijacking, an actor can plant a registry hijack and a dropped DLL, trigger loading via DCOM over
+  RPC (port 135) from a remote host, and execute code in the victim user's session without taking over
+  the machine. SpeechRuntime.exe spawning child processes is the observable tail of that chain, so the
+  investigation should confirm what child was spawned, identify the remote DCOM source and authenticating
+  account, check whether SpeechRuntime.exe loaded a newly dropped or unsigned DLL, and determine whether
+  the child activity is benign speech-feature behavior or operator follow-on execution.
+type: detection
+detection_id: 78f10490-f2f4-4d19-a75b-4e0683bf3b8d
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- question: Does the alert show a child process whose parent image ends in \SpeechRuntime.exe?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the triggering event. The rule fires on a single condition, a process whose ParentImage ends in \SpeechRuntime.exe. Confirm SpeechRuntime.exe is the direct parent and note the child Image and command line, since the child identity drives the rest of the investigation.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+- question: Is this user and host expected to produce speech-related processes that spawn child programs?
+  context: SpeechRuntime.exe normally runs as part of Windows speech and dictation features and rarely spawns arbitrary child processes. Knowing whether the logged-on user actually uses speech features, and whether this host has a role consistent with that, is often the fastest way to separate routine behavior from a hijacked COM class executing in the user's session.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What is the child binary, and is it a known living-off-the-land or remote-execution program rather than an expected speech component?
+  context: The child process is the payload of the chain. Speech-feature behavior produces few or no child processes; a hijacked COM class commonly spawns command interpreters, script hosts, or signed binaries used for proxy execution such as cmd.exe, powershell.exe, rundll32.exe, regsvr32.exe, mshta.exe, or wmic.exe. Identify the child binary and its full path so its name, location, and signing can be assessed.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: What exactly did the child process do? Decode its full command line.
+  context: The full command line of the spawned child reveals the operator's intent. Decode any flags, encoded blobs, file paths, URLs, or DLL entry points. A download cradle, an in-memory loader, a reverse shell, or a regsvr32/rundll32 invocation pointing at a dropped DLL all signal follow-on execution; benign speech behavior carries no such arguments. Scoping to all executions of this child binary on the host within the window captures multi-command sequences that form one logical operation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Did SpeechRuntime.exe load a newly dropped or unsigned DLL shortly before spawning this child?
+  context: COM hijacking of the Speech class works by pointing a hijacked CLSID at an attacker DLL that SpeechRuntime.exe then loads from the hijack location, often dropped over SMB just before execution. A module load into SpeechRuntime.exe from a user-writable or temp path, or an unsigned or recently created DLL, is the loader step that precedes the child process. If image_load events are not collected in this environment, treat zero results as a visibility gap rather than evidence nothing loaded.
+  range: -10m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: \SpeechRuntime.exe
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+- question: What remote host initiated DCOM activity to this host over RPC around the alert time, and is it an expected administrative source?
+  context: 'DCOM-triggered execution requires a remote caller reaching this host over the RPC endpoint mapper (port 135) and dynamic high ports, typically preceded by a network logon. Identifying the source address shows whether the trigger came from a known admin jump box or an unexpected workstation acting as a pivot. If network connection telemetry is not collected, this step depends on the authentication record instead.'
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationPort: 135
+      condition: selection
+    fields:
+      - SourceIp
+      - DestinationPort
+      - Initiated
+- question: What account authenticated to this host around the alert time, and was it a network logon consistent with a remote DCOM trigger?
+  context: 'DCOM-based remote execution authenticates to the target before instantiating the COM object. Network logons (type 3) and explicit-credential logons from a remote address, especially under a privileged or rarely seen account, point to a remote operator rather than the interactive session owner. Correlate the authenticating account and source address with the user the child process ran as.'
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        EventID:
+          - 4624
+          - 4648
+        Computer|expand: '%hostname%'
+      condition: selection
+    fields:
+      - TargetUserName
+      - IpAddress
+      - LogonType
+      - EventID
+- question: Has SpeechRuntime.exe ever spawned this child binary on this host before?
+  context: SpeechRuntime.exe spawning child processes is unusual on its own, so the historical frequency of this specific parent-child pairing is a strong discriminator. Zero or very low counts indicate a novel spawning relationship consistent with COM-class abuse rather than a routine speech-feature side effect that has run many times before.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What other child processes did SpeechRuntime.exe spawn on this host?
+  context: An operator using the hijacked COM class as an execution foothold often spawns several tools in sequence through the same parent, such as reconnaissance, credential access, then lateral movement. Listing every child SpeechRuntime.exe spawned reveals the full scope of activity initiated through this chain beyond the single child that tripped the alert.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \SpeechRuntime.exe
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \SpeechRuntime.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the same user triggered similar activity on other hosts in the window, the scope of the operation may be larger than this single endpoint, which is the expected pattern when DCOM is used to reach multiple victims.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \SpeechRuntime.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this user account driven lateral-movement tooling against other hosts in the environment?
+  context: Actors rarely stop at one target. If the account tied to this activity is also running remote-execution and lateral-movement tools across other systems, the scope of compromise is larger. Finding such tool usage by the same account on many hosts within a short window indicates active lateral movement rather than a contained event.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      selection_lateral:
+        Image|endswith:
+          - '\psexec.exe'
+          - '\psexec64.exe'
+          - '\mstsc.exe'
+          - '\ssh.exe'
+          - '\plink.exe'
+          - '\wmic.exe'
+      condition: selection and selection_lateral
+    fields:
+      - host.name
+      - Image
+- question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate context: what led to this event, what happened after, and whether it is part of a larger sequence. Look for reconnaissance, privilege escalation, persistence installation, or further remote-execution attempts close in time to the SpeechRuntime.exe child spawn.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Is SpeechRuntime.exe spawning child processes on other hosts in the environment?
+  context: A DCOM-driven COM-hijack campaign reaches many victims by triggering the same COM class on each. Finding SpeechRuntime.exe spawning child processes on other hosts in a short window shows the activity is not isolated and helps scope containment. A single host is more consistent with a targeted action.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \SpeechRuntime.exe
+      filter_self:
+        host.name|expand: '%hostname%'
+      condition: selection and not filter_self
+    fields:
+      - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: 'Alerts rarely happen in isolation. Earlier detections on the same host, such as remote registry modification, SMB file drops, or reconnaissance, may reveal the COM-hijack setup steps that preceded execution and help reconstruct the timeline. Look for patterns: a remote file drop or registry change followed by this execution.'
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

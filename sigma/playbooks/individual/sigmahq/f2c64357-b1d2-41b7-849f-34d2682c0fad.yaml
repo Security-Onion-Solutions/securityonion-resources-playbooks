@@ -1,0 +1,471 @@
+name: Suspicious Command Patterns In Scheduled Task Creation
+id: 0b760fbc-c74a-4b7e-85b1-af1fe61b4a4b
+description: |
+  Detects schtasks.exe creating a scheduled task (/Create) whose command line carries one or more suspicious patterns. The rule fires when the schtasks /Create event is present AND at least one of several pattern groups also matches -- either a privileged/short-interval schedule (/sc minute, /ru system) combined with an embedded cmd /c|/k|/r launcher, or a download/encoding/proxy-execution indicator (-enc, IEX, DownloadString, FromBase64String, mshta http), or a user-writable path reference (%Temp%, \AppData\, Users\Public) combined with a script interpreter (cscript, wscript, curl). Scheduled tasks are a routine administration and software-install mechanism, so legitimate installers running from temp folders can match; the investigation determines whether the task installs a persistence payload (a download cradle, encoded command, or remote-HTA loader) versus an approved deployment.
+type: detection
+detection_id: f2c64357-b1d2-41b7-849f-34d2682c0fad
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- question: Does the schtasks command line show /Create together with at least one of the rule's suspicious pattern groups?
+  context: Confirm the alert by reading the full command line. The rule requires the schtasks /Create event plus at least one match from these groups -- a privileged or minute-interval schedule (/sc minute, /ru system) paired with an embedded cmd /c|/k|/r launcher, a download or encoding or proxy-execution token (-enc, IEX, DownloadString, FromBase64String, mshta http), or a user-writable path (%Temp%, \AppData\, Users\Public) paired with a script interpreter (cscript, wscript, curl). Note which group actually fired -- a minute-cadence SYSTEM task and a remote-HTA download cradle imply different follow-up, so the matched group steers which downstream questions carry weight.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Is this user and host expected to create scheduled tasks from the command line?
+  context: Legitimate administrators and software installers do create scheduled tasks, so identify whether the account and host function fit. A build server, a software-deployment host, or an admin workstation creating tasks is routine; a standard user endpoint or a service account that never schedules tasks is a deviation worth pursuing.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What scheduled task was created, and what command does it run?
+  context: The schtasks command line carries the task name (/TN), the program or command to execute (/TR), the schedule type (/SC), and the run-as account (/RU). Identify each. A /TR that launches a download cradle, an encoded command, or mshta against a remote URL is the persistence payload; a /RU of SYSTEM grants the payload elevated execution; a task name imitating a vendor update or sync routine is a masquerade.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Is the task command encoded or obfuscated, and what does it decode to?
+  context: When the /TR payload uses encoding -- base64 (FromBase64String, -enc), hex (-decode), character concatenation, or environment-variable substitution -- decode it to recover the actual operation. The rule's uncommon-pattern group flags exactly these tokens. Decoded content commonly resolves to a download cradle, a reverse shell, an in-memory loader, or a remote-HTA fetch. Iterate decoding for multi-layer encoding until the payload is readable.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What process spawned schtasks.exe, and is that parent chain expected for task creation?
+  context: The parent reveals how the task was registered. Administrative task creation typically descends from explorer.exe, an interactive console, or a deployment agent. A parent of wscript.exe, cscript.exe, mshta.exe, or an Office application points to a script or macro injecting the task rather than an operator running it, which shifts the disposition toward a malicious loader chain.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: When is the task scheduled to run, and has it already executed?
+  context: The schedule type determines when the payload activates -- boot and logon triggers fire on next restart or sign-in, while minute or daily recurrences may have already run several times. Scheduled tasks execute as children of the Task Scheduler service, so processes spawned by svchost.exe running Schedule after task creation show whether the payload has already fired. Correlate the execution window against the task-creation time to bound how long the persistence has been active.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: '\svchost.exe'
+        ParentCommandLine|contains: 'Schedule'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Is the scheduled task still registered on the system?
+  context: Persistence is only active if the task still exists. Some operators delete the task after a single execution to reduce forensic traces, while others leave it for recurring beaconing. Confirming whether the task is still registered (via schtasks /query /tn or the Task Scheduler view) determines whether the mechanism is live and requires removal.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: If the task command references a file or URL, what is the content of that artifact?
+  context: The rule's download and path patterns (DownloadFile, DownloadString, mshta http, %Temp%, \AppData\) imply a file or remote resource is fetched or executed. Retrieve the referenced artifact and read its content -- check for base64 or other encoding, embedded URLs and IP addresses, PowerShell or script payloads, and known-malicious string patterns. For a downloaded binary, examine imports, embedded strings, packer signatures, and signing status.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What is the hash of the file the task fetches or runs, and how do you obtain it?
+  context: The task runs its command later, under the Task Scheduler rather than in this schtasks process, and the file path or URL on the /TR value is not a queryable field. The task command is a download-or-decode cradle (cmd, powershell, mshta), so the payload is pulled or decoded only when the task fires -- there is no hash to read yet. When the task runs, its payload's hash is recorded as a process; check process history once it has triggered (see the trigger-and-timing and task-configuration questions), or pull the file from the path or URL on the command line and hash it by hand. This query surfaces any file this schtasks process tree wrote, in case the same session also staged the payload.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_schtasks:
+        Image|endswith: \schtasks.exe
+        CommandLine|contains: '/Create '
+      selection_pattern_1:
+        CommandLine|contains:
+        - '/sc minute '
+        - '/ru system '
+      selection_pattern_2:
+        CommandLine|contains:
+        - cmd /c
+        - cmd /k
+        - cmd /r
+        - 'cmd.exe /c '
+        - 'cmd.exe /k '
+        - 'cmd.exe /r '
+      selection_uncommon:
+        CommandLine|contains:
+        - ' -decode '
+        - ' -enc '
+        - ' -w hidden '
+        - ' bypass '
+        - ' IEX'
+        - .DownloadData
+        - .DownloadFile
+        - .DownloadString
+        - '/c start /min '
+        - FromBase64String
+        - mshta http
+        - mshta.exe http
+      selection_anomaly_1:
+        CommandLine|contains:
+        - :\ProgramData\
+        - :\Temp\
+        - :\Tmp\
+        - :\Users\Public\
+        - :\Windows\Temp\
+        - \AppData\
+        - '%AppData%'
+        - '%Temp%'
+        - '%tmp%'
+      selection_anomaly_2:
+        CommandLine|contains:
+        - cscript
+        - curl
+        - wscript
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection_schtasks and ( all of selection_pattern_* or selection_uncommon or all of selection_anomaly_* )) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_schtasks:
+        Image|endswith: \schtasks.exe
+        CommandLine|contains: '/Create '
+      selection_pattern_1:
+        CommandLine|contains:
+        - '/sc minute '
+        - '/ru system '
+      selection_pattern_2:
+        CommandLine|contains:
+        - cmd /c
+        - cmd /k
+        - cmd /r
+        - 'cmd.exe /c '
+        - 'cmd.exe /k '
+        - 'cmd.exe /r '
+      selection_uncommon:
+        CommandLine|contains:
+        - ' -decode '
+        - ' -enc '
+        - ' -w hidden '
+        - ' bypass '
+        - ' IEX'
+        - .DownloadData
+        - .DownloadFile
+        - .DownloadString
+        - '/c start /min '
+        - FromBase64String
+        - mshta http
+        - mshta.exe http
+      selection_anomaly_1:
+        CommandLine|contains:
+        - :\ProgramData\
+        - :\Temp\
+        - :\Tmp\
+        - :\Users\Public\
+        - :\Windows\Temp\
+        - \AppData\
+        - '%AppData%'
+        - '%Temp%'
+        - '%tmp%'
+      selection_anomaly_2:
+        CommandLine|contains:
+        - cscript
+        - curl
+        - wscript
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection_schtasks and ( all of selection_pattern_* or selection_uncommon or all of selection_anomaly_* )) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the account's activity across all hosts in the alert window surfaces lateral movement or parallel task creation on other endpoints. The same user scheduling tasks on multiple hosts in a short window widens the apparent scope and points toward an operator working through several systems.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_schtasks:
+        Image|endswith: \schtasks.exe
+        CommandLine|contains: '/Create '
+      selection_pattern_1:
+        CommandLine|contains:
+        - '/sc minute '
+        - '/ru system '
+      selection_pattern_2:
+        CommandLine|contains:
+        - cmd /c
+        - cmd /k
+        - cmd /r
+        - 'cmd.exe /c '
+        - 'cmd.exe /k '
+        - 'cmd.exe /r '
+      selection_uncommon:
+        CommandLine|contains:
+        - ' -decode '
+        - ' -enc '
+        - ' -w hidden '
+        - ' bypass '
+        - ' IEX'
+        - .DownloadData
+        - .DownloadFile
+        - .DownloadString
+        - '/c start /min '
+        - FromBase64String
+        - mshta http
+        - mshta.exe http
+      selection_anomaly_1:
+        CommandLine|contains:
+        - :\ProgramData\
+        - :\Temp\
+        - :\Tmp\
+        - :\Users\Public\
+        - :\Windows\Temp\
+        - \AppData\
+        - '%AppData%'
+        - '%Temp%'
+        - '%tmp%'
+      selection_anomaly_2:
+        CommandLine|contains:
+        - cscript
+        - curl
+        - wscript
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection_schtasks and ( all of selection_pattern_* or selection_uncommon or all of selection_anomaly_* )) and _pb_scope
+    fields:
+    - host.name
+- question: Was schtasks.exe executed from its expected System32 path?
+  context: schtasks.exe running from outside System32 or SysWOW64 -- a user temp directory, a profile path, or ProgramData -- can indicate a copied or renamed binary used to evade path-based allowlists. Compare the Image path and OriginalFileName against the system location; a relocated or renamed scheduler binary is more suspicious than one in System32.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- question: How often has this host fired the rule's schtasks pattern over the past 90 days, and what command-line structures are typical?
+  context: A task-creation pattern with no prior history on a host is more suspicious than one used regularly under stable parents. The query mirrors the rule's selection structure scoped to this host, so the count reflects the rule's specific firing pattern rather than generic schtasks usage. The command-line projection lets you compare typical invocation patterns against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_schtasks:
+        Image|endswith: \schtasks.exe
+        CommandLine|contains: '/Create '
+      selection_pattern_1:
+        CommandLine|contains:
+        - '/sc minute '
+        - '/ru system '
+      selection_pattern_2:
+        CommandLine|contains:
+        - cmd /c
+        - cmd /k
+        - cmd /r
+        - 'cmd.exe /c '
+        - 'cmd.exe /k '
+        - 'cmd.exe /r '
+      selection_uncommon:
+        CommandLine|contains:
+        - ' -decode '
+        - ' -enc '
+        - ' -w hidden '
+        - ' bypass '
+        - ' IEX'
+        - .DownloadData
+        - .DownloadFile
+        - .DownloadString
+        - '/c start /min '
+        - FromBase64String
+        - mshta http
+        - mshta.exe http
+      selection_anomaly_1:
+        CommandLine|contains:
+        - :\ProgramData\
+        - :\Temp\
+        - :\Tmp\
+        - :\Users\Public\
+        - :\Windows\Temp\
+        - \AppData\
+        - '%AppData%'
+        - '%Temp%'
+        - '%tmp%'
+      selection_anomaly_2:
+        CommandLine|contains:
+        - cscript
+        - curl
+        - wscript
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection_schtasks and ( all of selection_pattern_* or selection_uncommon or all of selection_anomaly_* )) and _pb_scope
+    fields:
+    - CommandLine
+- question: Were other process-based persistence mechanisms installed on this host around the same time?
+  context: Operators rarely rely on a single persistence mechanism. Alongside a scheduled task, they commonly install backups using services, registry Run keys, BITS jobs, or WMI subscriptions. Several persistence installations from the same timeframe point to intentional stacking rather than an isolated administrative action.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host -- macro execution, reconnaissance, defense tampering, or credential access -- may reveal the stages that preceded the task creation and help reconstruct the timeline of how the persistence was placed.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

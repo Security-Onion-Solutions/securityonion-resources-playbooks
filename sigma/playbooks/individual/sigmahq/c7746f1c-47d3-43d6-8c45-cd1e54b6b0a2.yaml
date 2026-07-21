@@ -1,0 +1,308 @@
+name: Kernel Memory Dump Via LiveKD
+id: 53e80d46-16ce-44e1-95ab-688c1393004c
+description: |
+  Detects execution of LiveKD (livekd.exe / livekd64.exe, or a renamed binary whose OriginalFileName is livekd.exe)
+  with the "-m" mirror-dump flag, which writes a consistent snapshot of kernel-mode memory to disk without crashing
+  the host. The rule fires when the LiveKD image (or its original filename) AND the "-m" command-line flag both match.
+  Legitimately, support and IR engineers use LiveKD with the Microsoft kernel debuggers to capture a live memory dump
+  for troubleshooting; the same workflow lets an operator harvest a full kernel image — which contains credential
+  structures and cached secrets — silently and without touching LSASS directly. Determine whether the invocation is
+  expected administrative or debugging activity, what was dumped and where it was written, and whether surrounding
+  activity points to credential access or collection.
+type: detection
+detection_id: c7746f1c-47d3-43d6-8c45-cd1e54b6b0a2
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- question: Does the command line match what this rule detects — a LiveKD invocation carrying the "-m" mirror-dump flag?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule fires only when both the
+    image (or original filename) resolves to LiveKD and the command line carries the "-m" flag (windash-normalized, so
+    "/m" and "-m" both match). Read the full command line and process details against those two criteria.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to run kernel memory-dumping or live-debugging tools?
+  context: Legitimate administrative or support activity can trigger this detection. LiveKD requires kernel/admin rights
+    and the Microsoft Debugging Tools; routine use is limited to a small set of support, IR, or debugging staff on
+    specific hosts. Knowing whether this user role and host function are consistent with live kernel debugging is often
+    the fastest path to distinguishing a sanctioned dump from an operator harvesting memory.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What exactly did this LiveKD invocation do — decode the full command line, including the dump flag mask and
+    any output-file path?
+  context: The full command line reveals what was actually dumped. The "-m" flag takes an optional region mask (default
+    0x18F8 — paged/non-paged pool, system PTEs, session/driver pages, kernel stacks); "-mp <pid>" also includes one
+    process's user-mode memory; "-o <file>" writes memory.dmp to disk instead of launching the debugger. Identify the
+    mask, whether "-o" was present, and the destination path — an output file means a dump now exists on disk and is the
+    artifact to locate and preserve.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What process spawned LiveKD and is that parent chain expected?
+  context: The parent process reveals how the tool was invoked. Legitimate use is typically driven from an elevated,
+    interactive shell (cmd.exe or powershell.exe launched by a console host or explorer.exe). Parents such as a remote
+    shell, a service, a scripting host (wscript.exe, mshta.exe), or an Office application point to scripted or remote
+    operator activity rather than hands-on troubleshooting.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What child processes did LiveKD spawn afterward?
+  context: LiveKD wraps the Microsoft kernel debuggers, so a legitimate live-debug session normally spawns kd.exe or
+    windbg.exe. A child kd.exe/windbg.exe opening a dump with "-z", or compression/archival and copy/exfil tooling
+    spawned shortly after, indicates the dump is being processed or moved. Unexpected children point to post-dump
+    handling of the captured memory image.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Does this host normally run LiveKD?
+  context: A kernel-dumping tool that has never been seen on a host is more suspicious than one that runs on a routine
+    debugging cadence. Zero or very low historical counts indicate first-time or rare execution; a steady prior count
+    suggests this host is a known debugging or support endpoint.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: When this host has previously fired the rule's pattern, what parents and users normally drive that activity,
+    and does the current alert fit that pattern?
+  context: Even sanctioned tools get abused. This query mirrors the rule's selection (LiveKD image or original filename
+    AND the "-m" flag) scoped to this host, so the resulting parent/user distribution reflects how the rule's specific
+    firing pattern — not generic LiveKD usage — has historically run here. A new parent process, an unexpected user
+    account, or an unusual command-line structure is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \livekd.exe
+        - \livekd64.exe
+      - OriginalFileName: livekd.exe
+      selection_cli:
+        CommandLine|contains|windash: ' -m'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \livekd.exe
+        - \livekd64.exe
+      - OriginalFileName: livekd.exe
+      selection_cli:
+        CommandLine|contains|windash: ' -m'
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \livekd.exe
+        - \livekd64.exe
+      - OriginalFileName: livekd.exe
+      selection_cli:
+        CommandLine|contains|windash: ' -m'
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or staging on multiple endpoints. If the
+    same user ran similar tooling on other hosts in this window, the scope of the memory-collection activity may be larger
+    than this single dump.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \livekd.exe
+        - \livekd64.exe
+      - OriginalFileName: livekd.exe
+      selection_cli:
+        CommandLine|contains|windash: ' -m'
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the dump reveals the immediate context: what led
+    to this event, what happened after, and whether it is part of a larger sequence. Look for reconnaissance, privilege
+    escalation, archival of the dump, or staging for exfiltration.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Have other hosts fired the rule's pattern in the past week, and does the cross-host distribution look like
+    consistent automation or one-off activity?
+  context: This query mirrors the rule's selection (LiveKD image or original filename AND the "-m" flag) with no host
+    scope, so the result is a fleet-wide count of the rule's firing pattern rather than generic LiveKD usage. Many hosts
+    firing the same pattern points to scripted deployment or sanctioned debugging automation; one host or a small
+    unrelated set points to manual operator activity. Use the host distribution to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \livekd.exe
+        - \livekd64.exe
+      - OriginalFileName: livekd.exe
+      selection_cli:
+        CommandLine|contains|windash: ' -m'
+      condition: all of selection_*
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — defense tampering, reconnaissance, privilege escalation, or credential
+    access — may reveal the stages that preceded the memory dump and help reconstruct the timeline. A kernel dump is
+    frequently a collection step that follows privilege escalation.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

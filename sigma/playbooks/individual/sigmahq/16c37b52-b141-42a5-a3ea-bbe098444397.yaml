@@ -1,0 +1,310 @@
+name: Suspect Svchost Activity
+id: d6bd2f17-87cf-4e28-8d58-bfdfc3d48820
+description: |
+  Detects svchost.exe running with no command-line arguments. Legitimate svchost.exe is always launched by services.exe with a "-k <service group>" argument, so a bare svchost process with only its own image path on the command line is abnormal. The rule fires when the command line ends in "svchost.exe" and the image ends in \svchost.exe, AND the parent is not rpcnet.exe/rpcnetp.exe and the command line is not empty. This pattern is consistent with a process created in a suspended state for hollowing or remote-thread injection, where another process allocates memory in svchost and writes code into it. Investigation should determine which process created this svchost, whether memory/handle access or unusual DLL loads occurred against it, and whether the host shows surrounding injection or post-exploitation activity.
+type: detection
+detection_id: 16c37b52-b141-42a5-a3ea-bbe098444397
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- question: Did svchost.exe run with no service-group argument, and is its parent something other than rpcnet.exe/rpcnetp.exe?
+  context: Confirm the alert is a true positive. The rule fires when the image ends in \svchost.exe and the command line is just the image path with no "-k" service-group argument, AND the parent is not the lojack-style rpcnet.exe/rpcnetp.exe. Verify the exact command line and image path against these criteria before investing further.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Is this host expected to produce a svchost.exe process with no service-group argument?
+  context: Genuine svchost processes are spawned by services.exe with a "-k" argument identifying the service group. A bare svchost with no arguments is not part of normal Windows service startup on any host, so there is rarely a benign business explanation. Establish whether any local software or imaging process is known to produce this pattern before treating it as injection.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What process created this argument-less svchost, and is that parent expected to spawn svchost?
+  context: Legitimate svchost is created only by services.exe. Any other parent — explorer.exe, an Office application, a script host, a packer, or an unsigned binary — is the central anomaly, because injection-style creation of a suspended svchost is performed by the injecting process itself. Identify the parent and walk up its own parent chain to see what launched it.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What is the full creation context of this bare svchost — its image path, working directory, and integrity level?
+  context: The triggering event has no command-line payload to decode, so the operational meaning is in the surrounding fields. Confirm the image path is the genuine system32/syswow64 svchost and not a relocated copy, and review the working directory and any sibling svchost executions in the same window. A svchost created from a non-system path, or one with no inbound service-control activity, points away from normal service startup.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+      - ParentImage
+- question: Did a process on this host make the cross-process API calls consistent with writing code into and starting execution inside this bare svchost?
+  context: Process hollowing writes a payload into the target's memory and forces execution
+    there through calls such as writing into the target's address space, queueing an APC, or
+    installing a hook. Reviewing these behavioral API calls corroborates that code was actually
+    injected into this argument-less svchost rather than the process merely being created and
+    left suspended, and identifies the process that performed the write.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        event.dataset: endpoint.events.api
+        process.Ext.api.name:
+          - WriteProcessMemory
+          - QueueUserAPC
+          - SetWindowsHookEx
+      condition: selection
+    fields:
+      - process.executable
+      - process.Ext.api.name
+      - Image
+- question: Did this svchost load any DLLs from unexpected paths or any unsigned modules after creation?
+  context: Reflective or remote DLL injection loads code into the target that does not come from the normal service-DLL set under system32. Review modules loaded by this svchost for unusual paths (user-writable directories, temp, AppData), unsigned modules, or DLLs with no matching service registration. A bare svchost that goes on to load a non-system DLL is a strong follow-on signal for injection. If module-load telemetry is not ingested here, zero results is a visibility gap, not a clean result.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \svchost.exe
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+- question: What process activity clustered on this host in the minutes immediately around the svchost creation?
+  context: Injection unfolds as a short sequence — a parent allocates memory, writes the payload, and starts a thread in the target, often within seconds. Examining the tight window around the bare svchost creation surfaces the process that performed the allocation/write/thread steps and any tool that was running at the same moment. A narrow time correlation separates the injection actor from unrelated background activity.
+  range: +/-5m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: What child processes did this svchost spawn after creation?
+  context: A normally functioning svchost service host hosts service DLLs rather than spawning interactive children. Once code is injected, the target frequently spawns cmd.exe, powershell.exe, rundll32.exe, or other post-exploitation tooling. Unexpected children of this svchost reveal the actual impact of the injected code.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Has this host produced an argument-less svchost before, or is this a first-time occurrence?
+  context: A bare svchost with no service-group argument has no legitimate recurring cause, so historical counts should be near zero on a clean host. A first-time occurrence raises suspicion; a recurring pattern may point to a specific local software product that should be identified and confirmed benign.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: When this host has previously fired this rule's pattern, what parents and users drove it, and does the current alert fit that pattern?
+  context: The query mirrors the rule's selection structure scoped to this host, so the resulting parent/user distribution reflects how this specific firing pattern — bare svchost, no service-group argument — has historically run here. A new parent process or an unexpected user account relative to that history is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|endswith: svchost.exe
+        Image|endswith: \svchost.exe
+      filter:
+      - ParentImage|endswith:
+        - \rpcnet.exe
+        - \rpcnetp.exe
+      - CommandLine: null
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|endswith: svchost.exe
+        Image|endswith: \svchost.exe
+      filter:
+      - ParentImage|endswith:
+        - \rpcnet.exe
+        - \rpcnetp.exe
+      - CommandLine: null
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|endswith: svchost.exe
+        Image|endswith: \svchost.exe
+      filter:
+      - ParentImage|endswith:
+        - \rpcnet.exe
+        - \rpcnetp.exe
+      - CommandLine: null
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around the time of this alert?
+  context: Tracking the user's activity across all hosts reveals lateral movement or parallel activity on multiple endpoints. If the same user is associated with similar activity on other hosts in this window, the scope may be larger than a single host. Under a service principal this returns agent-telemetry noise — use the parent+binary cross-host view instead.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|endswith: svchost.exe
+        Image|endswith: \svchost.exe
+      filter:
+      - ParentImage|endswith:
+        - \rpcnet.exe
+        - \rpcnetp.exe
+      - CommandLine: null
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate context: what led to this event, what happened after, and whether it is part of a larger sequence. Look for reconnaissance, privilege escalation, or persistence mechanisms surrounding the svchost creation.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — defense tampering, reconnaissance, credential access — may reveal the stages that preceded this event and help reconstruct the timeline. Injection into a system process is frequently a mid-chain step rather than the initial access.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

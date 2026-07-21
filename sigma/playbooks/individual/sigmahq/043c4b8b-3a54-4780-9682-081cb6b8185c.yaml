@@ -1,0 +1,418 @@
+name: Suspicious IIS Module Registration
+id: fd93db7d-4c18-4b04-8c12-29fe6f0caf94
+description: |
+  Detects the IIS worker process w3wp.exe spawning a child that registers a new IIS
+  module, where the child command line EITHER contains 'appcmd.exe add module', OR
+  is powershell.exe running 'system.enterpriseservices.internal.publish', OR runs
+  gacutil with '/I'. Registering a managed or native module is a legitimate
+  administrative action when an application is being deployed or updated, but the
+  same operation lets an operator install a passive backdoor that loads into the
+  worker process on every HTTP request and persists across IIS restarts and OS
+  updates. The investigation should determine which registration branch fired, what
+  module and DLL were registered, whether a configuration change and a corresponding
+  module load followed, and whether the worker process spawning a registration tool
+  is expected on this server.
+type: detection
+detection_id: 043c4b8b-3a54-4780-9682-081cb6b8185c
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-04
+questions:
+- question: Does the alerting child of w3wp.exe match one of the IIS module registration patterns this rule detects?
+  context: >-
+    Before investing investigation time, confirm the alert is a true positive. The
+    rule fires when w3wp.exe is the parent AND the child command line matches at
+    least ONE branch: it contains 'appcmd.exe add module', OR it is powershell.exe
+    running 'system.enterpriseservices.internal.publish', OR it runs gacutil with
+    '/I'. Note which branch fired — it determines what module or assembly was
+    registered and which downstream evidence (config change, DLL load) is worth
+    chasing. Confirm ParentImage is w3wp.exe and read the full command line.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Is this user and host expected to register IIS modules?
+  context: >-
+    Legitimate application deployment registers IIS modules, but normally from a
+    deployment pipeline, an admin session, or a maintenance window — not from the
+    web worker process under the application-pool identity. Knowing whether this
+    server is an IIS host under active deployment and whether this account performs
+    module registration is often the fastest way to separate a routine deployment
+    from operator persistence.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Is w3wp.exe expected to spawn a registration tool here, and what started w3wp.exe itself?
+  context: >-
+    The w3wp.exe parent is the core signal. The worker process spawning appcmd,
+    powershell, or gacutil means a registration command ran inside the IIS request
+    pipeline rather than from an administrative context. Tracing the worker's own
+    origin and command line shows which application pool and site it serves, which
+    helps decide whether a deployment legitimately drives registration from the
+    worker or whether an HTTP request reached code execution and pivoted to
+    persistence.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What module, assembly, and DLL did the registration command install? Decode the full command line.
+  context: >-
+    The full command line names what was registered. For 'appcmd add module', read
+    the module name and the image DLL path it points at. For the
+    system.enterpriseservices.internal.publish branch, identify the assembly being
+    published into the GAC. For gacutil '/I', read the assembly path being
+    installed. A DLL or assembly path under a webroot directory such as
+    inetpub\wwwroot\bin or App_Bin, or any non-Microsoft signed DLL, is the artifact
+    to pivot on. This query scopes to registration commands on this host within a
+    tight window so a multi-step deployment is visible as one operation rather than
+    a single line.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_register:
+        CommandLine|contains:
+          - 'appcmd.exe add module'
+          - ' system.enterpriseservices.internal.publish'
+          - 'gacutil'
+      condition: selection and selection_register
+    fields:
+      - CommandLine
+      - Image
+      - CurrentDirectory
+- question: What HTTP request or site activity drove the worker process to run a registration command?
+  context: >-
+    When the IIS worker process reaches code execution, the trigger is usually an
+    inbound HTTP request against a vulnerable application or an exposed management
+    surface rather than email or a document. Identify the application pool, site,
+    and the request that preceded the spawn so the entry point can be patched and
+    other servers running the same application can be checked. The worker's command
+    line and parent context point at which site and pool to pull web access logs
+    for.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+- question: What other child processes did this same w3wp.exe worker spawn around the alert?
+  context: >-
+    If the worker process reached code execution, the registration command is rarely
+    the only thing it ran. Other children of the same worker instance may include
+    reconnaissance, credential access, or a download that staged the module DLL.
+    Multiple distinct children from the same worker strongly suggests interactive
+    operator activity rather than a scripted deployment.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Was applicationHost.config modified or a DLL dropped to a webroot or inetsrv path around this time?
+  context: >-
+    Module registration ultimately writes a new entry into applicationHost.config
+    under modules or globalModules, and the referenced DLL is typically dropped into
+    a writable path first. File events on
+    C:\Windows\System32\inetsrv\config\applicationHost.config, on the inetsrv
+    directory, or on webroot bin directories such as inetpub\wwwroot\bin and
+    App_Bin corroborate that a module was actually installed rather than the command
+    failing. A new add element referencing an unfamiliar DLL path is the persistence
+    artifact.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_paths:
+        TargetFilename|contains:
+          - '\inetsrv\config\applicationHost.config'
+          - '\inetsrv\'
+          - '\inetpub\wwwroot\bin\'
+          - '\App_Bin\'
+      condition: selection and selection_paths
+    fields:
+      - TargetFilename
+      - Image
+- question: Did w3wp.exe load a newly registered or unsigned DLL from a webroot path after the registration?
+  context: >-
+    A registered module only becomes a working backdoor once the worker process
+    loads it, so the canonical post-installation indicator is w3wp.exe loading a DLL
+    from a webroot subdirectory such as inetpub\wwwroot\bin or App_Bin, or loading a
+    non-Microsoft signed DLL from any inetsrv path. Correlating a module-load event
+    on the worker with the registration command confirms the module is live in the
+    request pipeline. If image-load telemetry is not collected in this environment,
+    treat zero results as a visibility gap rather than evidence that no module
+    loaded.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: '\w3wp.exe'
+      selection_paths:
+        ImageLoaded|contains:
+          - '\inetpub\wwwroot\bin\'
+          - '\App_Bin\'
+          - '\inetsrv\'
+      condition: selection and selection_paths
+    fields:
+      - ImageLoaded
+      - Image
+- question: If the powershell.exe publish branch fired, was the command encoded or obfuscated, and what does it decode to?
+  context: >-
+    The system.enterpriseservices.internal.publish branch runs through
+    powershell.exe, which is frequently wrapped in -EncodedCommand, string
+    concatenation, or backtick escaping to hide what assembly is being published.
+    Decode any base64 or obfuscated content to recover the real assembly path and
+    publish call. If this branch did not fire, the registration ran through appcmd
+    or gacutil and the command line is already readable.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did PowerShell script block logging capture the full publish script content?
+  context: >-
+    Script block logging records the deobfuscated script content PowerShell actually
+    executed, even when the command line is encoded. For the publish branch this is
+    ground truth about the assembly being registered and any surrounding logic. If
+    PowerShell operational logs are not ingested in this environment, treat the
+    absence of results as a visibility gap rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent:
+        ParentImage|endswith: \w3wp.exe
+      selection_cli_1:
+        CommandLine|contains: appcmd.exe add module
+      selection_cli_2:
+        CommandLine|contains: ' system.enterpriseservices.internal.publish'
+        Image|endswith: \powershell.exe
+      selection_cli_3:
+        CommandLine|contains|all:
+        - gacutil
+        - ' /I'
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection_parent and 1 of selection_cli_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent:
+        ParentImage|endswith: \w3wp.exe
+      selection_cli_1:
+        CommandLine|contains: appcmd.exe add module
+      selection_cli_2:
+        CommandLine|contains: ' system.enterpriseservices.internal.publish'
+        Image|endswith: \powershell.exe
+      selection_cli_3:
+        CommandLine|contains|all:
+        - gacutil
+        - ' /I'
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection_parent and 1 of selection_cli_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user account do across the environment around the time of the alert?
+  context: >-
+    Tracking the account's activity across hosts in the alert window reveals whether
+    the registration is isolated or part of broader activity, such as the same
+    account touching other IIS servers. If multiple hosts show related activity from
+    this account, the scope of the operation is larger than one server.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent:
+        ParentImage|endswith: \w3wp.exe
+      selection_cli_1:
+        CommandLine|contains: appcmd.exe add module
+      selection_cli_2:
+        CommandLine|contains: ' system.enterpriseservices.internal.publish'
+        Image|endswith: \powershell.exe
+      selection_cli_3:
+        CommandLine|contains|all:
+        - gacutil
+        - ' /I'
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection_parent and 1 of selection_cli_*) and _pb_scope
+    fields:
+    - host.name
+- question: Were other process-based persistence mechanisms installed on this server around the same time?
+  context: >-
+    Operators rarely rely on a single foothold. After registering an IIS module,
+    they commonly stack backup persistence using scheduled tasks, services, registry
+    Run keys, BITS jobs, or WMI. Multiple persistence installations in the same
+    timeframe indicate intentional stacking rather than an isolated deployment
+    action.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- question: Did other detections fire on this server in the hours before this alert?
+  context: >-
+    Persistence rarely happens in isolation. Earlier detections on the same
+    server — web exploitation, reconnaissance, or credential access — may reveal the
+    stages that preceded the module registration and help reconstruct when the
+    server was first reached.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

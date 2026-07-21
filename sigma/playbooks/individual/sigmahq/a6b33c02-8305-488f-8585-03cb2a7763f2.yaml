@@ -1,0 +1,373 @@
+name: Windows Credential Editor Registry
+id: 239d9ca8-06d5-4df3-a865-bc57613f56db
+description: |
+  Detects a registry write under Services\WCESERVICE\Start, the service key created when Windows Credential
+  Editor (WCE) is run in service mode. WCE is a credential-dumping tool that reads and injects Windows
+  logon credentials - it can extract plaintext passwords, NTLM hashes, and Kerberos tickets from LSASS
+  memory and perform pass-the-hash. The presence of its service registry key means the tool was installed
+  and almost certainly executed on the host, so treat this as active credential theft unless an authorized
+  engagement explains it. Investigation should identify the process that wrote the key and what launched it,
+  confirm LSASS was accessed, check for the tool's output files on disk, assess which accounts are exposed,
+  and look for subsequent credential reuse and lateral movement.
+type: detection
+detection_id: a6b33c02-8305-488f-8585-03cb2a7763f2
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-10
+questions:
+- question: Does the alerting registry write target the WCESERVICE service key?
+  context: >-
+    Before investing investigation time, confirm the alert is a true positive. The rule fires when a value
+    whose path contains Services\WCESERVICE\Start is written - the service registration created when Windows
+    Credential Editor runs in service mode. Review the exact TargetObject on the triggering event to confirm
+    it is the WCESERVICE key. This service name is specific to the tool and has no legitimate use, so a
+    genuine match indicates the credential-dumping tool was installed on the host.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this user and host expected to install a service like this?
+  context: >-
+    A WCESERVICE registration should never occur through normal administration. Knowing whether the writing
+    account and host function match any sanctioned change - a security team running a sanctioned tool, a
+    red-team exercise - is the fastest way to separate testing from a live credential dump. User attribution
+    is present on roughly 94% of endpoint registry events; when it is a machine account or SYSTEM, judge by
+    the writing process and host role instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: What was written to the WCESERVICE key, and why is this key a credential-dumping indicator?
+  context: >-
+    The key HKLM\SYSTEM\CurrentControlSet\Services\WCESERVICE holds the service registration that Windows
+    Credential Editor creates when run in service mode to acquire the privileges it needs to read LSASS.
+    Confirming the exact path and the Start / ImagePath values establishes that this is the WCE service
+    rather than an unrelated service edit, and points to where the tool binary lives on disk. The presence
+    of the key is itself the indicator - the service is a means for the tool to run with the rights to
+    extract credentials.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: What service configuration and binary path were registered for WCESERVICE?
+  context: >-
+    The Details on the WCESERVICE values reveal how the service was configured - the Start type (whether it
+    runs automatically or on demand) and, on the ImagePath value, the path to the WCE binary. Decode these:
+    the ImagePath points at the tool on disk, which becomes a lead for hashing the binary and confirming
+    execution, and the Start type indicates whether the tool was set to persist across reboots or run once.
+    Details is present on roughly 79% of registry modifications and should be populated for these string
+    values.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- question: What process wrote the WCESERVICE key, and what launched that process?
+  context: >-
+    The registry event carries no command line, so pivot by ProcessGuid to the writing process to read its
+    Image, full command, and parent lineage. WCE writes its own service key when executed, so the writing
+    process is typically the tool binary itself or a renamed copy; its command line often carries the tool's
+    switches, and its parent chain shows whether it was launched interactively from a shell or programmatically
+    by a script host or another tool. An Office application, script host, or unsigned binary in the parent
+    chain points to a scripted intrusion.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: Was LSASS memory accessed to extract credentials, and by what method?
+  context: >-
+    Windows Credential Editor reads and writes LSASS memory to extract logon sessions' plaintext passwords,
+    NTLM hashes, and Kerberos tickets, and to inject credentials for pass-the-hash. The targeted credential
+    store is therefore LSASS memory, which holds material for every account with a session on the host. Note
+    a telemetry limit: the cross-process handle access and memory read/write against lsass that the tool
+    performs are not captured as events in this environment, so the service key, the tool binary, and its
+    output files are the evidence that the credential operation occurred rather than a handle-open record.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did the WCE binary or its service write credential-output files on this host?
+  context: >-
+    Windows Credential Editor writes the credentials it harvests to disk - by default to files such as
+    wceaux.dll (the DLL it injects into LSASS) and text output of dumped hashes and passwords. Searching for
+    files created by the writing process and its service around the alert surfaces where the harvested
+    credentials landed, which is both direct confirmation the dump ran and the material an attacker would
+    exfiltrate. Correlate file writes by the tool's process lineage rather than by a fixed path, since the
+    output location is operator-controlled.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+- question: Which accounts may be compromised, and do any have elevated privileges?
+  context: >-
+    The severity depends on which accounts had sessions on the host when the tool ran. Domain admin,
+    enterprise admin, or broad service-account credentials extracted here require incident escalation and
+    password resets, while a single standard user is a narrower exposure. Cross-reference the accounts active
+    on this host - the logged-on user, service accounts, and any admin who authenticated recently - against
+    directory group memberships to scope the reset.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Were outbound remote-access connections (RDP, SMB, WinRM, SSH) initiated from this host after the service was registered?
+  context: >-
+    Credential theft is followed by reuse of the stolen credentials. The query returns outbound connections
+    from this host to remote-access ports - 3389 (RDP), 445 (SMB/PsExec), 5985/5986 (WinRM), 22 (SSH) - in
+    the hours after the WCESERVICE key was written, with the originating process and user for each. WCE also
+    supports pass-the-hash, so movement may use extracted hashes directly. Two limits: credentials replayed
+    from another machine will not appear here, so also review successful logons for the affected accounts on
+    suspected targets, and if network telemetry is not collected treat zero rows as a visibility gap.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
+- question: Did the WCESERVICE service start or the WCE binary execute after the key was written?
+  context: >-
+    Registering the service is the setup step; the credential dump happens when the service starts or the
+    tool binary runs. Listing process activity on this host after the write - the WCE binary named on the
+    ImagePath value, services.exe starting the service, or the tool binary executing - shows whether the
+    dump actually ran. Execution of the registered binary shortly after the key write ties the service
+    registration to an active credential-extraction attempt.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: '\services.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - User
+- question: After this write, was the WCESERVICE key modified again or the service reconfigured?
+  context: >-
+    Registry key or value deletions are not observable in this telemetry, so durability is judged from the
+    key's re-modification history rather than from a delete event. Operators frequently remove the service
+    registration after the dump completes to cover their tracks: a later write that reconfigures or blanks
+    the key suggests cleanup, while the key remaining in place leaves the tool installed and able to run
+    again. Compare the values written to the key over the following window.
+  range: +24h
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - Details
+      - Image
+- question: Has the WCESERVICE key been modified before on this host?
+  context: >-
+    This service key should never appear through normal operation, so a history with no prior writes makes
+    this a first-time event and raises its weight. A prior history of the same key being written and removed
+    would itself indicate repeated use of the tool on this host. Compare the historical writes to see whether
+    this is the first time the WCE service has been registered here.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - Details
+      - Image
+- question: Was the WCESERVICE key registered on other hosts in the environment?
+  context: >-
+    The same service registration across many hosts indicates the tool was run broadly - a credential-harvest
+    sweep across the estate - while a single host suggests a targeted operation. Compare the key writes
+    across hosts to see how many are affected and whether the writing process is consistent, which separates
+    a single hands-on operation from repeated use of the tool across the environment and sizes the credential
+    exposure.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+      - Details
+- question: What other registry modifications were made on this host in the same window?
+  context: >-
+    An actor who runs a credential dumper often makes other configuration changes in the same session -
+    disabling LSA protection or WDigest to enrich the dump, installing other services, or adding persistence
+    keys. Clustering the registry writes on this host in a short window around the alert reveals the full
+    scope of changes and which process made them. The WCESERVICE key appears in the results; the signal is
+    what else was modified and by which process.
+  range: +/-30m
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - User
+- question: What other process activity occurred on this host around the time of the alert?
+  context: >-
+    Credential dumping sits in the middle of an intrusion, so the surrounding process activity often shows
+    how the actor arrived and what they did next. Aggregating process creations in a tight window around the
+    alert collapses routine agent telemetry into high-count rows while novel parent-child pairs stand out at
+    low counts - reconnaissance commands, a script host launching the tool, or archiving utilities are the
+    kind of low-count neighbors that reveal the wider operation.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before the alert?
+  context: >-
+    Credential dumping is usually reached after initial access and often after defense tampering or
+    reconnaissance. Earlier detections on the same host - execution of scripting tools, disabling of
+    protections, or discovery commands - help reconstruct the stages that led here and place the credential
+    theft within the larger sequence.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

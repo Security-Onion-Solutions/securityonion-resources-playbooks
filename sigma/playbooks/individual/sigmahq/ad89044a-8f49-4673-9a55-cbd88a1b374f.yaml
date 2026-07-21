@@ -1,0 +1,383 @@
+name: Enabling COR Profiler Environment Variables
+id: 12e505a7-43ad-4993-b60d-b36fd8531eec
+description: |
+  Detects a registry write that sets one of the .NET profiler environment variables the CLR uses
+  to load a profiling DLL into a managed process. The rule fires when a value name ends in
+  COR_ENABLE_PROFILING, COR_PROFILER, or CORECLR_ENABLE_PROFILING, OR when a value name contains
+  CORECLR_PROFILER_PATH. Setting the enable flag to 1 together with a COR_PROFILER CLSID — and
+  either a CORECLR_PROFILER_PATH pointing at a DLL, or a COM registration under HKEY_CLASSES_ROOT
+  that resolves the CLSID to a DLL — causes the .NET runtime to load and run that DLL inside every
+  managed process the variable applies to, which gives an actor both execution hijack and
+  persistence. Legitimate profiling, code-coverage, and application-performance-monitoring tools use
+  the same variables, so the investigation should establish which variable was set, what CLSID or
+  DLL path it references, whether that DLL is signed and in an expected location, whether a managed
+  process actually loaded it, and whether the configuration was approved.
+type: detection
+detection_id: ad89044a-8f49-4673-9a55-cbd88a1b374f
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-10
+questions:
+- question: Does the alerting registry write set one of the .NET COR_PROFILER variables, either a profiling-enable or profiler-GUID value or a profiler-DLL-path value?
+  context: >-
+    Before investing investigation time, confirm the alert is a true positive. The rule fires on a
+    disjunction: EITHER a value name ending in COR_ENABLE_PROFILING, COR_PROFILER, or
+    CORECLR_ENABLE_PROFILING (the profiling-enable flag or the profiler CLSID), OR a value name
+    containing CORECLR_PROFILER_PATH (the profiler DLL path). Review the exact TargetObject to
+    confirm which variable was set, and note which branch fired: a CORECLR_PROFILER_PATH write hands
+    the DLL path directly, so file-path and DLL-load follow-up is load-bearing, while an enable/CLSID
+    write resolves its DLL through a COM registration and points the analyst at the matching CLSID
+    entry instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this user and host expected to configure .NET profiling for a managed application?
+  context: >-
+    The COR_PROFILER variables are set legitimately by developers, code-coverage runs, and
+    application-performance-monitoring agents, but only on hosts and under accounts where such tooling
+    is deployed. Knowing whether the writing account and host function match a sanctioned profiling
+    setup is often the fastest way to separate an approved profiler rollout from an execution hijack.
+    User attribution is present on roughly 94% of endpoint registry events; when it is a machine
+    account or missing, pivot on the writing process instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Which COR_PROFILER variable was set, and why is this registry location an execution-hijack primitive?
+  context: >-
+    The value name and its hive determine the blast radius. A variable placed under an Environment key
+    (for example HKCU\Environment) becomes a persistent environment variable inherited by every
+    managed process that account launches; a per-application location narrows the effect to one target.
+    The three enable/GUID names arm profiling and name the COM profiler to load, while
+    CORECLR_PROFILER_PATH supplies the DLL directly. Confirming the exact key and the writing process
+    establishes that this is a COR_PROFILER configuration rather than an unrelated Environment edit and
+    sets up decoding the value.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: What CLSID or DLL path does the profiler value contain, and where does that DLL live?
+  context: >-
+    Decode the value data. A COR_PROFILER value holds a CLSID GUID that the runtime resolves to a DLL
+    through a COM registration under HKEY_CLASSES_ROOT; a CORECLR_PROFILER_PATH value holds the DLL
+    path directly; an enable value is typically the flag 1. The DLL path is the pivot that matters — a
+    path in a user-writable location such as Temp, AppData, ProgramData, or a Public directory, or a
+    freshly created DLL, is the injection payload. Details is present on roughly 79% of registry
+    modifications and should be populated for these string values.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- question: What process wrote the profiler variable, and what launched that process?
+  context: >-
+    The registry event carries no command line, so pivot by ProcessGuid to the writing process to read
+    its Image, full command, and parent. A setx.exe, reg.exe, powershell.exe, or cmd.exe write launched
+    from an Office application, a script host such as wscript.exe or mshta.exe, or an unsigned binary
+    points to the variable being staged programmatically rather than through a deliberate developer or
+    administrator action. The parent chain distinguishes an automated hijack from an interactive
+    tooling change.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: After the profiler variable was set, what unsigned DLLs were loaded into processes on this host?
+  context: >-
+    The technique completes when a managed process starts and the CLR loads the configured profiler DLL
+    into it as unmanaged code. A malicious profiler DLL is typically unsigned and staged in a
+    user-writable path, whereas legitimate profiling and application-performance-monitoring components
+    are vendor-signed and installed under known program directories. Scanning the unsigned DLL loads on
+    this host in the window after the write surfaces the profiler DLL loading into .NET runtime hosts;
+    compare the loaded paths against the DLL path or CLSID from the registry value and against the set
+    of profilers expected in this environment. The interval between the registry write and the DLL load
+    is the correlation the analyst is confirming.
+  range: +4h
+  query: |
+    aggregation: true
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Signed: 'false'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Image
+      - SignatureStatus
+- question: Was the profiler DLL written to disk by the process that set the variable or its children?
+  context: >-
+    The profiler configuration only executes code if the referenced DLL exists at the resolved path.
+    Correlating file activity by the registry-writing process and its children reveals whether that DLL
+    was dropped in the same session, and where. The file-write event carries no hash; if the DLL is
+    present, hash it from a later load or execution for a reputation lookup. A configuration that names
+    a DLL which was never written to disk is either inert or points at a DLL staged earlier or by a
+    separate process.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Has this profiler variable been set on this host before?
+  context: >-
+    The COR_PROFILER variables rarely change outside development or monitoring hosts, so a history with
+    no prior writes makes this a first-time change and raises its weight. A history of periodic writes
+    setting the same CLSID or DLL path points instead to an installed profiler or a management process.
+    Compare the historical Details values to see whether the same value was set before or whether this
+    is new.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - Details
+      - Image
+- question: Does the profiler configuration persist, or was the value changed again afterward?
+  context: >-
+    Registry key or value deletions are not observable in this telemetry, so durability is judged from
+    the value's re-modification history rather than from a delete event. A configuration that remains in
+    place leaves the profiler primed to load into every managed process the variable applies to; a later
+    write that clears or overwrites the value suggests the setup was temporary or was reverted to reduce
+    exposure. Compare the Details values written over the following window to establish whether the
+    configuration is still active.
+  range: +24h
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - Details
+      - Image
+- question: Was the same profiler variable set on other hosts in the environment?
+  context: >-
+    The same write across many hosts suggests a broad tool run, a management deployment, or a
+    monitoring-agent rollout; the same write confined to one host suggests a targeted hijack. Compare
+    the Details values across hosts to see whether they all set the same CLSID or DLL path and whether
+    the writing process is consistent, which separates a fleet-wide profiler deployment from repeated
+    hands-on use of the technique.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+      - Details
+- question: What other registry modifications were made on this host in the same window?
+  context: >-
+    Arming COR_PROFILER through a CLSID often requires a companion registration: the same session
+    frequently writes an InprocServer32 entry under HKEY_CLASSES_ROOT\CLSID that maps the profiler
+    GUID to its DLL, and may also set the enable flag and the path in separate writes. Clustering the
+    registry modifications on this host around the alert reveals the full setup and which process made
+    it. The triggering key appears in the results; the signal is what else was modified and by which
+    process.
+  range: +/-30m
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - User
+- question: What other process activity occurred on this host around the time of the alert?
+  context: >-
+    Alerts rarely occur in isolation. Aggregating process activity in a tight window around the alert
+    surfaces what led up to the profiler configuration and what ran immediately after it. Novel
+    parent-child pairs stand out at low counts against high-count routine telemetry, which is what
+    points to the tool that set the variable and any follow-on actions once a managed process loaded
+    the profiler.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host — reconnaissance, execution of scripting tools, or defense
+    tampering — may reveal the stages that preceded this change and help reconstruct the timeline.
+    Configuring a profiler for injection is usually a means to run privileged or stealthy follow-on
+    code, so prior alerts help place this write within a larger sequence.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Were other process-based persistence mechanisms installed on this host in the same window?
+  context: >-
+    A profiler configuration is one persistence and execution-hijack primitive; actors rarely rely on a
+    single mechanism. Scheduled tasks, services, registry Run keys, BITS jobs, or WMI subscriptions
+    created by schtasks.exe, sc.exe, reg.exe, bitsadmin.exe, or wmic.exe near the profiler write indicate
+    the foothold was stacked with additional persistence rather than being an isolated change.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- question: Was there a change ticket, maintenance window, or documented approval for enabling .NET profiling on this host?
+  context: >-
+    Profiler and application-performance-monitoring rollouts are usually deployed through managed
+    tooling and recorded in change control. A corresponding ticket or maintenance window suggests an
+    authorized profiling setup; absence of one where policy requires it suggests the variable was set
+    outside sanctioned processes and moves the alert toward a hijack.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Does the user or an administrator recall enabling .NET profiling on this host?
+  context: >-
+    Direct confirmation from the account owner or the team responsible for the host is often the fastest
+    way to resolve the alert. If a developer or a monitoring team enabled profiling for a known
+    application, that closes it; if no one recalls the action, the account may be compromised or the
+    variable was set by automated tooling, and the investigation should continue into the writing process
+    and any DLL that was loaded.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine

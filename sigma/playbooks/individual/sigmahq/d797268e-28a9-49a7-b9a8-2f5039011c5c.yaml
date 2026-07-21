@@ -1,0 +1,359 @@
+name: Bypass UAC via WSReset.exe
+id: 7c293875-fe32-4b9e-8b9b-5c301f18d67f
+description: |
+  Detects a child process spawned by the auto-elevated system binary wsreset.exe
+  where that child is anything other than conhost.exe. wsreset.exe runs at high
+  integrity without a UAC prompt and reads a command from
+  HKCU\Software\Classes\AppX82a6gwre4fdg3bt635tn5ctqjf8msdd2\Shell\open\command on
+  startup; planting a payload in that key makes wsreset launch arbitrary code at high
+  integrity, so any non-conhost child is the elevated payload. The investigation should
+  confirm the child binary and command, identify the registry write that set up the
+  bypass, and determine what action the elevated child performed.
+type: detection
+detection_id: d797268e-28a9-49a7-b9a8-2f5039011c5c
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-09
+questions:
+- question: Is the alerting process a child of wsreset.exe whose image is something other than conhost.exe?
+  context: The rule fires when wsreset.exe is the parent and the child is anything except
+    conhost.exe (conhost is the legitimate console host wsreset spawns and is filtered out).
+    Confirm the parent image is wsreset.exe and identify the child binary and its full
+    command line. Any non-conhost child of wsreset is the payload executing at high
+    integrity and establishes the true/false positive call.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+- question: Is this user and host expected to run wsreset.exe and spawn this child binary?
+  context: wsreset.exe legitimately resets Windows Store state and normally launches only
+    conhost.exe. A different child is rarely part of routine use. Knowing whether the
+    account is a local administrator and whether the host's role involves Store
+    troubleshooting helps separate a true positive from sanctioned activity.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What did the child process do? Decode its full command line and working directory.
+  context: The child spawned by wsreset.exe is the payload that runs at high integrity, so
+    its command line and working directory reveal the operator's action — a downloader, a
+    shell, a persistence write, or a credential-access tool. Decode any flags, encoded
+    content, file paths, or URLs. This query returns every execution of the same binary on
+    the host in the surrounding window, which captures multi-step operations that span
+    sequential invocations.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What launched wsreset.exe itself, and what was its command line?
+  context: wsreset.exe is the auto-elevated parent, but it does not start on its own — a
+    user action or a script invokes it to trigger the bypass. Retrieving the wsreset.exe
+    process event shows its own parent and command line, distinguishing an interactive user
+    opening Store troubleshooting from a loader or script that launched wsreset to elevate.
+    The long lookback is intentional because the launching process may have started well
+    before the alert.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- question: What action was performed with elevated privileges after the bypass?
+  context: UAC bypass is a means to an end — operators elevate to install persistence, dump
+    credentials, tamper with security tools, or reach protected resources. Examine processes
+    running at High or System integrity shortly after the bypass; the detection analytics
+    call for correlating the elevation with follow-on activity within a tight window
+    (roughly 30 seconds is a common tuning) to separate the operator's objective from
+    unrelated admin work.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        IntegrityLevel:
+          - 'High'
+          - 'System'
+          - 'S-1-16-16384'
+          - 'S-1-16-12288'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - IntegrityLevel
+- question: Were registry modifications made through reg.exe, cmd, or PowerShell to set up this UAC bypass?
+  context: The wsreset bypass works by writing a payload command into
+    HKCU\Software\Classes\AppX82a6gwre4fdg3bt635tn5ctqjf8msdd2\Shell\open\command, which
+    wsreset.exe reads and executes at high integrity. Sibling auto-elevate proxies
+    (sdclt.exe, eventvwr.exe, computerdefaults.exe, fodhelper.exe) key on similar
+    shell\open\command and DelegateExecute handlers. Finding the write in the minutes before
+    the elevation confirms the mechanism and reveals the exact payload run at high integrity.
+  range: -15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\reg.exe'
+          - '\powershell.exe'
+          - '\cmd.exe'
+        CommandLine|contains:
+          - 'ms-settings'
+          - 'mscfile'
+          - 'Classes\exefile'
+          - 'Classes\Folder'
+          - 'Environment'
+          - 'Shell\Open\command'
+          - 'DelegateExecute'
+      condition: selection
+    fields:
+      - CommandLine
+      - Image
+- question: Did a registry-set event write the wsreset AppX shell-handler key on this host?
+  context: When the bypass key is written programmatically (PowerShell .NET calls,
+    IFileOperation COM) rather than through reg.exe, the process-creation view misses it. A
+    registry-set event records the write directly. Look for writes to the wsreset AppX
+    open-command handler and to other shell\open\command and DelegateExecute handlers that
+    auto-elevated binaries read, written shortly before the elevation fired.
+  range: -15m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains:
+          - 'AppX82a6gwre4fdg3bt635tn5ctqjf8msdd2\Shell\open\command'
+          - 'Shell\open\command'
+          - 'Shell\Open\command'
+          - 'DelegateExecute'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+- question: Were other privilege-escalation or UAC-bypass detections raised on this host around the same time?
+  context: Operators who try one UAC bypass often try several until one works, especially
+    when the OS version blocks a given technique. Multiple bypass or escalation alerts in
+    rapid succession from the same host or user confirms deliberate privilege-escalation
+    activity rather than a one-off false positive.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - rule.name
+      - rule.uuid
+      - event.severity_label
+- question: What other child processes did wsreset.exe spawn around this time?
+  context: A single wsreset invocation can launch more than one payload. Seeing every child
+    of wsreset.exe on this host reveals whether the operator chained reconnaissance,
+    credential access, or persistence through the one elevated parent, or whether this was
+    an isolated spawn.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Does wsreset.exe normally spawn this child binary on this host?
+  context: wsreset.exe spawning conhost.exe is routine; wsreset.exe spawning any other
+    binary is the deviation this rule keys on. Historical frequency of this specific
+    parent-child pairing distinguishes routine Store maintenance from an anomalous elevation
+    path. Zero or very low counts indicate a novel spawning relationship worth chasing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Does this host normally run the child binary?
+  context: A binary that has never executed on a host is more suspicious than one that runs
+    regularly. The payload launched through wsreset may be a common interpreter or a
+    rarely-seen tool; zero or very low historical counts indicate first-time or rare
+    execution and raise the priority of the finding.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \wsreset.exe
+      filter:
+      - Image|endswith: \conhost.exe
+      - OriginalFileName: CONHOST.EXE
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \wsreset.exe
+      filter:
+      - Image|endswith: \conhost.exe
+      - OriginalFileName: CONHOST.EXE
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the environment around this time?
+  context: Tracking the account's activity across all hosts in the surrounding window
+    reveals lateral movement or coordinated activity on multiple endpoints. If the same user
+    triggered similar elevation activity elsewhere, the scope is larger than this one host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \wsreset.exe
+      filter:
+      - Image|endswith: \conhost.exe
+      - OriginalFileName: CONHOST.EXE
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Surveying activity around the alert reveals
+    what led to the elevation and what followed — reconnaissance, persistence, or further
+    escalation. Aggregating by process and parent collapses repetitive agent telemetry into
+    high-count rows while novel parent-child pairs stand out at low counts.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage

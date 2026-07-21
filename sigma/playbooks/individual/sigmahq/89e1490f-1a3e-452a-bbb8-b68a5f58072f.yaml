@@ -1,0 +1,491 @@
+name: Injected Browser Process Spawning Rundll32 - GuLoader Activity
+id: 43a96ea1-ae63-4b1f-8da5-4702240d3397
+description: |
+  Detects a browser process (chrome.exe, firefox.exe, or msedge.exe) spawning rundll32.exe whose
+  command line ends at the binary name itself — that is, rundll32 launched with no DLL and no
+  export argument. All three conditions must hold together for the rule to fire. Browsers do not
+  launch rundll32 as part of normal operation, and rundll32 without arguments loads nothing of its
+  own: the pairing implies code was written into the browser's address space and is now using a
+  signed system binary as an execution host, with the payload supplied in memory rather than on the
+  command line. GuLoader-style loaders use exactly this arrangement to stage network retrieval of a
+  follow-on payload from inside a process that already has outbound network access. Determine
+  whether the browser process was injected, what the argument-less rundll32 did after it started,
+  and whether the same parent-driven pattern appears on other hosts.
+type: detection
+detection_id: 89e1490f-1a3e-452a-bbb8-b68a5f58072f
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-17
+questions:
+- question: >-
+    Does the alerting event show a browser parent spawning rundll32.exe with no DLL or export
+    argument on its command line?
+  context: >-
+    The rule requires all three conditions at once — a ParentImage ending in chrome.exe, firefox.exe,
+    or msedge.exe, an Image ending in rundll32.exe, and a CommandLine that ends at rundll32.exe with
+    nothing after it. Confirm each before investing further time; a rundll32 command line carrying a
+    DLL path and an export name would not have fired this rule, and an argument-less launch is what
+    distinguishes an execution host from ordinary rundll32 use.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+  answer_sources:
+  - alert
+  - process_creation
+- question: Is this user and host expected to run a browser that launches system binaries?
+  context: >-
+    Browsers spawn a narrow and well-known set of children — their own helper and renderer processes,
+    a crash handler, and occasionally the default handler for a downloaded file. rundll32 with no
+    arguments is not among them, and no browser configuration, enterprise policy, or extension
+    produces it. If the host is a normal workstation and the user a normal browsing user, there is no
+    routine explanation to fall back on.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: What started the browser process itself, and what was its own command line?
+  context: >-
+    The browser's own creation event and command line separate a user-launched browsing session from
+    a browser started headless or with automation switches by another process. Reading the
+    grandparent tells you whether the injected process was a session the user was actually using or
+    one started programmatically as a host for the loader.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+  answer_sources:
+  - process_creation
+- question: What other child processes did this same browser instance spawn?
+  context: >-
+    An injected process is often used to launch more than one stage. Listing every child of the exact
+    alerting browser instance separates the browser's own helper and renderer processes from anything
+    else the injected code started — additional signed-binary hosts, script interpreters, or a
+    dropped executable.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: >-
+    What command lines did rundll32.exe run with on this host in the alert window, and where was each
+    one started from?
+  context: >-
+    Ordinary rundll32 invocations name a DLL and an export, and are started from a system directory
+    by explorer.exe, a control panel applet, or an installer. Listing every rundll32 execution on the
+    host in the surrounding minutes lets you contrast the argument-less alerting instance against the
+    normal ones, and the working directory of each shows whether any of them was started from a
+    user-writable location.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: >-
+    What modules did the browser process load before it spawned rundll32, and were any unsigned or
+    loaded from a user-writable path?
+  context: >-
+    One route into a browser's address space is a module load — a DLL written to a user-writable
+    directory and pulled in by the browser process. The signer and path of every module the alerting
+    browser instance loaded separate the browser's own signed components and known plugins from an
+    unsigned or oddly located one. Loaders that map their payload manually into memory produce no
+    module-load record at all, so an entirely clean list does not rule out injection; treat it as
+    narrowing rather than clearing.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+      - SignatureStatus
+      - Hashes
+  answer_sources:
+  - process_creation
+  - edr_console
+- question: >-
+    Did any process on this host issue memory-write, APC-queue, or hook-installation calls against
+    another process around the time of the alert?
+  context: >-
+    Injection is carried out by opening a handle to the target with write and thread rights and then
+    writing memory and steering execution into it. The handle open and the access rights it requested
+    are not recorded by endpoint telemetry, which is a known visibility gap — read-side access such as
+    a memory read of another process leaves nothing here. The write-side primitives are recorded, so
+    this surfaces the calls that would have placed code into the browser and started it. Correlate any
+    result with the browser process and the rundll32 spawn in the same window; absence of these calls
+    does not clear the alert, since some loaders write memory only within a process they already
+    control.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        event.dataset: endpoint.events.api
+        process.Ext.api.name:
+          - WriteProcessMemory
+          - QueueUserAPC
+          - SetWindowsHookEx
+      condition: selection
+    fields:
+      - Image
+      - process.Ext.api.name
+  answer_sources:
+  - edr_console
+  - process_creation
+- question: What did the browser spawn on this host in the hours after the alert?
+  context: >-
+    An execution host started with no arguments retrieves and runs its next stage in memory, so the
+    follow-on work often appears as further children of the same browser binary rather than of
+    rundll32. Watching the browser's children forward from the alert shows whether a second stage was
+    launched, and whether the pattern repeated.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: >-
+    Did other processes commonly used as injection hosts spawn signed-binary proxies or interpreters
+    on this host around this time?
+  context: >-
+    Injection concentrates on a small set of targets — lsass.exe, explorer.exe, and svchost.exe
+    alongside browsers — because they are long-lived, already running, and unremarkable when they hold
+    network connections or handles. If more than one of those parents launched rundll32, regsvr32,
+    mshta, a script host, or a command interpreter in the same window, the activity on this host is
+    broader than the single browser instance that alerted.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith:
+          - '\lsass.exe'
+          - '\explorer.exe'
+          - '\svchost.exe'
+          - '\winlogon.exe'
+          - '\chrome.exe'
+          - '\firefox.exe'
+          - '\msedge.exe'
+        Image|endswith:
+          - '\rundll32.exe'
+          - '\regsvr32.exe'
+          - '\mshta.exe'
+          - '\wscript.exe'
+          - '\cscript.exe'
+          - '\cmd.exe'
+          - '\powershell.exe'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: What other process activity occurred on this host around the time of the alert?
+  context: >-
+    Aggregating every parent-child pair on the host in the surrounding minutes collapses routine
+    agent and service telemetry into high-count rows while novel pairings stand out at low counts.
+    Look for the delivery step that preceded the browser injection — an archive extraction, a script
+    host, an installer — and for anything that ran after it.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+  answer_sources:
+  - process_creation
+  - file_event
+  - registry_event
+- question: Has this browser ever spawned rundll32.exe on this host before?
+  context: >-
+    A ninety-day count of this parent-child pairing on the host establishes whether it has any
+    precedent at all. Browsers have no routine reason to launch rundll32, so a zero or near-zero
+    count is the expected result and confirms the pairing is novel; a non-zero count is worth reading
+    line by line, since the command lines returned will show whether prior instances carried DLL
+    arguments and therefore represent something else entirely.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: How often has rundll32.exe started with no arguments on this host over the past 90 days?
+  context: >-
+    rundll32 itself runs constantly on a Windows host, so its raw frequency says nothing. Restricting
+    the history to launches whose command line ends at the binary name — no DLL, no export — isolates
+    the argument-less form the rule fires on and shows which accounts, if any, have produced it
+    before. A count near zero means the form is new to this host.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|endswith: '\rundll32.exe'
+      condition: selection
+    fields:
+      - User
+  answer_sources:
+  - process_creation
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: >-
+    The query mirrors the rule's selection structure scoped to this user, so the result is the user's
+    ninety-day history of a browser spawning argument-less rundll32, aggregated by host — not their
+    generic use of rundll32. A user who has never produced this pattern is the common case. Weigh any
+    non-zero count against the user's role, and note that the alert may fire under an account that
+    does not attribute behaviour to a person.
+  range: -90d
+  always_include: true
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith:
+        - \chrome.exe
+        - \firefox.exe
+        - \msedge.exe
+        Image|endswith: \rundll32.exe
+        CommandLine|endswith: \rundll32.exe
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+- question: >-
+    Has this browser binary historically driven the rule's pattern on this host or across the
+    environment, or is it new for this activity?
+  context: >-
+    When the alert fires under a service principal, user identity does not attribute behaviour and the
+    meaningful pivot is the launch mechanism. The query mirrors the rule's selection structure scoped
+    to the alerting parent binary, so the result is the ninety-day history of that browser driving this
+    specific pattern rather than generic browser and rundll32 co-occurrence. A parent that already
+    accounts for a large volume of prior events points at vendor or platform automation; a parent with
+    no history for this pattern is the deviation to chase.
+  range: -90d
+  always_include: true
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith:
+        - \chrome.exe
+        - \firefox.exe
+        - \msedge.exe
+        Image|endswith: \rundll32.exe
+        CommandLine|endswith: \rundll32.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- question: What else did this user do across the environment around this time?
+  context: >-
+    Tracking the account's process activity on every host in the surrounding hour shows whether the
+    same person was active elsewhere while this fired, which would widen the scope beyond one endpoint.
+    If the alert fired under a machine or service account, this returns routine agent telemetry from
+    across the fleet and the parent-scoped fleet question is the meaningful read instead.
+  range: +/-1h
+  always_include: true
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+- question: >-
+    Did this same browser-driven pattern fire on other hosts in the same window, or is the activity
+    isolated to this host?
+  context: >-
+    The query mirrors the rule's selection structure scoped to the alerting parent binary, fleet-wide,
+    within the alert window. Several hosts producing the pattern at once points to a shared delivery
+    step — a mail run or a watering-hole page reached by many users in a short period. A single host
+    points to a host-local trigger.
+  range: +/-1h
+  always_include: true
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith:
+        - \chrome.exe
+        - \firefox.exe
+        - \msedge.exe
+        Image|endswith: \rundll32.exe
+        CommandLine|endswith: \rundll32.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- question: Is a browser spawning rundll32 on other hosts in the environment?
+  context: >-
+    A fleet-wide count of this parent-child pairing over the past day calibrates how far the activity
+    reaches. The returned command lines show whether the other hosts produced the argument-less form
+    the rule fires on or ordinary rundll32 use with a DLL argument, which distinguishes multi-host
+    activity from unrelated background noise.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host may show the delivery and staging steps that preceded the
+    injection — a download, an archive extraction, a script host, or a defence-tampering attempt.
+    Reading them in order reconstructs how the browser came to be hosting foreign code.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+  answer_sources:
+  - alert

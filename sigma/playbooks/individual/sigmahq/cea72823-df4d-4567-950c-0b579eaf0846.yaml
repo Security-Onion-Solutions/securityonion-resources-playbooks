@@ -1,0 +1,489 @@
+name: Potential Dropper Script Execution Via WScript/CScript/MSHTA
+id: 8c79c642-d3ff-49d4-bc06-a369eeb224bf
+description: |
+  Detects wscript.exe, cscript.exe, or mshta.exe executing a script whose command line references a user-writable
+  staging directory (Temp, Public, AppData, Perflogs, Startup) AND a scripting extension (.hta, .js, .jse, .vba,
+  .vbe, .vbs, .wsf, .wsh). All three conditions must hold together — the script host, the staging path, and the
+  scripting extension. This pattern is the classic first-stage dropper: a downloaded or mailed script lands in a
+  temp folder and is run by the default Windows Script Host, often spawning encoded PowerShell, pulling a remote
+  installer, or reflectively loading follow-on payloads. Legitimate installers occasionally produce similar
+  behavior, so an environment baseline is required. The investigation should determine what the script decodes to,
+  what the script host spawned next, and whether the parent and user fit normal activity for this host.
+type: detection
+detection_id: cea72823-df4d-4567-950c-0b579eaf0846
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- question: Does the command line show a script host running a script from a user-writable directory with a scripting extension?
+  context: Confirm the alert is a true positive before investing time. The rule fires only when all three conditions
+    hold together — the process is wscript.exe, cscript.exe, or mshta.exe; the command line references a staging
+    directory such as Temp, Users\Public, AppData, Perflogs, or a Startup folder; and the command line carries a
+    scripting extension (.hta, .js, .jse, .vba, .vbe, .vbs, .wsf, .wsh). Read the full command line and verify the
+    referenced script path and extension match the staging-directory pattern rather than a normal install path.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Is this user and host expected to run scripts from a user-writable staging directory via Windows Script Host?
+  context: Legitimate administrative activity and installers can trigger this detection. A user whose role involves
+    running deployment or login scripts, or a host that routinely executes vendor installers from temp paths, lowers
+    suspicion. An ordinary workstation user double-clicking a downloaded .js or .hta is the higher-risk reading.
+    Knowing whether the user role and host function fit this behavior is often the fastest triage path.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What script did the script host run, and what does the full command line reveal about its arguments and target file?
+  context: The full command line names the script file the host executed and any arguments passed to it. Identify the
+    exact script path, its extension, and the staging directory it was launched from. For mshta.exe, the argument may
+    be an inline HTA or a URL rather than a file on disk. The script file itself is where the payload logic lives, so
+    pin down its full path before pivoting to decode its contents or trace what it spawned.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Is the script or its command line obfuscated, and what does the decoded content do?
+  context: Dropper scripts hide their intent behind encoding. VBScript droppers use Chr() chains and string
+    concatenation; JavaScript droppers use String.fromCharCode, eval, and character math; HTA payloads embed inline
+    script that is often base64 or URL-encoded. Reconstruct the obfuscated strings and read the result. Decoded
+    content typically reveals a download cradle pulling a remote installer, an encoded PowerShell stager, or
+    reflective in-memory loading. Read the script file from disk if the command line only names the path; iterate
+    decoding until the payload is readable.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What process spawned this script host, and is that parent chain expected?
+  context: The parent process reveals how the script host was invoked. A user-driven double-click usually shows
+    explorer.exe as the parent; a mailed attachment may show an Office application (winword.exe, excel.exe,
+    outlook.exe) or a browser; a chained dropper may show mshta.exe or another script host as the parent. An Office
+    or browser parent spawning wscript.exe or cscript.exe to run a temp-folder script points to user-execution of a
+    malicious file. Walk up the tree to the parent's own parent if the immediate parent is itself a script host.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What child processes did the script host spawn afterward?
+  context: The processes spawned by the script host reveal its actual impact. A benign script typically spawns
+    nothing or a single expected child. A dropper commonly spawns powershell.exe with an encoded or hidden command,
+    cmd.exe, or a chained cscript.exe or rundll32.exe to stage follow-on payloads, pull a remote installer, or
+    reflectively load code. Unexpected children running encoded or download-cradle command lines are the strongest
+    sign the script executed a malicious payload.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Did the alerting host load scripting-engine modules around the time of the alert?
+  context: Script execution by wscript.exe, cscript.exe, or mshta.exe loads scripting-engine modules into the
+    process — vbscript.dll and scrrun.dll for VBScript, jscript.dll or jscript9.dll for JavaScript, and mshtml.dll
+    for HTA rendering. Correlating module loads on this host in the alert window confirms which scripting engine
+    actually ran and can surface a second script host that the process-creation view missed. If image-load events
+    are not collected in this environment, treat zero results as a visibility gap rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|endswith:
+          - \vbscript.dll
+          - \jscript.dll
+          - \jscript9.dll
+          - \scrrun.dll
+          - \mshtml.dll
+      condition: selection
+    fields:
+      - Image
+      - ImageLoaded
+- question: Was the script host executed from its expected system path?
+  context: wscript.exe, cscript.exe, and mshta.exe normally run from System32 or SysWOW64. A copy of one of these
+    binaries running from a user-writable directory may indicate it was relocated or renamed to evade path-based
+    allowlists. Compare the Image path against the expected system path and check OriginalFileName for a mismatch
+    that would indicate a renamed binary.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- question: How often has this host run a script host against a staging-directory script over the past 90 days, and what command-line structures are typical?
+  context: A dropper-script pattern with no prior history on a host is more suspicious than one that recurs under
+    stable parents — for example a deployment tool that routinely runs login scripts from a temp path. The query
+    mirrors the rule's selection structure scoped to this host, so the count reflects the rule's specific firing
+    pattern rather than generic script-host usage. Compare the typical command-line structures against the alerting one,
+    and note whether prior activity clusters around business hours or maintenance windows versus the current alert
+    time.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_exec:
+        Image|endswith:
+        - \wscript.exe
+        - \cscript.exe
+        - \mshta.exe
+      selection_paths:
+        CommandLine|contains:
+        - :\Perflogs\
+        - :\Temp\
+        - :\Tmp\
+        - :\Users\Public\
+        - :\Windows\Temp\
+        - \AppData\Local\Temp\
+        - \AppData\Roaming\Temp\
+        - \Start Menu\Programs\Startup\
+        - \Temporary Internet
+        - \Windows\Temp
+        - '%LocalAppData%\Temp\'
+        - '%TEMP%'
+        - '%TMP%'
+      selection_ext:
+        CommandLine|contains:
+        - .hta
+        - .js
+        - .jse
+        - .vba
+        - .vbe
+        - .vbs
+        - .wsf
+        - .wsh
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - CommandLine
+- question: Were any other proxy-execution or download LOLBins used on this host recently?
+  context: Operators who use one script host or LOLBin to run a dropper often chain several — a script host pulls a
+    payload, then certutil or curl downloads more, and rundll32, regsvr32, or msbuild proxy-executes the follow-on.
+    Finding multiple LOLBins performing staging or proxy-execution in the same window strengthens the case for a
+    multi-stage operation rather than an isolated benign script.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\certutil.exe'
+          - '\bitsadmin.exe'
+          - '\curl.exe'
+          - '\rundll32.exe'
+          - '\regsvr32.exe'
+          - '\msbuild.exe'
+          - '\cmstp.exe'
+          - '\msiexec.exe'
+          - '\installutil.exe'
+          - '\regasm.exe'
+          - '\presentationhost.exe'
+          - '\expand.exe'
+          - '\extrac32.exe'
+          - '\makecab.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- question: When this host has previously fired this dropper-script pattern, what parents and users normally drive it, and does the current alert fit?
+  context: Even routine script activity can be abused. The query mirrors the rule's selection structure scoped to
+    this host, so the resulting parent and user distribution reflects how the rule's specific firing pattern has
+    historically run here — not generic script-host usage. A new parent process, an unexpected user account, or an
+    unusual command-line structure relative to that history is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_exec:
+        Image|endswith:
+        - \wscript.exe
+        - \cscript.exe
+        - \mshta.exe
+      selection_paths:
+        CommandLine|contains:
+        - :\Perflogs\
+        - :\Temp\
+        - :\Tmp\
+        - :\Users\Public\
+        - :\Windows\Temp\
+        - \AppData\Local\Temp\
+        - \AppData\Roaming\Temp\
+        - \Start Menu\Programs\Startup\
+        - \Temporary Internet
+        - \Windows\Temp
+        - '%LocalAppData%\Temp\'
+        - '%TEMP%'
+        - '%TMP%'
+      selection_ext:
+        CommandLine|contains:
+        - .hta
+        - .js
+        - .jse
+        - .vba
+        - .vbe
+        - .vbs
+        - .wsf
+        - .wsh
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_exec:
+        Image|endswith:
+        - \wscript.exe
+        - \cscript.exe
+        - \mshta.exe
+      selection_paths:
+        CommandLine|contains:
+        - :\Perflogs\
+        - :\Temp\
+        - :\Tmp\
+        - :\Users\Public\
+        - :\Windows\Temp\
+        - \AppData\Local\Temp\
+        - \AppData\Roaming\Temp\
+        - \Start Menu\Programs\Startup\
+        - \Temporary Internet
+        - \Windows\Temp
+        - '%LocalAppData%\Temp\'
+        - '%TEMP%'
+        - '%TMP%'
+      selection_ext:
+        CommandLine|contains:
+        - .hta
+        - .js
+        - .jse
+        - .vba
+        - .vbe
+        - .vbs
+        - .wsf
+        - .wsh
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_exec:
+        Image|endswith:
+        - \wscript.exe
+        - \cscript.exe
+        - \mshta.exe
+      selection_paths:
+        CommandLine|contains:
+        - :\Perflogs\
+        - :\Temp\
+        - :\Tmp\
+        - :\Users\Public\
+        - :\Windows\Temp\
+        - \AppData\Local\Temp\
+        - \AppData\Roaming\Temp\
+        - \Start Menu\Programs\Startup\
+        - \Temporary Internet
+        - \Windows\Temp
+        - '%LocalAppData%\Temp\'
+        - '%TEMP%'
+        - '%TMP%'
+      selection_ext:
+        CommandLine|contains:
+        - .hta
+        - .js
+        - .jse
+        - .vba
+        - .vbe
+        - .vbs
+        - .wsf
+        - .wsh
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple
+    endpoints. If the same user triggered similar script execution on several hosts, the scope of the activity may be
+    larger than this one alert. This is the immediate cross-host view, distinct from the user's longer-term baseline.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_exec:
+        Image|endswith:
+        - \wscript.exe
+        - \cscript.exe
+        - \mshta.exe
+      selection_paths:
+        CommandLine|contains:
+        - :\Perflogs\
+        - :\Temp\
+        - :\Tmp\
+        - :\Users\Public\
+        - :\Windows\Temp\
+        - \AppData\Local\Temp\
+        - \AppData\Roaming\Temp\
+        - \Start Menu\Programs\Startup\
+        - \Temporary Internet
+        - \Windows\Temp
+        - '%LocalAppData%\Temp\'
+        - '%TEMP%'
+        - '%TMP%'
+      selection_ext:
+        CommandLine|contains:
+        - .hta
+        - .js
+        - .jse
+        - .vba
+        - .vbe
+        - .vbs
+        - .wsf
+        - .wsh
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering,
+    reconnaissance, or credential access — may reveal the stages that preceded this script execution and help
+    reconstruct the timeline. A dropper script is frequently an early foothold, so prior or immediately following
+    alerts help place it in the larger sequence.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

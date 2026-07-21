@@ -1,0 +1,388 @@
+name: Msiexec Quiet Installation
+id: 02f723f0-0bb5-44fb-aa49-fd5eacdee507
+description: |
+  Detects msiexec.exe (matched by image name or original filename) run with an install or administrative-install flag (-i, -package, -a, or -j) together with the quiet flag (-q), excluding the known-good cases where the parent is a user or system temp installer or the SCCM Ccm32BitLauncher running as SYSTEM. msiexec is the signed Windows Installer utility, so a silent install is ordinary during software deployment, but the same binary is abused to proxy execution of an attacker-supplied package — a local dropped .msi, one fetched over HTTP(S), one on a UNC share, or a DLL run through an installer custom action — all without a visible UI. The investigation should decode which package is being installed and from where, confirm what process launched msiexec, and look at the network fetch, the modules loaded, and what executed after the install.
+type: detection
+detection_id: 79a87aa6-e4bd-42fc-a5bb-5e6fbdcd62f5
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-03
+questions:
+- question: Does this match the rule — msiexec.exe run with an install flag and the quiet flag?
+  context: Confirm the alert before investing time. The rule fires when the image (or original filename) is msiexec.exe AND the command line carries an install or administrative-install flag (-i, -package, -a, or -j) AND the quiet flag (-q), and the parent is not one of the filtered installer or SCCM contexts. Read the full command line and confirm the install and quiet flags, and note the package argument — that is the subject of the rest of the investigation.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to run silent MSI installations?
+  context: Software-deployment tooling and admins legitimately run msiexec quietly, so the relevant question is whether this account and host have a reason to. A managed endpoint receiving a packaged install from a deployment service is routine; a standard user workstation silently installing an MSI by hand, or a server with no deployment role doing so, is worth a closer look.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What package is msiexec installing, and where does it come from?
+  context: Decode the full command line. The argument after the install flag is the package — read whether it is a local path, a UNC share, or an HTTP(S) URL, and where on disk it sits. A quiet install of a signed MSI from a known vendor path is routine; a quiet install of an MSI from a temp or public directory, a remote URL, or a UNC share, or a DLL run through an installer custom action, is the proxy-execution pattern. Note the package source so the network and module-load questions can be tied to it.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What process spawned msiexec, and is that parent chain expected?
+  context: A silent install launched by a deployment agent, a software center, or an interactive admin session is routine. The same install spawned by winword.exe or excel.exe (a macro), mshta.exe, a script host, or a PowerShell cradle points to a delivery chain proxying execution through the installer. The parent's own command line shows whether a loader or document drove the install, and walking up reconstructs how it started.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Did this msiexec process make outbound network connections, and to what host or IP?
+  context: msiexec can install a package directly from a URL or UNC path, so a remote fetch is the clearest sign the package was attacker-hosted rather than a local vendor MSI. Correlating the alerting process to its network connections recovers the destination host, IP, and port. Compare them against known software-distribution and update endpoints; an external or newly seen address is the signal to chase, and the absence of any connection points to a local package instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+      - Initiated
+- question: Did this msiexec process load a DLL from a user-writable or temp location?
+  context: Beyond installing an MSI, msiexec is abused to run a DLL through an installer custom action. A module loaded by the alerting process from a temp, AppData, ProgramData, or public path — rather than from a signed vendor or System directory — indicates the installer pulled in attacker code. Matching such a load to this process confirms execution beyond the command-line string; loads only from standard locations are consistent with a benign install.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+        ImageLoaded|contains:
+          - '\AppData\Local\Temp\'
+          - '\AppData\Roaming\'
+          - '\Windows\Temp\'
+          - '\Users\Public\'
+          - '\ProgramData\'
+      condition: selection
+    fields:
+      - ImageLoaded
+- question: What did msiexec spawn or run after the install?
+  context: The impact of a proxied install is whatever it leaves running. Children of this msiexec process reveal what the package did — a new service binary, a scheduled task, a dropped executable launching, or a fresh interpreter. A quiet install that immediately spawns a non-installer process is the fetch-and-run pattern; a clean install that registers a normal application reads very differently.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Were other proxy-execution or download LOLBins used on this host recently?
+  context: Operators who proxy execution through one signed binary usually use several. Alongside msiexec, look for the other proxy-execution binaries (rundll32, regsvr32, mshta, msbuild, installutil, cmstp) and the download tools (certutil, bitsadmin, curl) that fetch or run a payload. Several of these in the same day on the same host strengthens the case that the quiet install was one step in a delivery chain rather than routine deployment.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\rundll32.exe'
+          - '\regsvr32.exe'
+          - '\mshta.exe'
+          - '\msbuild.exe'
+          - '\installutil.exe'
+          - '\cmstp.exe'
+          - '\certutil.exe'
+          - '\bitsadmin.exe'
+          - '\curl.exe'
+          - '\forfiles.exe'
+          - '\pcalua.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- question: Was msiexec.exe executed from its expected System32 / SysWOW64 path, and is it the genuine signed binary?
+  context: The genuine msiexec.exe is a signed Microsoft binary under System32 / SysWOW64. A copy running from a user temp directory, ProgramData, or another non-standard path — or one whose original filename is not msiexec.exe — suggests the binary was staged to dodge path-based allowlists, which raises the priority of the alert.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- question: How often has this host run the quiet msiexec-install pattern over the past 90 days, and what command structures are typical?
+  context: A silent install with no prior history on a host is more notable than one that recurs under a stable deployment routine. This mirrors the rule's exact pattern scoped to this host, so the count reflects the rule's specific firing (not all msiexec usage), and the command-line projection lets you compare the historical package sources and flags against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \msiexec.exe
+      - OriginalFileName: msiexec.exe
+      selection_cli:
+        CommandLine|contains|windash:
+        - -i
+        - -package
+        - -a
+        - -j
+      selection_quiet:
+        CommandLine|contains|windash: -q
+      filter_user_temp:
+        ParentImage|startswith: C:\Users\
+        ParentImage|contains: \AppData\Local\Temp\
+      filter_system_temp:
+        ParentImage|startswith: C:\Windows\Temp\
+      filter_ccm:
+        ParentImage: C:\Windows\CCM\Ccm32BitLauncher.exe
+        IntegrityLevel:
+        - System
+        - S-1-16-16384
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_* and not 1 of filter_*) and _pb_scope
+    fields:
+    - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \msiexec.exe
+      - OriginalFileName: msiexec.exe
+      selection_cli:
+        CommandLine|contains|windash:
+        - -i
+        - -package
+        - -a
+        - -j
+      selection_quiet:
+        CommandLine|contains|windash: -q
+      filter_user_temp:
+        ParentImage|startswith: C:\Users\
+        ParentImage|contains: \AppData\Local\Temp\
+      filter_system_temp:
+        ParentImage|startswith: C:\Windows\Temp\
+      filter_ccm:
+        ParentImage: C:\Windows\CCM\Ccm32BitLauncher.exe
+        IntegrityLevel:
+        - System
+        - S-1-16-16384
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_* and not 1 of filter_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \msiexec.exe
+      - OriginalFileName: msiexec.exe
+      selection_cli:
+        CommandLine|contains|windash:
+        - -i
+        - -package
+        - -a
+        - -j
+      selection_quiet:
+        CommandLine|contains|windash: -q
+      filter_user_temp:
+        ParentImage|startswith: C:\Users\
+        ParentImage|contains: \AppData\Local\Temp\
+      filter_system_temp:
+        ParentImage|startswith: C:\Windows\Temp\
+      filter_ccm:
+        ParentImage: C:\Windows\CCM\Ccm32BitLauncher.exe
+        IntegrityLevel:
+        - System
+        - S-1-16-16384
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_* and not 1 of filter_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts in a tight window reveals lateral movement or activity spanning multiple endpoints. If the same user ran installs or other tooling on other hosts in the same window, the scope is larger than a single machine. This pivot is meaningful only when a real user account fired the alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \msiexec.exe
+      - OriginalFileName: msiexec.exe
+      selection_cli:
+        CommandLine|contains|windash:
+        - -i
+        - -package
+        - -a
+        - -j
+      selection_quiet:
+        CommandLine|contains|windash: -q
+      filter_user_temp:
+        ParentImage|startswith: C:\Users\
+        ParentImage|contains: \AppData\Local\Temp\
+      filter_system_temp:
+        ParentImage|startswith: C:\Windows\Temp\
+      filter_ccm:
+        ParentImage: C:\Windows\CCM\Ccm32BitLauncher.exe
+        IntegrityLevel:
+        - System
+        - S-1-16-16384
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_* and not 1 of filter_*) and _pb_scope
+    fields:
+    - host.name
+- question: Have other hosts run the quiet msiexec-install pattern in the past week, and does the distribution look like deployment or one-off activity?
+  context: This mirrors the rule's pattern with no host scope, giving a fleet-wide count of where the silent install fired. Many hosts at once points to a pushed package or deployment routine; one host or a small unrelated set points to manual or targeted activity. Use the distribution to judge how unusual this single alert is.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \msiexec.exe
+      - OriginalFileName: msiexec.exe
+      selection_cli:
+        CommandLine|contains|windash:
+        - -i
+        - -package
+        - -a
+        - -j
+      selection_quiet:
+        CommandLine|contains|windash: -q
+      filter_user_temp:
+        ParentImage|startswith: C:\Users\
+        ParentImage|contains: \AppData\Local\Temp\
+      filter_system_temp:
+        ParentImage|startswith: C:\Windows\Temp\
+      filter_ccm:
+        ParentImage: C:\Windows\CCM\Ccm32BitLauncher.exe
+        IntegrityLevel:
+        - System
+        - S-1-16-16384
+      condition: all of selection_* and not 1 of filter_*
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — a download cradle, a macro-spawned shell, defense tampering, or reconnaissance — may reveal how the package arrived and help reconstruct the timeline that led to the silent install.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

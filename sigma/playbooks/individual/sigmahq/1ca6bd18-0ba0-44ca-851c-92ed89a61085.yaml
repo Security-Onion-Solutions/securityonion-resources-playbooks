@@ -1,0 +1,397 @@
+name: UAC Bypass Using Consent and Comctl32 - Process
+id: 9085a4ec-01a4-471d-9160-76302a9a2ca4
+description: |
+  Detects a User Account Control (UAC) bypass that abuses the auto-elevated
+  consent.exe to run code at high integrity through a planted comctl32.dll
+  (the UACMe method-22 pattern). The rule fires when consent.exe spawns
+  werfault.exe at High or System integrity — a parent-child pairing that does
+  not occur in normal operation and that lets a split-token administrator
+  escalate from Medium to High integrity silently. The investigation should
+  confirm the integrity level and parent-child pair, identify the elevated
+  action that followed, and determine whether a DLL plant or registry write set
+  up the bypass.
+type: detection
+detection_id: 1ca6bd18-0ba0-44ca-851c-92ed89a61085
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the alert match the rule — consent.exe spawning werfault.exe at High or System integrity?
+  context: Before investing investigation time, confirm the alert is a true positive. The
+    rule fires only when the parent Image ends in consent.exe, the child Image ends in
+    werfault.exe, and the IntegrityLevel is High or System. consent.exe is the legitimate
+    UAC consent prompt; it does not spawn werfault.exe in normal operation, so the
+    parent-child pair together with the elevated integrity level establishes the
+    true/false-positive call.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - IntegrityLevel
+- question: Is this user and host expected to perform local privilege elevation?
+  context: A UAC bypass running under an administrator who routinely elevates on their own
+    workstation is far less concerning than the same pattern under a standard user or on a
+    server. Knowing whether the account is a local admin and whether the host's function
+    involves administrative tooling is often the fastest way to separate a true positive
+    from sanctioned activity.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What did the elevated werfault.exe do? Decode its command line and working directory.
+  context: werfault.exe is normally the Windows Error Reporting host launched by the OS when
+    a process crashes. When it runs as the child of consent.exe at high integrity, the
+    invocation is the side effect of a planted comctl32.dll loaded during the bypass, so its
+    own command line and working directory tell you whether it is behaving as a genuine
+    crash handler or was coerced into running operator code. Decode whatever it executed and
+    note the directory it ran from.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Is consent.exe expected to spawn werfault.exe, and what started consent.exe itself?
+  context: The parent-child relationship is the core signal. consent.exe is launched by the
+    Application Information service when an elevation prompt is requested, and it does not
+    spawn werfault.exe in normal operation. Tracing what started consent.exe — and what
+    requested the elevation — shows whether a user approved a genuine prompt or a loader
+    drove the auto-elevation to trigger the bypass.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What other child processes did the same consent.exe instance spawn?
+  context: If this consent.exe instance launched the detected werfault.exe, it may have
+    launched other elevated children too. Multiple children from the same parent instance
+    points to deliberate orchestration — recon, credential access, or persistence staged
+    through one bypass — rather than an isolated event. The query scopes to the exact parent
+    instance and falls back to host scope where the parent identifier is unavailable.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: What action was performed with elevated privileges after the bypass?
+  context: UAC bypass is a means to an end — operators elevate to install persistence, dump
+    credentials, tamper with security tools, or reach protected resources. Examine processes
+    spawned at High or System integrity shortly after the bypass; the detection analytics
+    call for correlating the elevation with follow-on activity within a tight window
+    (roughly 30 seconds is a common tuning) to separate the operator's objective from
+    unrelated admin work.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        IntegrityLevel:
+          - 'High'
+          - 'System'
+          - 'S-1-16-16384'
+          - 'S-1-16-12288'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - IntegrityLevel
+- question: Were registry modifications made to set up this UAC bypass?
+  context: Many UAC bypasses write a command into a registry key that an auto-elevated
+    process reads and executes. Common targets are HKCU\Software\Classes\ms-settings\Shell,
+    HKCU\Software\Classes\mscfile\shell, and DelegateExecute values, and the auto-elevate
+    proxies attackers reach for most often include sdclt.exe, fodhelper.exe,
+    computerdefaults.exe, and eventvwr.exe. Finding the write in the minutes before the
+    elevation confirms the mechanism and reveals the exact payload run with high integrity.
+    This query catches writes performed through reg.exe, cmd, or PowerShell.
+  range: -15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\reg.exe'
+          - '\powershell.exe'
+          - '\cmd.exe'
+        CommandLine|contains:
+          - 'ms-settings'
+          - 'mscfile'
+          - 'Classes\exefile'
+          - 'Classes\Folder'
+          - 'Environment'
+          - 'Shell\Open\command'
+          - 'DelegateExecute'
+      condition: selection
+    fields:
+      - CommandLine
+      - Image
+- question: Did a registry-set event write a shell-handler or DelegateExecute key used by UAC bypasses on this host?
+  context: When a bypass key is written programmatically (PowerShell .NET calls,
+    IFileOperation COM) rather than through reg.exe, the process-creation view misses it. A
+    registry-set event records the write directly. Look for handler keys an auto-elevated
+    binary reads — mscfile and ms-settings shell\open\command, other Classes shell handlers,
+    and DelegateExecute values — written shortly before the elevation fired.
+  range: -15m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains:
+          - '\mscfile\shell\open\command'
+          - '\ms-settings\shell\open\command'
+          - '\ms-settings\Shell\Open\command'
+          - 'Shell\Open\command'
+          - 'DelegateExecute'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+- question: What DLLs did the elevated werfault.exe load, and were any unsigned or loaded from a non-standard path?
+  context: This bypass is a search-order DLL hijack — the auto-elevated path loads a planted
+    comctl32.dll that runs the operator's code at high integrity. Reviewing the modules the
+    elevated werfault.exe loaded distinguishes a clean system binary from one that
+    side-loaded an attacker DLL. A comctl32.dll, or any module, loaded from a user-writable
+    or non-System32 path, or an unsigned module, is the artifact of the hijack.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - ImageLoaded
+- question: Were other privilege-escalation or UAC-bypass detections raised on this host around the same time?
+  context: Operators who try one UAC bypass often try several until one works, especially
+    when the OS version blocks a given technique. Multiple bypass or escalation alerts in
+    rapid succession from the same host or user confirms deliberate privilege-escalation
+    activity rather than a one-off false positive.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - rule.name
+      - rule.uuid
+      - event.severity_label
+- question: Does consent.exe normally spawn werfault.exe on this host?
+  context: Some parent-child pairs are routine and some do not occur in normal operation.
+    consent.exe spawning werfault.exe is the discriminator here — it is not a pairing the OS
+    produces, so any prior history is itself informative. Zero or very low counts confirm a
+    novel spawning relationship; a non-trivial history would point to a recurring local
+    condition worth understanding.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Does this host normally run werfault.exe, and how often at high integrity?
+  context: werfault.exe runs routinely as the Windows Error Reporting host, so raw execution
+    counts are high on most systems. The discriminator is not whether it runs but whether it
+    runs as a child of consent.exe at High or System integrity, which is the rare condition
+    this rule keys on. Use the historical baseline to gauge how unusual the alerting
+    invocation is against this host's normal werfault.exe activity.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \consent.exe
+        Image|endswith: \werfault.exe
+        IntegrityLevel:
+        - High
+        - System
+        - S-1-16-16384
+        - S-1-16-12288
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \consent.exe
+        Image|endswith: \werfault.exe
+        IntegrityLevel:
+        - High
+        - System
+        - S-1-16-16384
+        - S-1-16-12288
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the environment around this time?
+  context: Tracking the account's activity across all hosts in the surrounding window
+    reveals lateral movement or coordinated activity on multiple endpoints. If the same user
+    triggered similar elevation activity elsewhere, the scope is larger than this one host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \consent.exe
+        Image|endswith: \werfault.exe
+        IntegrityLevel:
+        - High
+        - System
+        - S-1-16-16384
+        - S-1-16-12288
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Surveying activity around the alert reveals what
+    led to the elevation and what followed — reconnaissance, persistence, or further
+    escalation. Aggregating by process and parent collapses repetitive agent telemetry into
+    high-count rows while novel parent-child pairs stand out at low counts.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage

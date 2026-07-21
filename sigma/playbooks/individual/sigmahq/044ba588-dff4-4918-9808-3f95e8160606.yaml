@@ -1,0 +1,365 @@
+name: Copy .DMP/.DUMP Files From Remote Share Via Cmd.EXE
+id: 18c18c0c-2fe8-4a29-a9fe-a726300e64a1
+description: |
+  Detects cmd.exe running a copy command that pulls files with a .dmp, .dump, or
+  .hdmp extension from a remote UNC share. The rule fires when the process is
+  cmd.exe (by Image or OriginalFileName) AND its command line contains both a
+  "copy " verb and a " \\" UNC prefix AND references one of the dump extensions.
+  Legitimately, administrators rarely copy raw memory-dump files across SMB;
+  malicious use is the staging step of a credential-theft chain, where a process
+  memory dump created on one host is pulled over a share to an operator's box for
+  offline credential extraction. Determine which dump file was copied, where it
+  came from and went to, what process tree launched the copy, and whether
+  credential access or lateral movement surrounds the event.
+type: detection
+detection_id: 044ba588-dff4-4918-9808-3f95e8160606
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-04
+questions:
+- question: Does the command line show cmd.exe copying a .dmp, .dump, or .hdmp file from a remote share?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule requires the process to be cmd.exe AND the command line to contain a copy verb together with a UNC prefix together with one of the dump extensions. Read the exact command line and confirm all three elements are present and that the source path is a remote share rather than a local path.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to copy memory-dump files from remote shares?
+  context: Legitimate administrative activity can trigger this detection, but copying raw memory-dump files across SMB is rare outside specific debugging or backup-recovery workflows. Knowing whether the user role and host function involve that kind of activity is often the fastest path to distinguishing a true positive from routine operations.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What credential store does the copied dump file correspond to?
+  context: A copied .dmp/.dump/.hdmp file is typically a process memory dump, and memory dumps of LSASS are the most common credential-theft target. Read the source path and filename from the command line and determine which process the dump represents (lsass.dmp and similar names point directly at LSASS memory). The identified store determines which accounts may be exposed and what remediation is required.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Confirm the copied file is a real memory dump. Check its size, header, and embedded strings rather than trusting the filename.
+  context: A .dmp/.dump/.hdmp extension does not guarantee the file is a memory dump, and the filename alone does not confirm intent. Retrieve the copied file from the destination path and check whether it carries a minidump header, whether its size is consistent with a process dump, and whether it contains credential-material strings. A decoy or renamed file changes the disposition.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Where on disk was the dump file written, and what is its hash if you retrieve it?
+  context: Copying a file with cmd.exe writes a new file but records no hash in the file-creation event, so the hash cannot be read from telemetry here. This query locates the file that cmd.exe (or a child) wrote so you can pull it from its on-disk path and hash it for a reputation check. A process memory dump is normally unique to each capture, so a hash lookup rarely matches threat intel — the investigative value is the credential material inside the dump (covered by the content-inspection question), not its hash. Hash it manually only to fingerprint this specific sample for cross-host correlation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What process spawned this cmd.exe and is that parent chain expected?
+  context: The parent process reveals how the copy was invoked. An interactive administrative shell launched from explorer.exe is a different disposition than cmd.exe spawned by a script host, a remote-execution service, or a post-exploitation framework. Walk up from the parent to understand whether the copy was a hands-on-keyboard action or part of an automated tool chain.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: When this host has previously fired the rule's pattern, what parents and users normally drive that activity, and does the current alert fit that pattern?
+  context: Even an administrative environment may occasionally copy dump files across shares. The query mirrors the rule's selection structure scoped to this host, so the resulting parent and user distribution reflects how this specific remote-dump-copy pattern has historically run here. A new parent process, an unexpected user account, or an unusual command-line structure is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \cmd.exe
+      - OriginalFileName: Cmd.Exe
+      selection_cli:
+        CommandLine|contains|all:
+        - 'copy '
+        - ' \\\\'
+        CommandLine|contains:
+        - .dmp
+        - .dump
+        - .hdmp
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: What child processes did this cmd.exe spawn after the copy?
+  context: The processes spawned by the shell after the copy reveal the next stage. Copying a dump to a staging directory is often followed by a credential-extraction tool, an archiver that packages the dump, or an upload utility that exfiltrates it. Unexpected children launched by the same cmd.exe extend the timeline.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Is the copied dump file still on disk at the destination path for analysis?
+  context: If the copied dump file still exists at the destination, it can be hashed, submitted to a sandbox, and inspected for credential material. If it has already been deleted, look for recovery from shadow copies or backups and preserve any surrounding artifacts before they age out.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Which accounts may be exposed by this dump, and do any have elevated privileges?
+  context: The severity depends on which accounts have credential material in the copied dump. A dump of LSASS on a server with active domain-admin or service-account sessions requires incident escalation; a dump from a low-value host with only a standard user session may need only monitoring. Cross-reference the host's recent logon sessions and the source host of the dump against directory group memberships.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Were outbound remote-access connections (RDP, SMB, WinRM, SSH) initiated from this host after
+    this event?
+  context: Credential theft is typically followed by lateral movement. The query returns outbound connections
+    from this host to remote-access ports -- 3389 (RDP), 445 (SMB/PsExec), 5985/5986 (WinRM), 22 (SSH)
+    -- in the hours after the event; the originating Image and User show what drove each connection. Two
+    limits to keep in mind -- credentials exfiltrated and replayed from another machine will not appear
+    here (check security 4624 logons on suspected targets for this account and any accounts with sessions
+    on this host), and the query requires Sysmon network telemetry (EID 3); if that is not collected from
+    this host, treat zero rows as a visibility gap, not as evidence no movement occurred.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \cmd.exe
+      - OriginalFileName: Cmd.Exe
+      selection_cli:
+        CommandLine|contains|all:
+        - 'copy '
+        - ' \\\\'
+        CommandLine|contains:
+        - .dmp
+        - .dump
+        - .hdmp
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \cmd.exe
+      - OriginalFileName: Cmd.Exe
+      selection_cli:
+        CommandLine|contains|all:
+        - 'copy '
+        - ' \\\\'
+        CommandLine|contains:
+        - .dmp
+        - .dump
+        - .hdmp
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals whether the copy is isolated or part of broader hands-on activity. If the same user triggered similar staging or credential-access activity on multiple hosts, the scope of compromise may be larger than this one event.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \cmd.exe
+      - OriginalFileName: Cmd.Exe
+      selection_cli:
+        CommandLine|contains|all:
+        - 'copy '
+        - ' \\\\'
+        CommandLine|contains:
+        - .dmp
+        - .dump
+        - .hdmp
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Have other hosts fired the rule's pattern in the past week, and does the cross-host distribution look like consistent automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of the remote-dump-copy pattern rather than generic cmd.exe usage. Many hosts firing the same pattern points to a scripted or vendor process; one host or a small unrelated set points to manual operator activity. Use the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \cmd.exe
+      - OriginalFileName: Cmd.Exe
+      selection_cli:
+        CommandLine|contains|all:
+        - 'copy '
+        - ' \\\\'
+        CommandLine|contains:
+        - .dmp
+        - .dump
+        - .hdmp
+      condition: all of selection_*
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: A remote dump copy rarely happens in isolation. Earlier detections on the same host, such as process memory access, defense tampering, or discovery activity, may reveal how the dump was created and staged before this copy and help reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

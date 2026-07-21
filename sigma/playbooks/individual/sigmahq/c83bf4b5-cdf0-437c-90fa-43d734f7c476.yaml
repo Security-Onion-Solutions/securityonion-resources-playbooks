@@ -1,0 +1,361 @@
+name: Run PowerShell Script from Redirected Input Stream
+id: 4fb708c6-82d9-4e27-ae7a-6e07cb5bf456
+description: |
+  Detects powershell.exe or pwsh.exe launched with a command line that pipes a script in through a redirected input stream
+  (the ' - < ' pattern), which feeds PowerShell from a file or alternate data stream instead of a named script or -Command
+  argument. This indirection hides the executed content from simple command-line inspection and is a known living-off-the-land
+  trick for running staged scripts, including content placed in NTFS alternate data streams. Legitimate use is rare; confirm
+  the command line, decode what is actually fed in, and determine whether the parent chain, user, and host are consistent with
+  expected PowerShell activity.
+type: detection
+detection_id: c83bf4b5-cdf0-437c-90fa-43d734f7c476
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-09
+questions:
+- question: Does the command line match the rule's pattern — powershell.exe or pwsh.exe with a redirected input stream?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the exact command line and
+    process details. The rule fires when the Image ends in \powershell.exe or \pwsh.exe AND the command line contains a
+    redirected input stream (a dash followed by '<', e.g. 'powershell -ep bypass - < c:\temp:ttt'). Confirm both conditions
+    are present in the alerting event.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Is this user and host expected to run PowerShell scripts fed through a redirected input stream?
+  context: Legitimate administrative activity can trigger detections, but feeding a script into PowerShell through input
+    redirection is an unusual invocation style. Knowing whether the user role and host function include scripting or admin
+    automation is often the fastest path to distinguishing a true positive from routine operations.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What exactly was fed into PowerShell through the redirected stream, and what does the full command line do?
+  context: The full command line reveals the source of the redirected content — a file path, or an NTFS alternate data stream
+    such as 'c:\temp:ttt'. Decode the surrounding flags (execution policy bypass, hidden window) and identify the file or
+    stream supplying the script, then read that content to determine the actual operation. This query scopes to the rule's
+    redirect pattern on this host so a multi-step staging sequence is visible, not just the single alerting event.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - \powershell.exe
+          - \pwsh.exe
+        CommandLine|re: \s-\s*<
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Is the redirected content or command line encoded or obfuscated, and what does it decode to?
+  context: The script supplied through the redirected stream may itself be encoded or obfuscated, and the launching command
+    line may add -EncodedCommand, string concatenation, backtick escaping, or variable substitution to hide intent. Read the
+    file or alternate data stream the stream redirect points to and decode any base64 or obfuscated payload — download cradles,
+    reverse shells, or in-memory loading of .NET assemblies are common results.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did PowerShell script block logging capture the deobfuscated content that actually executed?
+  context: Script block logging records the deobfuscated script content PowerShell actually runs, even when the source is a
+    redirected file or alternate data stream that is hard to read from the command line alone. This provides ground truth
+    about what executed, bypassing the input-redirection indirection. If PowerShell operational logs are not ingested in this
+    environment, treat zero results as a visibility gap rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Were PowerShell security controls bypassed or weakened before this execution?
+  context: Attackers often disable or bypass PowerShell security controls before running a payload. Common techniques include
+    AMSI bypass (patching amsi.dll in memory), execution policy changes (Set-ExecutionPolicy or -ep bypass), constrained
+    language mode escape, and downgrade to PowerShell v2 which lacks logging. The redirect invocation here is frequently paired
+    with an -ep bypass flag, so prior or co-occurring bypass activity strengthens the case for malicious use.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: What process spawned this PowerShell instance, and is that parent chain expected?
+  context: The parent process reveals how PowerShell was invoked. Legitimate usage often has predictable parents (explorer.exe
+    for user actions, services.exe or a scheduler for automation). Unusual parents such as mshta.exe, wscript.exe, cmd.exe
+    running a downloader, or an Office application can indicate exploitation or a malicious macro chaining into the redirect
+    invocation. If the parent identifier is unavailable, pivot on the host timeline around the alert instead.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Does this host normally run powershell.exe or pwsh.exe at all?
+  context: A binary that has never been seen on a host is more suspicious than one that runs regularly. Zero or very low
+    historical counts indicate first-time or rare execution; high counts establish a routine baseline against which the
+    current redirect invocation can be judged.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: When this host has previously fired the rule's redirect pattern, what parents and users normally drive it, and
+    does the current alert fit?
+  context: Even common tools can be abused. This query mirrors the rule's selection — powershell.exe/pwsh.exe with the input
+    redirect — scoped to this host, so the resulting parent and user distribution reflects how this specific firing pattern
+    has historically run here, not generic PowerShell usage. A new parent process, an unexpected user account, or an unusual
+    command-line structure is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        CommandLine|re: \s-\s*<
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: What child processes did this PowerShell instance spawn afterward?
+  context: The processes spawned after the redirect invocation reveal its actual impact. A script staged through input
+    redirection commonly launches follow-on tooling — cmd.exe, certutil.exe, additional powershell.exe instances, or network
+    utilities — for download, persistence, or post-exploitation. Unexpected children point to active operator activity rather
+    than a benign script run.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        CommandLine|re: \s-\s*<
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        CommandLine|re: \s-\s*<
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity across multiple endpoints. If
+    the same user triggered similar activity on multiple hosts, the scope of the incident may be larger than the single
+    alerting host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        CommandLine|re: \s-\s*<
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate context: what led to
+    this event, what happened after, and whether it is part of a larger sequence. Look for reconnaissance, the file or
+    alternate data stream being staged before the redirect, privilege escalation, or persistence.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance, or
+    credential access — may reveal the attack stages that preceded the redirect execution and help reconstruct the full
+    timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Have other hosts fired the rule's redirect pattern in the past week, and does the cross-host distribution look
+    like consistent automation or one-off activity?
+  context: This query mirrors the rule's selection with no host scope, so the result is a fleet-wide count of the input-redirect
+    firing pattern, not generic PowerShell usage. Many hosts firing the same pattern points to scripted deployment or vendor
+    automation; one host or a small unrelated set points to manual operator activity. Use the host distribution and
+    parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        CommandLine|re: \s-\s*<
+      condition: selection
+    fields:
+    - host.name

@@ -1,0 +1,378 @@
+name: Windows Event Log Access Tampering Via Registry
+id: 203d244c-7246-462d-85a9-1a6bdf563c6b
+description: |
+  Detects a registry write that changes the access-control (SDDL) string of a Windows Event Log
+  channel so that specific users or groups can no longer read or write it. The rule fires when a
+  value is written to EITHER a CustomSD value under a \SYSTEM\CurrentControlSet\Services\EventLog\
+  channel key OR a ChannelAccess value under the \Policies\Microsoft\Windows\EventLog\ or
+  \Microsoft\Windows\CurrentVersion\WINEVT\Channels keys, AND the written value contains a Deny ACE
+  (an SDDL DACL beginning with D:(D; or containing a )(D; deny entry). A permissive channel normally
+  carries only Allow ACEs, so a Deny ACE that blocks reading a log is a defense-evasion move that
+  blinds an event log channel ahead of or during other activity; the access change takes effect once
+  the Event Log service is restarted. Legitimate changes to these values are rare. Investigate which
+  SDDL was written and what it denies, which process wrote it and what launched that process, whether
+  the Event Log service was subsequently restarted to apply the restriction, whether other channels
+  were tampered in the same session, and whether the value was later reverted.
+type: detection
+detection_id: ba226dcf-d390-4642-b9af-b534872f1156
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-10
+questions:
+- question: Does the alerting write set an event log channel access value to an SDDL containing a Deny ACE?
+  context: >-
+    Before investing investigation time, confirm the alert is a true positive. The rule fires on
+    EITHER a CustomSD value under a Services\EventLog channel key OR a ChannelAccess value under the
+    EventLog policy or WINEVT\Channels keys, AND only when the written value data contains a Deny ACE
+    (the SDDL DACL starts with D:(D; or contains a )(D; deny entry). Review the exact TargetObject and
+    Details on the triggering event and note which branch fired: a CustomSD write targets a classic
+    Services\EventLog channel, while a ChannelAccess write targets a modern WINEVT channel. A
+    permissive channel carries only Allow ACEs, so a Deny ACE is the setup step of the access
+    restriction.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this user and host expected to modify event log channel access permissions?
+  context: >-
+    Event log channel access strings effectively never change through normal use, so knowing whether
+    the writing account and host function match any sanctioned maintenance is the fastest way to
+    separate authorized hardening from a live defense-evasion attempt. User attribution is present on
+    roughly 94% of endpoint registry events; when it is a machine account or SYSTEM, which is common
+    for service-driven writes, pivot on the writing process instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Which event log channel does this value control, and why is this a defense-evasion location?
+  context: >-
+    The CustomSD value under a Services\EventLog channel key and the ChannelAccess value under the
+    WINEVT\Channels or EventLog policy keys both hold the SDDL that governs who can read and write that
+    channel. Writing a restrictive SDDL here lets an actor deny the analyst, or even SYSTEM, visibility
+    into a specific log without stopping the service or clearing entries. Confirming the exact key path
+    identifies which channel is being blinded - Security, System, PowerShell/Operational, or another
+    high-value channel - and the writing process, which sets up decoding the SDDL itself.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: What does the written SDDL string deny, and to whom?
+  context: >-
+    The Details field holds the security descriptor being applied to the channel. Decode it: the DACL
+    (the D: section) is a sequence of ACEs, and a Deny ACE (D;...) names the trustee it blocks and the
+    rights denied. A Deny ACE against Everyone (the WD trustee) or against a specific SID removes read
+    access to the channel, which is what makes the log invisible to Event Viewer, wevtutil, and
+    Get-EventLog. Determine which trustee is denied and whether the descriptor also drops the Allow
+    entries a functioning channel needs. Details is present on roughly 79% of registry modifications
+    and should be populated for this string value.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- question: What process wrote this access value, and what launched that process?
+  context: >-
+    The registry event carries no command line, so pivot by ProcessGuid to the writing process to read
+    its Image, full command, and parent. A reg.exe, powershell.exe (Set-ItemProperty), or cmd.exe write
+    launched from a script host such as wscript.exe or mshta.exe, an Office application, or an unsigned
+    binary points to the access change being staged programmatically rather than a deliberate
+    administrator edit. The parent chain distinguishes a scripted tampering operation from an
+    interactive console action.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: Was the Event Log service restarted or a channel disabled after this change, applying the restriction?
+  context: >-
+    A CustomSD or ChannelAccess change only takes effect once the Event Log service is restarted, so a
+    service restart shortly after the write confirms the actor intended the access denial to be live
+    rather than staged for later. Restart and disable actions surface in process activity as
+    Restart-Service, sc.exe, or net.exe commands referencing the Event Log service, or as wevtutil
+    calls that disable a channel outright - a parallel method of blinding logging. The query lists
+    process activity on this host in the window whose command line references the Event Log service or
+    wevtutil.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_apply:
+        CommandLine|contains:
+          - 'EventLog'
+          - 'wevtutil'
+      condition: selection and selection_apply
+    fields:
+      - Image
+      - CommandLine
+- question: After this write, was the channel access value modified again or restored to a permissive SDDL?
+  context: >-
+    Registry key and value deletions are not observable in this telemetry, so durability is judged from
+    the value's re-modification history rather than from a delete event. If a later write restores a
+    permissive SDDL, the restriction was temporary - a window during which specific activity was hidden
+    from the log; if the Deny ACE remains, the channel stays blinded and will continue to suppress
+    visibility after each service restart. Compare the Details values written to this key over the
+    following window.
+  range: +24h
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - Details
+      - Image
+- question: Has this channel access value been modified before on this host?
+  context: >-
+    Event log channel access strings should change rarely and only through deliberate action, so a
+    history with no prior writes makes this a first-time change and raises its weight. A history of
+    periodic writes with the same permissive value points instead to a management process or an imaging
+    baseline. Compare the historical Details values to see whether a Deny ACE was ever set before or
+    whether this restriction is new.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - Details
+      - Image
+- question: Was this same channel access value modified on other hosts in the environment?
+  context: >-
+    The same restrictive write across many hosts suggests a broad tool run or a mis-scoped policy push;
+    the same write confined to one host suggests targeted tampering. Compare the Details values across
+    hosts to see whether they all apply the same Deny ACE and whether the writing process is
+    consistent, which separates a single hands-on operation from repeated use of the same technique
+    across the environment.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+      - Details
+- question: What other registry modifications were made on this host in the same window?
+  context: >-
+    An actor who restricts one event log channel often makes other configuration changes in the same
+    session - denying access to additional channels, disabling Defender or audit policy keys, or
+    setting persistence keys. Clustering the registry writes on this host in a short window around the
+    alert reveals the full scope of changes and which process made them. The triggering key appears in
+    the results; the signal is what else was modified and by which process.
+  range: +/-30m
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - User
+- question: What other process activity occurred on this host around the time of the alert?
+  context: >-
+    Defense tampering rarely happens in isolation. Aggregating process activity in a tight window
+    around the alert surfaces what led up to the access change and what ran immediately after it. Novel
+    parent-child pairs stand out at low counts against high-count routine telemetry, which is what
+    points to the tool that wrote the SDDL and any follow-on actions taken once logging was blinded.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host - reconnaissance, credential access, or other defense tampering
+    - may reveal the stages that preceded this change and help reconstruct the timeline. Blinding an
+    event log channel is typically done to hide subsequent or concurrent activity, so prior alerts help
+    place this access change within a larger sequence.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Were persistence mechanisms installed on this host in the same window?
+  context: >-
+    Actors who blind a log channel frequently do so as part of a hands-on session that also establishes
+    a foothold. Scheduled tasks, services, registry Run keys, BITS jobs, or WMI subscriptions created by
+    schtasks.exe, sc.exe, reg.exe, bitsadmin.exe, or wmic.exe near the tampering indicate the log
+    access change accompanied persistence installation rather than being an isolated action.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- question: Was there a change ticket or maintenance window for this event log access change?
+  context: >-
+    Some organizations harden event log ACLs deliberately, but such changes are normally deployed
+    through group policy under a documented change. A corresponding ticket or maintenance window
+    suggests authorized hardening; the absence of one when policy requires it suggests the SDDL was
+    written outside sanctioned process. This check can quickly close a false positive or escalate a
+    true positive.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Does the user or an administrator recall restricting access to this event log channel?
+  context: >-
+    Direct confirmation from the account owner is often the fastest path to legitimacy. If an
+    administrator or a red-team operator applied the SDDL as part of testing or approved hardening, that
+    closes the alert; if no one recalls the action, the account may be compromised or the change was
+    made by automated tooling, and the investigation should continue into the writing process and
+    whether the Event Log service was restarted.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Does the timing of this change align with normal work hours and maintenance windows?
+  context: >-
+    Legitimate configuration changes typically occur during business hours or a scheduled maintenance
+    window. An event log access restriction applied outside those times, or on a host with no
+    associated administrative activity, is more suspicious than the same change during a documented
+    window. Check whether the write time aligns with the host's expected administration schedule.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine

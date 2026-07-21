@@ -1,0 +1,301 @@
+name: Potential File Download Via MS-AppInstaller Protocol Handler
+id: 9453d6e1-772b-4050-9af1-3d333b7b0fed
+description: |
+  Detects a command line that invokes the ms-appinstaller:// protocol handler with an http(s) source, which causes AppInstaller.exe (the trusted, signed handler for AppX/MSIX packages) to retrieve a remote file into the user's package cache (C:\Users\<user>\AppData\Local\Packages\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\AC\INetCache\<random>). The rule fires when the command line contains both ms-appinstaller://?source= AND http, so the URL the handler is asked to fetch is the primary indicator of what was pulled down. Because AppInstaller.exe is trusted and signed, this is a proxy-execution / ingress path that lets an operator fetch a payload without a recognizable download tool; it is legitimately exercised when users install MSIX apps from a vendor URL and rarely with arbitrary endpoints. Investigation should confirm the URL fetched, what process invoked the handler, whether a file landed in the cache, and whether the activity is isolated or part of broader host activity.
+type: detection
+detection_id: 180c7c5c-d64b-4a63-86e9-68910451bc8b
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- question: Does this command line match the rule — an ms-appinstaller://?source= handler invocation carrying an http(s) URL?
+  context: Confirm the alert is a true positive by reviewing the exact command line against the detection criteria. The rule requires both the ms-appinstaller://?source= protocol-handler token AND an http string on the same command line; verify a real remote URL is present and note its scheme and host.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Is this user and host expected to install packages or fetch remote content via the AppInstaller protocol handler?
+  context: Installing an MSIX/AppX package from a vendor URL can legitimately drive this handler, but supplying an arbitrary http(s) source is uncommon for ordinary users. Knowing whether the user role and host function involve app deployment or developer workflows is often the fastest way to separate routine activity from operator-driven downloads.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What exactly was fetched? Decode the full command line and extract the URL the AppInstaller handler was asked to retrieve.
+  context: The full command line reveals the specific download. Extract the complete URL after ms-appinstaller://?source= (scheme, host, path, query string), note whether it points directly at a package or executable, and identify any additional arguments. The retrieved file lands in the package cache (INetCache) rather than at a path named on the command line, so the URL itself is the primary indicator of what was pulled down.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Did the handler open a network connection to the URL host, and what does that destination resolve to?
+  context: The fetch is a network retrieval. Resolve the URL host from the command line and look for outbound connections from the handler process in the alert window, then investigate the destination — DNS history, registration age, and threat-intel hits. Recently registered domains, raw IP literals, non-standard ports, or known C2 infrastructure point to attacker-controlled endpoints; well-known software-distribution hosts point to benign package retrieval.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationHostname
+      - DestinationPort
+      - Initiated
+- question: Did a file actually land in the package cache after the fetch?
+  context: A download command does not guarantee retrieval; network errors, blocked URLs, or proxy controls may stop the transfer. Files fetched this way are written to the DesktopAppInstaller package cache (AppData\Local\Packages\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\AC\INetCache) rather than a command-line path, so confirm file creation by the handler process to establish whether the attack progressed past delivery.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains: '\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\AC\INetCache\'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: What file did the AppInstaller protocol handler cache to disk, and can you retrieve and hash it?
+  context: Files fetched via the ms-appinstaller protocol land in the DesktopAppInstaller INetCache folder. File-creation events carry no hash, so the path is the artifact here — retrieve the cached file from the path below and submit its hash to threat intelligence, or detonate it in a sandbox, to determine whether it is a known-malicious package, a legitimate app, or something novel.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains: '\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\AC\INetCache\'
+      condition: selection
+    fields:
+      - TargetFilename
+- question: What process spawned the handler, and is that parent chain expected?
+  context: The parent process reveals how the protocol handler was invoked. A user launching it from explorer.exe or a browser as part of an MSIX install is routine; script hosts, shells, or remote-access tooling (wscript.exe, powershell.exe, cmd.exe, mshta.exe) driving the ms-appinstaller:// URI point to scripted or operator-driven proxy execution.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What child processes did the handler spawn afterward?
+  context: A download is typically only the delivery stage. Processes spawned by the handler, or by the same parent shortly after, reveal whether the retrieved package or executable was run — look for installer processes, interpreters, or LOLBins (cmd.exe, powershell.exe, rundll32.exe, regsvr32.exe, mshta.exe) starting in the same window.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Does this host normally run the AppInstaller handler this way?
+  context: A binary that has never been seen on a host is more suspicious than one that runs regularly. Zero or very low historical counts over the baseline window indicate first-time or rare invocation of this handler, which most endpoints exercise only during occasional MSIX installs.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: When this host has previously fired the rule's pattern, what parents and users normally drive it, and does the current alert fit?
+  context: Even trusted handlers get abused. The query mirrors the rule's selection structure scoped to this host, so the resulting parent/user distribution reflects how this specific firing pattern (ms-appinstaller://?source= with an http URL) has historically run here. A new parent process, an unexpected user account, or an unusual command-line structure is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - ms-appinstaller://?source=
+        - http
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - ms-appinstaller://?source=
+        - http
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - ms-appinstaller://?source=
+        - http
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the same user drove similar activity on more than one host in the window, the scope of the operation may be larger than a single download.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - ms-appinstaller://?source=
+        - http
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Have other hosts fired the rule's pattern in the past week, and does the cross-host distribution look like consistent automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of this firing pattern (ms-appinstaller://?source= with an http URL) rather than generic handler use. Many hosts firing the same pattern points to scripted deployment or vendor automation; one host or a small unrelated set points to manual operator activity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - ms-appinstaller://?source=
+        - http
+      condition: selection
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining activity around the event reveals what led to it and what followed — look for reconnaissance, additional downloads, privilege escalation, or persistence that places the proxy-execution download into a larger sequence.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — defense tampering, reconnaissance, credential access — may reveal the attack stages that preceded this download and help reconstruct the timeline. A proxy-execution fetch following earlier suspicious activity reads differently than one in isolation.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

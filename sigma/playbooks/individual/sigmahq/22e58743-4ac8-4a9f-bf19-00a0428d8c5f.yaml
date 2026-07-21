@@ -1,0 +1,324 @@
+name: Base64 MZ Header In CommandLine
+id: bf270311-a4bb-4fd3-a1eb-df6a3a6c08b9
+description: |
+  Detects a base64-encoded MZ (DOS/PE) header embedded directly in a process command line. A base64 string
+  beginning with one of these prefixes decodes to the first bytes of a Windows portable executable, so its
+  presence on the command line indicates an entire PE is being carried inline rather than written to disk.
+  The pattern is characteristic of in-memory reflective loading, where a script host decodes the blob and
+  hands the bytes to a .NET assembly-load API to run the embedded binary without a dropper file. Legitimate
+  software almost never passes a raw PE on the command line, so the disposition centers on decoding the blob,
+  identifying the embedded executable and the loader that consumes it, and checking whether endpoint protection
+  was weakened or other stages preceded it.
+type: detection
+detection_id: 22e58743-4ac8-4a9f-bf19-00a0428d8c5f
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the command line contain a base64-encoded MZ/PE header matching what this rule detects?
+  context: >-
+    Before investing investigation time, confirm the alert is a true positive. The rule fires when the command
+    line contains one of several base64 prefixes that decode to the leading bytes of a Windows executable header
+    (the "MZ" signature plus the standard PE preamble). Read the full command line on the triggering event and
+    locate the encoded blob; a long base64 string that begins with TVqQ, TVpQ, TVqA, TVoA, or TVpT decodes to a
+    PE header, which means a binary is being carried inline on the command line rather than on disk.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Is this user and host expected to pass an inline executable on a command line?
+  context: >-
+    Legitimate administrative or developer activity can trigger many detections, but carrying a raw PE as a
+    base64 blob on the command line is not a routine operation for end users or most service accounts. Knowing
+    whether the user role and host function involve scripted in-memory execution or developer tooling is often
+    the fastest path to separating a true positive from an unusual-but-sanctioned operation. A general user
+    account or a server with no development purpose running this pattern is the deviation worth chasing.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What does the full command line do around the inline PE? Identify the loader call and any reflective-load API.
+  context: >-
+    The encoded executable is only useful to the operator if something decodes and runs it, so read the entire
+    command line, not just the blob. Look for a base64-decode step followed by an in-memory assembly-load
+    invocation that hands the decoded bytes straight to a .NET load API and invokes an entry point, which runs
+    the binary without ever writing it to disk. Note the interpreter that received the command, any encoding
+    wrapper around the whole command, and whether the same line also flips a script-scanning bypass before the
+    load. The query retrieves the alerting event's command line for this manual decode.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Decode the base64 MZ blob from the command line. What executable does it reconstruct?
+  context: >-
+    The base64 string that begins with an MZ/PE prefix decodes to a real binary embedded inline. Convert the
+    blob from base64 to bytes and confirm the leading bytes are the MZ signature and PE preamble, then carry the
+    decode far enough to identify the executable — its imports, strings, or any embedded configuration reveal
+    whether it is a loader, a miner, a remote-access payload, or another tool. If the command wraps the blob in
+    a further encoding layer (an encoded-command wrapper, character concatenation, or environment-variable
+    substitution), iterate the decode until the PE bytes are readable. The query retrieves the full command line
+    for this manual reconstruction.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What process spawned this command, and is that parent chain expected?
+  context: >-
+    The parent process reveals how the inline-PE command was invoked. A predictable interactive or
+    software-management parent points toward user-driven or sanctioned activity, while a database service, a
+    web-server worker, a remote-execution service, or an Office application spawning a script host that carries
+    an embedded executable points toward exploitation of a public-facing service or a malicious launch. Walk up
+    the tree from the immediate parent to see what spawned it and what else it spawned.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: When this host has previously fired this inline-PE pattern, what parents and users drove it, and does this alert fit?
+  context: >-
+    This query mirrors the rule's selection structure scoped to this host, so the resulting parent and user
+    distribution reflects how this specific firing pattern — an inline base64 PE on the command line — has run
+    here, not generic activity of any one binary. A new parent process, an unexpected account, or a first-ever
+    appearance of the pattern on this host is the anomaly worth chasing; a recurring parent-and-user pair may
+    indicate a benign internal tool that legitimately ships PEs inline.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - TVqQAAMAAAAEAAAA
+        - TVpQAAIAAAAEAA8A
+        - TVqAAAEAAAAEABAA
+        - TVoAAAAAAAAAAAAA
+        - TVpTAQEAAAAEAAAA
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: What child processes did this command spawn afterward?
+  context: >-
+    The processes spawned after the inline executable is loaded reveal its actual impact. An in-memory payload
+    frequently establishes follow-on activity — additional script hosts, persistence creation through scheduling
+    or service installation, archive or discovery utilities, or network clients reaching out for instructions.
+    Scoping to children of this exact process keeps the result precise rather than returning every descendant on
+    the host.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - TVqQAAMAAAAEAAAA
+        - TVpQAAIAAAAEAA8A
+        - TVqAAAEAAAAEABAA
+        - TVoAAAAAAAAAAAAA
+        - TVpTAQEAAAAEAAAA
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - TVqQAAMAAAAEAAAA
+        - TVpQAAIAAAAEAA8A
+        - TVqAAAEAAAAEABAA
+        - TVoAAAAAAAAAAAAA
+        - TVpTAQEAAAAEAAAA
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the user's activity across all hosts reveals lateral movement or staging that accompanies an
+    in-memory payload launch. If the same user triggered similar activity on multiple hosts in this window, the
+    scope of the operation may be larger than a single endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - TVqQAAMAAAAEAAAA
+        - TVpQAAIAAAAEAA8A
+        - TVqAAAEAAAAEABAA
+        - TVoAAAAAAAAAAAAA
+        - TVpTAQEAAAAEAAAA
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Alerts rarely occur in isolation. Examining activity around the inline-PE launch reveals the immediate
+    context: what led to it, what followed, and whether it is part of a larger sequence. Aggregating by parent
+    and child image collapses repetitive agent telemetry while novel parent-child pairs — reconnaissance,
+    persistence creation, or additional script hosts — stand out at low counts.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Have other hosts fired this inline-PE pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: >-
+    This query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of
+    this firing pattern rather than generic activity of any binary. Many hosts firing the same inline-PE pattern
+    points to scripted deployment or a sanctioned internal tool that ships executables inline; one host or a small
+    unrelated set points to manual operator activity. Use the host distribution to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - TVqQAAMAAAAEAAAA
+        - TVpQAAIAAAAEAA8A
+        - TVqAAAEAAAAEABAA
+        - TVoAAAAAAAAAAAAA
+        - TVpTAQEAAAAEAAAA
+      condition: selection
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    An inline-PE execution is often a mid-stage step rather than the first action. Earlier detections on the same
+    host — exploitation of a public-facing service, credential access, reconnaissance, or defense tampering — may
+    reveal the stages that preceded this event and help reconstruct the timeline. Reviewing the alert sequence on
+    the host situates this command in the larger operation.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

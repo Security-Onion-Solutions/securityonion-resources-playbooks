@@ -1,0 +1,421 @@
+name: Copy From VolumeShadowCopy Via Cmd.EXE
+id: 88904115-dc1f-4ef3-b982-a94a82b3b0fd
+description: |
+  Detects cmd.exe running the built-in copy command against a Volume Shadow Copy device path
+  (\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy...). Copying from a shadow snapshot is the standard
+  way to read files the live OS holds open — most often the registry hives and the AD database
+  (NTDS.dit, SAM, SYSTEM) — for offline credential extraction. Legitimate backup or recovery tooling
+  occasionally uses the same path, so the investigation should determine which file was copied, where
+  it was written, what spawned the copy, and whether recovery-inhibiting or destructive actions
+  accompanied it on this or other hosts.
+type: detection
+detection_id: c73124a7-3e89-44a3-bdc1-25fe4df754b1
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- question: Does the command line contain both 'copy' and a GLOBALROOT shadow-copy device path?
+  context: Confirm the alert is a true positive by reviewing the exact command line. The rule fires
+    only when the command line contains both the copy verb and the
+    \\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy device prefix. Note which file the path points at —
+    NTDS.dit, the SYSTEM or SAM hive, or something else — and where the destination is.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Is this user and host expected to copy files out of a Volume Shadow Copy?
+  context: Reading from a shadow snapshot via copy is a normal action for some backup, imaging, or
+    recovery workflows, but on a domain controller or a host that holds registry hives it is a common
+    credential-theft step. Knowing whether the account and host function fit the behavior is the
+    fastest way to separate routine operations from hands-on-keyboard activity.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Is the copied output file still on disk for analysis?
+  context: The copy writes a destination file derived from the command line — frequently a hive or
+    NTDS.dit dump in a temp or staging directory. If that file still exists, it can be hashed, reviewed,
+    and submitted for reputation. Its presence also confirms the copy succeeded rather than failing
+    silently.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What exactly did the copy command do — which shadow-copy source and which destination?
+  context: Parse the full command line to identify the source path inside the shadow snapshot (the
+    HarddiskVolumeShadowCopy index and the file under it, e.g. \Windows\NTDS\NTDS.dit or
+    \Windows\System32\config\SYSTEM) and the destination it was written to. The source file names the
+    asset being stolen; the destination names the staging location to look for. Scoping is by command-line
+    pattern rather than by cmd.exe alone, which is far too common for host-wide scoping.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains|all:
+        - 'copy '
+        - \\\\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Is the copied destination file the expected hive or database, or a decoy/renamed artifact?
+  context: Confirm what the copied file actually is. Check its size, magic bytes, and structure against
+    the expected target — a registry hive or NTDS.dit has a characteristic size and header. A file that
+    does not match suggests a different objective or a renamed binary. Content retrieval is a manual or
+    endpoint-side step.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Where did the copied hive land on disk, and how do you handle it?
+  context: Copying a file out of a shadow copy with cmd.exe writes a new file but records no hash, so the
+    copied hive cannot be hashed from telemetry. This locates the destination file cmd.exe wrote so you can
+    retrieve it from that path. The copied artifact is a registry hive (SYSTEM, SAM) or database pulled from
+    the shadow copy because the live file is locked -- it is data, not an executable, and its value is the
+    credential material it holds (account password hashes), so treat it as exposed secrets and rotate affected
+    credentials rather than relying on a hash lookup. A per-capture hive copy is unique and will not match
+    threat intel; hash it only to fingerprint this specific sample.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What recovery-inhibiting commands were executed on this host?
+  context: Shadow-copy access often sits alongside recovery destruction. This surfaces native
+    recovery-inhibiting commands — shadow copy deletion (vssadmin, wmic), boot recovery changes
+    (bcdedit), backup catalog deletion (wbadmin), and recovery-environment changes (reagentc) — on the
+    host. Verify each action's effect by checking system state directly (vssadmin list shadows, bcdedit
+    /enum, reagentc /info).
+  range: +24h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_recovery:
+        Image|endswith:
+          - '\vssadmin.exe'
+          - '\wmic.exe'
+          - '\bcdedit.exe'
+          - '\wbadmin.exe'
+          - '\reagentc.exe'
+          - '\diskshadow.exe'
+      selection_cmdline:
+        CommandLine|contains:
+          - 'delete shadows'
+          - 'shadowcopy delete'
+          - 'recoveryenabled'
+          - 'bootstatuspolicy'
+          - 'delete catalog'
+          - 'delete systemstatebackup'
+          - 'boot.ini'
+          - 'winre.wim'
+          - '/disable'
+      condition: selection and (selection_recovery or selection_cmdline)
+    fields:
+      - Image
+      - CommandLine
+- question: What other destructive or recovery-inhibiting actions occurred on this host?
+  context: Hands-on-keyboard impact and credential-theft sequences chain multiple native utilities —
+    shadow copy and backup deletion, service stops, permission changes, and log clearing. Finding the
+    complete set of these commands shows whether the shadow-copy access is part of a broader operation
+    or an isolated administrative action. A shared parent process across the commands points to scripted
+    execution.
+  range: +/-30m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_destructive:
+        Image|endswith:
+          - '\vssadmin.exe'
+          - '\wmic.exe'
+          - '\bcdedit.exe'
+          - '\wbadmin.exe'
+          - '\cipher.exe'
+          - '\fsutil.exe'
+          - '\icacls.exe'
+          - '\takeown.exe'
+          - '\attrib.exe'
+          - '\sc.exe'
+          - '\net.exe'
+          - '\net1.exe'
+          - '\powershell.exe'
+          - '\taskkill.exe'
+      condition: selection and selection_destructive
+    fields:
+      - Image
+      - User
+- question: Did unknown binaries execute from user-writable paths on this host after the shadow-copy access?
+  context: Shadow-copy access is followed by different next stages depending on intent — offline hash
+    extraction for credential theft, or file encryption for destructive impact. This surfaces non-system
+    executables running after the alert from temp or user-writable directories, which can be the staged
+    extraction tool, an exfiltration helper, or an encryption binary. Ransom notes and mass file renames
+    should also be checked via file events.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      filter_known:
+        Image|startswith:
+          - 'C:\Program Files'
+          - 'C:\Windows\System32\svchost'
+          - 'C:\Windows\System32\wbem'
+      condition: selection and not filter_known
+    fields:
+      - Image
+      - CommandLine
+      - CurrentDirectory
+- question: Is this same shadow-copy access firing on other hosts in the environment?
+  context: The same shadow-copy extraction is frequently run across multiple hosts — domain controllers
+    and member servers holding hives — in quick succession. Finding the same alert on several hosts
+    indicates multi-host activity and sets the scope for containment and response.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        rule.uuid|expand: '%rule_uuid%'
+      condition: selection
+    fields:
+      - host.name
+      - rule.name
+      - event.severity_label
+- question: What process spawned this cmd.exe, and is that parent chain expected?
+  context: The parent reveals how the copy was launched. An interactive explorer.exe or a scripted
+    parent (powershell.exe, wmic, a remote-execution service) each carry different weight — remote or
+    scripted parents fit operator-driven credential theft, while an interactive admin shell may be
+    routine. Walk up to the parent's own parent if the immediate one is itself a shell.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: When this host has previously fired this shadow-copy pattern, what parents and users drove
+    it, and does the current alert fit?
+  context: The query mirrors the rule's command-line selection scoped to this host, so the parent and
+    user distribution reflects how this specific shadow-copy pattern — not generic cmd.exe usage — has
+    run here before. A new parent, an unexpected account, or a first-ever appearance is the deviation
+    worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - 'copy '
+        - \\\\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Have other hosts fired this shadow-copy pattern in the past week, and does the distribution
+    look like automation or one-off activity?
+  context: The query mirrors the rule's command-line selection with no host scope, so the result is a
+    fleet-wide count of this shadow-copy pattern rather than generic cmd.exe usage. Many hosts firing the
+    same pattern suggests scripted or scheduled backup automation; one host or a small unrelated set
+    points to manual operator activity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - 'copy '
+        - \\\\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy
+      condition: selection
+    fields:
+    - host.name
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - 'copy '
+        - \\\\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - 'copy '
+        - \\\\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the account's activity across all hosts in the alert window reveals whether the
+    shadow-copy access is isolated or part of movement across multiple systems. The same user driving
+    similar activity on several hosts widens the likely scope of compromise.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - 'copy '
+        - \\\\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Shadow-copy credential theft rarely happens in isolation. Earlier detections on the same host
+    — privilege escalation, reconnaissance, defense tampering, or other credential-access steps — help
+    reconstruct how the operator reached the point of reading hives, and what to expect next.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

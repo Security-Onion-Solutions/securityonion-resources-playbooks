@@ -1,0 +1,569 @@
+name: NotPetya Ransomware Activity
+id: 3a971d0c-f358-41b0-8123-74de8d83efcc
+description: |
+  Fires when a process creation event matches any one of three independent branches: either a command line
+  containing the combined `wevtutil cl Application & fsutil usn deletejournal /D C:` sequence or a
+  `dllhost.dat %WINDIR%\ransoms` reference, or rundll32.exe whose command line ends in a DLL/.dat ordinal
+  export (`.dat,#1`, `.dat #1`, `.zip.dll",#1`), or an event referencing `\perfc.dat`. These are the
+  anti-forensic and payload-execution steps of the NotPetya family — indicator removal (T1070.001),
+  inhibiting system recovery (T1490), and proxied execution of a payload DLL through a signed system
+  binary (T1218.011) ahead of impact (T1486).
+  The same command patterns are produced by other ransomware and wiper families and, for the log-clearing
+  and journal-deletion parts, by imaging, decommissioning, and some backup tooling, so the branch that
+  matched determines what to look at next. The investigation should establish which branch fired, what the
+  referenced DLL or command actually did, whether recovery data and log evidence still exist on the host or
+  only in forwarded copies, and whether the same pattern reached other hosts.
+type: detection
+detection_id: 79aeeb41-8156-4fac-a0cd-076495ab82a1
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-16
+questions:
+- question: Does the alerting event match either the wevtutil/fsutil command chain, the rundll32 DLL-export invocation, or the perfc.dat reference?
+  context: >-
+    The rule fires on any one of three independent branches, and which one matched changes what the rest of
+    the investigation is looking for. A command line containing `wevtutil cl Application & fsutil usn
+    deletejournal /D C:` or `dllhost.dat %WINDIR%\ransoms` is the log-and-journal destruction stage;
+    rundll32.exe whose command line ends in `.dat,#1`, `.dat #1`, or `.zip.dll",#1` is a DLL export being
+    run through a signed system binary, and that branch fires only when the image and the command-line
+    ending match together; a `\perfc.dat` reference anywhere in the event names the payload artifact.
+    Record which branch matched — on the rundll32 branch the identity and origin of the loaded module carry
+    the investigation, while on the destruction branch the surviving copies of the cleared channels do.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - alert
+  - process_creation
+- question: Is this user and host expected to clear event logs, delete the file system journal, or execute DLL exports through rundll32?
+  context: >-
+    Bulk log clearing and USN journal deletion are routine on a narrow set of hosts — imaging and
+    decommissioning workflows, and some backup and support tooling — and rundll32 export execution is
+    normal for installers and control-panel applets. Whether this account and host have such a role, and
+    whether a change record covers the window, is the fastest way to separate sanctioned maintenance from
+    unsanctioned activity.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: What recovery-inhibiting commands were executed on this host?
+  context: >-
+    Recovery destruction is normally a chain rather than a single command: shadow copy deletion (vssadmin,
+    wmic), boot recovery disabling (bcdedit), backup catalog deletion (wbadmin), and Windows Recovery
+    Environment removal (reagentc). This query surfaces every recovery-inhibiting command run on the host
+    over the following day. Verify each hit against live system state — vssadmin list shadows, bcdedit
+    /enum, reagentc /info, wbadmin get versions — and confirm whether off-host or offline backups are
+    intact, since the same sequence also deletes the USN journal that a local recovery attempt would use.
+  range: +24h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_recovery:
+        Image|endswith:
+          - '\vssadmin.exe'
+          - '\wmic.exe'
+          - '\bcdedit.exe'
+          - '\wbadmin.exe'
+          - '\reagentc.exe'
+          - '\diskshadow.exe'
+      selection_cmdline:
+        CommandLine|contains:
+          - 'delete shadows'
+          - 'shadowcopy delete'
+          - 'recoveryenabled'
+          - 'bootstatuspolicy'
+          - 'delete catalog'
+          - 'delete systemstatebackup'
+          - 'boot.ini'
+          - 'winre.wim'
+          - '/disable'
+      condition: selection and (selection_recovery or selection_cmdline)
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+  - manual_review
+  - edr_console
+- question: What other destructive or recovery-inhibiting actions occurred on this host?
+  context: >-
+    The destruction stage of a ransomware sequence is usually several commands, not one: shadow copy
+    deletion, recovery disabling, security service stopping, file permission changes, and log or journal
+    clearing. Aggregating the destructive binaries run on the host in the surrounding half hour shows how
+    many of those steps ran and under which account. If they all descend from one parent, the sequence was
+    scripted rather than typed by hand.
+  range: +/-30m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_destructive:
+        Image|endswith:
+          - '\vssadmin.exe'
+          - '\wmic.exe'
+          - '\bcdedit.exe'
+          - '\wbadmin.exe'
+          - '\cipher.exe'
+          - '\fsutil.exe'
+          - '\icacls.exe'
+          - '\takeown.exe'
+          - '\attrib.exe'
+          - '\sc.exe'
+          - '\net.exe'
+          - '\net1.exe'
+          - '\powershell.exe'
+          - '\taskkill.exe'
+      condition: selection and selection_destructive
+    fields:
+      - Image
+      - User
+  answer_sources:
+  - process_creation
+- question: Are there signs of file encryption, ransom notes, or unknown binaries executing on this host after the alert?
+  context: >-
+    Recovery-inhibiting and log-destroying commands typically run within minutes of the encryption or
+    disk-overwrite stage. This query lists processes on the host over the following half hour with the
+    common system paths filtered out, which surfaces payloads running from temp or user-writable
+    directories. Also check the host for ransom notes, mass file renames, and new file extensions. A forced
+    reboot scheduled through schtasks and shutdown.exe is part of this family's sequence and can end the
+    collection window early, so treat an abrupt stop in telemetry as a data point rather than an absence of
+    activity.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      filter_known:
+        Image|startswith:
+          - 'C:\Program Files'
+          - 'C:\Windows\System32\svchost'
+          - 'C:\Windows\System32\wbem'
+      condition: selection and not filter_known
+    fields:
+      - Image
+      - CommandLine
+      - CurrentDirectory
+  answer_sources:
+  - file_event
+  - process_creation
+  - manual_review
+- question: Which event log channels were cleared, and was the NTFS change journal deleted?
+  context: >-
+    `wevtutil cl <channel>` clears a named channel in place and `fsutil usn deletejournal /D C:` removes the
+    NTFS USN change journal; together they destroy the local records an investigation of this host would
+    otherwise rely on (T1070.001), including the file-creation history a recovery or scoping effort needs.
+    Read the alerting command line and list every channel named — the pattern the rule matches names
+    Application, but Setup, System, and Security are commonly cleared in the same command. Evidence that
+    survives the clear: forwarded or centralized copies of those channels, the record each channel writes
+    when it is cleared, and process telemetry collected off-host.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: What credential stores, if any, does the alerting command line reference?
+  context: >-
+    The rule carries a T1003.001 tag because this family runs a bundled extractor that reads lsass.exe
+    memory and returns logins and passwords to the main module over a named pipe with a random GUID-style
+    name; the harvested credentials then drive spread over SMB using an embedded PsExec copy and wmic. That
+    extractor rarely shows in the alerting command line, and read-side access to lsass memory has no
+    endpoint telemetry in most deployments, so a clean command line here is not evidence that credentials
+    were untouched. Look instead for a short-lived binary written under %TEMP% and for a named-pipe argument
+    on sibling processes, and treat every account with a session on this host as potentially exposed.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - process_creation
+  - file_event
+- question: Which module did the alerting process load, and is it signed and located where you would expect?
+  context: >-
+    On the rundll32 branch the command line names a DLL — or a .dat / .zip.dll file holding one — plus an
+    ordinal export such as #1, and the module load event is where the path it actually loaded from, its
+    signature status, and its hash become visible. An unsigned module loaded from a user-writable or temp
+    path under rundll32 is the proxied-execution pattern this technique describes, and its hash is what
+    makes the payload searchable on other hosts; a Microsoft-signed module under System32 points at routine
+    control-panel or installer usage. If the alert matched the log-clearing branch instead, this returns the
+    alerting process's ordinary module list and adds nothing.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+      - SignatureStatus
+      - Hashes
+  answer_sources:
+  - process_creation
+  - external_threat_intel
+- question: Was a log-clear record written on this host, and which account performed the clear?
+  context: >-
+    Clearing the Security channel is itself recorded: the channel receives a single EventID 1102 record
+    naming the account that cleared it, and that record survives the clear. Its presence pins the time of
+    the clear and attributes it to an account; its absence, where the command line shows the channel was
+    named, points either to the clear failing or to the record being lost before it left the host. Where the
+    channel is forwarded off-host, the pre-clear events remain available centrally even though they are gone
+    locally, which is the copy to scope the surrounding activity from.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 1102
+      condition: selection
+    fields:
+      - EventID
+      - SubjectUserName
+  answer_sources:
+  - manual_review
+- question: What process spawned this one, and is that parent chain expected?
+  context: >-
+    The parent shows how the command was launched. Log clearing and journal deletion typed by an
+    administrator normally descend from an interactive shell under explorer.exe or a remote-management
+    service; the same commands under a scripting engine, an unrelated rundll32 instance, or a short-lived
+    binary in a temp directory point to programmatic execution. The lookup is unique per process instance,
+    so a long-running parent that started hours or days before the alert still resolves.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Were outbound remote-access connections (RDP, SMB, WinRM, SSH) initiated from this host after this event?
+  context: >-
+    Credential theft is normally followed by spread, and this family drives spread over SMB using an
+    embedded PsExec copy and wmic against hosts enumerated from network adapters, NetBIOS names, and DHCP
+    leases, probing TCP 445 and 139. The query returns outbound connections from this host to 3389 (RDP),
+    445 (SMB), 5985/5986 (WinRM), and 22 (SSH) in the four hours after the event, with the originating Image
+    and User. Two limits: credentials replayed from a different machine will not appear here — check
+    authentication events on suspected targets for accounts with sessions on this host — and if endpoint
+    network telemetry is not collected from this host, zero rows is a visibility gap rather than evidence
+    that nothing moved.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
+  answer_sources:
+  - network_connection
+- question: When this host has previously matched the rule's pattern, what parents and users drove that activity, and does the current event fit?
+  context: >-
+    The query mirrors the rule's selection structure scoped to this host, so the parent and user
+    distribution reflects how these specific branches have fired here over the past two weeks rather than
+    generic rundll32 or wevtutil usage. On most hosts this returns nothing, which makes the current event
+    first-of-its-kind. Where it does return rows — imaging or decommissioning workflows can reproduce the
+    log-clearing pattern on a schedule — a new parent process or an unexpected account is the deviation to
+    chase.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_specific_pattern:
+        CommandLine|contains:
+        - 'wevtutil cl Application & fsutil usn deletejournal /D C:'
+        - dllhost.dat %WINDIR%\ransoms
+      selection_rundll32:
+        Image|endswith: \rundll32.exe
+        CommandLine|endswith:
+        - .dat,#1
+        - '.dat #1'
+        - .zip.dll",#1
+      selection_perfc_keyword:
+      - \perfc.dat
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+  answer_sources:
+  - process_creation
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: >-
+    The query mirrors the rule's selection structure scoped to this user, so the result is the account's
+    90-day history of these specific branches — not its generic use of rundll32 or wevtutil — aggregated by
+    host. An account that has never produced this pattern is a different proposition from one that produces
+    it on a rebuild cadence; weigh the count and the host spread against the account's role and normal
+    toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_specific_pattern:
+        CommandLine|contains:
+        - 'wevtutil cl Application & fsutil usn deletejournal /D C:'
+        - dllhost.dat %WINDIR%\ransoms
+      selection_rundll32:
+        Image|endswith: \rundll32.exe
+        CommandLine|endswith:
+        - .dat,#1
+        - '.dat #1'
+        - .zip.dll",#1
+      selection_perfc_keyword:
+      - \perfc.dat
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+  always_include: true
+- question: Has this parent process historically driven the rule's pattern on this host or across the environment, or is the parent new for this activity?
+  context: >-
+    When the alert fires under SYSTEM, a service account, or a computer account, user identity attributes
+    nothing and the launch mechanism is the meaningful pivot. The query mirrors the rule's selection
+    structure scoped to the alerting parent process, so the result is that parent's 90-day history of
+    driving these specific branches, aggregated by host. A parent that is new or rare for this pattern is
+    the deviation to chase; a parent already accounting for a large, evenly spread history is management or
+    imaging automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_specific_pattern:
+        CommandLine|contains:
+        - 'wevtutil cl Application & fsutil usn deletejournal /D C:'
+        - dllhost.dat %WINDIR%\ransoms
+      selection_rundll32:
+        Image|endswith: \rundll32.exe
+        CommandLine|endswith:
+        - .dat,#1
+        - '.dat #1'
+        - .zip.dll",#1
+      selection_perfc_keyword:
+      - \perfc.dat
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  always_include: true
+- question: What else did this user do across the environment around this time?
+  context: >-
+    Tracking the account's activity across all hosts in the surrounding hour shows whether the same identity
+    was active on other endpoints, which is how spread looks from the identity angle: the same account
+    running command interpreters or rundll32 on several hosts in one window is the pattern remote execution
+    leaves behind. If the alert fired under SYSTEM or a computer account, this returns routine service and
+    agent activity from every host and answers nothing — the parent-driven equivalent is the pivot to use in
+    that case.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+  always_include: true
+- question: Did this same parent-driven pattern fire on other hosts in the same window, or is the activity isolated to this host?
+  context: >-
+    Under a service principal, asking what else the user did across the environment returns telemetry from
+    every host that runs system-owned services. The narrower question is whether the same launch mechanism
+    produced this pattern elsewhere: the query mirrors the rule's selection structure scoped to the alerting
+    parent process, fleet-wide, inside the alert window. Several hosts in the same hour points to pushed or
+    scheduled execution and sets the containment boundary; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_specific_pattern:
+        CommandLine|contains:
+        - 'wevtutil cl Application & fsutil usn deletejournal /D C:'
+        - dllhost.dat %WINDIR%\ransoms
+      selection_rundll32:
+        Image|endswith: \rundll32.exe
+        CommandLine|endswith:
+        - .dat,#1
+        - '.dat #1'
+        - .zip.dll",#1
+      selection_perfc_keyword:
+      - \perfc.dat
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  always_include: true
+- question: Have other hosts matched the rule's pattern in the past week, and how is that activity distributed across them?
+  context: >-
+    The query mirrors the rule's selection structure with no host scope, so the result counts fleet-wide
+    matches of these specific branches rather than the generic footprint of rundll32 or wevtutil. Several
+    hosts matching inside a short window is the distribution that pushed or wormed execution produces and
+    defines the set of hosts to check for encryption and recovery destruction; a thin, even spread over days
+    is more consistent with a rebuild or decommissioning workflow that clears logs as a step. Use the host
+    list, and the parent consistency across it, to set the boundary of the investigation.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_specific_pattern:
+        CommandLine|contains:
+        - 'wevtutil cl Application & fsutil usn deletejournal /D C:'
+        - dllhost.dat %WINDIR%\ransoms
+      selection_rundll32:
+        Image|endswith: \rundll32.exe
+        CommandLine|endswith:
+        - .dat,#1
+        - '.dat #1'
+        - .zip.dll",#1
+      selection_perfc_keyword:
+      - \perfc.dat
+      condition: 1 of selection_*
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- question: Were scheduled tasks, services, or registry-based mechanisms created on this host around this time?
+  context: >-
+    This surfaces every persistence-tool execution on the host in the surrounding four hours — schtasks, at,
+    sc, reg, bitsadmin, wmic — not only the alerting one. Separate two patterns in the results: a task,
+    service, or Run key that re-launches a payload is persistence and outlives a rebuild of the running
+    process, while a task of the form `schtasks /TR "%WINDIR%\system32\shutdown.exe /r /f"` is the delayed
+    forced reboot this family schedules to hand control to its boot-time stage. The second is not
+    persistence, but its scheduled time is the point after which the host stops producing evidence.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation

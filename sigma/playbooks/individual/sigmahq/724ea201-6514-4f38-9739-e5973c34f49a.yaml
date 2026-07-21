@@ -1,0 +1,393 @@
+name: Bypass UAC Using SilentCleanup Task
+id: df3d2354-6d63-4761-9fe8-7145843fd5ac
+description: |
+  Detects a registry write that sets the user's windir environment variable (a TargetObject
+  ending in \Environment\windir) to a value other than the legitimate %SystemRoot%. The
+  SilentCleanup scheduled task auto-elevates and runs %windir%\system32\cleanmgr.exe with no
+  UAC prompt; by redirecting the windir variable, an actor causes the task to expand the
+  hijacked value and execute an arbitrary command at high integrity. The rule fires when the
+  \Environment\windir value is written AND the data is anything other than the default
+  %SystemRoot%. Legitimate changes to this variable are rare; investigate the value that was
+  written, the process that wrote it and its parent chain, whether the SilentCleanup task was
+  then force-run and cleanmgr.exe spawned a high-integrity child, and whether the value was
+  reverted afterward.
+type: detection
+detection_id: 724ea201-6514-4f38-9739-e5973c34f49a
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-10
+questions:
+- question: Does the alerting registry write set the windir environment value to something other than %SystemRoot%?
+  context: >-
+    Before investing investigation time, confirm the alert is a true positive. The rule fires
+    when a value whose path ends in \Environment\windir is written AND the data is NOT the
+    default %SystemRoot%. Review the exact TargetObject and Details on the triggering event to
+    confirm the written value is a non-default command. On a clean host the windir variable
+    resolves to the Windows directory, so any other value redirects where the auto-elevated
+    SilentCleanup task expands %windir% and is the setup step of the bypass.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this user and host expected to modify the windir environment variable?
+  context: >-
+    The user's windir environment variable should resolve to the Windows directory and
+    effectively never changes through normal use. A medium-integrity user account writing this
+    per-user Environment value is the preparatory move of the User Account Control bypass, so
+    knowing whether the writing account and host function match any sanctioned change is the
+    fastest way to separate testing or red-team activity from a live bypass. User attribution is
+    present on roughly 94% of endpoint registry events; when it is a machine account or missing,
+    pivot on the writing process instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Which windir value was written, and why is HKCU\Environment\windir a UAC-bypass location?
+  context: >-
+    The per-user HKCU\Environment\windir value overrides the machine windir path for the user's
+    processes. The SilentCleanup scheduled task auto-elevates and expands %windir% into the
+    command line of %windir%\system32\cleanmgr.exe, so a value placed here by a medium-integrity
+    user is inherited and executed by the high-integrity task. Confirming the exact path and
+    writing process establishes that this is the windir hijack location rather than an unrelated
+    Environment edit, and sets up decoding the redirected command.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: What command or path was written to the windir value?
+  context: >-
+    The Details field holds the string the SilentCleanup task will expand and run at high
+    integrity. Decode it: a common form is cmd /k REM followed by content that turns the rest of
+    the expanded command line into a comment so a chosen command runs first, or a path to a
+    dropped binary. If it references a file path, that path becomes a lead for confirming a
+    payload on disk; if it is an inline interpreter command, the operation is fileless. Details
+    is present on roughly 79% of registry modifications and should be populated for this string
+    value.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- question: What process wrote the windir value, and what launched that process?
+  context: >-
+    The registry event carries no command line, so pivot by ProcessGuid to the writing process
+    to read its Image, full command, and parent. A reg.exe, powershell.exe, or cmd.exe write
+    launched from an Office application, a browser, a script host such as wscript.exe or
+    mshta.exe, or an unsigned binary points to the bypass being staged programmatically rather
+    than a deliberate administrator edit. The parent chain distinguishes a scripted hijack from
+    an interactive console action.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: Was the SilentCleanup scheduled task force-run on this host after the windir value was set?
+  context: >-
+    The bypass completes when the auto-elevating SilentCleanup task is triggered after the key is
+    planted; a common trigger is an explicit schtasks force-run of
+    \Microsoft\Windows\DiskCleanup\SilentCleanup, though the task can also fire on its normal
+    schedule. A schtasks invocation referencing SilentCleanup shortly after the write ties the
+    registry edit to the elevation attempt. If no explicit trigger appears, the task may still
+    run later on schedule, so a negative result here does not clear the hijack.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains: 'SilentCleanup'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: After the windir value was set, did cleanmgr.exe spawn a child process, and what was it?
+  context: >-
+    When the SilentCleanup task runs, %windir%\system32\cleanmgr.exe executes at high integrity
+    and expands the hijacked windir value. On a clean system cleanmgr.exe does its disk cleanup
+    work; when the variable is redirected, cleanmgr.exe instead spawns the planted command as a
+    high-integrity child, so any child process of cleanmgr.exe here is the bypass firing. A
+    cmd.exe, powershell.exe, or arbitrary binary child confirms high-integrity code execution
+    resulting from the redirect.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: '\cleanmgr.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - IntegrityLevel
+- question: What action was performed with elevated privileges after the SilentCleanup bypass?
+  context: >-
+    UAC bypass is a means to an end - actors elevate to perform actions that require high
+    integrity: installing persistence, dumping credentials, tampering with security tools, or
+    accessing protected resources. Examining processes running at High or System integrity
+    shortly after the windir hijack reveals the objective. Correlating the registry write with
+    elevated execution within a tight window (on the order of tens of seconds to a few minutes)
+    separates the bypass payload from unrelated elevated activity.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        IntegrityLevel:
+          - 'High'
+          - 'System'
+          - 'S-1-16-16384'
+          - 'S-1-16-12288'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - IntegrityLevel
+- question: Were registry modifications made to set up this UAC bypass?
+  context: >-
+    Many UAC bypass techniques rely on registry key manipulation - writing a command to a key
+    that an auto-elevated process reads and executes. The SilentCleanup variant writes the
+    per-user Environment\windir value; related techniques target HKCU\Software\Classes
+    associations such as ms-settings and mscfile. Finding the write from a reg.exe, powershell.exe,
+    or cmd.exe process confirms the bypass mechanism and reveals the exact payload staged for
+    elevated execution.
+  range: -15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\reg.exe'
+          - '\powershell.exe'
+          - '\cmd.exe'
+        CommandLine|contains:
+          - 'ms-settings'
+          - 'mscfile'
+          - 'Classes\exefile'
+          - 'Classes\Folder'
+          - 'Environment'
+          - 'Shell\Open\command'
+          - 'DelegateExecute'
+      condition: selection
+    fields:
+      - CommandLine
+      - Image
+- question: Were other privilege escalation techniques attempted on this host?
+  context: >-
+    Actors who attempt one UAC bypass often try multiple methods until one succeeds, especially
+    if the OS version or configuration blocks certain techniques. Finding multiple bypass or
+    privilege-escalation detections on the same host in a short window confirms deliberate
+    escalation activity rather than a false positive, and defense-tampering or credential-access
+    alerts around the same time point to the objective behind the elevation.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - rule.name
+      - rule.uuid
+      - event.severity_label
+- question: After this write, was the windir value restored to %SystemRoot% or changed again?
+  context: >-
+    Registry key or value deletions are not observable in this telemetry, so durability is judged
+    from the value's re-modification history rather than from a delete event. Cleanup is common
+    immediately after the elevated child launches: a later write that restores windir to
+    %SystemRoot% indicates the hijack was reverted to hide it, while the value remaining a
+    non-default command leaves the task primed to re-run the payload the next time SilentCleanup
+    fires. Compare the Details values written over the following window.
+  range: +24h
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - Details
+      - Image
+- question: Has the windir environment value been modified before on this host?
+  context: >-
+    The windir environment variable should change rarely and only through deliberate action, so
+    a history with no prior writes makes this a first-time change and raises its weight. A history
+    of periodic writes to the same value points instead to a management process or a repeatedly
+    run tool. Compare the historical Details values to see whether a non-default value was set
+    before or whether this is new.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - Details
+      - Image
+- question: Was this same windir value modified on other hosts in the environment?
+  context: >-
+    The same write across many hosts suggests a broad tool run or a mis-scoped deployment; the
+    same write confined to one host suggests a targeted bypass. Compare the Details values across
+    hosts to see whether they all set the same command and whether the writing process is
+    consistent, which separates a single hands-on operation from repeated use of the same
+    technique across the environment.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+      - Details
+- question: What other registry modifications were made on this host in the same window?
+  context: >-
+    An actor who stages a UAC bypass often makes other configuration changes in the same session
+    - additional Classes hijacks for other auto-elevating binaries, Defender or firewall policy
+    edits, or persistence keys. Clustering the registry writes on this host in a short window
+    around the alert reveals the full scope of changes and which process made them. The triggering
+    key appears in the results; the signal is what else was modified and by which process.
+  range: +/-30m
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - User
+- question: What other process activity occurred on this host around the time of the alert?
+  context: >-
+    A UAC bypass rarely happens in isolation. Aggregating process activity in a tight window
+    around the alert surfaces what led up to the windir write and what ran immediately after it.
+    Novel parent-child pairs stand out at low counts against high-count routine telemetry, which
+    is what points to the tool that staged the hijack and any high-integrity actions taken once
+    elevation succeeded.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host - reconnaissance, execution of scripting tools, or
+    defense tampering - may reveal the stages that preceded this change and help reconstruct the
+    timeline. A UAC bypass is typically a means to run privileged follow-on actions, so prior
+    alerts help place this environment-variable write within a larger sequence.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

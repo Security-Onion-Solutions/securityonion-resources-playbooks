@@ -1,0 +1,348 @@
+name: Potential Powershell ReverseShell Connection
+id: 9674ca8a-0487-4015-8842-db716103dea5
+description: |
+  Fires when a PowerShell process (powershell.exe, pwsh.exe, or any binary whose OriginalFileName is PowerShell.EXE / pwsh.dll) runs a command line that contains all of Net.Sockets.TCPClient, .GetStream(, and .Write( together. That combination is the inline-socket pattern used to open a raw TCP connection, attach a stream, and write to it — the mechanics of an interactive reverse shell rather than a normal cmdlet. In rare cases an administrator may script a raw socket to test connectivity, so investigation should establish the remote endpoint the socket targets, the parent that launched PowerShell, what the shell did next, and whether the user, host, and launch mechanism match expected activity.
+type: detection
+detection_id: edc2f8ae-2412-4dfd-b9d5-0c57727e70be
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- question: Does the PowerShell command line contain Net.Sockets.TCPClient together with .GetStream( and .Write(?
+  context: Confirm the alert is real by reviewing the exact command line and process details. The rule fires only when all three socket fragments appear together on a PowerShell process, so the presence of all three in the captured CommandLine is what distinguishes a true positive from an incidental string match.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to open raw TCP sockets from PowerShell?
+  context: Raw socket scripting from PowerShell is uncommon outside of red-team tooling and a narrow set of connectivity tests. Knowing whether the user role and host function involve hand-written network scripts is often the fastest way to separate a sanctioned test from operator activity.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What remote address and port does the TCPClient connect to, and what does the socket do after connecting?
+  context: The full command line names the endpoint the reverse shell reaches. Pull the host or IP and port passed to Net.Sockets.TCPClient, then read how the stream is used — a read-execute-write loop that pipes command output back over .Write( is the interactive-shell signature, as opposed to a single write-and-close connectivity probe.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains|all:
+          - ' Net.Sockets.TCPClient'
+          - .GetStream(
+          - .Write(
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Is the socket command obfuscated, and what is the resolved remote endpoint once it is deobfuscated?
+  context: This inline pattern is plain-text by nature, but the IP, port, or fragments are often hidden with string concatenation, backtick escaping, char-code arrays, or base64 wrappers so the literal endpoint is not obvious. Resolve any concatenation or encoding to recover the actual address and port the stream targets so the connection can be checked against known infrastructure.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What process spawned this PowerShell, and is that parent chain expected?
+  context: The parent reveals how the shell was launched. A PowerShell socket script started from explorer.exe during interactive admin work reads differently than one spawned by a web server worker, an Office application, mshta.exe, wscript.exe, or a service binary, which point to exploitation or a malicious document.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Did PowerShell script block logging capture the full deobfuscated script behind this socket command?
+  context: Event ID 4104 records the script content PowerShell actually executed after deobfuscation, giving ground truth about the socket setup and the command loop even when the command line is concatenated or encoded. If PowerShell operational logs are not ingested in this environment, treat zero results as a visibility gap rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Were PowerShell security controls bypassed or weakened on this host shortly before the socket ran?
+  context: Operators frequently clear the path before launching an interactive shell — AMSI patching, an execution-policy bypass, or a downgrade to PowerShell v2 to escape logging. Finding such precursor activity on the host in the hour before strengthens the case that the socket connection is hostile rather than an administrative test.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: What child processes did this PowerShell spawn after the socket connection opened?
+  context: An interactive reverse shell exists to run further commands, so the children of this PowerShell reveal its actual impact — cmd.exe, nested powershell.exe, certutil.exe, whoami, net.exe, or credential-access tooling that arrived over the channel. A socket that spawns nothing may be an aborted or test connection.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: When this host has previously fired this socket pattern, what parents and users drove it, and does the current alert fit?
+  context: Even legitimate connectivity scripts leave a footprint. The query mirrors the rule's selection scoped to this host, so the resulting parent and user distribution reflects how this specific socket pattern has run here before. A new parent process, an unexpected account, or a first-ever appearance is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+      selection_cli:
+        CommandLine|contains|all:
+        - ' Net.Sockets.TCPClient'
+        - .GetStream(
+        - .Write(
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+      selection_cli:
+        CommandLine|contains|all:
+        - ' Net.Sockets.TCPClient'
+        - .GetStream(
+        - .Write(
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+      selection_cli:
+        CommandLine|contains|all:
+        - ' Net.Sockets.TCPClient'
+        - .GetStream(
+        - .Write(
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts in the window can reveal lateral movement or parallel footholds. If the same user triggered similar PowerShell activity on multiple endpoints, the scope of the incident is broader than this one host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+      selection_cli:
+        CommandLine|contains|all:
+        - ' Net.Sockets.TCPClient'
+        - .GetStream(
+        - .Write(
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Did the socket activity occur outside normal working or maintenance hours for this host?
+  context: Reverse-shell sessions tend to land off-hours or outside change windows because there is no human operator on the endpoint to notice. Place the alert time against this host's routine activity rhythm — a socket opened in the middle of the night on a workstation that is idle then carries different weight than one during a known administrative window.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+      selection_cli:
+        CommandLine|contains|all:
+        - ' Net.Sockets.TCPClient'
+        - .GetStream(
+        - .Write(
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - User
+- question: Have other hosts fired this socket pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: The query mirrors the rule's selection with no host scope, so the result is a fleet-wide count of this specific socket pattern rather than generic PowerShell usage. Many hosts firing the same pattern points to scripted deployment or vendor automation; one host or a small unrelated set points to manual operator activity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+      selection_cli:
+        CommandLine|contains|all:
+        - ' Net.Sockets.TCPClient'
+        - .GetStream(
+        - .Write(
+      condition: all of selection_*
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance, or credential access — may reveal the stages that preceded the reverse shell and help reconstruct how the operator reached the point of opening an outbound socket.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

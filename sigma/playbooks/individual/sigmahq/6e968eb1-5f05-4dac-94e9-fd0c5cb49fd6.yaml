@@ -1,0 +1,340 @@
+name: Uncommon Link.EXE Parent Process
+id: 28564c74-b0eb-4a7b-ad2b-021a5d2de3fa
+description: |
+  Detects link.exe (the Microsoft incremental linker, normally bundled with Visual Studio) running with a "LINK /"
+  command line from a parent process outside the known Visual Studio install paths. Sibling utilities such as
+  editbin.exe, dumpbin.exe, and lib.exe call link.exe by name without validating it, so an attacker who drops a
+  malicious link.exe alongside one of those tools and runs it from an arbitrary location can proxy execution through a
+  trusted-looking binary name. The rule fires when an event matches the link.exe + "LINK /" selection AND the parent is
+  not one of the filtered Visual Studio toolchain paths. The investigation should confirm the binary at that path is the
+  genuine Microsoft linker, identify the non-Visual-Studio parent that launched it, and determine whether this is a
+  developer using a portable toolchain or a sideloaded binary proxying execution.
+type: detection
+detection_id: 6e968eb1-5f05-4dac-94e9-fd0c5cb49fd6
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- question: Does the alerting event match the rule, with an Image ending in link.exe and a command line containing 'LINK /'?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule fires only when both halves hold together, an Image ending in link.exe AND a command line containing 'LINK /', and the parent process is not under a known Visual Studio install path. Confirm the full path of the alerting Image and the exact command line from the event.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Is this user and host expected to run the Microsoft linker outside a Visual Studio install path?
+  context: Legitimate use of link.exe almost always comes from a Visual Studio toolchain, a portable build environment, or a CI agent. Knowing whether the user role and host function involve compiling or linking native code is often the fastest path to distinguishing a developer or build job from a sideloaded binary proxying execution from an arbitrary location.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What process spawned link.exe, and is that parent chain expected for a linker invocation?
+  context: The parent process is the core of this detection, since the rule only fires when the parent is outside the Visual Studio toolchain paths. A sibling utility such as editbin.exe, dumpbin.exe, or lib.exe calling link.exe from a non-standard location, or an unrelated parent such as a script host, archive tool, or office application, points to sideloading rather than a normal build. Walk up the tree to see what spawned the parent.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What full 'LINK /' command line and working directory did this invocation use, and what does the switch after 'LINK /' indicate it was doing?
+  context: 'The full command line reveals the specific linker operation. Read the switch that follows ''LINK /'' (for example /DUMP, /EDITBIN, /LIB, or a real /OUT link step) and the working directory, since sibling tools proxy through link.exe with a fixed switch (dumpbin.exe issues LINK /DUMP). Note the directory the binary ran from and any file paths on the command line, which tell you what was being linked or inspected and where the binary actually lives.'
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|contains: 'LINK /'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Is the link.exe binary at this path the genuine Microsoft-signed linker, and where on disk does it live?
+  context: This technique abuses a trusted binary name, so the authenticity of the file at the alerting path is decisive. A genuine link.exe carries a valid Microsoft Authenticode signature and normally resides under a Visual Studio or Windows SDK install tree. An unsigned or differently signed link.exe, or one running from a user-writable or temporary directory, indicates a planted binary proxying execution rather than the real linker. Confirm the signing chain and the on-disk location from the recorded Image path.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CurrentDirectory
+- question: What modules did this link.exe process load, and are any of them unsigned or loaded from a user-writable directory?
+  context: 'Proxy execution through a trusted binary often depends on a planted or hijacked module loaded by the process, so the modules link.exe loaded indicate whether execution stayed inside the genuine toolchain. A real linker loads Microsoft-signed system and toolchain DLLs from protected paths; an unsigned module, or one loaded from a temp or user-profile directory, points to a sideloaded dependency. If module-load events are not collected in this environment, treat zero results as a visibility gap rather than evidence nothing loaded.'
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+- question: Did this link.exe process open any network connections, and to what destinations?
+  context: A genuine linker operates entirely on local files and does not contact the network, so any outbound connection from link.exe is a strong deviation from normal behavior and may indicate a sideloaded binary retrieving a remote payload or beaconing. Review the destination addresses and ports for connections attributed to this process. If network telemetry for endpoints is not collected in this environment, treat zero results as a visibility gap rather than evidence no connection occurred.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- question: What child processes did this link.exe invocation spawn afterward?
+  context: A genuine linker spawns nothing or only other toolchain utilities. A sideloaded link.exe used to proxy execution commonly spawns shells or living-off-the-land binaries such as cmd.exe, powershell.exe, or certutil.exe for follow-on staging. Review the children and their command lines for post-execution activity.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Does this host normally run link.exe?
+  context: A linker that has never been seen on a host is more suspicious than one that runs regularly. Zero or very low historical counts on a host that does not host a build environment raise the priority of confirming the binary's authenticity and parent.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: When this host has previously fired the rule's pattern, what parents and users normally drive that activity, and does the current alert fit that pattern?
+  context: Even a legitimately installed linker can be abused. The query mirrors the rule's selection structure scoped to this host, so the resulting parent and user distribution reflects how this specific uncommon-parent firing pattern has historically run here, not generic link.exe usage. A new parent process, an unexpected user account, or an unusual command-line structure is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \link.exe
+        CommandLine|contains: LINK /
+      filter_main_visual_studio:
+        ParentImage|startswith:
+        - C:\Program Files\Microsoft Visual Studio\
+        - C:\Program Files (x86)\Microsoft Visual Studio\
+        ParentImage|contains:
+        - \VC\bin\
+        - \VC\Tools\
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \link.exe
+        CommandLine|contains: LINK /
+      filter_main_visual_studio:
+        ParentImage|startswith:
+        - C:\Program Files\Microsoft Visual Studio\
+        - C:\Program Files (x86)\Microsoft Visual Studio\
+        ParentImage|contains:
+        - \VC\bin\
+        - \VC\Tools\
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \link.exe
+        CommandLine|contains: LINK /
+      filter_main_visual_studio:
+        ParentImage|startswith:
+        - C:\Program Files\Microsoft Visual Studio\
+        - C:\Program Files (x86)\Microsoft Visual Studio\
+        ParentImage|contains:
+        - \VC\bin\
+        - \VC\Tools\
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity across multiple endpoints. If the same user triggered similar activity on multiple hosts, the scope of the operation may be larger than a single endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \link.exe
+        CommandLine|contains: LINK /
+      filter_main_visual_studio:
+        ParentImage|startswith:
+        - C:\Program Files\Microsoft Visual Studio\
+        - C:\Program Files (x86)\Microsoft Visual Studio\
+        ParentImage|contains:
+        - \VC\bin\
+        - \VC\Tools\
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate context: what led to this event, what happened after, and whether it is part of a larger sequence. Look for reconnaissance, privilege escalation, persistence installation, or data staging.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Have other hosts fired the rule's pattern in the past week, and does the cross-host distribution look like consistent automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of this uncommon-parent firing pattern, not generic link.exe usage. Many hosts firing the same pattern points to a build-toolchain layout or vendor automation that runs link.exe from a non-Visual-Studio path; one host or a small unrelated set points to manual operator activity. Use host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \link.exe
+        CommandLine|contains: LINK /
+      filter_main_visual_studio:
+        ParentImage|startswith:
+        - C:\Program Files\Microsoft Visual Studio\
+        - C:\Program Files (x86)\Microsoft Visual Studio\
+        ParentImage|contains:
+        - \VC\bin\
+        - \VC\Tools\
+      condition: selection and not 1 of filter_main_*
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: 'Alerts rarely happen in isolation. Earlier detections on the same host, defense tampering, reconnaissance, or credential access, may reveal the stages that preceded this event and help reconstruct the timeline. Look for patterns: tampering followed by execution, or reconnaissance followed by exploitation.'
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

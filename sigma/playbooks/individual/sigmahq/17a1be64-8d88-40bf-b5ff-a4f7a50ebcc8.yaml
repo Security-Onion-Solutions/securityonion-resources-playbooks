@@ -1,0 +1,458 @@
+name: Suspicious New Service Creation
+id: 6932f13b-9a7e-4520-b78a-e849bd880db4
+description: |
+  Detects creation of a new Windows service whose binary path contains a command
+  interpreter, a script host, or a user-writable directory — fired EITHER through
+  the sc.exe "create ... binPath=" command OR through the PowerShell New-Service
+  cmdlet with -BinaryPathName. Services that launch powershell.exe, cmd.exe,
+  rundll32.exe, mshta.exe, or run from C:\Users\Public, Temp, Downloads, or Startup
+  paths are a common persistence and privilege-escalation foothold, since the
+  service starts under SYSTEM and survives reboot. Legitimate software installers
+  and administrators also create services, so the investigation centers on the
+  service name, the exact binary path it executes, the account it runs as, and
+  whether the action was expected for this user and host.
+type: detection
+detection_id: 17a1be64-8d88-40bf-b5ff-a4f7a50ebcc8
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the command line match what this rule detects — a service created
+    either with sc.exe create/binPath= or PowerShell New-Service -BinaryPathName,
+    pointing at a suspicious binary path?
+  context: Before investing investigation time, confirm the alert is a true positive.
+    The rule fires on EITHER an sc.exe "create ... binPath=" invocation OR a PowerShell
+    New-Service -BinaryPathName invocation, and in both cases the binary path must
+    contain an interpreter (powershell, cmd, rundll32, mshta, wscript, cscript) or
+    a user-writable directory (C:\Users\Public, Temp, Downloads, Desktop, Startup).
+    Note which branch fired — sc.exe versus New-Service — because the service-field
+    and process-lineage follow-up differs between them.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Is this user and host expected to create Windows services from the command
+    line?
+  context: Legitimate administrative activity and software installers create services
+    routinely. Knowing whether this user role and host function normally involve
+    direct command-line service creation is often the fastest path to distinguishing
+    a true positive from routine operations — a workstation user creating a service
+    that runs powershell.exe from a Temp directory is far more unusual than a deployment
+    server doing so under an installer.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Was there a change ticket, maintenance window, or documented approval for
+    this service creation?
+  context: Many organizations require change tickets for persistence-relevant system
+    modifications such as service installation. A corresponding ticket suggests authorized
+    deployment; absence of one when policy requires it suggests the action was unauthorized.
+    This check can quickly close false positives or escalate true positives.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What service was created, and what binary and start type does it execute?
+  context: The command line carries the service name and binary path, but the System
+    event for service installation provides the same fields in structured form. The
+    binary path is the persistence payload — attackers point it at interpreters or
+    binaries placed in world-writable directories. Check the start type (auto-start
+    persists across reboot) and the account the service runs under.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: system
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 7045
+      condition: selection
+    fields:
+      - ServiceName
+      - ImagePath
+      - StartType
+      - AccountName
+- question: Does the Security log show a service install event for this host, and what
+    subject account and service file name did it record?
+  context: Service installation is also recorded in the Security channel as event 4697,
+    which attributes the action to the subject account that performed it. This is a
+    distinct evidence source from the System-channel install record and is valuable
+    when command-line collection is incomplete, since it ties the service file name
+    to the account that registered it.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4697
+      condition: selection
+    fields:
+      - ServiceName
+      - ServiceFileName
+      - ServiceAccount
+      - SubjectUserName
+- question: Does the service binary referenced in the path exist on disk, and is it a
+    known legitimate file or suspicious?
+  context: The binary path from the command line should be verified on disk. Legitimate
+    services run from System32 or Program Files. A binary in a user-writable directory
+    (C:\Users\Public, Temp, Downloads), with a random name, or with a hash matching
+    known malware is a high-confidence indicator of malicious persistence. Pull the
+    file's location, hash, and signing status.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: What is the content of the binary or script the service path points to?
+  context: Beyond reputation, read what the service payload actually does. For scripts
+    and text files referenced in the binPath, check for base64 encoding, obfuscated
+    strings, embedded URLs or IP addresses, and download cradles. For compiled binaries,
+    check imports, embedded strings, packer signatures, and signing status. Content
+    analysis distinguishes a renamed legitimate tool from a purpose-built payload.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Is the service currently running, and what account is it using?
+  context: A created service may not have started yet (demand start) or may have been
+    stopped after detection. Checking the current status reveals whether the persistence
+    is active. A service running as LocalSystem has full system privileges; one running
+    as a specific user account indicates the attacker's access level. Run sc query or
+    sc qc against the service name from the alert command line on the host.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What process spawned the tool that created this service, and is that parent
+    chain expected?
+  context: The parent process reveals how the service was created. Legitimate creation
+    often has predictable parents — explorer.exe for interactive admin actions,
+    services.exe or an installer process for software deployment. Unusual parents
+    such as mshta.exe, wscript.exe, an Office application, or an unsigned binary in a
+    user directory point to exploitation or a malicious script driving the service
+    install.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Were the service's registry keys under the Services hive created or modified
+    around this time, including any Start or ImagePath changes?
+  context: Service creation writes a key under HKLM\System\CurrentControlSet\Services
+    with an ImagePath value and a Start value. Registry evidence captures direct hive
+    manipulation that bypasses sc.exe and New-Service entirely, and reveals changes to
+    an existing service's Start type (flipping a disabled service to auto-start) or its
+    ImagePath (repointing a legitimate service at a malicious binary).
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains: '\System\CurrentControlSet\Services\'
+      filter_endpoint:
+        TargetObject|endswith:
+          - '\Start'
+          - '\ImagePath'
+          - '\ServiceDll'
+      condition: selection and filter_endpoint
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- question: When this host has previously fired this service-creation pattern, what
+    parents and users normally drive it, and does the current alert fit?
+  context: Even routine service creation has a stable pattern on a given host. This query
+    mirrors the rule's selection structure scoped to this host, so the resulting
+    parent/user distribution reflects how this specific firing pattern has historically
+    run here — not generic sc.exe usage. A new parent process, an unexpected user
+    account, or an unusual command-line structure is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_sc:
+        Image|endswith: \sc.exe
+        CommandLine|contains|all:
+        - create
+        - binPath=
+      selection_posh:
+        CommandLine|contains|all:
+        - New-Service
+        - -BinaryPathName
+      susp_binpath:
+        CommandLine|contains:
+        - powershell
+        - mshta
+        - wscript
+        - cscript
+        - svchost
+        - dllhost
+        - 'cmd '
+        - cmd.exe /c
+        - cmd.exe /k
+        - cmd.exe /r
+        - rundll32
+        - C:\Users\Public
+        - \Downloads\
+        - \Desktop\
+        - \Microsoft\Windows\Start Menu\Programs\Startup\
+        - C:\Windows\TEMP\
+        - \AppData\Local\Temp
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (1 of selection* and susp_binpath) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Was sc.exe executed from its expected System32 path, or from a copied or
+    renamed location?
+  context: sc.exe normally runs from System32 or SysWOW64. Execution from a user
+    directory or under a different file name can indicate the binary was copied or
+    renamed to evade path-based allowlists or to obscure the service-creation action.
+    Compare the executable path against the original file name recorded in the alert.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- question: How often has this host fired this service-creation pattern over the past
+    90 days, and what command-line structures are typical?
+  context: A service-creation pattern with no prior history on a host is more suspicious
+    than one used regularly under stable parents. This query mirrors the rule's
+    selection structure scoped to this host, so the count reflects the rule's specific
+    firing pattern rather than generic binary usage. The command-line projection lets
+    you compare typical invocation patterns — service names, binary paths — against the
+    alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_sc:
+        Image|endswith: \sc.exe
+        CommandLine|contains|all:
+        - create
+        - binPath=
+      selection_posh:
+        CommandLine|contains|all:
+        - New-Service
+        - -BinaryPathName
+      susp_binpath:
+        CommandLine|contains:
+        - powershell
+        - mshta
+        - wscript
+        - cscript
+        - svchost
+        - dllhost
+        - 'cmd '
+        - cmd.exe /c
+        - cmd.exe /k
+        - cmd.exe /r
+        - rundll32
+        - C:\Users\Public
+        - \Downloads\
+        - \Desktop\
+        - \Microsoft\Windows\Start Menu\Programs\Startup\
+        - C:\Windows\TEMP\
+        - \AppData\Local\Temp
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (1 of selection* and susp_binpath) and _pb_scope
+    fields:
+    - CommandLine
+- question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining activity around the service
+    creation reveals what led to it and what followed — reconnaissance, credential
+    access, or additional persistence. Novel parent-child process pairs at low counts
+    stand out against repetitive agent telemetry and are what the investigation is
+    scanning for.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Were other process-based persistence mechanisms installed on this host?
+  context: Attackers rarely rely on a single persistence mechanism. After establishing
+    one service foothold, they commonly stack backups using different techniques —
+    scheduled tasks, additional services, registry Run keys, BITS jobs, or WMI
+    subscriptions. Multiple persistence installations in the same timeframe indicate
+    intentional stacking rather than isolated administrative action.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- question: Were files dropped to persistence locations such as Startup folders or Run
+    key paths on this host?
+  context: File-based persistence bypasses command-line detection entirely. Dropping an
+    executable or script into a Startup folder or a path referenced by a registry Run
+    key achieves persistence without running sc.exe or reg.exe. File event monitoring
+    captures these drops even when the attacker avoids standard persistence tools, and
+    a drop in the same window as the service creation widens the foothold picture.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist_paths:
+        TargetFilename|contains:
+          - '\Start Menu\Programs\Startup\'
+          - '\Windows\System32\Tasks\'
+          - '\Windows\Tasks\'
+      condition: selection and selection_persist_paths
+    fields:
+      - TargetFilename
+      - Image
+- question: Were any other persistence or tamper LOLBins used on this host recently?
+  context: Operators who use one living-off-the-land binary for persistence often use
+    several. Alongside service creation, check whether scheduled-task, registry,
+    boot-configuration, or shadow-copy tools were also run on this host in the surrounding
+    window. Multiple persistence- or tamper-class binaries in the same timeframe
+    strengthens the case for deliberate operator activity.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\reg.exe'
+          - '\at.exe'
+          - '\netsh.exe'
+          - '\wevtutil.exe'
+          - '\bcdedit.exe'
+          - '\vssadmin.exe'
+          - '\diskshadow.exe'
+          - '\dnscmd.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+          - '\rundll32.exe'
+          - '\regsvr32.exe'
+          - '\mshta.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine

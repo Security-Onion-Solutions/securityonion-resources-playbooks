@@ -1,0 +1,410 @@
+name: Add Port Monitor Persistence in Registry
+id: f5596f2d-7a35-4be0-a5b6-3de5bbea7683
+description: |
+  Detects a registry write that adds or changes a port monitor Driver value under
+  ...\Control\Print\Monitors\ where the value data ends in .dll. The rule fires when the value
+  points at a DLL AND the write is not one of the known-good printer-monitor products (CutePDF,
+  MONVNC, VNC Printer). A port monitor Driver value names a DLL that the print spooler service,
+  spoolsv.exe, loads at system startup under SYSTEM. Adding an arbitrary DLL to this key therefore
+  yields both persistence (the DLL loads on every boot) and privilege escalation (it runs as
+  SYSTEM). Legitimate writes come from printer-driver installers; direct writes outside a driver
+  install are rare. Investigate which DLL was named, which process wrote the value and what launched
+  it, whether spoolsv.exe subsequently loaded that DLL and whether it was signed, whether the DLL
+  landed on disk, whether spoolsv.exe spawned any child processes, and whether the value was later
+  changed again.
+type: detection
+detection_id: 944e8941-f6f6-4ee8-ac05-1c224e923c0e
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-10
+questions:
+- question: Does the alerting registry write add a port monitor Driver value that points at a DLL?
+  context: >-
+    Before investing investigation time, confirm the alert is a true positive. The rule fires when a
+    value under a path containing \Control\Print\Monitors\ is set AND the value data ends in .dll,
+    AND the write is not one of the known-good printer-monitor products the rule excludes. Review the
+    exact TargetObject and Details on the triggering event to confirm a port monitor Driver entry was
+    set to a DLL rather than an unrelated print-configuration change.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this user and host expected to modify a print-monitor registry key?
+  context: >-
+    Port monitor Driver values normally change only when a printer driver is installed, which runs
+    under SYSTEM or an installer service account. A regular user account writing this key outside a
+    driver install is the setup step of the persistence technique, so knowing whether the writing
+    account and host function match any sanctioned printer deployment is the fastest way to separate a
+    legitimate install from an implant. User attribution is present on roughly 94% of endpoint
+    registry events; when it is a machine account or SYSTEM, pivot on the writing process instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Which port monitor key and DLL value were written, and why is this a persistence and privilege-escalation location?
+  context: >-
+    The Driver value under ...\Control\Print\Monitors\<name>\ names a DLL that spoolsv.exe loads at
+    every boot under SYSTEM. Confirming the exact key and DLL value establishes that this is the port
+    monitor mechanism rather than an unrelated print setting, and sets up decoding the DLL path.
+    Legitimate monitor DLLs live in C:\Windows\System32 and are installed by a driver package; a value
+    naming a DLL outside System32, or one written without an accompanying driver install, is the signal
+    that this is being used for autostart persistence.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: What DLL path was written to the port monitor Driver value, and where does it resolve?
+  context: >-
+    The Details field holds the DLL that spoolsv.exe will load at startup. Read it closely: a bare
+    filename resolves out of C:\Windows\System32, so a name there matching a known driver is likely
+    benign, while a DLL in a user-writable or unusual directory, an unfamiliar name, or a fully
+    qualified path outside System32 points to an arbitrary DLL staged for SYSTEM execution. The path
+    also becomes the lead for confirming the file on disk. Details is present on roughly 79% of
+    registry modifications and is populated for this string value.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- question: What process wrote the port monitor value, and what launched that process?
+  context: >-
+    The registry event carries no command line, so pivot by ProcessGuid to the writing process to read
+    its Image, full command, and parent. The process that configured the monitor is the caller that
+    invoked the AddMonitor path or wrote the key directly. A reg.exe, powershell.exe, or cmd.exe write
+    launched from an Office application, a browser, a script host such as wscript.exe or mshta.exe, or
+    an unsigned binary points to persistence being staged programmatically rather than a driver
+    installer or a deliberate administrator action. The parent chain distinguishes a scripted
+    installation from a legitimate print-driver package.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: After this change, did spoolsv.exe load the referenced DLL, and was it signed?
+  context: >-
+    The persistence takes effect when the print spooler service loads the named DLL at startup under
+    SYSTEM, which is the step that turns the registry value into code execution. Looking for
+    spoolsv.exe loading a module whose path matches the written value confirms the mechanism fired; the
+    signature fields show whether the loaded DLL is a signed system component or an unsigned or
+    unexpectedly signed module. An unsigned DLL, or a signed one that does not match a known printer
+    driver, loaded by spoolsv.exe is strong corroboration that an arbitrary DLL was planted. The load
+    can occur any time from the next reboot onward, so this looks forward from the registry write.
+  range: +7d
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: '\spoolsv.exe'
+        ImageLoaded|endswith|expand: '%Details%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+      - SignatureStatus
+      - Hashes
+- question: After the port monitor was configured, did spoolsv.exe spawn any child processes?
+  context: >-
+    A malicious port monitor DLL runs inside the print spooler as SYSTEM and can launch further
+    processes from it. spoolsv.exe normally spawns very few children, so any command interpreter,
+    script host, or unfamiliar binary parented to spoolsv.exe after the registry write is a sign the
+    planted DLL executed and took action at high privilege. This looks forward from the write to
+    capture the next boot and any immediate post-load activity.
+  range: +7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: '\spoolsv.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - User
+- question: Was the referenced monitor DLL written to disk, and where does it live?
+  context: >-
+    The monitor loads only if the named DLL exists at a path spoolsv.exe can reach. If the writing
+    process or its children created the DLL, the file-write event shows where it landed - a drop into
+    System32 requires privileged write, while a DLL in a user-writable directory named by a fully
+    qualified path is the arbitrary-DLL variant. The file-write event carries no hash; if the DLL is
+    present, hash it from a later load or execution or retrieve it for a reputation lookup.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Is the port monitor key a known persistence location, and does the value remain or get changed again?
+  context: >-
+    Driver values under the Print\Monitors key are a documented autostart and privilege-escalation
+    location because spoolsv.exe loads them as SYSTEM at boot. Registry key or value deletions are not
+    observable in this telemetry, so durability is judged from the value's re-modification history
+    rather than from a delete event. A value that stays in place leaves the DLL primed to load on every
+    reboot; a later write that removes or overwrites it points to cleanup after the payload ran. Compare
+    the Details values written to this key over the following window.
+  range: +24h
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - Details
+      - Image
+- question: Has this port monitor key been modified before on this host?
+  context: >-
+    Port monitor Driver values change rarely and normally only when a printer driver is installed, so a
+    history with no prior writes makes this a first-time change and raises its weight. A history of
+    writes tied to printer-driver deployments points instead to routine software management. Compare the
+    historical Details values to see whether a DLL was set here before or whether this entry is new.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - Details
+      - Image
+- question: Was this same port monitor value modified on other hosts in the environment?
+  context: >-
+    The same monitor DLL written across many hosts suggests either a legitimate printer-driver rollout
+    or a technique applied broadly; the same write confined to one host suggests a targeted
+    installation. Compare the Details values and the writing process across hosts to see whether they
+    all name the same DLL and whether the writing process looks like a driver installer or a scripting
+    tool, which separates a managed deployment from repeated hands-on use of the technique.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+      - Details
+- question: What other registry modifications were made on this host in the same window?
+  context: >-
+    An actor establishing SYSTEM persistence often makes other configuration changes in the same
+    session - additional autostart keys, Run/RunOnce entries, Defender or firewall policy edits, or
+    service changes. Clustering the registry writes on this host in a short window around the alert
+    reveals the full scope of changes and which process made them. The triggering key appears in the
+    results; the signal is what else was modified and by which process.
+  range: +/-30m
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - User
+- question: What other process activity occurred on this host around the time of the alert?
+  context: >-
+    Persistence writes rarely happen in isolation. Aggregating process activity in a tight window around
+    the alert surfaces what led up to the monitor write and what ran immediately after. Novel
+    parent-child pairs stand out at low counts against high-count routine telemetry, which is what points
+    to the tool that staged the change and any follow-on actions taken by the process that wrote the key.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host - reconnaissance, execution of scripting tools, or defense
+    tampering - may reveal the stages that preceded this change and help reconstruct the timeline.
+    Autostart persistence is commonly installed after initial access and execution, so prior alerts help
+    place this monitor write within a larger sequence.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Were other process-based persistence mechanisms installed on this host in the same window?
+  context: >-
+    Attackers rarely rely on a single persistence mechanism. After planting one autostart (the port
+    monitor DLL), they commonly add backups - scheduled tasks, services, registry Run keys, BITS jobs,
+    or WMI subscriptions created by schtasks.exe, sc.exe, reg.exe, bitsadmin.exe, or wmic.exe. Multiple
+    persistence installations in the same timeframe indicate intentional stacking rather than an
+    isolated printer-driver install.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- question: Were files dropped to Startup or scheduled-task locations on this host in the same window?
+  context: >-
+    File-based persistence bypasses command-line detection entirely - dropping an executable or script
+    into a Startup folder or a path referenced by a registry Run key achieves persistence without
+    invoking schtasks, sc, or reg. File writes to these locations near the port monitor write indicate
+    the actor established a parallel persistence mechanism alongside the spooler DLL.
+    Run-key persistence itself is a registry write, not a file drop, so it does not appear in file telemetry; this query covers Startup folders and scheduled-task definition files, and Run-key writes surface in registry questions instead.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist_paths:
+        TargetFilename|contains:
+          - '\Start Menu\Programs\Startup\'
+          - '\Windows\System32\Tasks\'
+          - '\Windows\Tasks\'
+      condition: selection and selection_persist_paths
+    fields:
+      - TargetFilename
+      - Image
+- question: Does the user or an administrator recall installing a printer driver or port monitor here?
+  context: >-
+    A port monitor Driver value changes legitimately only during a printer-driver installation, so
+    direct confirmation from the account owner or the team that manages printing is a fast way to
+    resolve the alert. If an administrator installed a printer or a driver package around this time,
+    that likely explains the write; if no one recalls a printer change, the account may be compromised
+    or the write was made by automated tooling, and the investigation should continue into the writing
+    process and the spooler DLL load.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine

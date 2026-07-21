@@ -1,0 +1,417 @@
+name: Potentially Suspicious Child Process Of VsCode
+id: 8d8c3d8c-c814-41ba-99c1-098bc3bffb35
+description: |
+  Detects a process whose parent is the VsCode editor (code.exe) spawning a child that is uncommon for a code editor.
+  The rule fires when the parent ends in code.exe AND at least one of three branches matches: the child is a system
+  proxy-execution binary (calc.exe, regsvr32.exe, rundll32.exe, cscript.exe, wscript.exe); the child is a shell
+  (cmd.exe, powershell.exe, pwsh.exe) carrying download or expression-evaluation keywords (IEX, Invoke-Expression,
+  Invoke-Command, DownloadString, rundll32, regsvr32, wscript, cscript); or the child runs from a user-writable path
+  (Users\Public, Windows\Temp, \Temp). VsCode can be steered into launching arbitrary commands through workspace task
+  definitions and terminal profile settings, so this chain is a known persistence and indirect-execution path. Legitimate
+  developer workflows do compile and run code from the editor, so the investigation should confirm which branch fired,
+  decode the child command, and determine whether a workspace or terminal profile was configured to auto-run a payload.
+type: detection
+detection_id: 5a3164f2-b373-4152-93cf-090b13c12d27
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- question: Does this event match what the rule detects, with code.exe as the parent and a child that either is a proxy-execution binary or carries download keywords or runs from a user-writable path?
+  context: 'Before investing investigation time, confirm the alert is a true positive. The rule fires when the parent ends in code.exe AND at least one of three branches matches: the child is a proxy-execution binary (calc.exe, regsvr32.exe, rundll32.exe, cscript.exe, wscript.exe); the child is a shell (cmd.exe, powershell.exe, pwsh.exe) whose command line contains IEX, Invoke-Expression, Invoke-Command, DownloadString, rundll32, regsvr32, wscript, or cscript; or the child Image path contains Users\Public, Windows\Temp, or \Temp. Note which branch fired, because the branch determines which downstream questions carry weight: the path branch makes binary-origin and signature questions load-bearing, while the keyword branch makes command decoding load-bearing.'
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Is this user and host expected to run developer tooling that launches shells, scripting hosts, or system binaries from VsCode?
+  context: Legitimate developer workflows do compile and run code from the editor, and build tasks can spawn shells and interpreters. Knowing whether this user is a developer and whether this host is a development workstation rather than a server or a general-purpose endpoint is often the fastest path to separating routine build activity from abuse of VsCode tasks or terminal profiles. Treat a non-developer user or a server firing this pattern as higher priority.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Is code.exe expected to spawn this child, and what started the code.exe instance?
+  context: The parent-child relationship is the core signal for this detection. A code editor legitimately spawns build tools and shells when the user runs tasks, but workspace task definitions and terminal profiles can be configured to auto-launch arbitrary commands when a folder is opened or a terminal is created. Tracing what started code.exe itself separates an interactive developer session from a code.exe launched by a script, an archive extraction, or another automated chain.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What exactly did the child process do? Decode its full command line, including any download or expression-evaluation keywords.
+  context: 'The full command line reveals the specific action the child took. For the shell branch, decode any of the matched keywords: IEX and Invoke-Expression evaluate downloaded or constructed strings; DownloadString and Net.WebClient pull remote content; rundll32, regsvr32, wscript, and cscript proxy execution through signed binaries. Decode any base64, identify URLs, file paths, and DLL entry points, and read the operation the command performs. The query returns all executions of this binary on the host in a tight window so multi-step operations are visible together.'
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: If the child is PowerShell, was the command encoded or obfuscated, and what does it decode to?
+  context: When the child branch that fired is a shell carrying IEX, Invoke-Expression, or DownloadString, the command is often wrapped to hide intent. PowerShell -EncodedCommand (-enc) base64 blobs, string concatenation, backtick escaping, and variable substitution are common. Decoding reveals the actual payload, typically a download cradle, a reverse shell, or in-memory loading of a .NET assembly. If the child is not PowerShell or the command is already plain text, read the cradle directly and identify the URL fetched and what gets executed.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: If the child is a proxy-execution binary, what payload does its command line load, and is the target a remote URL, a script, or a DLL entry point?
+  context: 'System binaries such as regsvr32.exe, rundll32.exe, cscript.exe, and wscript.exe are trusted and signed, so operators use them to run externally hosted or unsigned payloads through command-line parameters. Inspect the child argument for the load target: a remote scriptlet URL passed to regsvr32 (/i:http...scrobj.dll), a DLL plus exported function passed to rundll32, or a script path passed to a script host. A path under a user-writable directory or a URL argument is the operative indicator.'
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - Image
+      - CurrentDirectory
+- question: What other child processes did this code.exe instance spawn around the time of the alert?
+  context: A workspace task or terminal profile configured to run a payload often launches more than one process in sequence, chaining reconnaissance, download, and execution steps. Listing the other children of the same code.exe instance reveals whether the alerting child was a single action or one stage of a scripted sequence. Multiple uncommon children from the same editor parent strengthens the case for an auto-run task rather than a one-off build command.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Were VsCode workspace or task definition files created or modified on this host shortly before the alert?
+  context: 'VsCode can be steered into launching arbitrary commands through on-disk configuration: a .code-workspace file or a tasks.json inside a .vscode folder with a runOn folderOpen task and automatic tasks enabled, or a settings.json defining a terminal profile set as default. A recent write to one of these files immediately before the child spawned indicates the editor was configured to auto-run the payload, which is the persistence mechanism this pattern reflects. Review the writer process and the file content for an embedded command.'
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_vscode_files:
+        TargetFilename|contains:
+          - '\.vscode\tasks.json'
+          - '\.vscode\settings.json'
+          - '.code-workspace'
+          - '\Code\User\settings.json'
+      condition: selection and selection_vscode_files
+    fields:
+      - TargetFilename
+      - Image
+      - User
+- question: Did the child process or its descendants make outbound network connections, and to what destinations?
+  context: Proxy-execution binaries and download cradles fetch remote payloads or open command-and-control channels. Correlating outbound connections from the alerting child against the spawn time distinguishes a self-contained local action from one that reaches the network to pull or stage content. Review destination addresses, ports, and the initiating process; connections to raw IP addresses or newly seen external hosts are higher priority than connections to known enterprise domains.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- question: Were PowerShell security controls bypassed or weakened before this execution?
+  context: When the shell branch fires, operators frequently disable or bypass PowerShell controls before running a payload. Common precursors include AMSI bypass (patching amsi.dll in memory), execution policy changes (-ExecutionPolicy Bypass or -ep bypass), constrained language mode escape, and downgrade to PowerShell v2 which lacks logging. Finding these precursor events on the host strengthens the case for malicious activity.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: Did PowerShell script block logging capture the full script content the child executed?
+  context: Script block logging (Event ID 4104) records the deobfuscated script content PowerShell actually executes, even when the command line is encoded or obfuscated, providing ground truth about what ran. This is most useful when the shell branch fired with download or expression-evaluation keywords. If PowerShell operational logs are not ingested in this environment, treat zero results as a visibility gap rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Does code.exe normally spawn this child binary on this host?
+  context: A code editor spawning a shell or build tool is routine on a developer workstation, but a code.exe parent spawning a proxy-execution binary such as regsvr32.exe or rundll32.exe, or a child from a user-writable path, is unusual. Historical frequency of this specific code.exe-to-child pairing on this host distinguishes a normal build step from a novel spawning relationship. Zero or very low counts raise the priority of the decode result.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent:
+        ParentImage|endswith: \code.exe
+      selection_children_images:
+        Image|endswith:
+        - \calc.exe
+        - \regsvr32.exe
+        - \rundll32.exe
+        - \cscript.exe
+        - \wscript.exe
+      selection_children_cli:
+        Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        - \cmd.exe
+        CommandLine|contains:
+        - Invoke-Expressions
+        - IEX
+        - Invoke-Command
+        - ICM
+        - DownloadString
+        - rundll32
+        - regsvr32
+        - wscript
+        - cscript
+      selection_children_paths:
+        Image|contains:
+        - :\Users\Public\
+        - :\Windows\Temp\
+        - :\Temp\
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection_parent and 1 of selection_children_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent:
+        ParentImage|endswith: \code.exe
+      selection_children_images:
+        Image|endswith:
+        - \calc.exe
+        - \regsvr32.exe
+        - \rundll32.exe
+        - \cscript.exe
+        - \wscript.exe
+      selection_children_cli:
+        Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        - \cmd.exe
+        CommandLine|contains:
+        - Invoke-Expressions
+        - IEX
+        - Invoke-Command
+        - ICM
+        - DownloadString
+        - rundll32
+        - regsvr32
+        - wscript
+        - cscript
+      selection_children_paths:
+        Image|contains:
+        - :\Users\Public\
+        - :\Windows\Temp\
+        - :\Temp\
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection_parent and 1 of selection_children_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the same user triggered similar editor-spawned execution on multiple hosts in this window, the scope of the operation may be larger than a single workstation.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent:
+        ParentImage|endswith: \code.exe
+      selection_children_images:
+        Image|endswith:
+        - \calc.exe
+        - \regsvr32.exe
+        - \rundll32.exe
+        - \cscript.exe
+        - \wscript.exe
+      selection_children_cli:
+        Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        - \cmd.exe
+        CommandLine|contains:
+        - Invoke-Expressions
+        - IEX
+        - Invoke-Command
+        - ICM
+        - DownloadString
+        - rundll32
+        - regsvr32
+        - wscript
+        - cscript
+      selection_children_paths:
+        Image|contains:
+        - :\Users\Public\
+        - :\Windows\Temp\
+        - :\Temp\
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection_parent and 1 of selection_children_*) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate context: what led to this event, what happened after, and whether it is part of a larger sequence. Look for reconnaissance, credential access, or persistence installation near the editor-spawned execution.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: 'Alerts rarely happen in isolation. Earlier detections on the same host, defense tampering, reconnaissance, or credential access, may reveal the stages that preceded this event and help reconstruct the timeline. Look for patterns: tampering followed by execution, or reconnaissance followed by exploitation.'
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

@@ -1,0 +1,346 @@
+name: HackTool - WSASS Execution
+id: cc924bd1-e1e2-4824-b8ec-e70dc08614ae
+description: |
+  Detects execution of WSASS, a tool that dumps LSASS process memory on modern Windows by abusing the Windows Error
+  Reporting binary WerFaultSecure.exe to bypass Protected Process Light (PPL) protections. The rule fires when at least
+  one of three independent conditions matches: a process Image ending in wsass.exe, a known import hash of the tool, or a
+  command line in which an executable launches werfaultsecure.exe with a trailing target process ID. WerFaultSecure.exe
+  normally runs from System32 at the highest PPL level to collect crash dumps of protected processes; relocating an older
+  copy and pointing it at LSASS turns that capability into a credential-dumping primitive whose output is a MINIDUMP of
+  LSASS memory. Because each of the three selections can fire alone, confirm which one matched, then determine whether the
+  activity is an authorized assessment or an attempt to scrape cached credentials from LSASS.
+type: detection
+detection_id: 589ac73f-8e12-409c-964e-31a2f5775ae2
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- question: Does this event match the rule, with either an Image ending in wsass.exe, the tool's import hash, or a command line launching werfaultsecure.exe against a target process ID?
+  context: Confirm the alert is a true positive before investing investigation time. The rule fires when any one of three independent conditions holds, an Image ending in wsass.exe, a Hashes value carrying the tool's IMPHASH, or a CommandLine in which an executable invokes werfaultsecure.exe followed by a numeric target process ID. Note which branch matched, because it changes what the downstream evidence looks like. A name or hash match means the packaged tool itself ran; a command-line-only match means the WerFaultSecure abuse was launched by some other executable and the binary name and hash carry little weight.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - Hashes
+- question: Is this user and host expected to dump or collect process memory from LSASS?
+  context: Reading LSASS memory is the work of a narrow set of legitimate tools (some AV/EDR agents, crash-diagnostic utilities) and almost never a routine end-user or general-server action. Knowing whether the user role and host function involve memory forensics or endpoint security operations is often the fastest path to separating sanctioned diagnostics from credential theft.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Is this WSASS or WerFaultSecure execution part of an authorized penetration test or red team engagement?
+  context: LSASS-dumping tooling is used in sanctioned security assessments. Before deeper analysis, check whether a penetration test or red team exercise is currently active on this host or network segment. An authorized engagement with matching tooling and timing resolves the alert without further investigation.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What WerFaultSecure.exe path and target process ID does the command line show?
+  context: The detection logic and the tool's design hinge on two command-line specifics. The path to WerFaultSecure.exe carried on the command line indicates which copy was used; a path outside C:\Windows\System32 is the relocated, attacker-supplied copy used for the PPL bypass, while System32 is the normal crash-handling location. The trailing numeric argument is the target process ID being dumped, which should resolve to the LSASS process for a credential-dumping attempt. Read both from the full command line to confirm what the tool was pointed at.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Was LSASS memory accessed or dumped, and by what method?
+  context: This technique scrapes credentials from LSASS process memory rather than from the SAM database or NTDS.dit. Confirm that the trailing process ID on the command line maps to LSASS and identify the dump method, here an older WerFaultSecure.exe driven at the WinTCB PPL level to read a protected process and write a MINIDUMP. Knowing the method and the target confirms which cached credentials may be exposed and what remediation is required.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did the WSASS/WerFaultSecure process, or a process it spawned, write a dump-like artifact to disk, consistent with a full-access read of lsass.exe memory?
+  context: Memory dumping requires a process-access handle to lsass.exe carrying the rights needed to read its memory, but that handle open is not observable here - this data source carries no cross-process access telemetry, so a zero result does not mean LSASS was not accessed; it only means this process tree did not drop a dump file. Any dump-like artifact written by the relocated WerFaultSecure.exe binary or its children is the one indirect signal available that the access half of the dump sequence completed.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Was a memory dump file written to disk on this host around the alert, and where?
+  context: A successful LSASS dump leaves a file artifact, here a MINIDUMP whose four-byte magic the tool rewrites to a PNG header to evade content inspection. Dump files commonly land in user-writable staging paths such as %TEMP% or C:\Windows\Temp. Locating the output file confirms the dump completed, preserves it for analysis, and gives the staging path the operator chose; its absence may mean the dump failed or the file was already moved or deleted.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      filter_temp:
+        TargetFilename|contains:
+          - '\Temp\'
+          - '\Tmp\'
+          - '\AppData\'
+          - '\Users\Public\'
+          - '\ProgramData\'
+      condition: selection and filter_temp
+    fields:
+      - TargetFilename
+      - Image
+      - ProcessGuid
+      - EventType
+- question: What process spawned this execution, and is that parent chain expected?
+  context: The parent process reveals how the activity was launched. Operator-driven credential dumping frequently descends from an interactive shell, a remote-execution service, or a script host such as cmd.exe, powershell.exe, wmiprvse.exe, or wscript.exe, rather than from a routine management agent. Walk up the tree to see what spawned the parent and whether that lineage fits sanctioned tooling.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What child processes did this execution spawn afterward?
+  context: The processes spawned after the dump reveal the operator's next step. Credential dumping is typically followed by staging or exfiltration of the dump file, or by tools that parse it offline. Review the children and their command lines for archive utilities, copy or transfer commands, or credential-parsing tooling.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Were outbound remote-access connections (RDP, SMB, WinRM, SSH) initiated from this host after
+    this event?
+  context: Credential theft is typically followed by lateral movement. The query returns outbound connections
+    from this host to remote-access ports -- 3389 (RDP), 445 (SMB/PsExec), 5985/5986 (WinRM), 22 (SSH)
+    -- in the hours after the event; the originating Image and User show what drove each connection. Two
+    limits to keep in mind -- credentials exfiltrated and replayed from another machine will not appear
+    here (check security 4624 logons on suspected targets for this account and any accounts with sessions
+    on this host), and the query requires Sysmon network telemetry (EID 3); if that is not collected from
+    this host, treat zero rows as a visibility gap, not as evidence no movement occurred.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
+- question: Which accounts may be exposed by this LSASS dump, and do any have elevated privileges?
+  context: LSASS memory holds the credentials and authentication material of every account with an active session on the host, so the severity depends on who was logged on. A host with domain administrator, service account, or other privileged sessions active at dump time requires escalation; a single standard-user session is a narrower exposure. Cross-reference the sessions present on the host against directory group memberships.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Are other artifacts of this tool present on the host?
+  context: 'The tool leaves characteristic traces beyond the single triggering process: the relocated copy of WerFaultSecure.exe staged outside System32, the MINIDUMP output with a rewritten PNG-style magic header, and any loader used to run the helper at PPL. File-creation events from the involved processes confirm execution and reveal the scope of activity even after the original process has exited.'
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: When this host has previously fired the rule's pattern, what parents and users normally drove that activity, and does the current alert fit that pattern?
+  context: The query mirrors the rule's selection structure scoped to this host, so the resulting parent and user distribution reflects how this specific firing pattern has historically run here, not generic process activity. For a credential-dumping tool a prior history is itself unusual; a new parent process, an unexpected user account, or a first-ever appearance is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+        Image|endswith: \wsass.exe
+      selection_hash:
+        Hashes|contains: IMPHASH=32F5095C9BBDCACF28FD4060EB4DFC42
+      selection_cli:
+        CommandLine|re: (?i)\.exe[\"\']?\s+[^\"]{0,64}werfaultsecure\.exe[\"\']?\s+\d{2,10}
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+        Image|endswith: \wsass.exe
+      selection_hash:
+        Hashes|contains: IMPHASH=32F5095C9BBDCACF28FD4060EB4DFC42
+      selection_cli:
+        CommandLine|re: (?i)\.exe[\"\']?\s+[^\"]{0,64}werfaultsecure\.exe[\"\']?\s+\d{2,10}
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+        Image|endswith: \wsass.exe
+      selection_hash:
+        Hashes|contains: IMPHASH=32F5095C9BBDCACF28FD4060EB4DFC42
+      selection_cli:
+        CommandLine|re: (?i)\.exe[\"\']?\s+[^\"]{0,64}werfaultsecure\.exe[\"\']?\s+\d{2,10}
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate context: what led to this event, what happened after, and whether it is part of a larger sequence. Look for reconnaissance, privilege escalation, defense tampering, or staging that surrounds the credential-access step.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Have other hosts fired the rule's pattern in the past week, and does the cross-host distribution look like consistent automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of this firing pattern rather than generic process activity. Many hosts firing the same pattern points to scripted deployment or a sanctioned assessment sweep; one host or a small unrelated set points to manual operator activity. Use the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+        Image|endswith: \wsass.exe
+      selection_hash:
+        Hashes|contains: IMPHASH=32F5095C9BBDCACF28FD4060EB4DFC42
+      selection_cli:
+        CommandLine|re: (?i)\.exe[\"\']?\s+[^\"]{0,64}werfaultsecure\.exe[\"\']?\s+\d{2,10}
+      condition: 1 of selection_*
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: 'Alerts rarely happen in isolation. Earlier detections on the same host, defense tampering, reconnaissance, or initial execution, may reveal the stages that preceded this event and help reconstruct the timeline. Look for patterns: defense tampering followed by credential access, or reconnaissance followed by hands-on-keyboard activity.'
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

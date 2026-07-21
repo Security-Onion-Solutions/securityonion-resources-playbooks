@@ -1,0 +1,366 @@
+name: MMC Spawning Windows Shell
+id: e0975290-3330-48bc-8ced-3f6bfe94903d
+description: |
+  Detects mmc.exe spawning a Windows command interpreter, script host, or system utility
+  (cmd.exe, powershell.exe, pwsh.exe, wscript.exe, cscript.exe, sh.exe, bash.exe, reg.exe,
+  regsvr32.exe, or bitsadmin). The rule fires when the parent process ends in mmc.exe AND the
+  child is one of those binaries. The Microsoft Management Console exposes the MMC20.Application
+  DCOM object, whose ExecuteShellCommand method lets a remote administrator run an arbitrary
+  command on a target host; the resulting child appears under mmc.exe with no interactive snap-in
+  context. Legitimate snap-in operations rarely launch shells or reg.exe, so this pairing usually
+  reflects DCOM-based remote code execution after an attacker has authenticated to the host with
+  administrative rights. Investigation should confirm the child binary, identify which remote
+  source initiated the DCOM activation, and determine what the spawned process did.
+type: detection
+detection_id: 05a2ab7e-ce11-4b63-86db-ab32e763e11d
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-04
+questions:
+- question: Did mmc.exe spawn a command interpreter, script host, or system utility on this host?
+  context: Confirm the alert is a true positive by reviewing the triggering event. The rule fires
+    only when the parent process ends in mmc.exe AND the child binary is one of cmd.exe,
+    powershell.exe, pwsh.exe, wscript.exe, cscript.exe, sh.exe, bash.exe, reg.exe, regsvr32.exe,
+    or bitsadmin. Verify both the parent and the child match before investing further analysis.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+- question: Is this user and host expected to drive Management Console snap-in operations that launch shells?
+  context: Legitimate MMC snap-in use rarely spawns command interpreters or reg.exe. Knowing whether
+    the host is an administrative workstation or jump box, and whether the acting account is an
+    administrator who routinely manages this system, is often the fastest way to separate routine
+    administration from DCOM-based remote execution.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Is mmc.exe expected to spawn this child, and what started mmc.exe itself?
+  context: The mmc.exe-to-shell relationship is the core signal. Tracing what spawned mmc.exe reveals
+    whether the console started from an interactive user action (services.exe or explorer.exe lineage,
+    a loaded snap-in) or was instantiated remotely. When mmc.exe is invoked through the MMC20.Application
+    DCOM object, it has no console window and no snap-in parent chain, and the shell it launches carries
+    the operator's command.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What other child processes did this same mmc.exe instance spawn?
+  context: If mmc.exe was driven remotely to run one command, it may have been used to run several.
+    Examining the other children of the exact mmc.exe instance reveals the full scope of commands
+    executed through the DCOM channel -- reconnaissance, credential access, or tool staging launched
+    in sequence from the same console.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: What exactly did the spawned process do? Decode its full command line.
+  context: The child's command line carries the operator's payload. Decode any flags, encoded content,
+    file paths, or URLs to understand the action taken on this host. ExecuteShellCommand passes the
+    program and its parameters straight through, so the full argument string reflects exactly what the
+    remote operator intended to run.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Which of the DCOM-abused binaries spawned, and is it the genuine signed system binary or a renamed copy?
+  context: The DCOM lateral-movement family targets a known set of executables -- cmd.exe, powershell.exe,
+    pwsh.exe, the script hosts, reg.exe, regsvr32.exe, and bitsadmin. Confirm which one fired and verify
+    the on-disk image path and signature. A binary that carries one of these names but runs from a
+    non-system directory, or is unsigned, points to a renamed or relocated tool rather than the genuine
+    Windows utility.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Was there a network logon to this host immediately before mmc.exe spawned the child?
+  context: DCOM activation is a privileged remote operation -- the operator authenticates to the target
+    over RPC before instantiating MMC20.Application. A network logon (type 3) or explicit-credential logon
+    arriving shortly before the spawn identifies the account and source address that drove the activity.
+    If Security logon events are not ingested in this environment, treat the absence of results as a
+    visibility gap rather than evidence no remote logon occurred.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID:
+          - 4624
+          - 4648
+        LogonType: 3
+      condition: selection
+    fields:
+      - TargetUserName
+      - IpAddress
+      - LogonType
+      - EventID
+- question: What host initiated the RPC connection to this system, and is it an expected administrative source?
+  context: DCOM activation reaches the target over RPC on TCP 135 plus a dynamic high port. Identifying the
+    source address of the inbound connection in the window around the spawn reveals whether the activation
+    came from a known admin jump box or from an unexpected workstation being used as a pivot. Correlating the
+    RPC connection time with the mmc.exe child spawn time confirms the two are part of one remote-execution
+    event.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationPort:
+          - 135
+          - 445
+      condition: selection
+    fields:
+      - SourceIp
+      - DestinationPort
+- question: What modules loaded into the spawned process or its host shortly after it started?
+  context: The DCOM detection strategy treats abnormal module loading on the target as a marker of code
+    execution following remote instantiation. Reviewing image loads in the spawned process -- especially
+    .NET runtime DLLs, scripting engines, or unsigned modules loaded from user-writable paths -- shows
+    whether the shell merely ran a benign command or hosted in-memory tooling. If module-load telemetry
+    is not collected in this environment, this returns nothing by construction.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+- question: If the spawned child was PowerShell, was the command encoded, and what does it decode to?
+  context: When the child binary is powershell.exe or pwsh.exe, DCOM operators commonly pass an
+    -EncodedCommand (-enc) base64 payload or otherwise obfuscated argument so the console runs a download
+    cradle, reverse shell, or in-memory .NET load. Decoding the argument reveals the actual payload. If
+    the child was not PowerShell, this question does not apply.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Does mmc.exe normally spawn command interpreters or system utilities on this host?
+  context: Some parent-child pairings are routine, but mmc.exe spawning a shell or reg.exe is inherently
+    unusual outside of specific snap-in operations. Historical frequency of this exact pairing on this host
+    distinguishes a novel spawning relationship from an established administrative pattern. Zero or very low
+    counts indicate first-time behavior worth chasing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection1:
+        ParentImage|endswith: \mmc.exe
+      selection2:
+      - Image|endswith:
+        - \cmd.exe
+        - \powershell.exe
+        - \pwsh.exe
+        - \wscript.exe
+        - \cscript.exe
+        - \sh.exe
+        - \bash.exe
+        - \reg.exe
+        - \regsvr32.exe
+      - Image|contains: \BITSADMIN
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection1:
+        ParentImage|endswith: \mmc.exe
+      selection2:
+      - Image|endswith:
+        - \cmd.exe
+        - \powershell.exe
+        - \pwsh.exe
+        - \wscript.exe
+        - \cscript.exe
+        - \sh.exe
+        - \bash.exe
+        - \reg.exe
+        - \regsvr32.exe
+      - Image|contains: \BITSADMIN
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this user account moved to other hosts using lateral-movement tooling?
+  context: DCOM execution is one lateral-movement method among several. If the same account is also driving
+    psexec, remote desktop, ssh, or wmic against other systems in the same period, the scope of compromise
+    extends beyond this host. A single account reaching many hosts in a short window indicates active
+    movement across the environment.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      selection_lateral:
+        Image|endswith:
+          - '\psexec.exe'
+          - '\psexec64.exe'
+          - '\mstsc.exe'
+          - '\ssh.exe'
+          - '\plink.exe'
+          - '\wmic.exe'
+      condition: selection and selection_lateral
+    fields:
+      - host.name
+      - Image
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Remote code execution rarely stands alone. Earlier detections on the same host -- reconnaissance,
+    credential access, or defense tampering -- may reveal the stages that preceded the DCOM activation and
+    help reconstruct how the operator obtained the administrative access the technique requires.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Is mmc.exe spawning these same shells on other hosts in the environment?
+  context: The same mmc.exe-to-shell pairing appearing on multiple hosts in a short window points to an
+    operator working through a set of systems via DCOM rather than a single isolated action. Enterprise-wide
+    comparison helps calibrate scope and identify other targets that may already have been reached. A known
+    set of systems that should never see DCOM-driven shell activity makes any match here a clear deviation.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+      - CommandLine

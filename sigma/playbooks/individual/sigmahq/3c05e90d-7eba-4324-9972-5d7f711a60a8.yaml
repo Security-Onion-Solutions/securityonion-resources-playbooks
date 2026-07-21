@@ -1,0 +1,403 @@
+name: UAC Bypass Tools Using ComputerDefaults
+id: 96e8fb3c-7fd7-40cb-b494-0f28d3dd4896
+description: |
+  Detects ComputerDefaults.exe running at High or System integrity when its parent process did NOT
+  launch from System32 or Program Files. ComputerDefaults.exe is an auto-elevated Windows binary; the
+  rule fires only when both conditions hold together — the elevated integrity level AND a parent
+  living outside the trusted system directories — which is the signature of a registry-handler UAC
+  bypass that proxies a user-controlled command through this auto-elevated binary. Legitimately,
+  ComputerDefaults.exe is launched by the user via explorer.exe or settings UI from a trusted path;
+  the investigation should determine what registry handler was hijacked, what command actually ran
+  elevated, and what the operator did with the new High-integrity token.
+type: detection
+detection_id: 3c05e90d-7eba-4324-9972-5d7f711a60a8
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Did ComputerDefaults.exe run at High or System integrity from a parent outside the trusted system directories?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule fires only when
+    both conditions hold together — ComputerDefaults.exe at High/System integrity AND a parent process that did
+    NOT launch from System32 or Program Files. Review the alerting event's Image and IntegrityLevel against those
+    criteria. ComputerDefaults.exe launched normally by the settings UI runs from a trusted parent and is excluded.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - IntegrityLevel
+- question: Is this user and host expected to launch elevated system settings utilities from a non-standard parent?
+  context: Legitimate administrative activity can trigger this detection — but ComputerDefaults.exe normally runs
+    from the settings UI under explorer.exe, not from a parent outside System32 or Program Files. Knowing whether
+    this user role and host function would plausibly produce that launch path is often the fastest way to separate
+    a true positive from a benign edge case.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What was the full command line of ComputerDefaults.exe, and what did the bypass cause it to run?
+  context: ComputerDefaults.exe itself takes no meaningful arguments — its abuse value is that it reads a hijacked
+    HKCU registry handler and executes whatever command was planted there. Examine the full command line and the
+    working directory of this and any closely sequenced executions on the host to identify the operation the bypass
+    set in motion.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What process spawned ComputerDefaults.exe, and is that parent chain expected?
+  context: The parent process is the heart of this detection — the rule fires precisely because the parent did not
+    launch from System32 or Program Files. A parent such as a script host, an Office application, or a binary in a
+    user-writable directory points to a deliberate bypass; a relocated-but-trusted launcher may explain a benign fire.
+    Walk up the tree to see what spawned the parent and what else it spawned.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Does this host normally run ComputerDefaults.exe at all?
+  context: ComputerDefaults.exe is a settings-launcher binary that most hosts run rarely or never. Zero or very low
+    historical counts make this firing more suspicious; a host where it appears regularly under benign parents is a
+    weaker signal.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: When this host previously fired this rule's pattern, what parents and users drove it, and does the current alert fit?
+  context: Even auto-elevated binaries fire benignly sometimes. The query mirrors the rule's selection structure scoped
+    to this host — the resulting parent and user distribution reflects how this specific elevated-with-untrusted-parent
+    pattern has historically run here. A new parent process, an unexpected user account, or a first-ever appearance is
+    the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        IntegrityLevel:
+        - High
+        - System
+        - S-1-16-16384
+        - S-1-16-12288
+        Image: C:\Windows\System32\ComputerDefaults.exe
+      filter:
+        ParentImage|contains:
+        - :\Windows\System32
+        - :\Program Files
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Was an auto-elevate registry handler written on this host, and what command did it plant?
+  context: The ComputerDefaults bypass works by writing an attacker command into an HKCU auto-elevate handler key —
+    most commonly the ms-settings Shell\Open\command default value, sometimes with a DelegateExecute marker — that the
+    auto-elevated binary then reads and executes at High integrity. Finding the registry write confirms the bypass
+    mechanism and reveals the exact payload. Inspect the registry value set and the process that wrote it.
+  range: -15m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains:
+          - 'ms-settings\Shell\Open\command'
+          - 'ms-settings\shell\open\command'
+          - 'Classes\ms-settings'
+          - 'Shell\Open\command'
+          - 'DelegateExecute'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- question: Which process wrote the registry keys that set up this UAC bypass, and what payload did they contain?
+  context: Many UAC bypass techniques rely on a process writing a command into a registry key that an auto-elevated
+    binary reads and executes. For the ComputerDefaults path the target is the HKCU ms-settings Shell\Open\command
+    handler. Identifying the writing process (reg.exe, powershell.exe, cmd.exe, or a custom tool such as the UACMe
+    family) and the planted command confirms the mechanism and the elevated payload.
+  range: -15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\reg.exe'
+          - '\powershell.exe'
+          - '\cmd.exe'
+        CommandLine|contains:
+          - 'ms-settings'
+          - 'mscfile'
+          - 'Classes\exefile'
+          - 'Classes\Folder'
+          - 'Environment'
+          - 'Shell\Open\command'
+          - 'DelegateExecute'
+      condition: selection
+    fields:
+      - CommandLine
+      - Image
+- question: What action was performed with elevated privileges after the UAC bypass?
+  context: UAC bypass is a means to an end — operators elevate to perform actions that require high integrity such as
+    installing persistence, dumping credentials, tampering with security tools, or accessing protected resources.
+    Examining High and System integrity processes spawned on this host shortly after the bypass (a tunable window, often
+    within tens of seconds to minutes) reveals the objective. Watch for sdclt.exe, eventvwr.exe, and other auto-elevate
+    proxies recurring, which can indicate repeated bypass attempts.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        IntegrityLevel:
+          - 'High'
+          - 'System'
+          - 'S-1-16-16384'
+          - 'S-1-16-12288'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - IntegrityLevel
+- question: Were other privilege escalation techniques attempted on this host?
+  context: Operators who attempt one UAC bypass often try multiple methods until one succeeds, especially when the OS
+    version or configuration blocks certain techniques. Other privilege-escalation or UAC-bypass detections on this host
+    — clustered in time with this one — point to deliberate escalation activity rather than an isolated benign fire.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - rule.name
+      - rule.uuid
+      - event.severity_label
+- question: Have other hosts fired this rule's pattern in the past week, and does the distribution look like automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of
+    this elevated-with-untrusted-parent pattern rather than generic ComputerDefaults.exe usage. Many hosts firing the
+    same pattern with a consistent parent points to scripted deployment or vendor automation; one host or a small
+    unrelated set points to manual operator activity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        IntegrityLevel:
+        - High
+        - System
+        - S-1-16-16384
+        - S-1-16-12288
+        Image: C:\Windows\System32\ComputerDefaults.exe
+      filter:
+        ParentImage|contains:
+        - :\Windows\System32
+        - :\Program Files
+      condition: selection and not filter
+    fields:
+    - host.name
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        IntegrityLevel:
+        - High
+        - System
+        - S-1-16-16384
+        - S-1-16-12288
+        Image: C:\Windows\System32\ComputerDefaults.exe
+      filter:
+        ParentImage|contains:
+        - :\Windows\System32
+        - :\Program Files
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        IntegrityLevel:
+        - High
+        - System
+        - S-1-16-16384
+        - S-1-16-12288
+        Image: C:\Windows\System32\ComputerDefaults.exe
+      filter:
+        ParentImage|contains:
+        - :\Windows\System32
+        - :\Program Files
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or coordinated action across multiple
+    endpoints. If the same user triggered similar elevation activity on more than one host, the scope of the operation
+    may be larger than this single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        IntegrityLevel:
+        - High
+        - System
+        - S-1-16-16384
+        - S-1-16-12288
+        Image: C:\Windows\System32\ComputerDefaults.exe
+      filter:
+        ParentImage|contains:
+        - :\Windows\System32
+        - :\Program Files
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate context: what led
+    to this event, what happened after, and whether it is part of a larger sequence. Look for reconnaissance, additional
+    elevation attempts, or persistence mechanisms close in time to the bypass.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance,
+    credential access — may reveal the attack stages that preceded this event and help reconstruct the full timeline
+    leading up to the elevation.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

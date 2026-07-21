@@ -1,0 +1,475 @@
+name: WSL Child Process Anomaly
+id: 5beeabe5-a49d-4667-a93e-374d786ed9eb
+description: |
+  Detects when wsl.exe or wslhost.exe spawns a child process that either matches a known
+  abuse-prone Windows binary (calc.exe, cmd.exe, cscript.exe, mshta.exe, powershell.exe,
+  pwsh.exe, regsvr32.exe, rundll32.exe, wscript.exe) or runs from a user-writable staging
+  directory (AppData Local Temp, Users Public, Windows Temp, C:\Temp, Downloads, Desktop).
+  wsl.exe is a Microsoft-signed launcher for the Windows Subsystem for Linux; it can proxy
+  arbitrary Windows or Linux execution and break the expected parent/child chain that endpoint
+  detections rely on, since the spawned process is parented to a WSL helper rather than to a
+  conventional shell. Legitimate developer or admin use of WSL is common, so the investigation
+  determines whether the spawned child is benign tooling or an attempt to run a payload through
+  a trusted intermediary while evading parent/child correlation.
+type: detection
+detection_id: 2267fe65-0681-42ad-9a6d-46553d3f3480
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Did wsl.exe or wslhost.exe spawn a child that either matches a flagged binary or ran from a user-writable directory?
+  context: >-
+    This rule fires when the parent is wsl.exe or wslhost.exe AND the child either ends in one of
+    the flagged binaries (calc.exe, cmd.exe, cscript.exe, mshta.exe, powershell.exe, pwsh.exe,
+    regsvr32.exe, rundll32.exe, wscript.exe) OR runs from a user-writable path (AppData Local Temp,
+    Users Public, Windows Temp, C:\Temp, Downloads, Desktop). Confirm the ParentImage and Image
+    against these criteria and note which branch fired: a name-branch hit means the child is a
+    well-known abuse binary regardless of location, while a path-branch hit means the child runs
+    from a staging directory regardless of its name. The branch that fired tells you whether the
+    binary identity or its location is the load-bearing signal downstream.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+- question: Is this user and host expected to run the Windows Subsystem for Linux?
+  context: >-
+    WSL is common on developer and engineering workstations and rare on general user endpoints or
+    servers. A standard interactive user on a non-developer host invoking WSL to launch Windows
+    binaries is more anomalous than a known developer doing the same. Confirm whether the user role
+    and host function are consistent with WSL usage before investing further.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Is wsl.exe expected to spawn this child here, and what started wsl.exe itself?
+  context: >-
+    The parent-child relationship is the core signal for this detection. wsl.exe proxies execution
+    so the child is parented to the WSL launcher rather than to the shell or application that
+    actually drove it, which breaks conventional parent/child correlation. Trace wsl.exe's own
+    origin (the grandparent) to see whether the chain is a user-initiated developer session
+    (explorer.exe, a terminal, an IDE) or an unexpected launcher such as a script host or Office
+    application, which would point to automated or scripted abuse.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What other child processes did the same wsl.exe instance spawn?
+  context: >-
+    If this wsl.exe instance spawned the flagged child, it may have spawned others as part of the
+    same operation. Examining the siblings of the exact parent instance reveals the full scope of
+    what was launched through the WSL launcher; multiple flagged children from one wsl.exe instance
+    points to orchestrated activity rather than a single benign invocation. host.name is included as
+    a fallback because the parent identifier may resolve to NODATA.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: What did the spawned child process actually do? Decode its command-line arguments.
+  context: >-
+    The child's full command line reveals the operational purpose of the indirect execution. Decode
+    any flags, encoded content, file paths, or URLs. For rundll32.exe and regsvr32.exe, identify the
+    DLL and entrypoint being invoked; for mshta.exe and the script hosts, identify the script or URL;
+    for cmd.exe and PowerShell, parse the staged command. The query returns every execution of this
+    binary on the host within a few minutes so a multi-step operation spread across sequential
+    invocations is visible together.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: If the child was PowerShell, was the command encoded or obfuscated, and what does it decode to?
+  context: >-
+    When the spawned child is powershell.exe or pwsh.exe, the operator frequently hides intent with
+    the -EncodedCommand (-enc) parameter, string concatenation, backtick escaping, or variable
+    substitution. Base64-encoded commands are the most common form. Decoding reveals the actual
+    payload such as a download cradle, a reverse shell, or in-memory execution of a .NET assembly.
+    If the child is not PowerShell, this question does not apply.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did PowerShell script block logging capture the full script content?
+  context: >-
+    Script block logging (Event ID 4104) records the deobfuscated script content PowerShell actually
+    executes, even when the command line is encoded or obfuscated, providing ground truth about what
+    ran. This is especially valuable here because a payload launched through WSL may pass an encoded
+    blob to powershell.exe that the process_creation command line alone does not reveal. If PowerShell
+    operational logs are not ingested in this environment, treat zero results as a visibility gap
+    rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Were PowerShell security controls bypassed or weakened before this execution?
+  context: >-
+    Before running a payload, operators often disable or bypass PowerShell security controls: AMSI
+    bypass (patching amsi.dll in memory), execution policy changes (Set-ExecutionPolicy or the
+    -ep bypass flag), constrained language mode escape, and PowerShell downgrade attacks (invoking
+    version 2, which lacks logging). Finding these precursor events on the host strengthens the case
+    that the WSL-launched activity is malicious.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: Did wsl.exe or the spawned child open outbound network connections around the time of the alert?
+  context: >-
+    Indirect command execution commonly pairs with network activity: the launcher or its child
+    retrieves a payload or opens a command-and-control channel. Correlating outbound connections
+    from the WSL launcher and its child within the alert window distinguishes a self-contained local
+    action from one that reaches external infrastructure. Known-good egress to enterprise update or
+    automation endpoints can be set aside; connections to unfamiliar external hosts are the priority.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - \wsl.exe
+          - \wslhost.exe
+          - \calc.exe
+          - \cmd.exe
+          - \cscript.exe
+          - \mshta.exe
+          - \powershell.exe
+          - \pwsh.exe
+          - \regsvr32.exe
+          - \rundll32.exe
+          - \wscript.exe
+        Initiated: 'true'
+      condition: selection
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- question: If the child was rundll32.exe or regsvr32.exe, what module did it load and is that module signed and on-disk in a normal location?
+  context: >-
+    Proxy execution through signed binaries leans on rundll32.exe and regsvr32.exe to load and run
+    externally supplied code. Reviewing the modules these children loaded on this host shows whether
+    the loaded DLL is a legitimate signed system module or an unsigned or relocated payload dropped
+    into a user-writable directory. An unsigned module, or one loaded from a staging path, points to
+    payload execution rather than benign system behavior.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - \regsvr32.exe
+          - \rundll32.exe
+      condition: selection
+    fields:
+      - Image
+      - ImageLoaded
+      - Signed
+      - Signature
+- question: Did WSL-related activity create or modify files in user-writable staging paths or the SSH config around this time?
+  context: >-
+    Indirect execution chains often leave file artifacts: a payload staged into a user-writable
+    directory, or a modified SSH client config that persists a LocalCommand/ProxyCommand to re-run a
+    command on each connection. Reviewing file writes in the staging directories named by this rule
+    and to the user's .ssh\config alongside the alert reveals dropped payloads or a persistence
+    foothold tied to the indirect-execution activity.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_paths:
+        TargetFilename|contains:
+          - \AppData\Local\Temp\
+          - C:\Users\Public\
+          - C:\Windows\Temp\
+          - C:\Temp\
+          - \Downloads\
+          - \Desktop\
+          - \.ssh\config
+      condition: selection and selection_paths
+    fields:
+      - Image
+      - TargetFilename
+      - User
+- question: Does wsl.exe normally spawn this child binary on this host?
+  context: >-
+    Some parent-child pairings are routine and some are novel. WSL legitimately launches a Linux
+    environment, but a Windows binary such as cmd.exe, mshta.exe, or rundll32.exe appearing as a
+    direct child of wsl.exe is the kind of crossing that indirect-execution abuse produces. A zero
+    or very low historical count for this specific wsl.exe-to-child pairing marks it as a first-time
+    or rare relationship on this host.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent:
+        ParentImage|endswith:
+        - \wsl.exe
+        - \wslhost.exe
+      selection_children_images:
+        Image|endswith:
+        - \calc.exe
+        - \cmd.exe
+        - \cscript.exe
+        - \mshta.exe
+        - \powershell.exe
+        - \pwsh.exe
+        - \regsvr32.exe
+        - \rundll32.exe
+        - \wscript.exe
+      selection_children_paths:
+        Image|contains:
+        - \AppData\Local\Temp\
+        - C:\Users\Public\
+        - C:\Windows\Temp\
+        - C:\Temp\
+        - \Downloads\
+        - \Desktop\
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection_parent and 1 of selection_children_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent:
+        ParentImage|endswith:
+        - \wsl.exe
+        - \wslhost.exe
+      selection_children_images:
+        Image|endswith:
+        - \calc.exe
+        - \cmd.exe
+        - \cscript.exe
+        - \mshta.exe
+        - \powershell.exe
+        - \pwsh.exe
+        - \regsvr32.exe
+        - \rundll32.exe
+        - \wscript.exe
+      selection_children_paths:
+        Image|contains:
+        - \AppData\Local\Temp\
+        - C:\Users\Public\
+        - C:\Windows\Temp\
+        - C:\Temp\
+        - \Downloads\
+        - \Desktop\
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection_parent and 1 of selection_children_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the environment around this time?
+  context: >-
+    Tracking the user's activity across all hosts in the alert window reveals whether the WSL-driven
+    execution is isolated or part of broader hands-on activity, such as the same user triggering
+    similar actions on multiple endpoints. Concurrent activity on several hosts widens the apparent
+    scope and changes the response.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent:
+        ParentImage|endswith:
+        - \wsl.exe
+        - \wslhost.exe
+      selection_children_images:
+        Image|endswith:
+        - \calc.exe
+        - \cmd.exe
+        - \cscript.exe
+        - \mshta.exe
+        - \powershell.exe
+        - \pwsh.exe
+        - \regsvr32.exe
+        - \rundll32.exe
+        - \wscript.exe
+      selection_children_paths:
+        Image|contains:
+        - \AppData\Local\Temp\
+        - C:\Users\Public\
+        - C:\Windows\Temp\
+        - C:\Temp\
+        - \Downloads\
+        - \Desktop\
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection_parent and 1 of selection_children_*) and _pb_scope
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering,
+    reconnaissance, or credential access — may reveal the attack stages that preceded the WSL-launched
+    execution and help reconstruct the timeline. A pattern such as protection tampering followed by
+    indirect execution materially changes the disposition.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

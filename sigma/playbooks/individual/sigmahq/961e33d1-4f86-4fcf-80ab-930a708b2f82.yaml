@@ -1,0 +1,394 @@
+name: Potential Persistence Via Excel Add-in - Registry
+id: b92097c5-5599-4951-b39d-b83381e3c15f
+description: |
+  Detects a registry write that registers an Excel XLL add-in for automatic loading. The rule
+  fires when a value under a key matching Software\Microsoft\Office\<version>\Excel\Options is set
+  to data that starts with '/R ' AND ends with .xll -- the OPEN entry Excel reads at startup to
+  auto-load a native-code (XLL) add-in. Legitimately this is how an installed Excel add-in
+  registers itself, but the same key is a persistence foothold: an actor drops an XLL to disk and
+  writes this value so the add-in's code runs every time Excel starts, often spawning scripting
+  engines or other anomalous child processes. Investigate which XLL path was registered, which
+  process wrote the value and what launched it, whether the referenced XLL exists on disk, whether
+  Excel subsequently loaded it and spawned an unexpected child, and whether the entry was later
+  changed or reverted.
+type: detection
+detection_id: 961e33d1-4f86-4fcf-80ab-930a708b2f82
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-10
+questions:
+- question: Does the alerting registry write register an XLL add-in by setting the Excel Options value to a '/R ...xll' command?
+  context: >-
+    Before investing investigation time, confirm the alert is a true positive. The rule fires when
+    a value under a key that contains Software\Microsoft\Office\ and ends in \Excel\Options is
+    written AND the value data starts with '/R ' AND ends with .xll. That combination is the OPEN
+    entry Excel reads at startup to auto-load a native-code add-in. Review the exact TargetObject
+    and Details on the triggering event to confirm the path is an Excel Options key and the data is
+    a /R command pointing at an .xll file.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this user and host expected to install or register an Excel add-in?
+  context: >-
+    Installing an XLL add-in is an uncommon action for most users, and on servers or kiosk-style
+    hosts it is rarely legitimate at all. Knowing whether the writing account and host function are
+    consistent with someone deliberately adding an Excel add-in is often the fastest way to separate
+    a sanctioned install from a planted persistence entry. User attribution is present on roughly
+    94% of endpoint registry events; when it is a machine account or missing, pivot on the writing
+    process instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: What add-in entry was registered under the Excel Options key, and why is this a known Office persistence location?
+  context: >-
+    The value under Software\Microsoft\Office\<version>\Excel\Options that begins with /R is the OPEN
+    directive Excel evaluates on every launch to load an add-in. A native-code XLL registered here
+    executes in-process the moment Excel starts, which makes this key a startup-persistence location
+    rather than a routine setting. Confirming the exact key and the writing process establishes that
+    this is the Excel add-in load path and sets up decoding the registered file path. Registry keys
+    used to load Office add-ins are version- and application-specific, so the exact path helps
+    confirm which Office component is being persisted.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: What XLL path does the registered value point to, and where does that file live?
+  context: >-
+    The Details field holds the /R command with the path to the add-in Excel will load. Decode it and
+    read the target location: an XLL under a user-writable directory such as %APPDATA%\Microsoft\AddIns,
+    Temp, or a network path is far more concerning than one under a managed Program Files add-in
+    directory. Malicious add-ins also appear with varying extensions (.wll, .dll, .vsto); this rule
+    pins .xll, so confirm the extension and note the exact drop path, which becomes the lead for
+    confirming the payload on disk. Details is present on roughly 79% of registry modifications and
+    should be populated for this string value.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- question: What process wrote this registry value, and what launched that process?
+  context: >-
+    The registry event carries no command line, so pivot by ProcessGuid to the writing process to
+    read its Image, full command, and parent. A genuine add-in install is usually written by
+    EXCEL.EXE itself through the add-ins dialog; a write by reg.exe, powershell.exe, cmd.exe, or a
+    script host such as wscript.exe or mshta.exe, especially one launched from an Office document,
+    a browser, or an unsigned binary, points to the entry being planted programmatically. The parent
+    chain distinguishes a scripted persistence write from a deliberate user action.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: After the add-in was registered, did Excel spawn a scripting or living-off-the-land child process?
+  context: >-
+    The persistence takes effect the next time Excel starts and loads the registered XLL. A native-code
+    add-in runs in-process inside EXCEL.EXE, and legitimate add-ins seldom spawn interpreters, so
+    EXCEL.EXE launching mshta.exe, powershell.exe, rundll32.exe, cmd.exe, wscript.exe, cscript.exe, or
+    regsvr32.exe after this write is a strong sign the add-in executed a payload. The query lists these
+    anomalous children of EXCEL.EXE on this host so their command lines can be examined.
+  range: +7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: '\EXCEL.EXE'
+      selection_child:
+        Image|endswith:
+          - '\mshta.exe'
+          - '\powershell.exe'
+          - '\rundll32.exe'
+          - '\cmd.exe'
+          - '\wscript.exe'
+          - '\cscript.exe'
+          - '\regsvr32.exe'
+      condition: selection and selection_child
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- question: Was the referenced XLL file written to disk by this process or one of its children?
+  context: >-
+    Registry add-in persistence is only effective if the XLL exists at the path written to the Options
+    value; without the file, the /R directive loads nothing. The process that wrote the registry value,
+    or a child of it, frequently drops the add-in in the same session. The query correlates .xll file
+    writes by that process lineage. The file-write event carries no hash; if the XLL is present, hash
+    it from a later execution or retrieve it for a reputation lookup.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      selection_ext:
+        TargetFilename|endswith: '.xll'
+      condition: (selection_self or selection_child) and selection_ext
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: After this write, was the Excel Options value changed again or restored to a benign state?
+  context: >-
+    Registry value deletions are not observable in this telemetry, so durability is judged from the
+    key's re-modification history rather than from a delete event. A later write that overwrites the
+    /R ...xll entry may indicate cleanup after the payload ran, while the value persisting leaves the
+    add-in primed to execute on every subsequent Excel launch. Compare the Details values written to
+    this key over the following window to see whether the add-in registration was reverted or left
+    in place.
+  range: +24h
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - Details
+      - Image
+- question: Has this Excel Options add-in key been modified before on this host?
+  context: >-
+    The Excel Options OPEN value changes only when add-ins are installed or removed, which is
+    infrequent on most hosts. A history with no prior writes makes this a first-time registration and
+    raises its weight; a history of periodic writes to the same value points instead to a managed
+    add-in deployment or a repeatedly run installer. Compare the historical Details values to see
+    whether this XLL entry is new.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - Details
+      - Image
+- question: Was this same Excel add-in entry registered on other hosts in the environment?
+  context: >-
+    The same add-in registration across many hosts suggests a broad tool run or a managed deployment;
+    the same entry confined to one host suggests a targeted persistence write. Compare the Details
+    values across hosts to see whether they all register the same XLL path and whether the writing
+    process is consistent, which separates a single hands-on operation from repeated use of the
+    technique across the environment.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+      - Details
+- question: What other registry modifications were made on this host in the same window?
+  context: >-
+    An actor who plants an add-in for persistence often makes other configuration changes in the same
+    session -- additional Office startup keys, Run or RunOnce entries, or security-policy edits.
+    Clustering the registry writes on this host in a short window around the alert reveals the full
+    scope of changes and which process made them. The triggering key appears in the results; the
+    signal is what else was modified and by which process.
+  range: +/-30m
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - User
+- question: What other process activity occurred on this host around the time of the alert?
+  context: >-
+    Persistence writes rarely happen in isolation. Aggregating process activity in a tight window
+    around the alert surfaces what led up to the add-in registration and what ran immediately after
+    it. Novel parent-child pairs stand out at low counts against high-count routine telemetry, which
+    is what points to the tool that staged the persistence and any follow-on actions.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host -- reconnaissance, execution of scripting tools, or defense
+    tampering -- may reveal the stages that preceded this persistence write and help reconstruct the
+    timeline. Establishing Office add-in persistence is often one step in a longer sequence, so prior
+    alerts help place this registration in context.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Were process-based persistence mechanisms installed on this host in the same window?
+  context: >-
+    Attackers rarely rely on a single persistence mechanism. After registering an Office add-in they
+    commonly install backups using different techniques. Scheduled tasks, services, registry Run
+    keys, BITS jobs, or WMI subscriptions created by schtasks.exe, sc.exe, reg.exe, bitsadmin.exe, or
+    wmic.exe near the add-in write indicate intentional stacking rather than an isolated action.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- question: Were files dropped to Startup or scheduled-task locations on this host in the same window?
+  context: >-
+    File-based persistence bypasses command-line detection entirely -- dropping an executable or
+    script into a Startup folder or a path referenced by a registry Run key achieves persistence
+    without invoking schtasks, sc, or reg. File writes to these locations near the add-in registration
+    indicate a parallel persistence mechanism was established on disk alongside the XLL.
+    Run-key persistence itself is a registry write, not a file drop, so it does not appear in file telemetry; this query covers Startup folders and scheduled-task definition files, and Run-key writes surface in registry questions instead.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist_paths:
+        TargetFilename|contains:
+          - '\Start Menu\Programs\Startup\'
+          - '\Windows\System32\Tasks\'
+          - '\Windows\Tasks\'
+      condition: selection and selection_persist_paths
+    fields:
+      - TargetFilename
+      - Image
+- question: Does the user or an administrator recall installing an Excel add-in?
+  context: >-
+    Installing an XLL add-in has few routine reasons, so direct confirmation from the account owner is
+    a fast way to resolve the alert. If a user deliberately added a known add-in, or an administrator
+    deployed one, that closes it; if no one recalls the action, the account may be compromised or the
+    entry was written by automated tooling, and the investigation should continue into the writing
+    process and any Excel-spawned follow-on.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine

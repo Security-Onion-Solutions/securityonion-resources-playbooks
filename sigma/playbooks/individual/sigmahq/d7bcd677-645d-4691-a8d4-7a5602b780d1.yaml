@@ -1,0 +1,431 @@
+name: Potential PowerShell Command Line Obfuscation
+id: 5b86dc25-97f3-4f14-8ac4-d13ed233708f
+description: |
+  Detects powershell.exe or pwsh.exe launched with a command line that contains heavily repeated obfuscation
+  characters -- long runs of '+', '{', '^', or backtick escapes -- a pattern produced by string-concatenation and
+  character-substitution obfuscators that hide the real script from casual inspection. Legitimate PowerShell rarely
+  needs this many concatenation or escape characters, though some packers, installers, and vendor automation can
+  generate similar syntax. The investigation should deobfuscate the command, recover what actually executed (script
+  block logging is the ground truth), establish the launching parent, and determine whether the same pattern is
+  routine for this host, user, and fleet or a one-off.
+type: detection
+detection_id: d7bcd677-645d-4691-a8d4-7a5602b780d1
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- question: Does the alerting command line match the obfuscation pattern this rule detects on powershell.exe or pwsh.exe?
+  context: Confirm the alert is a true positive by reviewing the exact command line and process details. The rule fires
+    only when the binary is powershell.exe or pwsh.exe (by Image or OriginalFileName) AND the command line contains a long
+    run of obfuscation characters -- many '+', many '{', repeated '^', or repeated backticks. Verify both conditions hold
+    on the triggering event before investing further time.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to run PowerShell with this kind of command line?
+  context: Legitimate administrative scripting and some vendor automation can trigger this detection. Knowing whether the
+    user role and host function normally involve PowerShell with heavily concatenated or escaped command lines is often the
+    fastest way to separate routine packing or installers from operator obfuscation.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What does the obfuscated PowerShell command line do once the concatenation and escape characters are resolved?
+  context: Resolve the obfuscation in the alerting command line and reconstruct the real arguments -- decode any encoded
+    blocks, collapse the '+', '{', '^', and backtick sequences, and identify the underlying flags, cmdlets, file paths, or
+    URLs. The query is scoped to PowerShell invocations on this host carrying the same obfuscation pattern so multiple
+    sequential invocations that form one logical operation are visible together.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      selection_re:
+      - CommandLine|re: \+.*\+.*\+.*\+.*\+.*\+.*\+.*\+.*\+.*\+.*\+.*\+.*\+.*\+
+      - CommandLine|re: \{.*\{.*\{.*\{.*\{.*\{.*\{.*\{.*\{.*\{
+      - CommandLine|re: \^.*\^.*\^.*\^.*\^
+      - CommandLine|re: '`.*`.*`.*`.*`'
+      condition: selection_host and selection_re
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Was the command base64-encoded or otherwise obfuscated, and what does the recovered payload do?
+  context: PowerShell obfuscation commonly layers string concatenation and backtick escaping on top of base64 (-EncodedCommand
+    / -enc), character-array reconstruction, or XOR. Decoding reveals the actual payload -- download cradles, reverse
+    shells, or in-memory loading of .NET assemblies. Iterate decoding for multi-layer encoding until the script is readable.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did PowerShell script block logging capture the deobfuscated script content?
+  context: Event ID 4104 records the script content PowerShell actually executes after deobfuscation, providing ground
+    truth even when the command line is concatenated, escaped, or encoded. If PowerShell operational logs are not ingested
+    in this environment, treat zero results as a visibility gap rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Were PowerShell security controls disabled or bypassed on this host before this execution?
+  context: Obfuscated PowerShell is often preceded by attempts to weaken defenses -- AMSI bypass (patching amsi.dll in
+    memory), execution-policy changes, language-mode escape, or a downgrade to PowerShell v2 which lacks modern logging.
+    Finding these precursor events on the host strengthens the case that the obfuscation is hiding malicious activity.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: What process spawned this PowerShell instance, and is that parent chain expected?
+  context: The parent reveals how PowerShell was invoked. Interactive use typically descends from explorer.exe or a console;
+    unusual parents -- mshta.exe, wscript.exe, rundll32.exe, regsvr32.exe, or Office applications such as winword.exe and
+    excel.exe -- point to macro-borne or LOLBin-driven execution rather than a user running a script.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What .NET or scripting assemblies did this PowerShell process load into memory?
+  context: Obfuscated PowerShell frequently reflectively loads .NET assemblies from byte arrays or the registry rather than
+    spawning child processes, leaving the only trace in image-load (module-load) events. Unusual or rarely seen assemblies
+    loaded by this PowerShell instance -- especially ones loaded from temp, user-writable, or non-standard paths -- indicate
+    in-memory, fileless execution. If image-load telemetry is not collected in this environment, treat zero results as a
+    visibility gap rather than evidence nothing loaded.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+- question: Are any files referenced by the decoded command still on disk for analysis?
+  context: If the deobfuscated command references a downloaded payload, decoded output, or staged script, checking whether
+    those files still exist on disk enables hash lookups, sandbox submission, or content review. File paths here are
+    recovered from the command line rather than from a dedicated path field.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Does this host normally run powershell.exe or pwsh.exe at all?
+  context: A binary that is rare or never-before-seen on a host is more suspicious than one that runs regularly. Very low
+    historical counts over the trailing window indicate first-time or unusual execution; high counts suggest PowerShell is
+    part of routine operation here, shifting attention to whether this specific obfuscated invocation deviates from that
+    norm.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: When this host has previously fired this obfuscation pattern, what parents and users drove it, and does the
+    current alert fit?
+  context: The query mirrors the rule's selection structure scoped to this host, so the resulting parent and user
+    distribution reflects how this specific obfuscation pattern -- not generic PowerShell usage -- has historically run
+    here. A new parent process, an unexpected user account, or an unusual command-line structure relative to that history is
+    the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_re:
+      - CommandLine|re: \+.*\+.*\+.*\+.*\+.*\+.*\+.*\+.*\+.*\+.*\+.*\+.*\+.*\+
+      - CommandLine|re: \{.*\{.*\{.*\{.*\{.*\{.*\{.*\{.*\{.*\{
+      - CommandLine|re: \^.*\^.*\^.*\^.*\^
+      - CommandLine|re: '`.*`.*`.*`.*`'
+      filter_optional_amazonSSM:
+        ParentImage: C:\Program Files\Amazon\SSM\ssm-document-worker.exe
+      filter_optional_defender_atp:
+        CommandLine|contains:
+        - new EventSource("Microsoft.Windows.Sense.Client.Management"
+        - public static extern bool InstallELAMCertificateInfo(SafeFileHandle handle);
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_* and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_re:
+      - CommandLine|re: \+.*\+.*\+.*\+.*\+.*\+.*\+.*\+.*\+.*\+.*\+.*\+.*\+.*\+
+      - CommandLine|re: \{.*\{.*\{.*\{.*\{.*\{.*\{.*\{.*\{.*\{
+      - CommandLine|re: \^.*\^.*\^.*\^.*\^
+      - CommandLine|re: '`.*`.*`.*`.*`'
+      filter_optional_amazonSSM:
+        ParentImage: C:\Program Files\Amazon\SSM\ssm-document-worker.exe
+      filter_optional_defender_atp:
+        CommandLine|contains:
+        - new EventSource("Microsoft.Windows.Sense.Client.Management"
+        - public static extern bool InstallELAMCertificateInfo(SafeFileHandle handle);
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_* and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_re:
+      - CommandLine|re: \+.*\+.*\+.*\+.*\+.*\+.*\+.*\+.*\+.*\+.*\+.*\+.*\+.*\+
+      - CommandLine|re: \{.*\{.*\{.*\{.*\{.*\{.*\{.*\{.*\{.*\{
+      - CommandLine|re: \^.*\^.*\^.*\^.*\^
+      - CommandLine|re: '`.*`.*`.*`.*`'
+      filter_optional_amazonSSM:
+        ParentImage: C:\Program Files\Amazon\SSM\ssm-document-worker.exe
+      filter_optional_defender_atp:
+        CommandLine|contains:
+        - new EventSource("Microsoft.Windows.Sense.Client.Management"
+        - public static extern bool InstallELAMCertificateInfo(SafeFileHandle handle);
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_* and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints.
+    If the same user triggered similar activity on several hosts, the scope of compromise may be larger than the single
+    alerting host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_re:
+      - CommandLine|re: \+.*\+.*\+.*\+.*\+.*\+.*\+.*\+.*\+.*\+.*\+.*\+.*\+.*\+
+      - CommandLine|re: \{.*\{.*\{.*\{.*\{.*\{.*\{.*\{.*\{.*\{
+      - CommandLine|re: \^.*\^.*\^.*\^.*\^
+      - CommandLine|re: '`.*`.*`.*`.*`'
+      filter_optional_amazonSSM:
+        ParentImage: C:\Program Files\Amazon\SSM\ssm-document-worker.exe
+      filter_optional_defender_atp:
+        CommandLine|contains:
+        - new EventSource("Microsoft.Windows.Sense.Client.Management"
+        - public static extern bool InstallELAMCertificateInfo(SafeFileHandle handle);
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_* and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - host.name
+- question: Have other hosts fired this obfuscation pattern in the past week, and does the cross-host distribution look like
+    automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, giving a fleet-wide count of this specific
+    obfuscation pattern rather than generic PowerShell usage. Many hosts firing the same pattern points to scripted
+    deployment or vendor automation; one host or a small unrelated set points to manual operator activity. Use the host
+    distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_re:
+      - CommandLine|re: \+.*\+.*\+.*\+.*\+.*\+.*\+.*\+.*\+.*\+.*\+.*\+.*\+.*\+
+      - CommandLine|re: \{.*\{.*\{.*\{.*\{.*\{.*\{.*\{.*\{.*\{
+      - CommandLine|re: \^.*\^.*\^.*\^.*\^
+      - CommandLine|re: '`.*`.*`.*`.*`'
+      filter_optional_amazonSSM:
+        ParentImage: C:\Program Files\Amazon\SSM\ssm-document-worker.exe
+      filter_optional_defender_atp:
+        CommandLine|contains:
+        - new EventSource("Microsoft.Windows.Sense.Client.Management"
+        - public static extern bool InstallELAMCertificateInfo(SafeFileHandle handle);
+      condition: all of selection_* and not 1 of filter_optional_*
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host -- defense tampering, reconnaissance,
+    credential access -- may reveal the attack stages that preceded this execution and help reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

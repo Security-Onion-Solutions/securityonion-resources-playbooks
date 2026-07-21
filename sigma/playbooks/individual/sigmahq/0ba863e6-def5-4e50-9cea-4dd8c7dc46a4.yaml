@@ -1,0 +1,420 @@
+name: Control Panel Items
+id: f7e5b4dc-8fb2-41ce-9e5d-3e2b5e1f46aa
+description: |
+  Detects abuse of Control Panel items for code execution and persistence. The rule fires on either of two patterns:
+  reg.exe registering a new Control Panel add-in under CurrentVersion\Control Panel\CPLs, or execution of a command line
+  ending in .cpl from a non-System32 location (excluding the known igfxCPL.cpl regsvr32 case). Registering a CPL DLL causes
+  it to load into explorer.exe when Control Panel opens, providing both proxy execution through a trusted process and a
+  persistence foothold; launching an out-of-tree .cpl directly proxies a DLL payload through control.exe or rundll32.exe.
+  Determine which branch fired, what registry value or .cpl path is involved, whether the referenced DLL exists and is
+  trustworthy, and whether the activity matches authorized administration.
+type: detection
+detection_id: 0ba863e6-def5-4e50-9cea-4dd8c7dc46a4
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- question: Did this alert fire on reg.exe registering a Control Panel add-in, or on a .cpl command line running outside System32?
+  context: Confirm which branch matched before investing time. One branch is reg.exe adding a value under CurrentVersion\Control
+    Panel\CPLs; the other is a command line ending in .cpl that does not resolve to System32 and is not the known igfxCPL.cpl
+    regsvr32 case. Note which branch fired — the registry branch points to add-in registration (persistence), while the .cpl
+    branch points to direct proxy execution of a DLL, and downstream questions weight differently for each.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to register Control Panel items or run .cpl files from non-standard locations?
+  context: Legitimate administrative activity can register CPLs or invoke control panel applets, but it is uncommon outside
+    of software installers and vendor tooling. Knowing whether the user role and host function are consistent with control
+    panel modification is often the fastest path to separating routine operations from abuse.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Is the parent expected to launch reg.exe or a .cpl execution, and what started the parent?
+  context: The parent-child relationship is the core signal. Tracing the parent's own origin reveals whether the chain is
+    legitimate (an installer or admin shell) or suspicious (a script host, Office application, or mshta.exe spawning the
+    control panel activity). Unexpected parents for reg.exe or for a .cpl invocation indicate the action was driven by
+    something other than a user opening Control Panel.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What other child processes did the same parent spawn?
+  context: If a suspicious parent spawned the detected activity, it likely spawned other processes too. Examining siblings
+    reveals the full scope of activity from that parent — multiple suspicious children from one parent points to scripted
+    orchestration rather than an isolated control panel action.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: What value name and DLL path were written under the Control Panel CPLs key, and does that DLL live in a trusted location?
+  context: For the registry branch, the value written under HKCU or HKLM Software\Microsoft\Windows\CurrentVersion\Control
+    Panel\CPLs names the DLL that will load into explorer.exe when Control Panel opens. Read the value name and the data
+    (the DLL path) directly rather than parsing reg.exe's command line. A DLL under a user-writable directory such as a
+    profile, temp, or public folder is far more concerning than a vendor path under Program Files.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- question: Were other registry modifications made on this host in the same session?
+  context: An operator who registers a Control Panel add-in often makes several registry changes — adding the CPL value
+    plus disabling protections or setting other autorun keys. Finding a cluster of reg.exe write operations from the same
+    host within a short window reveals whether multiple objectives were pursued alongside the control panel change.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_reg:
+        Image|endswith:
+          - '\reg.exe'
+          - '\regedit.exe'
+        CommandLine|contains:
+          - ' add '
+          - ' delete '
+          - ' import '
+          - '/s '
+      condition: selection and selection_reg
+    fields:
+      - CommandLine
+- question: Does the registered CPL DLL still exist on disk, and what is its hash and signing status?
+  context: Control Panel add-in persistence is only effective if the DLL named in the CPLs value is present at that path.
+    Confirming the file exists, then analyzing its hash and signature, determines whether the persistence mechanism is live
+    and whether the loaded code is trusted. The same check applies to the DLL or .cpl referenced by the direct execution branch.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_reg_img:
+      - Image|endswith: \reg.exe
+      - OriginalFileName: reg.exe
+      selection_reg_cli:
+        CommandLine|contains|all:
+        - add
+        - CurrentVersion\Control Panel\CPLs
+      selection_cpl:
+        CommandLine|endswith: .cpl
+      filter_cpl_sys:
+        CommandLine|contains:
+        - \System32\
+        - '%System%'
+        - '|C:\Windows\system32|'
+      filter_cpl_igfx:
+        CommandLine|contains|all:
+        - 'regsvr32 '
+        - ' /s '
+        - igfxCPL.cpl
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_reg_* or (selection_cpl and not 1 of filter_cpl_*)) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_reg_img:
+      - Image|endswith: \reg.exe
+      - OriginalFileName: reg.exe
+      selection_reg_cli:
+        CommandLine|contains|all:
+        - add
+        - CurrentVersion\Control Panel\CPLs
+      selection_cpl:
+        CommandLine|endswith: .cpl
+      filter_cpl_sys:
+        CommandLine|contains:
+        - \System32\
+        - '%System%'
+        - '|C:\Windows\system32|'
+      filter_cpl_igfx:
+        CommandLine|contains|all:
+        - 'regsvr32 '
+        - ' /s '
+        - igfxCPL.cpl
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_reg_* or (selection_cpl and not 1 of filter_cpl_*)) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints.
+    If the same user triggered similar control panel or registry activity on multiple hosts, the scope of compromise may be
+    larger than the single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_reg_img:
+      - Image|endswith: \reg.exe
+      - OriginalFileName: reg.exe
+      selection_reg_cli:
+        CommandLine|contains|all:
+        - add
+        - CurrentVersion\Control Panel\CPLs
+      selection_cpl:
+        CommandLine|endswith: .cpl
+      filter_cpl_sys:
+        CommandLine|contains:
+        - \System32\
+        - '%System%'
+        - '|C:\Windows\system32|'
+      filter_cpl_igfx:
+        CommandLine|contains|all:
+        - 'regsvr32 '
+        - ' /s '
+        - igfxCPL.cpl
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_reg_* or (selection_cpl and not 1 of filter_cpl_*)) and _pb_scope
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance, or
+    credential access — may reveal the attack stages that preceded the control panel activity and help reconstruct the full
+    timeline leading to this event.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Were other proxy-execution LOLBins used on this host recently?
+  context: Operators who abuse one trusted signed binary to proxy code often reach for several. If a CPL was registered or
+    a .cpl was executed to run a DLL, check whether rundll32, regsvr32, mshta, control, or similar proxy-execution binaries
+    were also used nearby. Multiple proxy-execution LOLBins performing the same objective strengthen the case for malicious
+    activity.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\rundll32.exe'
+          - '\regsvr32.exe'
+          - '\mshta.exe'
+          - '\control.exe'
+          - '\msbuild.exe'
+          - '\cmstp.exe'
+          - '\installutil.exe'
+          - '\msiexec.exe'
+          - '\forfiles.exe'
+          - '\pcalua.exe'
+          - '\presentationhost.exe'
+          - '\infdefaultinstall.exe'
+          - '\msdt.exe'
+          - '\mavinject.exe'
+          - '\xwizard.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- question: Was the alerting binary executed from its expected path?
+  context: A trusted binary executed from outside System32 or SysWOW64 may have been copied or renamed to evade path-based
+    allowlists, and a .cpl invoked from a user-writable directory is exactly what the execution branch targets. Compare the
+    Image path and OriginalFileName against the expected system location.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- question: How often has this host fired this Control Panel pattern over the past 90 days, and what command-line structures are typical?
+  context: A control panel registration or .cpl execution pattern with no prior history on a host is more suspicious than
+    one seen regularly under stable parents. This count reflects the rule's specific firing pattern rather than generic use
+    of reg.exe, and the command-line projection lets you compare typical invocation patterns against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_reg_img:
+      - Image|endswith: \reg.exe
+      - OriginalFileName: reg.exe
+      selection_reg_cli:
+        CommandLine|contains|all:
+        - add
+        - CurrentVersion\Control Panel\CPLs
+      selection_cpl:
+        CommandLine|endswith: .cpl
+      filter_cpl_sys:
+        CommandLine|contains:
+        - \System32\
+        - '%System%'
+        - '|C:\Windows\system32|'
+      filter_cpl_igfx:
+        CommandLine|contains|all:
+        - 'regsvr32 '
+        - ' /s '
+        - igfxCPL.cpl
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_reg_* or (selection_cpl and not 1 of filter_cpl_*)) and _pb_scope
+    fields:
+    - CommandLine
+- question: Have other hosts fired this Control Panel pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: This count mirrors the rule's selection structure with no host scope, so it reflects the rule's firing pattern
+    fleet-wide rather than generic reg.exe usage. Many hosts firing the same pattern points to scripted deployment or vendor
+    automation; one host or a small unrelated set points to manual operator activity. Use the host distribution to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_reg_img:
+      - Image|endswith: \reg.exe
+      - OriginalFileName: reg.exe
+      selection_reg_cli:
+        CommandLine|contains|all:
+        - add
+        - CurrentVersion\Control Panel\CPLs
+      selection_cpl:
+        CommandLine|endswith: .cpl
+      filter_cpl_sys:
+        CommandLine|contains:
+        - \System32\
+        - '%System%'
+        - '|C:\Windows\system32|'
+      filter_cpl_igfx:
+        CommandLine|contains|all:
+        - 'regsvr32 '
+        - ' /s '
+        - igfxCPL.cpl
+      condition: all of selection_reg_* or (selection_cpl and not 1 of filter_cpl_*)
+    fields:
+    - host.name

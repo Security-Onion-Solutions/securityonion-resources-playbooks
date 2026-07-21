@@ -1,0 +1,366 @@
+name: Suspicious HWP Sub Processes
+id: 1684cdeb-0714-4e4a-9c5e-7e74e6c1d9d2
+description: |
+  Detects the Hangul Word Processor main process (Hwp.exe) spawning gbb.exe, the bundled
+  Ghostscript-derived renderer that processes embedded PostScript/EPS graphics inside HWP
+  documents. A legitimate document that contains EPS images can cause this spawn, but the
+  same renderer is the execution surface for memory-corruption exploits in HWP-borne lures:
+  a weaponized document embeds a malicious EPS stream that triggers a bounds/heap-overflow
+  in the renderer, and shellcode then runs inside the child process. Investigation should
+  confirm the parent-child pair, determine what document opened the renderer, examine what
+  the renderer loaded and did (file writes to user-writable paths, outbound network, child
+  processes), and establish whether the same document reached other users.
+type: detection
+detection_id: 023394c4-29d5-46ab-92b8-6a534c6f447b
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-04
+questions:
+- question: Did the parent process end in \Hwp.exe and the child process end in \gbb.exe?
+  context: Confirm the alert is a true positive by checking the triggering event has a parent
+    image ending in Hwp.exe and a child image ending in gbb.exe, the exact parent-child pair
+    this rule fires on. Both conditions must hold together; verify the image paths before
+    investing further analysis.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+- question: Is this user and host expected to open Hangul Word Processor documents containing
+    embedded graphics?
+  context: Hangul is a common office suite in some regions and routinely renders embedded
+    PostScript or EPS images, which spawns the renderer legitimately. Knowing whether this
+    user opens HWP documents as part of their normal work, and whether the host is a typical
+    document-handling endpoint, is often the fastest way to separate routine rendering from
+    exploitation.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Is Hwp.exe expected to spawn gbb.exe here, and what document started Hwp.exe?
+  context: The parent-child relationship is the core signal for this detection. Tracing
+    Hwp.exe back to its own origin shows what opened the word processor, and the parent
+    command line typically carries the document path or filename that was opened. A document
+    arriving from email or a download immediately before the spawn is the lead worth chasing.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What did the renderer do once it started, and what file did it load?
+  context: The renderer reads an embedded PostScript or EPS stream that the document extracts
+    to a temporary path before processing it. Review the renderer's command line and working
+    directory to identify the file it loaded, and read it from disk to determine whether it
+    is a benign graphic or a crafted stream containing a heap-spray or NOP-sled idiom. Pair
+    this with the renderer's image-load and file-write activity for a complete picture of
+    the operation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What DLLs did the renderer load, and did it load its PostScript engine?
+  context: The renderer's exploit surface is its bundled PostScript engine library; a
+    successful memory-corruption exploit runs shellcode inside the renderer after that
+    library loads and parses the embedded stream. Reviewing the modules the renderer
+    loaded confirms the engine was exercised and can surface injected or unsigned modules
+    that do not belong to the normal rendering path.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+- question: Did Hwp.exe crash or exit abnormally around the time the renderer was spawned?
+  context: Client-side exploitation often leaves an application-error or abnormal-exit
+    record for the host application when the memory-corruption attempt destabilizes it. An
+    application fault for the word processor close in time to the renderer spawn supports an
+    exploitation reading over a clean render of a benign embedded graphic. If application
+    error logs are not collected in this environment, treat zero results as a visibility gap
+    rather than evidence the application stayed healthy.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      service: application
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        source: Application Error
+      condition: selection
+    fields:
+      - param1
+      - param2
+- question: What files were written to user-writable or temporary paths around this event?
+  context: Exploitation through the renderer typically extracts the embedded stream to a
+    temporary or per-user path and may drop a follow-on payload into Downloads, the user
+    temp directory, or the document application's own staging folder. Files written to these
+    writable locations close in time to the spawn are candidate payloads or the extracted
+    exploit stream and should be hashed and reviewed.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      filter_paths:
+        TargetFilename|contains:
+          - '\Temp\'
+          - '\AppData\'
+          - '\Downloads\'
+          - '\Users\Public\'
+      condition: selection and filter_paths
+    fields:
+      - TargetFilename
+      - Image
+- question: Did this host make outbound connections shortly after the renderer ran?
+  context: Successful client-side exploitation commonly fetches a next-stage payload or
+    establishes command-and-control shortly after code execution. Outbound connections from
+    the host in the minutes after the spawn, especially to newly seen destinations and from
+    processes that do not normally reach the network, point toward a live foothold rather
+    than a benign render.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+      filter_known:
+        Image|endswith:
+          - '\svchost.exe'
+          - '\SearchApp.exe'
+      condition: selection and not filter_known
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationHostname
+      - DestinationPort
+- question: What other child processes did the same Hwp.exe instance spawn?
+  context: A normal Hangul process tree is limited to the word processor, its tray helper,
+    and the EPS renderer. If the same Hwp.exe instance spawned a command interpreter, script
+    host, or other tooling alongside the renderer, that points to code execution following
+    a render rather than ordinary document handling. Examining all children of the exact
+    parent instance reveals the full scope of activity initiated through this document open.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \Hwp.exe
+        Image|endswith: \gbb.exe
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \Hwp.exe
+        Image|endswith: \gbb.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the environment around this time?
+  context: Tracking the user's activity across all hosts in the surrounding window reveals
+    whether this document open is isolated or part of broader activity, including movement
+    to other endpoints. The same user driving similar activity on multiple hosts widens the
+    scope that needs review.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \Hwp.exe
+        Image|endswith: \gbb.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining the process activity around the spawn
+    reveals what led to this event and what followed, and whether it sits inside a larger
+    sequence such as reconnaissance, payload retrieval, or persistence setup. Novel
+    parent-child pairs standing out at low counts are what to scan for.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: What document or email delivered the file that opened in the word processor?
+  context: Initial access through a document lure begins with the file reaching the user,
+    usually as an email attachment or a download. Identify the document filename from the
+    parent command line, then trace how it arrived so it can be blocked at the perimeter and
+    searched for additional recipients who received the same file.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+- question: Were other users or systems hit by this same detection?
+  context: Document-lure campaigns rarely target a single user. If one recipient opened a
+    weaponized document, others likely received it too. Correlating this same rule across
+    hosts reveals the breadth of delivery and identifies additional systems that need
+    investigation.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        rule.uuid|expand: '%rule_uuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Is the Hangul Word Processor installation on this host fully patched?
+  context: Client-side exploitation through the renderer relies on a memory-corruption flaw
+    in the bundled PostScript engine, and several such flaws are publicly documented with CVE
+    identifiers. An out-of-date installation confirms exploitation was feasible and flags
+    other hosts running the same vulnerable version. Patch status also helps separate
+    exploitation of a known CVE from a zero-day.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage

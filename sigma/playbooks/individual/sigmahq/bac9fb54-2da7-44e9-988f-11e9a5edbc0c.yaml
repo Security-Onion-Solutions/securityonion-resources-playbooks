@@ -1,0 +1,332 @@
+name: Potential Password Spraying Attempt Using Dsacls.EXE
+id: 998600dd-addd-45c2-bce7-2d6667e654c3
+description: |
+  Detects dsacls.exe (or a renamed binary whose OriginalFileName is DSACLS.EXE) running with a command line that contains
+  both /user: and /passwd:. dsacls is a Microsoft-signed Active Directory ACL tool; its /user:/passwd: options perform an
+  LDAP bind with the supplied credentials before reading an object's ACL, so a failed bind prints "Invalid Credentials".
+  This turns a trusted signed binary into a scriptable credential checker, and rapid sequential invocations from one host
+  against a high-value object distinguished name (Domain Admins, Enterprise Admins) are the password-spray fingerprint.
+  Legitimate operators almost always rely on the implicit current-session credentials, so explicit /user:+/passwd: on dsacls
+  is rare. Determine whether the invocation is an isolated administrative check or part of an iterative credential-guessing
+  loop, and whether any bind succeeded.
+type: detection
+detection_id: bac9fb54-2da7-44e9-988f-11e9a5edbc0c
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- question: Does the command line show dsacls.exe (or DSACLS.EXE by original filename) run with both the /user and /passwd flags?
+  context: Confirm the alert is a true positive before investing time. Review the exact command line and verify the binary
+    is dsacls (by Image path or OriginalFileName) and that both the /user and /passwd arguments are present, since that pairing
+    is the LDAP-bind credential-check primitive the rule fires on. Note the target object distinguished name and the supplied user.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to run dsacls against Active Directory objects?
+  context: dsacls ships with the AD DS role and the RSAT tools and normally runs from administrative or directory-management
+    contexts. Knowing whether the user role and host function involve AD ACL administration is often the fastest path to
+    separating a routine delegation check from anomalous activity. An ordinary workstation account binding to a domain object
+    is a stronger deviation than a directory administrator on a management host.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What exactly did this dsacls invocation do? Decode the full command line, the target object DN, and the supplied
+    user.
+  context: The full command line reveals the specific action. dsacls invoked with /user:<UPN> and /passwd:<value> binds to
+    LDAP with those credentials and then reads the named object's ACL; the object distinguished name (commonly a high-value
+    group such as Domain Admins or Enterprise Admins) tells you what was being probed. Note the supplied user and whether the
+    same password appears with different users, which is the spray pattern. The query scopes to all dsacls executions on this
+    host within +/-5m, so sequential bind attempts that form one spray loop appear together.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What process spawned dsacls.exe and is that parent chain expected?
+  context: The parent process reveals how dsacls was invoked. Interactive administrative use is typically launched from
+    explorer.exe or a console started by an administrator. A scripting host parent (powershell.exe, wscript.exe, cscript.exe,
+    cmd.exe driving a loop) is consistent with the documented spray script that iterates a username list and calls dsacls
+    once per candidate. Identify the parent and, where possible, what spawned the parent.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Does this host normally run dsacls.exe?
+  context: A binary that has never been seen on a host is more suspicious than one that runs regularly. dsacls is present by
+    default on domain controllers and on hosts with the RSAT AD DS tools; on a non-DC workstation it should be rare. Zero or
+    very low historical counts indicate first-time or rare execution.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: When this host has previously fired the rule's /user-plus-/passwd pattern, what parents and users normally drive
+    that activity, and does the current alert fit that pattern?
+  context: Even a signed AD tool can be abused. The query mirrors the rule's selection structure scoped to this host, so the
+    resulting parent and user distribution reflects how dsacls credential binds have historically run here, not generic dsacls
+    usage. A new parent process, an unexpected user account, or a first-ever appearance of this pattern is the anomaly worth
+    chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \dsacls.exe
+      - OriginalFileName: DSACLS.EXE
+      selection_cli:
+        CommandLine|contains|all:
+        - '/user:'
+        - '/passwd:'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: What child processes did dsacls.exe spawn afterward?
+  context: The processes a tool spawns reveal its actual impact. A spray loop driven through dsacls often runs alongside
+    discovery helpers such as nltest.exe (domain controller location) and AD lookups for per-user badPwdCount to stay under
+    the lockout threshold; follow-on cmd.exe or powershell.exe children can indicate the spray was scripted. dsacls itself
+    rarely spawns children in legitimate use.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Have other hosts fired the rule's /user-plus-/passwd pattern in the past week, and does the cross-host distribution
+    look like consistent automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of dsacls
+    credential-bind invocations, not generic dsacls usage. A single host or a small unrelated set points to manual operator
+    activity or a targeted spray origin; many hosts firing the identical pattern points to scripted deployment or sanctioned
+    automation that an allowlist should cover. Use the host distribution to calibrate severity and to find the spray origin.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \dsacls.exe
+      - OriginalFileName: DSACLS.EXE
+      selection_cli:
+        CommandLine|contains|all:
+        - '/user:'
+        - '/passwd:'
+      condition: all of selection*
+    fields:
+    - host.name
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \dsacls.exe
+      - OriginalFileName: DSACLS.EXE
+      selection_cli:
+        CommandLine|contains|all:
+        - '/user:'
+        - '/passwd:'
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \dsacls.exe
+      - OriginalFileName: DSACLS.EXE
+      selection_cli:
+        CommandLine|contains|all:
+        - '/user:'
+        - '/passwd:'
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or actions on multiple endpoints around the
+    alert. A spray operator often runs discovery and credential-checking from a single foothold, so concurrent activity by the
+    same account on other hosts widens the scope of the investigation.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \dsacls.exe
+      - OriginalFileName: DSACLS.EXE
+      selection_cli:
+        CommandLine|contains|all:
+        - '/user:'
+        - '/passwd:'
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection*) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining activity around the alert reveals what led to this event and what
+    happened after. Look for the spray-precursor combination — domain controller discovery, per-user lockout-threshold lookups,
+    and bulk account enumeration — as well as any post-spray privilege-escalation or persistence steps.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — reconnaissance, account discovery, or
+    other credential-access activity — may reveal the stages that preceded this event and help reconstruct the timeline. A
+    spray attempt is often preceded by domain and account enumeration.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: What LDAP connections to domain controllers did this host make around the alert, and do their volume and timing
+    look like a single check or an iterative bind loop?
+  context: dsacls performs its credential check by binding to LDAP on the domain controller (TCP 389 or 636) before reading
+    the object's ACL, so the network side of a spray is a burst of LDAP connections from the alerting host. A single bind is
+    consistent with an administrative ACL read; many connections in a short window, especially paced just under the account
+    lockout threshold, is the spray signature. Correlate the connection times with the dsacls executions to confirm whether
+    each invocation produced its own bind.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationPort:
+          - 389
+          - 636
+      condition: selection
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationPort

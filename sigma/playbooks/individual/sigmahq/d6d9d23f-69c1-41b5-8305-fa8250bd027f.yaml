@@ -1,0 +1,451 @@
+name: SNAKE Malware Kernel Driver File Indicator
+id: 0b0147d2-6aa7-44e6-96dd-eaf74a72b306
+description: |
+  Detects a file write to the fixed path C:\Windows\System32\Com\Comadmin.dat. SNAKE malware uses this
+  path as the on-disk container for its kernel driver component: a user-mode installer stages the
+  encrypted driver image here, then decrypts and loads it to obtain kernel-mode execution and covert
+  network handling. The COM directory under System32 ships with no component that writes a data file
+  under this name, so the rule fires on the path alone and legitimate matches are not expected. The
+  investigation should identify the process that wrote the file, determine whether a kernel driver
+  subsequently loaded or a driver service was registered, establish what else the writing process
+  touched, and check whether the same path appeared on other hosts.
+type: detection
+detection_id: d6d9d23f-69c1-41b5-8305-fa8250bd027f
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-17
+questions:
+- question: Does the file path match the one this rule pins, and which process performed the operation?
+  range: +/-5m
+  context: The rule matches a single literal path under the System32 COM directory, with no constraint
+    on the writing process or the operation type. Confirm the full path and the operation performed
+    (created, modified, renamed, deleted), and read the acting process and its signer for coherence
+    with a component that would legitimately write into a system directory. The signer columns are
+    context rather than a verdict; almost every process on Windows is trusted-signed, so judge whether
+    that signer has any business writing this path.
+  answer_sources:
+  - alert
+  - file_event
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this user and host expected to write a data file into the COM directory under System32?
+  range: +/-5m
+  context: Writes into System32 subdirectories normally come from operating-system servicing, an installer
+    running under an elevated context, or a management agent. The COM directory holds registered COM
+    component state and is not a location where general-purpose software stages data files. When the
+    user is a machine or service account, judge the write by the acting process and the host's function
+    instead of by identity.
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is the file still on disk, or was it deleted or renamed after the alert?
+  range: +4h
+  context: The file's post-alert lifecycle drives the next step. A container still on disk can be retrieved,
+    hashed, and analyzed offline; a deletion shortly after creation points to cleanup once the driver
+    it held was consumed, and moves the investigation to what loaded in between. Read the operation
+    type on each returned event and note the interval between creation and any removal.
+  answer_sources:
+  - file_event
+  - manual_review
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What does the file at this path actually contain, and does it hold a driver image?
+  range: +/-5m
+  context: The rule identifies the artifact by path only, so the container's contents have to be read
+    from the host. Retrieve the file and examine it offline. A staged driver container holds encrypted
+    or compressed data, which presents as high entropy, no PE header at offset zero, and a size in
+    the hundreds of kilobytes rather than the small structured records a legitimate .dat file in this
+    directory would carry. Record the size, entropy, and any recoverable strings, and hash the file
+    on disk since the write event itself carries no hash. The query returns the triggering write with
+    the process and account handles needed to locate the file.
+  answer_sources:
+  - file_event
+  - manual_review
+  - safe_environment
+  - external_threat_intel
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - ProcessGuid
+      - User
+- question: What process wrote this file, and what launched that process?
+  range: +/-30d
+  context: The file event names the acting process but not its origin. Retrieving that process's own
+    start event supplies its command line, working directory, and parent. A parent such as services.exe
+    or an installer bootstrapper points at a registered installation path; explorer.exe or a terminal
+    points at hands-on execution; a script host, archive utility, browser, or remote-management agent
+    points at a payload delivered from outside normal software distribution. The long range is intentional
+    because service hosts and shells often start long before the write.
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What other files did the responsible process write or delete around the alert?
+  range: +/-30m
+  context: An installer that stages a driver container rarely writes only that one file. Expect a working
+    copy of the loader, a configuration or queue file, and cleanup deletions once the kernel component
+    is in place. The breadth of the writing process's other file activity, and where those writes land,
+    enumerates what else needs retrieval. The correlation covers the writer and its direct children,
+    since installers commonly delegate the drop.
+  answer_sources:
+  - file_event
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What else has been written to the System32 COM directory recently, and by which processes?
+  range: -7d
+  context: Location drives the reading of this artifact. The COM directory under System32 has a small
+    set of legitimate writers, essentially operating-system servicing and COM registration. Other recent
+    arrivals in the same directory show whether this is an isolated drop or a location under active
+    use, and the aggregation by path and writing process makes a single unfamiliar writer across several
+    files stand out against the routine servicing rows.
+  answer_sources:
+  - file_event
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains: '\System32\Com\'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: Did a kernel driver load on this host after the file was written, and what are its signer
+    and hash?
+  range: +4h
+  context: A file write carries no hash, so the identity of the staged component has to come from the
+    load event instead. The driver held in this container is decrypted and loaded into the kernel after
+    the user-mode installer runs, and the load event does carry a path, a signer, a signature status,
+    and a hash. Submit the hash to threat intelligence, and read the signer and driver path for coherence
+    with software actually installed on this host — an unfamiliar or revoked signer, or a driver path
+    outside the standard system driver directory, is what connects the container to its outcome. Hosts
+    that do not ship driver-load telemetry return nothing here, which is a visibility gap rather than
+    evidence that no driver loaded.
+  answer_sources:
+  - external_threat_intel
+  - manual_review
+  query: |
+    aggregation: false
+    logsource:
+      category: driver_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signature
+      - SignatureStatus
+      - Hashes
+- question: Was a kernel driver service registered or modified on this host around the alert?
+  range: +/-4h
+  context: A kernel driver reaches the kernel through a service entry under the CurrentControlSet Services
+    key, whose ImagePath value names the driver file and whose Type value marks it as a driver rather
+    than a user-mode service. A service written within minutes of the container appearing ties the
+    staged file to the mechanism that loads it. Note the service name and its ImagePath, and compare
+    them against the driver-load view — a name that imitates a Windows component, or an ImagePath outside
+    the standard driver directory, identifies the entry to pursue.
+  answer_sources:
+  - manual_review
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains: '\CurrentControlSet\Services\'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- question: Did any process reference this file after it was written?
+  range: +4h
+  context: A data container does not execute as a process on its own; a loader reads it and stages the
+    component it holds. A process whose command line names this file identifies that consumer, and
+    its path and account narrow where the loader came from. If nothing references the file, the read
+    likely happened in-process within the writer itself, and the driver-load and service-registration
+    views carry the weight instead.
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_direct:
+        Image|endswith|expand: '%TargetFilename%'
+      selection_interpreter:
+        CommandLine|contains|expand: '%TargetFilename%'
+      condition: selection and 1 of selection_*
+    fields:
+      - Image
+      - CommandLine
+- question: Has this file name been written on this host before, and how often?
+  range: -90d
+  context: The path the rule pins should have no history on a host running only expected software. A
+    zero or near-zero prior count places the write as a first-time arrival and dates the activity to
+    the alert. Prior events on the same path move the timeline earlier and identify when the container
+    first landed, which redirects the investigation to what happened at that earlier point.
+  answer_sources:
+  - file_event
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- always_include: true
+  question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  range: -90d
+  context: The query mirrors the rule's selection scoped to this account, so the result is the account's
+    90-day history of writes to this exact path, aggregated by host. Because the path has no legitimate
+    producer, any prior history under this account extends the timeline rather than normalizing it —
+    treat returned hosts as additional systems to examine. No prior history places the account's involvement
+    at the alert itself; weigh that against the account's role and whether it administers system directories
+    at all.
+  answer_sources:
+  - file_event
+  - organizational_knowledge
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        TargetFilename: C:\Windows\System32\Com\Comadmin.dat
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: Has this program produced the rule's pattern before on this host or elsewhere, or is this
+    new for it?
+  range: -90d
+  context: 'When the write occurs under a machine account or a service principal, identity does not
+    attribute the behavior and the acting program is the meaningful pivot. The query mirrors the rule''s
+    selection scoped to the alerting binary, giving the 90-day history of this program writing this
+    specific path. Any returned host is a system where the same program produced the same artifact
+    and needs the same review; an empty result confines the program''s involvement with this path to
+    the alert window.'
+  answer_sources:
+  - file_event
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        TargetFilename: C:\Windows\System32\Com\Comadmin.dat
+      _pb_scope:
+        Image|endswith|expand: '%Image%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: What else did this account do across the environment around this time?
+  range: +/-1h
+  context: Tracking the account's activity across all hosts shows whether the write was isolated or
+    part of movement between endpoints. The same account driving comparable execution on several systems
+    widens the scope of the investigation to those hosts. When the alert fires under a machine or service
+    account this view returns routine agent telemetry on every host, and the program-scoped view is
+    the one that answers the question.
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- always_include: true
+  question: Did this same program write this path on other hosts in the same window, or is the activity
+    confined to this host?
+  range: +/-1h
+  context: The query mirrors the rule's selection scoped to the alerting binary, fleet-wide, within
+    the alert window. Several hosts in the same hour points to a push or a scripted rollout that staged
+    the container across systems, and each returned host needs the same driver-load and service review.
+    A single host keeps the investigation on how the program and its container arrived here.
+  answer_sources:
+  - file_event
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        TargetFilename: C:\Windows\System32\Com\Comadmin.dat
+      _pb_scope:
+        Image|endswith|expand: '%Image%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  range: +/-15m
+  context: Activity surrounding the write supplies the immediate context — what preceded the drop and
+    what followed it. Scan for archive extraction, remote-management tooling, service control utilities,
+    and any process running from a temporary or user-writable directory. Repetitive agent telemetry
+    collapses into single high-count rows, so novel parent-child pairs stand out at low counts.
+  answer_sources:
+  - process_creation
+  - file_event
+  - registry_event
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  range: -6h
+  context: Earlier detections on the same host help reconstruct what preceded the drop — remote access,
+    defense tampering, credential access, or an installer invocation. Staging a kernel component is
+    a late step that follows initial access and privilege escalation, so the order of preceding alerts
+    often identifies how the operator reached a context able to write into a system directory.
+  answer_sources:
+  - alert
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Has this file name appeared on any other hosts in the environment?
+  range: -24h
+  context: The same container name on several hosts indicates deliberate distribution rather than a
+    single targeted drop, and identifies every system needing driver-load and service review. A single
+    host narrows the work to how the artifact reached that machine. The query intentionally carries
+    no host filter and matches on the file name, so it also catches the container staged under a different
+    parent directory.
+  answer_sources:
+  - file_event
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        TargetFilename|endswith|expand: '%file_basename%'
+      condition: selection
+    fields:
+      - host.name
+      - TargetFilename
+      - Image

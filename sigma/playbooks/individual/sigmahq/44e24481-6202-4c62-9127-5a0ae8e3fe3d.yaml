@@ -1,0 +1,451 @@
+name: Obfuscated PowerShell OneLiner Execution
+id: 50ebe55a-8aa7-4e0d-acd7-209acc4fabd5
+description: |
+  Detects powershell.exe launched with a command line that contains all of a
+  loopback URL (http://127.0.0.1), the pipeline idiom %{(IRM $_)}, and the token
+  Invoke. Together these form an in-memory download cradle: Invoke-RestMethod
+  fetches content from a local relay or proxy endpoint and the result is piped
+  into reflective execution, so the payload never touches disk. The rule fires
+  only when powershell.exe runs AND the command line carries all three tokens.
+  Some developer and automation workflows pipe IRM output into a script block,
+  but the loopback target combined with the reflective-execution idiom is
+  characteristic of a stager that relays a module through a local listener. The
+  investigation should decode what URL is fetched and what gets executed in
+  memory, identify the parent that launched the cradle, confirm whether
+  defenses were weakened around it, and determine whether the same pattern
+  appears elsewhere on the host or fleet.
+type: detection
+detection_id: 44e24481-6202-4c62-9127-5a0ae8e3fe3d
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Did powershell.exe run with a command line containing the loopback URL,
+    the %{(IRM $_)} idiom, and the Invoke token together, matching what this rule
+    detects?
+  context: Before investing investigation time, confirm the alert is a true positive.
+    The rule fires only when the image is powershell.exe AND the command line
+    contains all three tokens - http://127.0.0.1, %{(IRM $_)}, and Invoke - at once.
+    Read the exact command line and confirm all three are present. Note the loopback
+    port and path on the URL and how the IRM output is piped, since that determines
+    what the cradle actually fetches and executes.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Is this user and host expected to run in-memory PowerShell download cradles?
+  context: A loopback-fetching reflective PowerShell one-liner is normal for a narrow
+    set of developers, red-team operators, and automation that relays modules through
+    a local listener. Most users and most endpoints never run this pattern. Knowing
+    whether the acting account and host function involve PowerShell development or
+    sanctioned tooling is often the fastest path to separating a benign pipeline from
+    a stager.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What process spawned this powershell.exe, and is that parent chain expected?
+  context: The parent process reveals how the cradle was invoked. The command line is
+    set by whatever launched powershell.exe, so the parent is where the cradle
+    originated. Interactive development usually shows a console shell or an IDE; an
+    unexpected parent such as a script host (wscript.exe, cscript.exe), mshta.exe, or
+    an Office application points to automated or malicious invocation that assembled
+    the obfuscated one-liner.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What URL does the IRM cradle fetch, and what does the piped content execute
+    in memory?
+  context: This command is already readable rather than base64-encoded, so decode the
+    cradle by following its structure. Invoke-RestMethod retrieves content from the
+    loopback URL and the %{(IRM $_)} pipeline passes that content into an Invoke that
+    runs it. Identify the exact loopback port and path, what the local endpoint relays
+    to, and whether the executed content reflectively loads a .NET assembly into
+    memory rather than writing a file. The source URL and the execution primitive
+    together reveal what was actually run.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What loopback endpoint and external destination does the cradle relay
+    through, and is that listener expected on this host?
+  context: The cradle targets http://127.0.0.1, so the immediate fetch is a local
+    relay or proxy rather than a direct external connection. Identify the loopback
+    port from the command line and determine which process is listening on it and what
+    upstream destination it forwards to. A local listener that proxies to attacker
+    infrastructure is a different finding than a sanctioned development server. Pivot
+    from the listening port to the network connections that follow the cradle launch.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      filter_loopback:
+        DestinationIp|expand: '%related_ip%'
+      condition: selection and filter_loopback
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationPort
+- question: Which .NET runtime and automation assemblies did powershell.exe load in
+    memory around the cradle launch, and do they indicate reflective assembly loading?
+  context: The reflective execution idiom loads code into memory without writing a
+    file, so the corroborating evidence is the set of .NET runtime and automation
+    assemblies the process pulled in. Image-load events for the CLR and PowerShell
+    automation modules from this powershell.exe confirm in-process .NET execution that
+    the command line alone cannot. If image-load telemetry is not collected in this
+    environment, treat zero results as a visibility gap rather than evidence nothing
+    loaded.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: \powershell.exe
+      filter_dotnet:
+        ImageLoaded|endswith:
+          - '\clr.dll'
+          - '\clrjit.dll'
+          - '\mscoree.dll'
+          - '\mscorlib.dll'
+          - '\System.Management.Automation.dll'
+          - '\System.Management.Automation.ni.dll'
+      condition: selection and filter_dotnet
+    fields:
+      - ImageLoaded
+- question: Did PowerShell script block logging capture the deobfuscated content the
+    cradle executed?
+  context: Windows Event ID 4104 records the deobfuscated script content PowerShell
+    actually runs, even when the command line uses pipeline obfuscation and reflective
+    invocation. This is ground truth for what the cradle fetched and executed. If
+    PowerShell operational logs are not ingested in this environment, treat the absence
+    of results as a visibility gap rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Were PowerShell security controls bypassed or weakened on this host before
+    the cradle ran?
+  context: A reflective download cradle commonly runs after defenses are loosened.
+    Common precursors include AMSI bypass (patching amsi.dll in memory), execution
+    policy changes (Set-ExecutionPolicy or -ep bypass), and PowerShell v2 downgrade,
+    which lacks script block logging. Finding these precursor events strengthens the
+    case that the cradle was an operator action rather than a benign pipeline.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: Were defense tampering actions performed on this host around the cradle
+    launch?
+  context: Reflective PowerShell stagers are frequently paired with steps that blind
+    the host - disabling Defender real-time protection, clearing event logs, deleting
+    shadow copies, or weakening firewall rules. Finding multiple tampering events from
+    the same user or parent process within a short window indicates a coordinated
+    effort to suppress detection rather than an isolated script invocation.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_tamper:
+        Image|endswith:
+          - '\wevtutil.exe'
+          - '\vssadmin.exe'
+          - '\bcdedit.exe'
+          - '\wbadmin.exe'
+          - '\netsh.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\powershell.exe'
+        CommandLine|contains:
+          - 'cl '
+          - 'clear-log'
+          - 'delete shadows'
+          - 'recoveryenabled'
+          - 'DisableRealtimeMonitoring'
+          - 'advfirewall'
+          - 'stop'
+          - 'delete'
+      condition: selection and selection_tamper
+    fields:
+      - Image
+      - User
+- question: What activity occurred on this host after the cradle launched?
+  context: A reflective stager runs to load and execute follow-on code in memory, so
+    examining what ran in the window immediately after the launch reveals what the
+    cradle delivered - credential access, reconnaissance, lateral movement tooling, or
+    further configuration changes. A burst of process creation right after the cradle
+    points to the activity the in-memory module performed.
+  range: +1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        Image|endswith: \powershell.exe
+        CommandLine|contains|all:
+        - http://127.0.0.1
+        - '%{(IRM $_)}'
+        - Invoke
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        Image|endswith: \powershell.exe
+        CommandLine|contains|all:
+        - http://127.0.0.1
+        - '%{(IRM $_)}'
+        - Invoke
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the acting account's activity across all hosts reveals whether the
+    cradle was a single event or part of activity spanning multiple endpoints. If the
+    same user triggered similar activity on other hosts, the scope of the incident is
+    larger than one machine.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        Image|endswith: \powershell.exe
+        CommandLine|contains|all:
+        - http://127.0.0.1
+        - '%{(IRM $_)}'
+        - Invoke
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining the activity surrounding the
+    cradle launch reveals what led to it and what followed - the parent that staged
+    the process, reconnaissance, or follow-on execution. Novel parent-child pairs at
+    low counts are what to scan for against the high-count noise of routine system
+    processes.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host - reconnaissance, credential access, or
+    defense tampering - may reveal the attack stages that preceded the cradle and help
+    reconstruct the full timeline. A download-and-execute stager is often one step in
+    a sequence, so prior alerts give the context for why it ran.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: When this host has previously fired the rule's loopback IRM cradle pattern,
+    what parents and users normally drive it, and does the current alert fit?
+  context: Even legitimate automation can run loopback-relay PowerShell. This query
+    mirrors the rule's selection structure scoped to this host, so the resulting parent
+    and user distribution reflects how this specific firing pattern has historically
+    run here, not generic PowerShell activity. A new parent process, an unexpected
+    account, or a first-ever occurrence is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        Image|endswith: \powershell.exe
+        CommandLine|contains|all:
+        - http://127.0.0.1
+        - '%{(IRM $_)}'
+        - Invoke
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Have other hosts fired the rule's loopback IRM cradle pattern in the past
+    week, and does the cross-host distribution look like consistent automation or
+    one-off activity?
+  context: This query mirrors the rule's selection structure with no host scope, so the
+    result is a fleet-wide count of the loopback IRM cradle firing pattern rather than
+    generic PowerShell activity. Many hosts firing the same pattern points to a build
+    pipeline or scripted deployment; one host or a small unrelated set points to manual
+    operator activity. Use the host distribution to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        Image|endswith: \powershell.exe
+        CommandLine|contains|all:
+        - http://127.0.0.1
+        - '%{(IRM $_)}'
+        - Invoke
+      condition: selection
+    fields:
+    - host.name

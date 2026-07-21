@@ -1,0 +1,367 @@
+name: Gzip Archive Decode Via PowerShell
+id: 29a17ed5-d074-4db3-b054-20475d728ba5
+description: |
+  Detects PowerShell command lines that decompress an in-memory Gzip stream by referencing
+  both the GZipStream .NET class and the ::Decompress mode. This pattern is common in fileless
+  loaders that decode an embedded blob to a payload entirely in memory, but it also appears in
+  legitimate administrative or build scripts that handle compressed data. The investigation should
+  determine what the decompressed content was, what executed it, and whether the decode was followed
+  by outbound network activity consistent with a command-and-control channel.
+type: detection
+detection_id: 98767d61-b2e8-4d71-b661-e36783ee24c1
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the command line reference both GZipStream and ::Decompress as the rule detects?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the
+    exact command line. The rule fires when a single PowerShell command line contains both the
+    GZipStream .NET class reference and the ::Decompress mode, indicating an in-memory Gzip
+    decompression. Confirm both tokens are present and read the surrounding code for what is being
+    decompressed.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Is this user and host expected to run PowerShell that decompresses in-memory Gzip data?
+  context: Legitimate administrative scripts, build tooling, and data-processing jobs can use
+    GZipStream decompression. Knowing whether the user role and host function routinely handle
+    compressed data in PowerShell is often the fastest way to separate a routine operation from a
+    fileless loader stage.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What exactly does this command decompress, and what does the decoded content do?
+  context: The full command line reveals where the compressed blob comes from and what happens to the
+    result. Trace whether the GZipStream input is read from a base64 literal, a file, a registry value,
+    or a network response, and whether the decompressed bytes are written to disk, loaded reflectively
+    into memory, or piped to another command. In-memory reflective loading of the decompressed result
+    is the highest-concern outcome.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains|all:
+          - GZipStream
+          - '::Decompress'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Is the surrounding command encoded or obfuscated, and what does it decode to?
+  context: A Gzip decompress is frequently the inner layer of a multi-stage decode. The outer command
+    line may use base64 (-EncodedCommand / -enc), string concatenation, backtick escaping, or variable
+    substitution to hide the blob and the logic that decompresses it. Decode the outer layers to
+    recover the cleartext, then identify the decompressed payload -- download cradle, reflective .NET
+    assembly load, or staged executable.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Does the command line carry a long base64 or other high-entropy literal feeding the decompression?
+  context: Standard-encoding loaders embed the compressed payload as a long encoded literal that is
+    base64-decoded, then Gzip-decompressed in memory. A continuous base64 token beyond roughly 100
+    characters, or a high-entropy string, alongside FromBase64String or Convert references points to an
+    embedded blob rather than a small administrative decompress. Inspect the literal length and entropy
+    to gauge whether a full payload is being carried inline.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did script block logging capture the full deobfuscated script around this decompression?
+  context: PowerShell script block logging (Event ID 4104) records the deobfuscated script content that
+    PowerShell actually executed, even when the outer command line is encoded. This provides ground
+    truth about the full decode-and-load logic, including the decompressed payload's handling, that the
+    process command line alone may not show. If PowerShell operational logs are not ingested in this
+    environment, treat zero results as a visibility gap rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Were PowerShell security controls bypassed or weakened on this host before the decompression?
+  context: Fileless loaders often disable or bypass PowerShell protections before decoding and running a
+    payload. Common precursors include AMSI bypass, execution policy changes (Set-ExecutionPolicy or -ep
+    bypass), and downgrade to PowerShell v2 to evade logging. Finding these events shortly before the
+    decompression strengthens the case that the decode is a malicious loader stage.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: What process spawned this PowerShell, and is that parent chain expected?
+  context: The parent process reveals how the decompression was invoked. Interactive or scripted admin
+    use typically descends from explorer.exe, a console host, or a known automation parent. Parents like
+    wscript.exe, mshta.exe, a Office application, or a batch file dropped from an email attachment point
+    to a delivery chain that ends in the in-memory decode.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Did this host make outbound connections shortly after the decompression that could carry encoded C2 traffic?
+  context: Standard-encoding C2 chains follow an encode/decode step with outbound egress, often with a
+    high bytes-out to bytes-in ratio or encoded content in HTTP headers and bodies. Look for connections
+    from this host in the window after the decompression to uncommon destinations or ports, and exclude
+    known-good system processes. A decompression followed by egress to an unfamiliar endpoint is
+    consistent with a loader fetching a next stage or establishing a channel.
+  range: +1h
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      filter_system:
+        Image|endswith:
+          - '\svchost.exe'
+          - '\services.exe'
+          - '\lsass.exe'
+      condition: selection and not filter_system
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- question: What child processes ran from PowerShell after the decompression?
+  context: The processes spawned after the decode reveal its actual impact. A fileless loader may write
+    and launch an executable, spawn additional script hosts, or invoke living-off-the-land binaries for
+    the next stage. Unexpected children such as cmd.exe, rundll32.exe, regsvr32.exe, or a newly written
+    binary indicate the decompressed content was executed.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: '\powershell.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: When this host previously ran the rule's decompression pattern, what parents and users drove it, and does this alert fit?
+  context: Even routine tooling can be abused. This view mirrors the rule's selection scoped to this
+    host, so the parent and user distribution reflects how the GZipStream decompression pattern
+    specifically has run here before. A new parent process, an unexpected account, or a first-time
+    appearance of the pattern is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - GZipStream
+        - ::Decompress
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - GZipStream
+        - ::Decompress
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - GZipStream
+        - ::Decompress
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or staging on multiple
+    endpoints. If the same user triggered similar decode or execution activity elsewhere, the scope of
+    the incident may be larger than the alerting host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - GZipStream
+        - ::Decompress
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Have other hosts run the rule's decompression pattern in the past week, and does the distribution look like automation or one-off activity?
+  context: This view mirrors the rule's selection with no host scope, giving a fleet-wide count of the
+    GZipStream decompression pattern rather than generic PowerShell usage. Many hosts running the same
+    pattern points to scripted deployment or vendor automation; one host or a small unrelated set points
+    to manual operator activity. Use the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - GZipStream
+        - ::Decompress
+      condition: selection
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host -- defense tampering,
+    delivery, reconnaissance, or credential access -- may reveal the stages that preceded the in-memory
+    decode and help reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

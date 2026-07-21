@@ -1,0 +1,511 @@
+name: Potential CVE-2021-41379 Exploitation Attempt
+id: 3c7e4b46-de7b-4dff-8250-c3af16c101fe
+description: |
+  Detects a Windows command interpreter created as a child of the Microsoft Edge elevation service
+  (elevation_service.exe) while running at SYSTEM integrity. The rule fires when the parent condition holds —
+  a parent path ending in \elevation_service.exe AND an IntegrityLevel of System (or its SID S-1-16-16384) —
+  and the child matches either the Image branch (a path ending in \cmd.exe, \powershell.exe, or \pwsh.exe) or
+  the OriginalFileName branch (Cmd.Exe, PowerShell.EXE, or pwsh.dll), so a renamed copy of an interpreter still
+  matches. This is the payoff step of public CVE-2021-41379 (InstallerFileTakeOver) exploitation and its
+  variants: the Windows Installer service's elevated file operations are abused to take over the elevation
+  service's binary or its DACL, and the service is then started so that a low-privileged user receives a SYSTEM
+  shell. The elevation service is a legitimate signed Microsoft component and has no routine reason to spawn an
+  interactive interpreter, so the investigation should establish which branch fired, what the interpreter ran,
+  whether the host carries the fixes for CVE-2021-41379 and CVE-2021-43883, and whether the SYSTEM token was
+  used for anything after the spawn.
+type: detection
+detection_id: af8bbce4-f751-46b4-8d91-82a33a736f61
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-17
+questions:
+- question: >-
+    Did the alerting process match either the interpreter Image branch or the OriginalFileName branch, and was
+    its parent elevation_service.exe at SYSTEM integrity?
+  context: >-
+    The rule needs the parent condition (ParentImage ending in \elevation_service.exe AND IntegrityLevel of
+    System or S-1-16-16384) plus a match on either branch of the child selection: Image ending in \cmd.exe,
+    \powershell.exe, or \pwsh.exe, or OriginalFileName equal to Cmd.Exe, PowerShell.EXE, or pwsh.dll. Note
+    which branch fired. An Image-branch match is an interpreter under its own name and the command line is the
+    next thing to read. An OriginalFileName-branch match with an Image that is not a known interpreter path
+    means a renamed or relocated copy of the interpreter ran, which makes binary origin, signature, and the
+    path it was launched from the load-bearing questions. Either way, confirm the parent is the real Edge
+    elevation service path and not a lookalike executable placed elsewhere.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - OriginalFileName
+      - IntegrityLevel
+  answer_sources:
+  - alert
+  - process_creation
+- question: Is this user and host expected to produce a SYSTEM-integrity command interpreter under the Edge elevation service?
+  context: >-
+    The Edge elevation service exists to perform a narrow set of elevated update and installer operations; it
+    does not normally launch interactive shells, and no supported administrative workflow asks it to. There is
+    effectively no benign baseline to appeal to here, so the useful judgment is about the account and the host
+    rather than the action: whether a low-privileged user was working locally at the time, whether the host is a
+    developer or test system where privilege-escalation tooling is run deliberately, and whether the host is
+    current on the fixes for CVE-2021-41379 and CVE-2021-43883. A failed attempt on a patched host is still a
+    live hypothesis and does not by itself mean the host is compromised.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: What started elevation_service.exe, and does its own command line look like the normal service start?
+  context: >-
+    The elevation service is normally started by the service control manager with a /svc style command line and
+    a services.exe grandparent. A start from a different launcher, an unexpected command line, or an image path
+    outside the Edge installation directory points at the service having been taken over or impersonated rather
+    than invoked. Reading the parent's own creation event also fixes the start time of the service instance,
+    which is what the installer-activity timeline is anchored to.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+  answer_sources:
+  - process_creation
+- question: What other child processes did this same elevation service instance spawn?
+  context: >-
+    A SYSTEM shell is a means, not an end. Other children of the same service instance show what the elevated
+    context was actually used for — account creation, defense tampering, credential access tooling, or a second
+    payload copied into place. If this scoping field resolves to NODATA the host filter still returns the
+    surrounding activity, and the same-parent view can be rebuilt from the parent-name questions.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: What did the SYSTEM-integrity interpreter actually execute — read the full command line and working directory.
+  context: >-
+    An empty or bare command line means an interactive shell was handed to whoever triggered the escalation, and
+    the follow-on activity is then visible only as child processes rather than as arguments. A populated command
+    line names the operation the elevated context was spent on. The working directory frequently points back at
+    the staging location the exploit ran from, which is often a user-writable directory. This is scoped to the
+    alerting process rather than to all interpreter executions on the host, because command interpreters are far
+    too common for a host-plus-binary scope to be readable.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: If the child was PowerShell, was the command encoded or obfuscated, and what does it decode to?
+  context: >-
+    When the interpreter branch that fired is powershell.exe or pwsh.exe, the arguments are where the elevated
+    intent is recorded. Base64 payloads passed through -EncodedCommand or -enc are the most common form,
+    alongside backtick escaping, string concatenation, and variable substitution. Decoding reveals what the
+    SYSTEM context was used for — a download cradle, an account or service modification, or in-memory execution
+    of a .NET assembly. If the command line is empty, an interactive session was opened and the decoding target
+    becomes the child processes instead.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: Did PowerShell script block logging capture the full script content?
+  context: >-
+    Event ID 4104 records the deobfuscated script text PowerShell actually executed, which is ground truth even
+    when the command line is encoded or when an interactive SYSTEM session leaves no arguments at all. For a
+    session opened through privilege escalation this is often the only record of what was typed. If PowerShell
+    operational logging is not collected in this environment, treat an empty result as a visibility gap rather
+    than as evidence that nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+  answer_sources:
+  - powershell_script_block
+- question: Were PowerShell security controls bypassed or weakened before this execution?
+  context: >-
+    Escalation to SYSTEM is usually followed, and sometimes preceded, by work to reduce what gets recorded or
+    blocked. Common forms are AMSI patching, execution policy bypass flags, and downgrade to PowerShell version
+    2 to lose script block logging. Finding these in the hour before the alert on this host places the
+    escalation inside a sequence rather than leaving it as an isolated event; finding them after it, under the
+    elevated context, changes the priority of containment.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Did the Security log record special privileges being assigned to a new logon around the time of the alert?
+  context: >-
+    Exploitation for privilege escalation is confirmed on the token side, not just the process side. Event 4672
+    records SYSTEM-level privilege assignment such as SeDebugPrivilege, SeTcbPrivilege, and SeImpersonatePrivilege
+    at logon, and 4673 records sensitive privilege use; both are the token behavior that follows a successful
+    escalation. The temporal link is tight — public exploitation of this class produces the SYSTEM interpreter
+    within seconds of the installer operation that triggers it — so read the events immediately around the
+    alert and check whether the subject is the low-privileged user rather than an expected service account. If
+    the Security channel is not collected from this host, an empty result is a visibility gap.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID:
+          - 4672
+          - 4673
+      condition: selection
+    fields:
+      - SubjectUserName
+      - SubjectLogonId
+      - PrivilegeList
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: What else did the elevation service launch on this host in the hours around the alert?
+  context: >-
+    This widens the same-parent view from the single service instance to every instance of the elevation service
+    on this host in the window. Repeated attempts, a second interpreter, or a copy or move of an executable
+    launched from the service all show whether this was one try or an iterated exploitation loop. Legitimate
+    children of this service are limited to Edge update and installer components.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Has this parent ever spawned this interpreter on this host before?
+  context: >-
+    The 90-day history of this specific parent-and-child pairing on this host says whether the relationship is
+    novel. Zero prior events is the expected answer for a healthy host, since the elevation service has no
+    routine reason to launch an interpreter, and it makes the alerting event a first occurrence. A non-zero
+    count is worth reading closely: it may indicate repeated exploitation attempts over time, or a local
+    packaging or support tool that has been driving the service in an unusual way.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Does this host routinely run command interpreters at SYSTEM integrity, and which parents launch them?
+  context: >-
+    A plain baseline of cmd.exe or powershell.exe on a host measures nothing useful — interpreters run
+    constantly. Constraining the 90-day history to SYSTEM integrity narrows it to the population that matters
+    here: shells running with the token the exploit is after. The parents in the result are the discriminator.
+    Service control manager, management agents, and scheduled task hosts are the normal launchers; the Edge
+    elevation service is not among them. On platforms or agents that do not populate integrity level, an empty
+    result should be read as a visibility gap rather than as an absence of SYSTEM shells.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - \cmd.exe
+          - \powershell.exe
+          - \pwsh.exe
+        IntegrityLevel:
+          - System
+          - S-1-16-16384
+      condition: selection
+    fields:
+      - ParentImage
+      - User
+  answer_sources:
+  - process_creation
+- always_include: true
+  question: Has this user account previously produced the rule's pattern, and does that history fit their role?
+  context: >-
+    The query mirrors the rule's selection structure scoped to this user, so the result is the 90-day history of
+    this account producing this exact pattern rather than generic interpreter use, aggregated by host. Zero is
+    the expected answer. A repeat count on the same host suggests iterated attempts by the same account; the
+    same pattern on several hosts under one account suggests tooling carried between systems. Weigh the answer
+    against the account's role, and note that the field may resolve to NODATA when the alert fires under a
+    service principal.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \cmd.exe
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - Cmd.Exe
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_parent:
+        ParentImage|endswith: \elevation_service.exe
+        IntegrityLevel:
+        - System
+        - S-1-16-16384
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+- always_include: true
+  question: Has this parent process historically driven the rule's pattern on this host or across the environment?
+  context: >-
+    This alert fires at SYSTEM integrity by construction, so the user field frequently attributes nothing and
+    the launch mechanism is the meaningful pivot. The query mirrors the rule's selection structure scoped to the
+    alerting parent name, giving the 90-day history of this service driving this specific pattern rather than
+    generic parent-and-binary co-occurrence, aggregated by host. Zero prior events makes the alerting event the
+    first time this launcher produced this pattern anywhere in view; a spread across many hosts would point at
+    something systemic rather than a host-local action.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \cmd.exe
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - Cmd.Exe
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_parent:
+        ParentImage|endswith: \elevation_service.exe
+        IntegrityLevel:
+        - System
+        - S-1-16-16384
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- always_include: true
+  question: What else did this user do across the environment around this time?
+  context: >-
+    Tracking the account's activity across all hosts in the alert window shows whether the escalation is one
+    step in a wider sequence — staging tooling, moving to another host, or repeating the attempt elsewhere. If
+    the alert fired under SYSTEM or another service principal this result degenerates into agent telemetry from
+    every host and should be discarded in favour of the parent-driven view.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+- always_include: true
+  question: Did this same parent-driven pattern fire on other hosts in the same window, or is the activity isolated to this host?
+  context: >-
+    Under a service principal, asking what else the user did returns noise from every host in the fleet. The
+    meaningful question is whether the same launch mechanism produced the same pattern elsewhere at the same
+    time. The query mirrors the rule's selection structure scoped to the alerting parent, fleet-wide, in the
+    alert window. Several hosts in one window points at a tool being run across systems by a common operator or
+    an automated rollout; a single host points at a local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \cmd.exe
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - Cmd.Exe
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_parent:
+        ParentImage|endswith: \elevation_service.exe
+        IntegrityLevel:
+        - System
+        - S-1-16-16384
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Aggregating every process creation on the host by binary and parent collapses routine agent telemetry into
+    high-count rows and leaves novel pairs visible at low counts. For this pattern the things to scan for are
+    msiexec.exe activity and installer or repair operations in the minutes before the alert, an executable
+    launched from a user-writable directory, and any post-escalation stage. Windows privilege escalation also
+    arrives through other vectors, such as loading a vulnerable signed driver, so an unexpected driver-loading
+    parent in the same window is worth following even though this rule does not fire on it.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+  answer_sources:
+  - process_creation
+  - file_event
+  - registry_event
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Escalation is rarely the first stage. Earlier detections on the same host — an unusual installer invocation,
+    a file dropped to a user-writable path, reconnaissance, or defense tampering — help reconstruct how a
+    low-privileged foothold reached the point of attempting escalation, and they tell the analyst whether the
+    account was already acting outside its normal pattern.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+  answer_sources:
+  - alert

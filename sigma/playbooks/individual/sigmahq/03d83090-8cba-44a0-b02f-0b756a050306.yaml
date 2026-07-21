@@ -1,0 +1,570 @@
+name: Potential WinAPI Calls Via PowerShell Scripts
+id: c2830115-cbbd-493e-869a-884b72e2689e
+description: >-
+  Detects PowerShell script blocks (Script Block Logging, Event ID 4104) whose content
+  references WinAPI call combinations used for in-memory code execution. The rule fires
+  when a block contains either a remote-injection set (VirtualAlloc, OpenProcess,
+  WriteProcessMemory, CreateRemoteThread), or a privilege-adjustment set (OpenProcessToken,
+  LookupPrivilegeValue, AdjustTokenPrivileges), or a token-duplication set (OpenProcessToken,
+  DuplicateTokenEx, CloseHandle), or a process memory read/write set (WriteProcessMemory,
+  VirtualAlloc, ReadProcessMemory, VirtualFree), or a local shellcode set (VirtualAlloc,
+  GetDelegateForFunctionPointer, Marshal.Copy). Shellcode runners and token-manipulation
+  tooling resolve these APIs from PowerShell to load and execute code directly in memory,
+  avoiding file-based inspection; some administrative, developer, and security tooling uses
+  the same interop legitimately. The investigation should recover the full script, determine
+  which API group matched and what the calls target, establish what launched the PowerShell
+  host, and check whether the pattern is new to the user, the host, and the fleet.
+type: detection
+detection_id: 03d83090-8cba-44a0-b02f-0b756a050306
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-17
+questions:
+- question: Does the script block contain one of the WinAPI combinations this rule detects?
+  context: >-
+    The rule fires when the script content contains either the remote-injection set
+    (VirtualAlloc, OpenProcess, WriteProcessMemory, CreateRemoteThread), or the
+    privilege-adjustment set (OpenProcessToken, LookupPrivilegeValue, AdjustTokenPrivileges),
+    or the token-duplication set (OpenProcessToken, DuplicateTokenEx, CloseHandle), or the
+    memory read/write set (WriteProcessMemory, VirtualAlloc, ReadProcessMemory, VirtualFree),
+    or the local shellcode set (VirtualAlloc, GetDelegateForFunctionPointer, Marshal.Copy).
+    Long scripts are split across multiple 4104 events, so read every chunk of the alerting
+    block and note which API group appears. The branch matters downstream, since it decides
+    whether the follow-up centers on another process's memory, on token and privilege
+    handling, or on in-process shellcode execution.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - ScriptBlockText
+  answer_sources:
+  - alert
+  - ps_script
+- question: Is this user and host expected to run PowerShell that calls Windows APIs directly?
+  context: >-
+    Direct WinAPI interop from PowerShell appears legitimately in some administrative,
+    developer, and security tooling (hardware utilities, performance probes, red-team or
+    vulnerability-assessment scripts), and blocks logged under SYSTEM often come from
+    deployment or agent tooling. Check the user's role, the host's function, and the on-disk
+    script path shown here against known automation before treating the block as attacker
+    activity.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - host.name
+      - user.name
+      - Path
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: What does the full script do with the WinAPI functions it references?
+  context: >-
+    Reassemble every chunk of the block (sequence/total order) and read the complete script.
+    The 4104 channel records what PowerShell actually compiles, so -EncodedCommand wrappers
+    are already unwrapped; only in-script obfuscation (string concatenation, format
+    operators, backticks) still needs manual decoding. Identify what the API calls operate
+    on: a target process name or PID passed to OpenProcess or WriteProcessMemory, the
+    privilege names passed to AdjustTokenPrivileges, and any embedded shellcode byte arrays
+    (0x.. sequences), base64 blobs, or download cradles that supply the payload. Shellcode
+    runners commonly take a process-ID argument that names the injection target; that
+    operand, and any URLs or paths in the script, drive the rest of the investigation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - powershell.sequence
+      - powershell.total
+      - ScriptBlockText
+  answer_sources:
+  - ps_script
+  - manual_review
+- question: Does the script exist on disk, and what process wrote it there?
+  context: >-
+    When the block ran from a file, its path is recorded on the event. A script calling
+    injection or token APIs from a user-writable or staging location (Temp, AppData,
+    ProgramData, Downloads) implies a delivery step that wrote it; find the file-creation
+    event to identify the process and account that staged it. No recorded path means
+    interactive or in-memory execution, which for this content is itself worth noting,
+    since memory-only delivery of injection code is a deliberate evasion choice.
+  range: +/-24h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - EventType
+      - TargetFilename
+      - Image
+      - User
+  answer_sources:
+  - file_event
+  - manual_review
+- question: Which process launched the PowerShell host that compiled this script?
+  context: >-
+    Script block events carry no process linkage, so recover the launch context from process
+    telemetry on this host around the alert. An office application, browser, or unusual
+    service binary as the parent points to delivery through a document, a download, or an
+    exploited service; explorer.exe or a terminal fits interactive use. The command line
+    also shows flags that script delivery typically sets, such as -nop, -w hidden, or -enc,
+    and distinguishes direct powershell.exe invocation from .NET automation hosting.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+          - '\powershell_ise.exe'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - CommandLine
+      - User
+  answer_sources:
+  - process_creation
+- question: Were PowerShell security controls bypassed or weakened before this script ran?
+  context: >-
+    In-memory API abuse is frequently preceded by disabling the controls that would catch
+    it. Common precursors include AMSI bypass (patching amsi.dll via AmsiUtils or setting
+    amsiInitFailed), execution-policy overrides (-ExecutionPolicy Bypass, -ep bypass),
+    real-time monitoring changes (Set-MpPreference, DisableRealtimeMonitoring), and
+    downgrade to PowerShell version 2, which lacks script block logging. Any of these on the
+    host in the preceding hour reads as preparation for the alerting block rather than
+    routine administration.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Which process made cross-process memory-write or execution-hijack API calls on this host in the alert window?
+  context: >-
+    Script block events record content, not execution, and read-side process-handle activity
+    is not collected in endpoint telemetry, so it cannot be queried directly. The behavioral
+    API channel records the injection side (WriteProcessMemory, QueueUserAPC,
+    SetWindowsHookEx) and names the calling executable, which is the process identity the
+    script block event lacks. A PowerShell host appearing here corroborates that the
+    script's cross-process calls actually executed. This channel is injection-side only:
+    token manipulation, memory reads, and in-process shellcode leave no record here, and it
+    carries no memory-protection detail, so an empty result is a visibility gap rather than
+    evidence the script did not run.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        event.dataset: endpoint.events.api
+        process.Ext.api.name:
+          - WriteProcessMemory
+          - QueueUserAPC
+          - SetWindowsHookEx
+      condition: selection
+    fields:
+      - Image
+      - process.Ext.api.name
+      - User
+  answer_sources:
+  - edr_console
+  - process_creation
+- question: Did PowerShell spawn follow-on processes after the script block was logged?
+  context: >-
+    A 4104 event records script content, not outcome. If the script staged further tooling,
+    launched what it injected, or used an adjusted token to start an elevated process, the
+    process-side evidence appears as children of the user's PowerShell hosts shortly after
+    the block was logged. The event carries no process link, so this pivots by host, user,
+    and time. Under SYSTEM the user anchor is broad because deployment tooling shares it;
+    weigh individual children rather than the raw count.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        User|expand: '%User%'
+        ParentImage|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+          - '\powershell_ise.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+  answer_sources:
+  - process_creation
+- question: What other PowerShell script activity occurred on this host around the alert?
+  context: >-
+    Attacker PowerShell rarely runs as a single block. Reconnaissance, staging, and
+    follow-on tooling produce a cluster of script blocks in a short window, and surrounding
+    blocks often contain the plaintext the alerting fragment lacks, such as target process
+    names, addresses, or tool output handling. The log.level column shows how complete this
+    picture is: verbose events mean full Script Block Logging is on, while warning-only
+    means the host records just the automatically-flagged subset.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - user.name
+      - log.level
+      - Path
+      - ScriptBlockText
+  answer_sources:
+  - ps_script
+- question: Is full script block logging enabled on this host, or only suspicious-content capture?
+  context: >-
+    PowerShell logs script blocks at verbose level when the Script Block Logging policy is
+    enabled, and only automatically-flagged suspicious content (at warning level) when it is
+    not. On a warning-only host this alert shows a fragment of the host's PowerShell
+    activity, not all of it, and absence of other 4104 evidence is not absence of activity.
+    The level distribution calibrates how much weight every other script-block query in this
+    investigation can carry.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - log.level
+  answer_sources:
+  - ps_script
+- question: What other process activity occurred on this host around the time of the alert?
+  context: >-
+    The aggregated parent-child pairs collapse routine agent noise into high-count rows
+    while novel pairs stand out at low counts. Around an injection-capable script, look for
+    the delivery side (office applications or browsers spawning script hosts), staging
+    (archivers, downloaders), and post-injection activity from processes that do not
+    normally spawn children.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+  answer_sources:
+  - process_creation
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Defense tampering, reconnaissance, or credential-access detections in the preceding
+    hours reveal the stages that led up to in-memory API use and help reconstruct the
+    timeline. Injection and token-manipulation tooling typically arrives after initial
+    access and delivery steps, so earlier alerts often mark where the activity began.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+  answer_sources:
+  - alert
+- question: Has this exact script block run on this host before?
+  context: >-
+    The hash matches byte-identical content only, so zero history is strong evidence this
+    exact script is new to the host, while a block that has recurred for months fits
+    deployment tooling or vendor automation. A trivially edited variant hashes differently,
+    so history says nothing about near-variants. On hosts without full Script Block Logging
+    the history contains only automatically-flagged blocks, which weakens an empty result.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_hash|expand: '%script_block_hash%'
+      condition: selection
+    fields:
+      - user.name
+      - Path
+  answer_sources:
+  - ps_script
+- question: Has this user previously produced this rule's API-call pattern, and does that fit their role?
+  always_include: true
+  context: >-
+    The query mirrors the rule's selection structure scoped to this user, returning their
+    90-day history of script blocks containing these WinAPI combinations, aggregated by
+    host. Developers, security engineers, and assessment teams may produce this pattern
+    legitimately; a first-ever occurrence from a user whose role involves no low-level
+    scripting reads differently. Weigh the count against what the user's job plausibly
+    involves.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: ps_script
+      definition: 'Requirements: Script Block Logging must be enabled'
+    detection:
+      selection_injection:
+        ScriptBlockText|contains|all:
+        - VirtualAlloc
+        - OpenProcess
+        - WriteProcessMemory
+        - CreateRemoteThread
+      selection_token_steal:
+        ScriptBlockText|contains|all:
+        - OpenProcessToken
+        - LookupPrivilegeValue
+        - AdjustTokenPrivileges
+      selection_duplicate_token:
+        ScriptBlockText|contains|all:
+        - OpenProcessToken
+        - DuplicateTokenEx
+        - CloseHandle
+      selection_process_write_read:
+        ScriptBlockText|contains|all:
+        - WriteProcessMemory
+        - VirtualAlloc
+        - ReadProcessMemory
+        - VirtualFree
+      selection_local_shellcode_injection:
+        ScriptBlockText|contains|all:
+        - VirtualAlloc
+        - GetDelegateForFunctionPointer
+        - Marshal.Copy
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+- question: Which hosts have produced this script pattern in the past 90 days, and is the alerting host among them?
+  always_include: true
+  context: >-
+    When the alert fires under SYSTEM or another service principal, user identity does not
+    attribute behavior, and script block events carry no process identity to pivot on, so
+    the pattern itself is the pivot. The query mirrors the rule's selection fleet-wide over
+    90 days, aggregated by host. A pattern that routinely appears on many hosts fits
+    deployed tooling or a vendor product; one that has never appeared before, or only on
+    this host, is the deviation worth chasing. Only hosts shipping the PowerShell channel
+    (and, for non-flagged content, with full Script Block Logging enabled) can appear here.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: ps_script
+      definition: 'Requirements: Script Block Logging must be enabled'
+    detection:
+      selection_injection:
+        ScriptBlockText|contains|all:
+        - VirtualAlloc
+        - OpenProcess
+        - WriteProcessMemory
+        - CreateRemoteThread
+      selection_token_steal:
+        ScriptBlockText|contains|all:
+        - OpenProcessToken
+        - LookupPrivilegeValue
+        - AdjustTokenPrivileges
+      selection_duplicate_token:
+        ScriptBlockText|contains|all:
+        - OpenProcessToken
+        - DuplicateTokenEx
+        - CloseHandle
+      selection_process_write_read:
+        ScriptBlockText|contains|all:
+        - WriteProcessMemory
+        - VirtualAlloc
+        - ReadProcessMemory
+        - VirtualFree
+      selection_local_shellcode_injection:
+        ScriptBlockText|contains|all:
+        - VirtualAlloc
+        - GetDelegateForFunctionPointer
+        - Marshal.Copy
+      condition: 1 of selection_*
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- question: What else did this user do across the network around this time?
+  always_include: true
+  context: >-
+    If the same account was active on several hosts in this window, the injection-capable
+    script may be one step of movement between them, and the per-host binary summary shows
+    what else the account ran. When the alert fired under SYSTEM or another service
+    principal this view fills with routine service activity; in that case the fleet-wide
+    script-pattern question is the meaningful breadth check.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+- question: Did the same script pattern fire on other hosts in this window, or is it isolated to this host?
+  always_include: true
+  context: >-
+    The query mirrors the rule's selection fleet-wide in the alert window, aggregated by
+    host, which is the meaningful breadth check when user identity is a service principal
+    and no process identity exists on this channel. Several hosts in the same window points
+    to scheduled or pushed automation, which change records should corroborate; a single
+    host points to a host-local trigger. Coverage is policy-gated per host, so absence
+    elsewhere is weak evidence.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: ps_script
+      definition: 'Requirements: Script Block Logging must be enabled'
+    detection:
+      selection_injection:
+        ScriptBlockText|contains|all:
+        - VirtualAlloc
+        - OpenProcess
+        - WriteProcessMemory
+        - CreateRemoteThread
+      selection_token_steal:
+        ScriptBlockText|contains|all:
+        - OpenProcessToken
+        - LookupPrivilegeValue
+        - AdjustTokenPrivileges
+      selection_duplicate_token:
+        ScriptBlockText|contains|all:
+        - OpenProcessToken
+        - DuplicateTokenEx
+        - CloseHandle
+      selection_process_write_read:
+        ScriptBlockText|contains|all:
+        - WriteProcessMemory
+        - VirtualAlloc
+        - ReadProcessMemory
+        - VirtualFree
+      selection_local_shellcode_injection:
+        ScriptBlockText|contains|all:
+        - VirtualAlloc
+        - GetDelegateForFunctionPointer
+        - Marshal.Copy
+      condition: 1 of selection_*
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- question: Did this exact script block run on other hosts in the environment?
+  context: >-
+    Byte-identical content across many hosts points to deployment tooling, GPO logon
+    scripts, or vendor agents; the same block on a small set of unrelated hosts is the
+    distribution lateral movement produces. This complements the pattern-based fleet
+    queries: the hash matches this exact script only, so together they distinguish "this
+    file was pushed" from "this technique is in use". Only hosts that logged the block can
+    appear, so absence elsewhere on a default-logging fleet is weak evidence.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        powershell.file.script_block_hash|expand: '%script_block_hash%'
+      condition: selection
+    fields:
+      - host.name
+      - user.name
+      - Path
+  answer_sources:
+  - ps_script

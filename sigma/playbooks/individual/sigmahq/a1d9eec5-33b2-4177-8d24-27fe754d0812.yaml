@@ -1,0 +1,364 @@
+name: Cloudflared Tunnels Related DNS Requests
+id: 329d1983-f418-48f2-bc82-652ac938e451
+description: |
+  Detects a DNS lookup for a Cloudflare Tunnel discovery domain (a QueryName ending in
+  .v2.argotunnel.com, protocol-v2.argotunnel.com, update.argotunnel.com, or trycloudflare.com).
+  The cloudflared client emits these lookups when a tunnel initializes, so the alert marks a
+  tunnel client running on the host rather than a connection to a specific destination. Cloudflare
+  Tunnel is a legitimate service for exposing a local application without a public IP, but the same
+  mechanism gives an operator a reverse channel into RDP, SMB, or SSH on the host with no
+  attacker-owned infrastructure (T1572, T1071.001). The tunnel's configuration lives off-host in a
+  Cloudflare account and is pulled at runtime via an opaque token, so the on-host artifacts do not
+  reveal which internal services are exposed. The investigation identifies the querying program and
+  its command line, whether the tunnel is sanctioned, the outbound QUIC transport it opens, and how
+  far the activity spreads across the host and fleet.
+type: detection
+detection_id: a1d9eec5-33b2-4177-8d24-27fe754d0812
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-10
+questions:
+- question: Does the queried domain match a Cloudflare Tunnel discovery domain, and which process queried it?
+  context: >-
+    Confirm the alert from the exact QueryName and the querying process. The rule fires on a lookup
+    whose name ends in .v2.argotunnel.com, protocol-v2.argotunnel.com, update.argotunnel.com, or
+    trycloudflare.com. A DNS event carries the domain and the querying program but no destination
+    address, so anchor on the domain and the process, not on any connection endpoint. The querying
+    program is normally cloudflared, though the binary may be renamed.
+  range: +/-5m
+  answer_sources:
+  - alert
+  - dns_query
+  query: |
+    aggregation: false
+    logsource:
+      category: dns_query
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        QueryName|expand: '%dns_query_name%'
+      condition: selection
+    fields:
+      - QueryName
+- question: Is this user and host expected to run a tunneling client?
+  context: >-
+    Cloudflare Tunnel has legitimate uses for exposing a local development service without a public
+    IP, so the fastest triage is whether this host and account have any routine reason to run a
+    tunnel client. A developer workstation with a known demo habit reads differently from a server
+    or a standard user's machine, where an outbound tunnel has no ordinary explanation. Process
+    attribution on the DNS event names the querying account and host for this check.
+  range: +/-30d
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Is Cloudflare Tunnel authorized for use on this host?
+  context: >-
+    Even where some tunneling is sanctioned, organizations typically approve specific tools and
+    hosts. Cloudflared not being on the approved list makes this either shadow IT, a user exposing an
+    internal service outside policy, or attacker-deployed reverse access. Both outcomes need action;
+    they differ in urgency, which the rest of the investigation establishes. A signed, legitimately
+    named cloudflared binary does not by itself make the use authorized.
+  range: +/-30d
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+- question: Is there an approved use case or support session explaining this tunnel?
+  context: >-
+    A sanctioned tunnel usually traces to something concrete: a development or testing task, a
+    documented remote-access procedure, or a change ticket. Ask the user and check support and change
+    records. No matching context means the tunnel was established by something other than the user's
+    intentional workflow, which points at malware or an unauthorized exposure of internal services.
+  range: +/-30d
+  answer_sources:
+  - organizational_knowledge
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Which Cloudflare Tunnel hostnames were looked up, and did they resolve?
+  context: >-
+    The discovery domains map to distinct tunnel phases: protocol-v2.argotunnel.com and the
+    region1/region2.v2.argotunnel.com hostnames appear at tunnel initialization, update.argotunnel.com
+    recurs while the tunnel stays up, and a random subdomain of trycloudflare.com indicates the
+    account-less TryCloudflare variant. A trycloudflare.com lookup is a stronger signal than argotunnel
+    alone because the account-less path is rarely used for legitimate internal exposure. Check whether
+    the lookups resolved and note the resolved address for pivoting into connection telemetry.
+  range: +/-5m
+  answer_sources:
+  - external_threat_intel
+  - manual_review
+  query: |
+    aggregation: false
+    logsource:
+      category: dns_query
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        QueryName|expand: '%dns_query_name%'
+      condition: selection
+    fields:
+      - QueryName
+      - Image
+- question: What program made the lookup, and what do its command line and working directory show?
+  context: >-
+    The command line separates a tunnel run from other cloudflared use. A token-based tunnel runs as
+    tunnel run --token <token> or tunnel --token, while the account-less form runs as tunnel --url
+    pointing at a local loopback address and port. The token is opaque and the ingress configuration lives in a Cloudflare
+    account rather than on the host, so the command line shows that a tunnel started but not which
+    internal services it exposes. A renamed binary, a program running from a user-writable path, or a
+    process with no visible tunnel arguments points at deliberate concealment rather than sanctioned
+    use.
+  range: +/-5m
+  answer_sources:
+  - process_creation
+  - manual_review
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What process spawned the tunnel client, and is that parent chain expected?
+  context: >-
+    A user intentionally starting a tunnel produces an explorer.exe or interactive shell parent. A
+    tunnel client launched by a script interpreter such as wscript.exe or powershell.exe, an Office
+    application, a LOLBin, or an unexpected service is the lineage pattern of attacker-deployed
+    tooling dropped after code execution. The parent's own command line shows what it was doing when
+    it started the tunnel.
+  range: +/-30d
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - Image
+      - CommandLine
+- question: Did the querying process open a sustained outbound tunnel connection, and over what port and protocol?
+  context: >-
+    The DNS lookups only announce the tunnel; the tunnel itself is an outbound flow from this process,
+    by default QUIC over UDP port 7844 to Cloudflare-owned address ranges. That single channel carries
+    whatever internal protocol the operator tunnels, so RDP, SMB, or SSH to local services is hidden
+    inside it, and to network monitoring the traffic appears to originate from this host rather than
+    from the external operator. A persistent outbound flow to port 7844 shortly after the argotunnel
+    lookups confirms the tunnel is live. Anchor on the querying process rather than any DNS resolver
+    address, because the lookup's answer is the resolver, not the tunnel endpoint.
+  range: +/-1h
+  answer_sources:
+  - network_connection
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationPort
+      - Initiated
+- question: What external endpoints is the tunnel process connecting to?
+  context: >-
+    The full destination set of the querying process shows whether it talks only to Cloudflare edge
+    infrastructure or also to other endpoints, such as a second callback server or an additional relay
+    service. A standard tunnel client should contact Cloudflare ranges and little else; a broader
+    destination set points at multi-channel tooling. Destination hostnames are sparsely recorded on
+    endpoint connection telemetry, so treat an empty hostname as a visibility gap and rely on the
+    address and port.
+  range: +/-15m
+  answer_sources:
+  - network_connection
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationHostname
+      - DestinationPort
+- question: What other domains did this process look up around the time of the alert?
+  context: >-
+    The querying process may have resolved more than the discovery domains. Listing every domain it
+    looked up in the surrounding window shows whether the tunnel client also contacts update or
+    staging infrastructure, and a burst of algorithmically varied domains from the same process would
+    indicate a separate beaconing or domain-generation pattern layered on top of the tunnel.
+  range: +/-1h
+  answer_sources:
+  - dns_query
+  query: |
+    aggregation: false
+    logsource:
+      category: dns_query
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - QueryName
+      - Image
+- question: Does this host normally look up Cloudflare Tunnel domains?
+  context: >-
+    A host that has resolved these domains daily for months under the same process is an established
+    workflow, still worth an authorization check but not an emerging intrusion. A first-time lookup,
+    or history that starts abruptly in recent days, marks when the tunnel appeared and anchors the
+    timeline for the rest of the investigation.
+  range: -90d
+  answer_sources:
+  - dns_query
+  query: |
+    aggregation: true
+    logsource:
+      category: dns_query
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        QueryName|expand: '%dns_query_name%'
+      condition: selection
+    fields:
+      - QueryName
+      - Image
+- question: Does this host normally run the querying program?
+  context: >-
+    A binary that has run regularly under the same user for months supports the established-workflow
+    reading; a program appearing on this host for the first time at the alert points at fresh tooling.
+    The user grouping also shows whether the program runs under the interactive user or a service
+    context, which matters when a machine or service account fired the lookup.
+  range: -90d
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: Did other hosts in the environment look up Cloudflare Tunnel domains?
+  context: >-
+    Fleet-wide lookups of these domains show the true footprint. A single host suggests targeted
+    reverse access, while several hosts resolving the same discovery domains, or servers with no
+    development role appearing in the list, points at coordinated deployment of the tunnel client.
+    Each host found needs the same authorization check as this one.
+  range: -7d
+  answer_sources:
+  - dns_query
+  query: |
+    aggregation: true
+    logsource:
+      category: dns_query
+      product: windows
+    detection:
+      selection:
+        QueryName|expand: '%dns_query_name%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Aggregated parent-child process pairs around the alert place the tunnel in its surrounding
+    sequence: how the tunnel client arrived and was launched before it, and what was reached through
+    it after. Novel low-count pairs stand out against repetitive agent telemetry, which is what points
+    to the tooling that staged the tunnel and any hands-on actions taken once it was live.
+  range: +/-15m
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host, such as credential access, discovery commands, or defense
+    tampering, may capture the stages that preceded the tunnel: how the operator gained the foothold
+    and what they collected before opening reverse access. The alert timeline reconstructs the
+    sequence from initial access to tunnel.
+  range: -6h
+  answer_sources:
+  - alert
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

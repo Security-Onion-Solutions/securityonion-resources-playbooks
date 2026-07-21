@@ -1,0 +1,341 @@
+name: Potential NTLM Coercion Via Certutil.EXE
+id: e2f5f64e-c86a-430d-81bc-6b70d981fd86
+description: |
+  Detects certutil.exe (by Image or OriginalFileName) invoked with the ' -syncwithWU ' flag together with a UNC path
+  (' \\'). Both the binary selection and the command-line selection must match for the rule to fire. The -syncwithWU
+  switch normally synchronizes certificate trust lists from Windows Update, but pointing it at an attacker-controlled UNC
+  share forces the executing host to authenticate to that remote server, leaking NTLM credentials for relay or offline
+  cracking. Legitimate use of -syncwithWU against an internal file share is plausible but uncommon, so the investigation
+  should recover the exact UNC target, confirm whether the host actually opened an outbound SMB or authentication
+  connection to it, and determine whether the destination is a trusted internal server or an unrecognized responder.
+type: detection
+detection_id: 6c6d9280-e6d0-4b9d-80ac-254701b64916
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- question: Does the command line match what this rule detects, with certutil.exe carrying both the -syncwithWU flag and a UNC path?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the exact command line and process details. The rule fires only when both conditions hold together, a certutil.exe binary (by Image or OriginalFileName) AND a command line that contains ' -syncwithWU ' and a UNC prefix ' \\'. Confirm both halves are present in the actual event and read off the full UNC target the flag points at.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to synchronize certificate trust lists with certutil against a remote share?
+  context: Legitimate administrative activity can trigger this detection, but -syncwithWU against a UNC path is an uncommon operation outside of specific certificate-management workflows. Knowing whether the user role and host function involve manual certificate trust-list maintenance is often the fastest path to distinguishing routine operations from credential-coercion attempts.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What exactly did this certutil invocation do? Recover the full UNC target the -syncwithWU flag pointed at.
+  context: The full command line reveals the specific action. Read off the server and share named after ' \\' in the UNC path, since that is the host certutil will authenticate to. A path to a recognized internal certificate or patch server is consistent with administrative use; a path to an unfamiliar host, a bare IP, or an external name is consistent with credential coercion to an operator-controlled responder. Note any additional switches that change where output is written.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|contains|all:
+          - ' -syncwithWU '
+          - ' \\'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Is the UNC path or any other argument on the command line obfuscated, and what does it resolve to once decoded?
+  context: 'Operators frequently disguise the responder target to evade simple string matching. Look for encodings and substitutions that hide the real destination: hex or octal IP literals, percent-encoded or environment-variable-substituted path segments, embedded credentials in the UNC string, or double-backslash padding. Resolve each layer until the actual server and share are readable, then judge whether that destination is a trusted internal resource or an unrecognized host.'
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did certutil on this host open an outbound SMB or authentication connection to the UNC target around the alert time?
+  context: NTLM coercion only succeeds if the host actually reaches out to the responder server and authenticates. Confirm whether certutil initiated an outbound connection, typically to SMB port 445 or to the responder's listening port, shortly after the command ran. A connection to a recognized internal file or certificate server is consistent with administrative use; a connection to an unrecognized host, a workstation-range address, or an external destination indicates credential coercion succeeded. Zero outbound connections may mean the coercion attempt failed or that network telemetry for this host is not collected.
+  range: +/-10m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        Initiated: 'true'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+      - CommandLine
+- question: What process spawned this certutil instance, and is that parent chain expected?
+  context: The parent process reveals how certutil was invoked. Interactive administration usually descends from explorer.exe or a shell; scheduled or service-driven certificate maintenance descends from services.exe or taskeng.exe. Parents like mshta.exe, wscript.exe, an Office application, or a remote-access tool indicate scripted or operator-driven execution rather than routine maintenance. Walk up the tree to see what spawned the parent.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: When this host has previously fired the rule's pattern, what parents and users normally drive that activity, and does the current alert fit that pattern?
+  context: Even a legitimate certificate-sync workflow leaves a stable signature. The query mirrors the rule's selection structure scoped to this host, so the resulting parent and user distribution reflects how this specific -syncwithWU-over-UNC firing pattern has historically run here, not generic certutil usage. A new parent process, an unexpected user account, or an unusual command structure is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \certutil.exe
+      - OriginalFileName: CertUtil.exe
+      selection_cli:
+        CommandLine|contains|all:
+        - ' -syncwithWU '
+        - ' \\\\'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \certutil.exe
+      - OriginalFileName: CertUtil.exe
+      selection_cli:
+        CommandLine|contains|all:
+        - ' -syncwithWU '
+        - ' \\\\'
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \certutil.exe
+      - OriginalFileName: CertUtil.exe
+      selection_cli:
+        CommandLine|contains|all:
+        - ' -syncwithWU '
+        - ' \\\\'
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity across multiple endpoints. If the same user triggered similar activity on multiple hosts, the scope of the operation may be larger than a single endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \certutil.exe
+      - OriginalFileName: CertUtil.exe
+      selection_cli:
+        CommandLine|contains|all:
+        - ' -syncwithWU '
+        - ' \\\\'
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate context: what led to this event, what happened after, and whether it is part of a larger sequence. Look for reconnaissance, credential access, or lateral-movement attempts that the coercion may support.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Were any other download or transfer LOLBins used on this host recently?
+  context: Operators who abuse one living-off-the-land binary often use several. If certutil was used to coerce authentication or pull content, check whether bitsadmin, curl, esentutl, expand, or similar download and cabinet tools were also used on the same host. Finding multiple LOLBins performing related transfer or retrieval actions strengthens the case for hands-on operator activity.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\bitsadmin.exe'
+          - '\curl.exe'
+          - '\esentutl.exe'
+          - '\expand.exe'
+          - '\extrac32.exe'
+          - '\makecab.exe'
+          - '\replace.exe'
+          - '\hh.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- question: Was certutil executed from its expected System32 or SysWOW64 path?
+  context: LOLBins executed from non-standard paths, outside System32 or SysWOW64, may indicate the binary was copied or renamed to evade path-based allowlists. A certutil.exe running from a user temp directory, a profile folder, or a removable drive is more suspicious than one in System32. Compare the Image path against OriginalFileName to confirm whether the binary was renamed.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- question: How often has this host fired the rule's certutil pattern over the past 90 days, and what command-line structures are typical?
+  context: A certutil -syncwithWU-over-UNC pattern with no prior history on a host is more suspicious than one used regularly under stable parents. The query mirrors the rule's selection structure scoped to this host, so the resulting count reflects the rule's specific firing pattern, not generic certutil usage. The CommandLine projection lets the analyst compare typical UNC targets and switches against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \certutil.exe
+      - OriginalFileName: CertUtil.exe
+      selection_cli:
+        CommandLine|contains|all:
+        - ' -syncwithWU '
+        - ' \\\\'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - CommandLine
+- question: Have other hosts fired the rule's pattern in the past week, and does the cross-host distribution look like consistent automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of this -syncwithWU-over-UNC firing pattern, not generic certutil usage. Many hosts firing the same pattern points to scripted deployment or vendor automation; one host or a small unrelated set points to manual operator activity. Use host distribution and the consistency of the UNC targets to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \certutil.exe
+      - OriginalFileName: CertUtil.exe
+      selection_cli:
+        CommandLine|contains|all:
+        - ' -syncwithWU '
+        - ' \\\\'
+      condition: all of selection_*
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: 'Alerts rarely happen in isolation. Earlier detections on the same host, defense tampering, reconnaissance, or prior credential-access attempts, may reveal the stages that preceded this event and help reconstruct the timeline. Look for patterns: reconnaissance followed by coercion, or coercion followed by lateral movement.'
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

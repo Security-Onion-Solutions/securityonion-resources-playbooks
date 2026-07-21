@@ -1,0 +1,430 @@
+name: Fireball Archer Install
+id: b5a061b1-e184-4386-8694-c773ab39808d
+description: |
+  Detects a process_creation command line that contains both `rundll32.exe` and the string `InstallArcherSvc`,
+  the named DLL export the Archer component of the Fireball family calls to register itself as a service.
+  Both strings must be present in the same command line for the rule to fire. Invoking a DLL export through
+  rundll32.exe is proxy execution: the DLL runs inside a Microsoft-signed host process, so the payload never
+  appears as its own image on disk-to-process telemetry, and application-control policies keyed on the running
+  executable see only rundll32. The export name here implies a service-install routine, which is a persistence
+  step rather than a one-off execution. The investigation should identify which DLL was actually mapped, where
+  it came from, whether a service was registered as a result, and whether the same command-line pattern reached
+  other hosts or users.
+type: detection
+detection_id: 3d4aebe0-6d29-45b2-a8a4-3dfde586a26d
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-16
+questions:
+- question: Does the command line contain both `rundll32.exe` and the `InstallArcherSvc` export name?
+  context: >-
+    The rule requires both strings in the same command line, so confirm both are present rather than assuming
+    a generic rundll32 invocation. Read the DLL path that sits between them — the argument immediately before
+    the comma is the module rundll32 was asked to map, and the token after the comma is the export it was asked
+    to call. A path under a user profile, a temp directory, or a download folder is the argument to carry into
+    the rest of the investigation.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - alert
+  - process_creation
+- question: Is this user and host expected to install services by calling DLL exports through rundll32?
+  context: >-
+    Some vendor installers and legacy setup packages do register services by way of a rundll32 export call, so
+    the pattern is not unique to the family the rule is named for. Whether this host was being installed or
+    updated at the alert time, and whether this account performs software deployment, is usually the fastest
+    separation between a packaged install and an unexpected one.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: What full DLL path and argument set was passed to rundll32 with the `InstallArcherSvc` export, and did any other invocation of that export run on this host in the same window?
+  context: >-
+    The DLL path is the payload; the export name is only the entry point. Installers of this family are typically
+    observed invoking the dropped module more than once in a short window — by ordinal (`,#1`) and by name — and
+    sometimes wrapped in `cmd.exe /C`, so a single alert may represent one step of a multi-call install sequence.
+    Note the directory the module lives in and whether the path is quoted, which affects how the argument parses.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains: 'InstallArcherSvc'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: Which module did this rundll32 process actually map, and is it signed?
+  context: >-
+    rundll32 maps the target module into its own address space before calling the export, so the load event names
+    the payload directly and carries its signature state and hash. Unlike file-write events, module loads do carry
+    a hash, so this is the artifact to submit for further analysis without waiting for an execution pivot. A module
+    that is unsigned, or signed by a publisher unrelated to software installed on the host, and that lives outside
+    the usual system directories, is the one to pursue. Comparing the loaded module against the set of DLLs rundll32
+    routinely loads in this environment is what separates a baseline entry from a new one.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+      - SignatureStatus
+      - Hashes
+  answer_sources:
+  - process_creation
+  - manual_review
+  - external_threat_intel
+- question: What process spawned this rundll32 instance and is that parent chain expected?
+  context: >-
+    The parent tells you how the export call was initiated. A vendor installer, msiexec, or a deployment agent is
+    an ordinary parent for a service-install routine. An installer EXE spawning cmd.exe which in turn calls rundll32
+    against a freshly written module is the delivery pattern this family typically produces; script hosts, Office
+    applications, browsers, and archive utilities as parents point at a download or attachment as the origin rather
+    than a packaged install.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Was the DLL written to disk on this host shortly before rundll32 was asked to load it, and which process wrote it?
+  context: >-
+    A module invoked from a user profile, temp, or download directory was almost always dropped there minutes earlier
+    by whatever delivered it. The writing process on that file event identifies the dropper and is often a different
+    process from the parent of rundll32. If the module instead resolves to a long-standing path under a program
+    directory with a matching install date, the pattern is more consistent with a legitimate package than a drop.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith: '.dll'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - ProcessGuid
+      - User
+  answer_sources:
+  - file_event
+  - process_creation
+- question: What child processes did this rundll32 instance spawn afterward?
+  context: >-
+    A DLL running under rundll32 can spawn processes of its own, and those children reveal what the export routine
+    actually did beyond registering itself. Command interpreters, script hosts, and download utilities as children
+    indicate the module went on to a further stage; service control tooling as a child corroborates that the export
+    was performing a service install rather than something else.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Was a service actually registered on this host around the alert, and what image path does it point at?
+  context: >-
+    An export named for a service install implies the module called into the service control manager. A service
+    registration event names the service, the image path it launches, and the account it runs under, which together
+    confirm whether the export completed its stated purpose and establish the persistence that survives reboot. An
+    image path pointing back at rundll32 with the DLL as an argument, or at a module in a user-writable directory,
+    is the durable artifact to remediate. If the system channel is not collected in this environment, treat an empty
+    result as a visibility gap rather than evidence no service was created.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: system
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 7045
+      condition: selection
+    fields:
+      - ServiceName
+      - ImagePath
+      - ServiceType
+      - StartType
+      - AccountName
+  answer_sources:
+  - organizational_knowledge
+  - manual_review
+- question: Did rundll32 make outbound connections from this host after the alert, and to what destinations?
+  context: >-
+    rundll32 hosting a payload inherits the payload's network behavior, so egress attributed to rundll32 is the
+    module's traffic, not the host binary's. Installers of this family typically reach a content-delivery endpoint
+    over HTTP shortly after the export runs, which means an ordinary-looking destination on port 80 or 443 does
+    not by itself normalize the connection. Judge each destination against the external ranges and enterprise
+    domains that are expected for this host rather than against reputation alone, and pivot on any address that
+    falls outside them.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: '\rundll32.exe'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Initiated
+  answer_sources:
+  - network_connection
+  - external_threat_intel
+- question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    A service-install call sits in the middle of an install sequence, not at its start. The surrounding process
+    activity shows what delivered and unpacked the module and what ran after it registered. Repetitive high-count
+    parent-child pairs are the host's normal telemetry; the novel pairs appearing at low counts in this window are
+    what to read.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+  answer_sources:
+  - process_creation
+  - file_event
+  - registry_event
+- question: When this host has previously run a rundll32 command line carrying the `InstallArcherSvc` export, what parents and users drove it, and does the current alert fit that history?
+  context: >-
+    The query mirrors the rule's selection scoped to this host, so the parent and user distribution reflects how this
+    specific command-line pattern has run here rather than generic rundll32 usage. An empty result means the pattern
+    is new to the host, which for an install routine usually means a first-time install. A recurring history with a
+    consistent parent points at repeated deployment of the same package; a new parent or an unexpected account against
+    an existing history is the deviation to chase.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - rundll32.exe
+        - InstallArcherSvc
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+  answer_sources:
+  - process_creation
+- question: Has this user previously produced this rundll32 export-call pattern, and does that history fit their role?
+  context: >-
+    The query mirrors the rule's selection scoped to this user, so the result is their 90-day history of this exact
+    command-line pattern rather than generic rundll32 use, aggregated by host. A deployment or packaging account with
+    a broad history across many hosts reads differently from a standard user account producing the pattern for the
+    first time. Weigh the count and host spread against what this account is provisioned to do.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - rundll32.exe
+        - InstallArcherSvc
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+  always_include: true
+- question: Has this parent process historically driven this export-call pattern here or across the environment, or is the parent new for this activity?
+  context: >-
+    When the alert fires under SYSTEM, a service account, or a computer account, the user field does not attribute the
+    behavior and the launch mechanism is the meaningful pivot. The query mirrors the rule's selection scoped to the
+    alerting parent, so the result is the 90-day history of this parent driving this specific pattern. A parent already
+    accounting for the pattern across many hosts is deployment automation; a parent that is new for it is the deviation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - rundll32.exe
+        - InstallArcherSvc
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  always_include: true
+- question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the account's activity across all hosts in the alert window shows whether the install was confined to one
+    endpoint or repeated elsewhere under the same identity. If the alert fired under a service principal this view
+    returns routine agent telemetry across every host the account touches and should be read alongside the
+    parent-scoped fleet view rather than on its own.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+  always_include: true
+- question: Did this same parent-driven pattern fire on other hosts in the same window, or is the activity isolated to this host?
+  context: >-
+    The query mirrors the rule's selection scoped to the alerting parent process, fleet-wide, within the alert window,
+    so it answers whether the same launch mechanism produced the pattern elsewhere at the same time. Several hosts in
+    one window points at scheduled or pushed deployment; a single host points at a host-local trigger such as a user
+    running a downloaded installer.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - rundll32.exe
+        - InstallArcherSvc
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  always_include: true
+- question: Have other hosts produced this rundll32 export-call pattern in the past week, and does the cross-host distribution look like consistent automation or one-off activity?
+  context: >-
+    The query mirrors the rule's selection with no host scope, so the result is a fleet-wide count of this specific
+    command-line pattern rather than rundll32's general footprint. Many hosts over a short interval points at a
+    packaged rollout or a delivery mechanism reaching multiple endpoints; a single host or a small unrelated set
+    points at individually delivered installs. The host list is also the remediation scope if the module proves
+    unwanted.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - rundll32.exe
+        - InstallArcherSvc
+      condition: selection
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host reconstruct what preceded the install call — a download utility, an archive
+    extraction, a script host, or a defense-tampering event. The ordering of the alert timeline is what tells you
+    whether this export call was the delivery mechanism's endpoint or one step inside a longer sequence.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+  answer_sources:
+  - alert

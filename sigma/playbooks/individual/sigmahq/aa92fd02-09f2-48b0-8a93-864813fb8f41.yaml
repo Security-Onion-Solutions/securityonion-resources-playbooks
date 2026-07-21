@@ -1,0 +1,442 @@
+name: Conti NTDS Exfiltration Command
+id: cabb9765-ec39-4198-b04f-29d13cac1bae
+description: |
+  Detects a process_creation command line that contains both the standalone 7-Zip console binary token
+  (7za.exe) and the administrative-share archive path \C$\temp\log.zip. Both strings must be present, so
+  the rule fires on one fixed archiving command form -- associated with Conti intrusions, where it packaged
+  the Active Directory database (ntds.dit) and the SYSTEM registry hive into an archive on a domain
+  controller's C$ share before removal -- rather than on 7-Zip usage generally. Legitimate causes are narrow:
+  AD backup, recovery, and forensic-collection tooling do archive across administrative shares, and the
+  operating account, the parent process, and a maintenance window usually settle those cases quickly.
+  The investigation should establish which host holds the C$\temp\log.zip target, what went into the archive,
+  whether the archive was password-protected, and whether it was moved off the host; if the archive contains
+  the AD database, every domain account hash it holds -- including krbtgt, which enables forged Kerberos
+  tickets -- must be treated as exposed and rotated. Because the account already had domain-controller-level
+  file access, the account, the parent chain, and the activity preceding the alert carry as much weight as
+  the forward exfiltration path.
+type: detection
+detection_id: aa92fd02-09f2-48b0-8a93-864813fb8f41
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-16
+questions:
+- question: Does the command line contain both the 7za.exe token and the administrative-share path \C$\temp\log.zip?
+  context: >-
+    The rule matches on the command line only, and both strings must be present. Confirm the archive path
+    resolves to a UNC administrative share (\\HOST\C$\temp\log.zip), note which host it names, and read the
+    archive operation and source arguments before spending further time on the alert.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - alert
+  - process_creation
+- question: Is this user and host expected to archive files onto another machine's administrative share?
+  context: >-
+    Archiving across a C$ share requires administrative rights on the target. Backup, recovery, and
+    forensic-collection workflows do this legitimately; confirm whether the account is an admin or service
+    identity used for those workflows and whether the host is the machine those workflows run from.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: What did the 7-Zip console command actually do -- which archive operation, which source paths, and which switches?
+  context: >-
+    Decode every argument. The leading letter selects the operation (a = add, x = extract), -t sets the
+    archive type, -mx sets compression, -r recurses, -p supplies a password, and the trailing arguments are
+    the source paths that went into the archive. Source paths naming ntds.dit, a SYSTEM or SECURITY hive, or
+    a shadow-copy device path mean the archive holds Active Directory credential material. The window covers
+    all 7za.exe invocations on this host, because operators frequently run extraction and archiving as
+    separate sequential commands.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains: 7za.exe
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: Which binary actually executed, where does it live, and is it a legitimate 7-Zip console build?
+  context: >-
+    7za.exe is a standalone console build that Windows does not ship and installers do not place on disk by
+    default, so its presence usually means someone copied it onto the host. Check the image path (a temp,
+    user-profile, or share path is a different situation from a managed install directory), the hash against
+    reputation data, and whether any approved business process on this host is permitted to use compression
+    utilities.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - Hashes
+      - CurrentDirectory
+      - IntegrityLevel
+  answer_sources:
+  - process_creation
+  - external_threat_intel
+  - organizational_knowledge
+- question: What files did the archiving process read or write on this host?
+  context: >-
+    Command-line arguments state what was requested; file telemetry states what was actually touched. Look
+    for the Active Directory database and registry hives, shadow-copy or backup staging directories, and
+    bulk reads of document or share paths. What the archive contains determines the credential-rotation and
+    notification scope.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - EventType
+  answer_sources:
+  - process_creation
+- question: Where was the archive written, and was it copied or moved anywhere else afterward?
+  context: >-
+    Staging and removal are separate steps -- the archive is written first and transferred later. Look for
+    the .zip output, then for the same content reappearing under another path, on removable media, or as the
+    input to an upload or copy tool in the hour after creation. An archive that is still in place is
+    recoverable evidence of exactly what was collected.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - EventType
+      - Image
+  answer_sources:
+  - file_event
+  - network_connection
+- question: Was the archive password-protected or header-encrypted?
+  context: >-
+    Read the alerting command line for -p (password) and -mhe=on (header encryption). A password keeps
+    inspection tooling from reading the contents in transit, and header encryption hides the file names
+    inside the archive as well, which removes the ability to tell what was collected from the archive alone.
+    Passwords can also be supplied on stdin or from a config file, so their absence from the command line
+    does not prove the archive is readable.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: Which host actually received the archive at the C$\temp\log.zip path?
+  context: >-
+    The archive path is a UNC administrative share, so the file write lands on the target machine and may
+    never appear on the host that ran the command. This fleet-wide lookup on the archive file name identifies
+    the receiving host, the writing process, and the account, which is what determines whether a domain
+    controller is in scope.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        TargetFilename|endswith: \\temp\\log.zip
+      condition: selection
+    fields:
+      - host.name
+      - TargetFilename
+      - Image
+      - User
+  answer_sources:
+  - file_event
+- question: Did the archiving process load the Windows cryptography libraries?
+  context: >-
+    Encrypting an archive pulls the platform crypto libraries into the process, so a crypt32 or bcrypt load
+    corroborates that a password was applied even when the flag is not visible on the command line. No load
+    is consistent with a plain compressed archive whose contents remain readable. Treat zero results as
+    inconclusive if module-load telemetry is not collected for this host.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+        ImageLoaded|contains:
+          - crypt32.dll
+          - bcrypt.dll
+          - bcryptprimitives.dll
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+  answer_sources:
+  - process_creation
+- question: What process launched the archiving command, and what launched that parent?
+  context: >-
+    The parent record shows how the command was invoked and what started the parent in turn. A backup or
+    management agent, a scheduler, or an installer is a different situation from a remote-execution service,
+    a shell opened over a remote session, or a script host. This is the backward pivot toward how the
+    account obtained the access the archiving step already required.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: When this host has previously produced this command pattern, what parents and users drove it, and does the current alert fit that history?
+  context: >-
+    The query mirrors the rule's selection scoped to this host, so the parent and user distribution reflects
+    how this specific archiving command has run here rather than generic 7-Zip usage. An established parent
+    and service account point toward a recurring backup workflow; no history at all means this command form
+    is new on the host.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - 7za.exe
+        - \\C$\\temp\\log.zip
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+  answer_sources:
+  - process_creation
+- question: Have other hosts produced this same command pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: >-
+    The query mirrors the rule's selection with no host scope, giving a fleet-wide count of this exact
+    archiving command. Many hosts running it on a schedule points to a deployed job; one host or a small
+    unrelated set points to hands-on-keyboard activity, and each additional host expands the set of systems
+    whose collected data must be accounted for.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - 7za.exe
+        - \\C$\\temp\\log.zip
+      condition: selection
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- question: Has this user previously produced this command pattern, and does that history fit their role?
+  context: >-
+    The query mirrors the rule's selection scoped to this account, returning its 90-day history of this exact
+    archiving command by host. An account that has never produced it, or one whose role has no backup or
+    recovery duties, is the deviation worth chasing; weigh the count against what the account is provisioned
+    to do.
+  range: -90d
+  always_include: true
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - 7za.exe
+        - \\C$\\temp\\log.zip
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+- question: Has this parent process historically driven this command pattern here or elsewhere, or is the parent new for this activity?
+  context: >-
+    When the alert fires under SYSTEM, a service account, or a computer account, user identity attributes
+    nothing and the launch mechanism is the meaningful pivot. The query mirrors the rule's selection scoped
+    to the alerting parent, so the result is the 90-day history of that parent driving this archiving command.
+    A parent with thousands of prior events is backup or management automation; a new parent is not.
+  range: -90d
+  always_include: true
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - 7za.exe
+        - \\C$\\temp\\log.zip
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- question: What else did this account do across the environment around this time?
+  context: >-
+    Tracking the account across all hosts in the alert window shows whether the archiving step sits inside a
+    wider sequence -- credential access, share enumeration, remote execution, or transfer tooling on other
+    machines. Multiple hosts under the same account widen the scope of what has to be reviewed and rotated.
+  range: +/-1h
+  always_include: true
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+- question: Did this same parent-driven command pattern fire on other hosts in the same window, or is the activity isolated to this host?
+  context: >-
+    Under a service principal, an account-wide sweep returns agent telemetry rather than an answer. The query
+    mirrors the rule's selection scoped to the alerting parent, fleet-wide, in the alert window. Several hosts
+    at once points to a pushed or scheduled job; a single host points to a host-local trigger.
+  range: +/-1h
+  always_include: true
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - 7za.exe
+        - \\C$\\temp\\log.zip
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Aggregating process activity in the alert window collapses routine agent noise into high-count rows and
+    leaves novel parent-child pairs standing out at low counts. Look for the steps that bracket archiving --
+    database or hive extraction, shadow-copy creation, share access, and transfer or upload utilities.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+  answer_sources:
+  - process_creation
+  - file_event
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Archiving data off a domain controller happens late in an intrusion, after the access it depends on was
+    already obtained. Earlier detections on the same host -- credential access, remote execution, defense
+    tampering, or reconnaissance -- reconstruct how the account reached this point and often name the entry
+    vector.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+  answer_sources:
+  - alert

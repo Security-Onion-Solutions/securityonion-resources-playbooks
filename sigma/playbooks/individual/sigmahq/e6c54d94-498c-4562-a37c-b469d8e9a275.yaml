@@ -1,0 +1,316 @@
+name: Suspicious PowerShell Download and Execute Pattern
+id: 57c70572-0b92-48be-8e82-ba851f326ce5
+description: |
+  Detects PowerShell command lines containing in-memory download-and-execute cradles -- IEX of a Net.WebClient DownloadString, or a DownloadFile call -- that pull remote script or payload content and run it without first writing a self-contained file to disk. Legitimately, some software installers and packaging tools fetch packages from remote systems and execute them this way. Maliciously, the same one-liner is the canonical loader for offensive PowerShell toolkits and second-stage payloads, often run directly in memory to limit on-disk evidence. The investigation should confirm the exact cradle that fired, identify the remote source and any payload written to disk, establish the launch context (parent process and user), and look for surrounding tampering, bypass, or follow-on activity.
+type: detection
+detection_id: e6c54d94-498c-4562-a37c-b469d8e9a275
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- question: Does the command line contain the PowerShell download-and-execute cradle this rule detects?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the exact command line against the rule's criteria -- an IEX of a Net.WebClient DownloadString, or a System.Net.WebClient DownloadFile call. Note which form fired, because an IEX cradle runs the fetched content in memory while DownloadFile writes a payload to disk first, and that distinction drives whether on-disk follow-up questions apply.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Is this user and host expected to run command-line PowerShell downloaders that fetch and execute remote content?
+  context: Legitimate administrative activity, software installers, and packaging tools can trigger this detection. Knowing whether the user role and host function are consistent with running PowerShell download cradles is often the fastest path to separating routine operations from operator activity.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What remote source does the cradle fetch, and what does the fetched content do once executed?
+  context: This cradle is a plain-text download pattern, so the command line is already readable -- the analytical task is to identify the URL being fetched and what runs after it loads. For an IEX of a Net.WebClient DownloadString, the fetched script executes directly in memory; for a DownloadFile call, note both the source URL and the local destination path. Check the reputation of the source URL and determine what cmdlet or payload the cradle invokes after the download.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: If a payload was written to disk, what is in it -- is it obfuscated, encoded, or a known offensive script?
+  context: When the cradle uses DownloadFile or the in-memory script drops a secondary file, read and analyze that file's actual content. Check for base64 encoding, obfuscated strings, embedded URLs or IP addresses, PowerShell commands, and known offensive-tool string patterns. Content analysis answers what is in the file, which is distinct from a hash reputation lookup that only answers whether the file is already known.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What process spawned this PowerShell instance, and is that parent chain expected?
+  context: The parent process reveals how the cradle was invoked. Legitimate usage often has predictable parents -- explorer.exe for interactive use, an installer or packaging tool for software deployment. Unusual parents such as office applications, mshta.exe, wscript.exe, or a web-server process point to macro execution, script-host abuse, or post-exploitation rather than routine administration.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Did PowerShell script block logging capture the full deobfuscated script content?
+  context: Script block logging (Event ID 4104) records the deobfuscated script content PowerShell actually executed, including the content pulled by an in-memory download cradle that never touched disk. It also exposes very long script blocks that a tuned length threshold might otherwise suppress, so it is the ground-truth source for what ran. If PowerShell operational logs are not ingested in this environment, treat the absence of results as a visibility gap rather than evidence that nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Were PowerShell security controls bypassed or weakened before this execution?
+  context: Operators frequently disable or bypass PowerShell controls before running a download cradle. Common precursors include AMSI bypass via in-memory patching, execution-policy changes such as an ExecutionPolicy Bypass or -ep bypass flag, and PowerShell version-2 downgrade to evade logging. Finding these events shortly before the cradle strengthens the case for malicious activity.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: Was a payload actually written to disk, or did the download fail or stay in memory?
+  context: A download command does not guarantee the file was retrieved -- network errors, blocked URLs, or security controls may have stopped the transfer, and an IEX cradle may execute entirely in memory with no file written. Confirming whether a file was created at the destination path establishes whether the activity progressed past delivery.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: If the downloaded payload was executed, what is its hash and does threat intelligence already know it?
+  context: The hash for a reputation lookup is recorded when the payload runs, not when it is fetched — file-creation events carry no hash. If the same command dropped and ran the payload, it is a child or sibling of the alerting process, so this query returns those processes with their executable hashes for a reputation check. If the download executed in memory (IEX) or was run later by an unrelated process, this returns nothing — review script-block logging, or retrieve the file from disk and hash it manually.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_children:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      selection_siblings:
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - Image
+      - Hashes
+      - Hashes
+- question: What other file activity occurred in the download target directory?
+  context: Download cradles often stage multiple files in the same directory, or the first file triggers further writes through extraction, decompression, or additional downloads. Examining directory-level file activity reveals the broader scope of the delivery operation beyond the single payload named on the command line.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - IEX ((New-Object Net.WebClient).DownloadString
+        - IEX (New-Object Net.WebClient).DownloadString
+        - IEX((New-Object Net.WebClient).DownloadString
+        - IEX(New-Object Net.WebClient).DownloadString
+        - ' -command (New-Object System.Net.WebClient).DownloadFile('
+        - ' -c (New-Object System.Net.WebClient).DownloadFile('
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - IEX ((New-Object Net.WebClient).DownloadString
+        - IEX (New-Object Net.WebClient).DownloadString
+        - IEX((New-Object Net.WebClient).DownloadString
+        - IEX(New-Object Net.WebClient).DownloadString
+        - ' -command (New-Object System.Net.WebClient).DownloadFile('
+        - ' -c (New-Object System.Net.WebClient).DownloadFile('
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts in the alert window reveals lateral movement or activity spanning multiple endpoints. If the same user triggered similar download or execution activity on other hosts, the scope of the operation may be larger than this single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - IEX ((New-Object Net.WebClient).DownloadString
+        - IEX (New-Object Net.WebClient).DownloadString
+        - IEX((New-Object Net.WebClient).DownloadString
+        - IEX(New-Object Net.WebClient).DownloadString
+        - ' -command (New-Object System.Net.WebClient).DownloadFile('
+        - ' -c (New-Object System.Net.WebClient).DownloadFile('
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host -- defense tampering, reconnaissance, or credential access -- may reveal the attack stages that preceded the download cradle and help reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Did this cradle run inside a normal working or maintenance window for this host?
+  context: Legitimate installer and packaging activity tends to cluster in business hours or scheduled maintenance windows, while hands-on-keyboard operator activity often lands off-hours. Comparing when the cradle fired against the host's normal PowerShell activity pattern helps calibrate suspicion -- an off-hours fetch-and-execute on a host that is otherwise quiet at that time is harder to explain as routine.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains:
+          - IEX ((New-Object Net.WebClient).DownloadString
+          - IEX (New-Object Net.WebClient).DownloadString
+          - IEX((New-Object Net.WebClient).DownloadString
+          - IEX(New-Object Net.WebClient).DownloadString
+          - ' -command (New-Object System.Net.WebClient).DownloadFile('
+          - ' -c (New-Object System.Net.WebClient).DownloadFile('
+      condition: selection
+    fields:
+      - CommandLine

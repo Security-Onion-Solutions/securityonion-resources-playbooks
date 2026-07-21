@@ -1,0 +1,399 @@
+name: UAC Bypass Using IDiagnostic Profile - File
+id: 55050dee-c1ba-445f-8217-c4a8c59e5df8
+description: |
+  Detects dllhost.exe writing a DLL into C:\Windows\System32\ — the on-disk artifact of the IDiagnosticProfile UAC bypass.
+  The bypass drives an auto-elevating COM object hosted in the dllhost.exe surrogate to drop a DLL into a protected system
+  path that a high-integrity diagnostic component then loads, running attacker code elevated without a consent prompt (T1548.002).
+  Legitimate System32 DLL writes come almost exclusively from Windows servicing (TrustedInstaller/msiexec) and rarely from the
+  COM surrogate; investigate what COM object dllhost.exe hosted, what the dropped DLL contains and whether it later executed,
+  and what elevated action followed the write.
+type: detection
+detection_id: 48ea844d-19b1-4642-944e-fe39c2cc1fec
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-03
+questions:
+- question: Do the file path and creating process match what this rule detects?
+  context: Confirm the alert is a true positive before investing time — verify that dllhost.exe is the writing process and that
+    the target is a .dll written directly under C:\Windows\System32\. A genuine hit is the COM surrogate placing a DLL into a
+    protected system directory, which is not part of any normal dllhost.exe behavior.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - Image
+      - TargetFilename
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this user and host expected to have a COM surrogate writing a DLL into System32?
+  context: Legitimate System32 DLL writes are driven by Windows servicing (TrustedInstaller, msiexec, Windows Update), not by
+    dllhost.exe. Knowing whether the host was mid-patch or mid-install, and whether the acting account is a machine/service
+    account versus an interactive user, is often the fastest way to separate a servicing artifact from a bypass. When the user
+    is a machine or service account, judge by the writing process and host role instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: What COM object did dllhost.exe host — decode its command line for the /Processid CLSID.
+  context: dllhost.exe is the COM surrogate; its command line carries a /Processid:{CLSID} argument identifying the exact COM
+    server it instantiated. Resolving that CLSID reveals which auto-elevating COM object was invoked to perform the write, which
+    is the core of the IDiagnosticProfile bypass. Pivot from the file event to the process-creation event via the writing
+    process to read the full command line.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What is in the dropped DLL — check imports, embedded strings, signing status, and known-malware indicators?
+  context: The written file is the payload the bypass will load elevated. Retrieve it from its on-disk path and examine its
+    imports, embedded strings, packer signatures, and code-signing status; compare suspicious strings against threat intel.
+    An unsigned or thinly-signed DLL placed by the COM surrogate into System32 is the artifact that runs at high integrity.
+    Content retrieval is a manual step from the endpoint or EDR.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: When the dropped DLL was loaded, what was its hash and signing state, and does threat intel flag it?
+  context: A file-creation event carries no hash — the hash and code-signature status are recorded when the DLL is loaded by
+    a process. This query looks for the load event of the dropped path and reads its hash and signer; submit the hash to
+    VirusTotal, Hybrid Analysis, or internal threat intel to determine whether it is known malicious, benign, or previously
+    unseen. A load into an auto-elevated/high-integrity process is the elevated code execution the bypass exists to achieve.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+      - SignatureStatus
+      - Hashes
+- question: Is the DLL still on disk, or was it deleted or renamed after the alert?
+  context: The file's post-alert lifecycle drives urgency and next steps. A DLL still on disk can be retrieved, hashed, and
+    analyzed; a file deleted seconds after creation suggests anti-forensic cleanup or a self-deleting stager and shifts the
+    investigation toward what loaded or executed it in the interval.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What process spawned this dllhost.exe surrogate, and is that launch chain expected?
+  context: The COM surrogate is normally started by the DCOM/RPCSS service under svchost.exe on behalf of a requesting client.
+    A parent-process anomaly — a non-elevated user process or an unusual launcher standing in the lineage that invoked the
+    auto-elevated COM object — is the elevation path the bypass creates. Retrieve the parent's own creation event and note
+    what invoked it.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - Image
+      - CommandLine
+- question: What other files did the responsible process write or delete around the alert?
+  context: A process that drops one DLL into System32 may stage several components. The breadth, paths, and extensions of the
+    surrogate's other file activity distinguish a single planted artifact from a broader staging operation and enumerate what
+    else needs review. The correlation covers the writer and its direct children, since droppers often delegate.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What else has been written into System32 recently, and by which processes?
+  context: System32 has a small set of processes that legitimately write there — chiefly Windows servicing components. Other
+    recent arrivals in the directory, and which processes placed them, reveal whether this is an isolated drop or a directory
+    under active use, and surface companion artifacts that belong to the same activity. A single unfamiliar writer across
+    several files is the signal.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains: '\Windows\System32\'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: What action was performed with elevated privileges after the bypass?
+  context: UAC bypass is a means to an end — attackers elevate to install persistence, dump credentials, tamper with security
+    tools, or reach protected resources. Examine processes running at High or System integrity on this host shortly after the
+    write. Known auto-elevating binaries commonly seen in this stage include sdclt.exe, eventvwr.exe, and computerdefaults.exe;
+    correlate the elevated activity to the write within a tight window to separate it from routine admin elevation.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        IntegrityLevel:
+          - 'High'
+          - 'System'
+          - 'S-1-16-16384'
+          - 'S-1-16-12288'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - IntegrityLevel
+- question: Was a companion registry-based UAC bypass also attempted on this host?
+  context: The IDiagnosticProfile technique abuses an auto-elevating COM object and does not manipulate UAC registry keys, but
+    operators who try one bypass often try several. This looks backward for registry-based bypass setup — a command writing to
+    keys an auto-elevated process reads, such as ms-settings\Shell\Open\command, mscfile\shell, Environment, or DelegateExecute.
+    A companion registry write confirms deliberate escalation rather than an isolated event.
+  range: -15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\reg.exe'
+          - '\powershell.exe'
+          - '\cmd.exe'
+        CommandLine|contains:
+          - 'ms-settings'
+          - 'mscfile'
+          - 'Classes\exefile'
+          - 'Classes\Folder'
+          - 'Environment'
+          - 'Shell\Open\command'
+          - 'DelegateExecute'
+      condition: selection
+    fields:
+      - CommandLine
+      - Image
+- question: Were other privilege escalation or UAC bypass detections raised on this host?
+  context: Attackers who attempt one UAC bypass often try multiple methods until one succeeds, especially if the OS version or
+    configuration blocks certain techniques. Multiple bypass or escalation alerts from the same host in a short span confirm
+    deliberate privilege escalation rather than a false positive, and defense-tampering or credential-access alerts around the
+    same time help reconstruct the objective.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - rule.name
+      - rule.uuid
+      - event.severity_label
+- question: When this host has previously fired this dllhost-into-System32 pattern, what programs and users drove it, and does
+    the current alert fit that history?
+  context: Even a rare pattern can have a benign local cause. The query mirrors the rule's selection scoped to this host, so the
+    resulting program/user distribution reflects how this specific firing pattern — not generic dllhost.exe activity — has run
+    here before; expect the Image column to show dllhost.exe itself, since file events carry no parent lineage. An unexpected
+    user account or a first firing against a mostly-empty history is the deviation worth chasing — pivot to the dllhost.exe
+    process-start event when ancestry matters.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        Image|endswith: \DllHost.exe
+        TargetFilename|startswith: C:\Windows\System32\
+        TargetFilename|endswith: .dll
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - Image
+    - User
+- question: Have other hosts fired this same pattern in the past week, and does the cross-host distribution look like automation
+    or one-off activity?
+  context: The query mirrors the rule's selection with no host scope, giving a fleet-wide count of this specific firing pattern
+    rather than generic dllhost.exe usage. Many hosts firing the same pattern points to scripted deployment or vendor automation
+    writing into System32; a single host or a small unrelated set points to manual operator activity. Use the host distribution
+    to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        Image|endswith: \DllHost.exe
+        TargetFilename|startswith: C:\Windows\System32\
+        TargetFilename|endswith: .dll
+      condition: selection
+    fields:
+    - host.name
+- always_include: true
+  question: Has this user previously produced this pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection scoped to this user, giving their 90-day history of this specific firing
+    pattern aggregated by host. A user who has never produced this pattern is more notable than one who does so regularly;
+    weigh the count against the user's role and expected toolset, keeping in mind the acting identity may be a machine or
+    service account rather than an interactive user.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        Image|endswith: \DllHost.exe
+        TargetFilename|startswith: C:\Windows\System32\
+        TargetFilename|endswith: .dll
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: Has this program historically driven this pattern here or across the environment, or is the program new for
+    this activity?
+  context: When the alert fires under a service principal, user identity does not attribute behavior — the meaningful pivot is
+    the launch mechanism. The query mirrors the rule's selection scoped to the alerting program, giving the 90-day
+    history of this program driving this specific pattern. A new or rare program for this pattern is the deviation worth chasing;
+    a program already accounting for thousands of prior events is OS or vendor automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        Image|endswith: \DllHost.exe
+        TargetFilename|startswith: C:\Windows\System32\
+        TargetFilename|endswith: .dll
+      _pb_scope:
+        Image|endswith|expand: '%Image%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or parallel activity on multiple endpoints.
+    If the same account produced similar activity elsewhere in the same window, the scope of the incident may be larger than
+    the single alerting host. When the alert fires under SYSTEM or a machine account, read this alongside the parent-driven
+    cross-host view, which is the meaningful answer for service principals.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- always_include: true
+  question: Did this same program-driven pattern fire on other hosts in the same window — a coordinated rollout, or isolated to
+    this host?
+  context: Under a service principal, asking what else the user did returns agent-telemetry noise. The meaningful question is
+    whether the same launch mechanism fired elsewhere — the query mirrors the rule's selection scoped to the alerting program, fleet-wide, in the alert window. Multiple hosts in the same window points to scheduled or pushed automation; a
+    single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        Image|endswith: \DllHost.exe
+        TargetFilename|startswith: C:\Windows\System32\
+        TargetFilename|endswith: .dll
+      _pb_scope:
+        Image|endswith|expand: '%Image%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name

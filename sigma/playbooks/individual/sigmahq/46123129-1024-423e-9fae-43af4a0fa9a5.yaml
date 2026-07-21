@@ -1,0 +1,444 @@
+name: File Download Via Windows Defender MpCmpRun.EXE
+id: 359e1853-2dc9-419b-80b3-b679023db890
+description: |
+  Detects the Windows Defender command-line utility MpCmdRun.exe being used to
+  download a file from a remote URL. The rule fires when the process is identified
+  as MpCmdRun.exe - by OriginalFileName, Image path, CommandLine reference, or the
+  Microsoft Malware Protection Command Line Utility description - AND its command
+  line contains both DownloadFile and url. MpCmdRun.exe accepts a
+  -DownloadFile -url <URL> -path <FILE> argument that performs an HTTP/HTTPS GET
+  against an arbitrary URL and writes the response to disk, turning a Microsoft-signed
+  antivirus binary into a file-download primitive that is trusted by allowlisting and
+  exempt from scanning. Legitimate Defender activity runs as SYSTEM or LOCAL SERVICE
+  and does not pull arbitrary files, so the investigation should determine which URL
+  and destination path were used, whether the file landed, what account and parent
+  launched the binary, and whether the downloaded content was executed.
+type: detection
+detection_id: 46123129-1024-423e-9fae-43af4a0fa9a5
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Was MpCmdRun.exe launched with a DownloadFile and url argument, matching
+    what this rule detects?
+  context: Before investing investigation time, confirm the alert is a true positive.
+    The rule fires when the process is identified as MpCmdRun.exe (by OriginalFileName,
+    Image path, CommandLine reference, or the Microsoft Malware Protection Command Line
+    Utility description) AND its command line contains both DownloadFile and url. Read
+    the exact command line and confirm both conditions hold - the canonical abuse form
+    is MpCmdRun.exe -DownloadFile -url <URL> -path <FILE>, with /DownloadFile /url /path
+    slash variants also valid. Legitimate Defender flags (-Scan, -SignatureUpdate) do
+    not carry a download argument.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+      - Description
+- question: Is this user and host expected to download files via Defender's command-line
+    utility?
+  context: Legitimate MpCmdRun.exe activity runs in SYSTEM or LOCAL SERVICE context as
+    part of antivirus operation and does not retrieve arbitrary files from the internet.
+    An interactive or service account invoking the binary with a download argument is
+    the notable case. Knowing whether the acting account and host function involve
+    administrative tooling or software distribution is often the fastest way to separate
+    a benign invocation from proxied download activity.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What URL and destination path did the DownloadFile command use, and does the
+    path target an alternate data stream?
+  context: The full command line reveals the remote source and local destination of the
+    transfer. Read the -url value to identify what was fetched and from where, and the
+    -path value to find where it was written. A destination of the form <file>:name writes
+    the content into an alternate data stream, hiding the payload inside another file.
+    Note user-writable destinations such as C:\Users\Public or %TEMP%, which are common
+    staging locations. The query scopes to MpCmdRun.exe download executions on this host
+    so multi-step copy-and-invoke sequences appear together.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains|all:
+          - DownloadFile
+          - url
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What process spawned MpCmdRun.exe, and is that parent chain expected for
+    Defender's command-line utility?
+  context: The parent process reveals how the download was invoked and is where the
+    decision to set the download argument was made. Defender's own operation launches
+    MpCmdRun.exe from service infrastructure; an interactive shell, a script host such
+    as wscript.exe or mshta.exe, or an Office application as the parent points to
+    operator or automated invocation rather than antivirus maintenance. Walk up the
+    parent chain to see what staged the launch.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Is the downloaded file still on disk at the destination path for analysis?
+  context: If the destination path from the download command still exists on disk,
+    checking it enables deeper analysis - hash lookups, sandbox submission, or content
+    review. The file may have been written into an alternate data stream, deleted after
+    use, or moved, so absence at the literal path is itself informative. The query
+    searches file creation events matching the download destination.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Did MpCmdRun.exe open an outbound connection to an external destination
+    around the time of the alert?
+  context: The download argument causes MpCmdRun.exe to perform an HTTP/HTTPS GET against
+    the supplied URL, so a successful transfer leaves an outbound network connection from
+    the binary. Identify the destination address, host, and port, and judge whether the
+    endpoint is an enterprise resource or an unfamiliar external host - internal software
+    distribution looks different from a connection to an unknown internet address. The
+    request originates from a Microsoft-signed antivirus binary, which can make the
+    traffic look trusted, so the destination rather than the process is what to weigh.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: \MpCmdRun.exe
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationHostname
+      - DestinationPort
+- question: Was the download successful? Check for file creation at the destination path.
+  context: A DownloadFile command does not guarantee the file was retrieved. A blocked
+    URL, network error, or security control may have prevented the transfer. Confirming
+    that a file was created at the -path destination establishes whether the activity
+    progressed past delivery into a payload landing on disk.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: If the file MpCmdRun downloaded was executed, what is its hash and does it have known threat-intel detections?
+  context: The hash for a reputation lookup is recorded when the payload runs, not when MpCmdRun's
+    -DownloadFile writes it to disk — file-creation events carry no hash. The trusted Defender binary
+    only fetches; the payload is usually run by the same shell as a sibling or child process, so this
+    query returns those processes with their executable hashes — match the downloaded file name and
+    submit its hash. If it was run later by an unrelated process, retrieve it from disk and hash it
+    manually.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_children:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      selection_siblings:
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - Image
+      - Hashes
+- question: What other file activity occurred in the destination directory?
+  context: Operators often stage multiple files in the same writable directory, and a
+    downloaded archive or installer may trigger further writes when extracted or executed.
+    Common staging locations include C:\Users\Public, Downloads, and %TEMP%. Examining
+    directory-level file activity reveals whether this was a single fetch or part of a
+    broader delivery that dropped additional files alongside it.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What processes ran on this host shortly after the download that could be the
+    fetched payload executing?
+  context: A downloaded file is only useful once it runs. Examining process creation in
+    the window after the MpCmdRun.exe download surfaces execution of the retrieved
+    content - a new executable from a writable path, a script host, or a command
+    interpreter. Because the download writes to disk under a separate process, correlate
+    by the destination path and by what newly appears on the host rather than by parent
+    lineage alone.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      filter_routine:
+        Image|endswith: \MpCmdRun.exe
+      condition: selection and not filter_routine
+    fields:
+      - Image
+      - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - OriginalFileName: MpCmdRun.exe
+      - Image|endswith: \MpCmdRun.exe
+      - CommandLine|contains: MpCmdRun.exe
+      - Description: Microsoft Malware Protection Command Line Utility
+      selection_cli:
+        CommandLine|contains|all:
+        - DownloadFile
+        - url
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - OriginalFileName: MpCmdRun.exe
+      - Image|endswith: \MpCmdRun.exe
+      - CommandLine|contains: MpCmdRun.exe
+      - Description: Microsoft Malware Protection Command Line Utility
+      selection_cli:
+        CommandLine|contains|all:
+        - DownloadFile
+        - url
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the acting account's activity across all hosts reveals whether the
+    download was a single event or part of activity spanning multiple endpoints. If the
+    same user triggered similar tooling on other hosts in the same window, the scope of
+    the activity is larger than one machine.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - OriginalFileName: MpCmdRun.exe
+      - Image|endswith: \MpCmdRun.exe
+      - CommandLine|contains: MpCmdRun.exe
+      - Description: Microsoft Malware Protection Command Line Utility
+      selection_cli:
+        CommandLine|contains|all:
+        - DownloadFile
+        - url
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining the activity surrounding the
+    download reveals what led to it and what followed - the parent that staged the
+    invocation, reconnaissance, or follow-on execution of the fetched file. Novel
+    parent-child pairs at low counts are what to scan for against the high-count noise
+    of routine system processes.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host - reconnaissance, defense tampering, or
+    credential access - may reveal the attack stages that preceded the download and help
+    reconstruct the full timeline. Pulling a payload with a trusted binary is often one
+    step in a sequence, so prior alerts give the context for why the file was retrieved.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: When this host has previously fired the rule's MpCmdRun.exe download pattern,
+    what parents and users normally drive it, and does the current alert fit?
+  context: Even legitimate administration can produce command-line downloads. This query
+    mirrors the rule's selection structure scoped to this host, so the resulting parent
+    and user distribution reflects how this specific firing pattern has historically run
+    here, not generic MpCmdRun.exe activity. A new parent process, an unexpected account,
+    or a first-ever occurrence is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - OriginalFileName: MpCmdRun.exe
+      - Image|endswith: \MpCmdRun.exe
+      - CommandLine|contains: MpCmdRun.exe
+      - Description: Microsoft Malware Protection Command Line Utility
+      selection_cli:
+        CommandLine|contains|all:
+        - DownloadFile
+        - url
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Have other hosts fired the rule's MpCmdRun.exe download pattern in the past
+    week, and does the cross-host distribution look like consistent automation or one-off
+    activity?
+  context: This query mirrors the rule's selection structure with no host scope, so the
+    result is a fleet-wide count of the MpCmdRun.exe download pattern rather than generic
+    binary activity. Many hosts firing the same pattern points to a software-distribution
+    workflow that uses the binary by design; one host or a small unrelated set points to
+    manual operator activity. Use the host distribution to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - OriginalFileName: MpCmdRun.exe
+      - Image|endswith: \MpCmdRun.exe
+      - CommandLine|contains: MpCmdRun.exe
+      - Description: Microsoft Malware Protection Command Line Utility
+      selection_cli:
+        CommandLine|contains|all:
+        - DownloadFile
+        - url
+      condition: all of selection_*
+    fields:
+    - host.name

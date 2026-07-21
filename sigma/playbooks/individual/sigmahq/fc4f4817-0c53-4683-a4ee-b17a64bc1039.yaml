@@ -1,0 +1,419 @@
+name: Suspicious Desktopimgdownldr Target File
+id: 1e08c0ec-853a-456b-8db5-eded2c0ab3e1
+description: |
+  Detects svchost.exe (the BITS transfer service) writing a file into a \Personalization\LockScreenImage\ directory
+  that is NOT under C:\Windows AND does NOT carry a .jpg/.jpeg/.png extension. This is the file-side artifact of the
+  desktopimgdownldr.exe living-off-the-land downloader: the binary, normally used to set the lockscreen wallpaper via the
+  Personalization CSP, can be driven with a %SYSTEMROOT% override so a standard user downloads an arbitrary non-image file
+  to a writable path, with the actual transfer performed by svchost -k netsvcs -s BITS rather than by desktopimgdownldr
+  itself. Legitimate lockscreen personalization writes image files under C:\Windows; a non-image file under a redirected
+  Personalization path is the download-abuse pattern. Investigate the desktopimgdownldr invocation and its download URL,
+  the file that landed and its type, the BITS network destination, and whether the payload was subsequently executed.
+type: detection
+detection_id: fc4f4817-0c53-4683-a4ee-b17a64bc1039
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-10
+questions:
+- question: Does the alert show svchost writing a non-image file to a Personalization LockScreenImage path outside C:\Windows?
+  context: Confirm the alert is a true positive before investing time. The rule fires only when all three conditions hold
+    together - the writer Image ends in svchost.exe, the TargetFilename contains \Personalization\LockScreenImage\, the path
+    is NOT under C:\Windows, AND the file does NOT end in .jpg/.jpeg/.png. Review the exact path, extension, and responsible
+    process against those criteria; a genuine lockscreen image under C:\Windows would not have fired.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - Image
+      - TargetFilename
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this host expected to have a service process write files under a redirected Personalization path?
+  context: Legitimate lockscreen personalization is driven by the OS under C:\Windows, not by a redirected path on another
+    volume. Knowing whether this host or its owning user has any reason to invoke the Personalization CSP outside the default
+    location is often the fastest way to separate a true positive from a benign misconfiguration. When the writer is a machine
+    or service account, judge by the host role and the invoking process rather than the account name.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is the downloaded file still on disk, or was it deleted or renamed after the alert?
+  context: The file's post-alert lifecycle drives urgency and next steps. A payload still on disk can be retrieved, hashed,
+    and analyzed; a file deleted seconds after it landed suggests a self-cleaning dropper and shifts the focus to what executed
+    in between. Interpret the operation type on each later event for this path.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What did the desktopimgdownldr invocation download - decode its /lockscreenurl command line?
+  context: The file write is a byproduct of desktopimgdownldr.exe being invoked with a /lockscreenurl argument, which is the
+    URL the file was fetched from. Decode the full command line and the working directory - a redirected working directory
+    (for example under C:\Windows\Temp) is the %SYSTEMROOT% override that lets a standard user drop the file outside C:\Windows.
+    If desktopimgdownldr process telemetry is not collected in this environment, treat an empty result as a visibility gap
+    and read the download source from the network destination and the file that landed instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: \desktopimgdownldr.exe
+        CommandLine|contains: /lockscreenurl
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What launched desktopimgdownldr, and does that parent chain fit expected activity?
+  context: The parent process reveals how the downloader was invoked. A launch through cmd.exe that also sets a SYSTEMROOT
+    environment override is the standard-user bypass pattern; a launch from a script host or an unexpected application is
+    worth chasing. Known-good updaters and deployment agents that legitimately run the binary should be recognizable here
+    and can be tuned out as benign parents.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: \desktopimgdownldr.exe
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - CommandLine
+- question: Which remote destinations did the transfer service contact around the time of the file write?
+  context: The actual transfer is performed by svchost -k netsvcs -s BITS, not by desktopimgdownldr, so the download and the
+    file write share the same responsible process. Correlate network connections by that process to find where the file was
+    fetched from. An external (internet) destination is the concern; connections that stay within internal address blocks
+    point to update or management traffic. Read the direction field to confirm outbound egress.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+      - Initiated
+- question: What is the downloaded file - its type, extension, and content?
+  context: The rule fires precisely because the file is NOT an image (it excludes .jpg/.jpeg/.png), so the extension and content
+    are the payload signal. Check whether it is an executable, script, archive, or renamed binary, and look for encoded strings,
+    embedded URLs, or known malware indicators. Actual content requires retrieving the file from the endpoint or an evidence
+    console; the alert fields give the path and the writing process.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: If the downloaded file was later executed, what is its hash and does threat intelligence flag it?
+  context: A file's hash is recorded when it runs, not when it is written - file-creation events carry no hash. This query
+    looks for the dropped file executing by its path and reads the execution hash; submit that to reputation services or
+    internal threat intel to judge whether it is known malicious, benign, or previously unseen. Because the download and its
+    execution are decoupled, the file may run later under an unrelated process; if it is present but has not executed, retrieve
+    it from its on-disk path and hash it manually.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - Image
+      - Hashes
+- question: What other files did the responsible process write or delete around the alert?
+  context: The BITS transfer service can write more than one file, and a delivery operation often stages several artifacts.
+    The breadth, paths, and extensions of the responsible process's other file activity distinguish a single lockscreen-path
+    drop from broader staging and enumerate what else needs review. Because svchost is a high-volume writer, volume alone
+    is not suspicion - look at WHERE the writes land and which are non-image files off the default C:\Windows path.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What else has been written to the Personalization LockScreenImage directory tree recently, and by which processes?
+  context: Location drives suspicion. Default lockscreen writes land under C:\Windows and use image extensions; any writes
+    to a \Personalization\LockScreenImage\ path on another volume, or with non-image extensions, are the abuse signal. Focus
+    on uncommon drop locations (for example under a redirected SYSTEMROOT such as C:\Windows\Temp or a user-writable path).
+    A single unfamiliar writer across several files in this tree is the pattern to isolate.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains: '\Personalization\LockScreenImage\'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: When this host has previously produced this file-write pattern, which programs and users drove it, and does the
+    current alert fit that history?
+  context: Even a signed Windows service can be abused. The query mirrors the rule's selection structure scoped to this host,
+    so the resulting program and user distribution reflects how this specific firing pattern - svchost writing a non-image
+    file to a redirected Personalization path - has historically run here. The Image column will show svchost.exe itself, so
+    the account and count carry the signal; file events carry no parent lineage, so pivot to the svchost.exe start event if
+    service lineage matters. An unexpected user account, or a first-ever fire against that history, is the anomaly worth
+    chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        Image|endswith: \svchost.exe
+        TargetFilename|contains: \Personalization\LockScreenImage\
+      filter1:
+        TargetFilename|contains: C:\Windows\
+      filter2:
+        TargetFilename|contains:
+        - .jpg
+        - .jpeg
+        - .png
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection and not filter1 and not filter2) and _pb_scope
+    fields:
+    - Image
+    - User
+- question: Have other hosts produced this file-write pattern in the past week, and does the cross-host distribution look like
+    automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of the
+    same firing pattern rather than generic svchost activity. Many hosts producing the same non-image Personalization write
+    points to scripted deployment or vendor automation; one host or a small unrelated set points to hands-on-keyboard operator
+    activity. Use the host distribution to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        Image|endswith: \svchost.exe
+        TargetFilename|contains: \Personalization\LockScreenImage\
+      filter1:
+        TargetFilename|contains: C:\Windows\
+      filter2:
+        TargetFilename|contains:
+        - .jpg
+        - .jpeg
+        - .png
+      condition: selection and not filter1 and not filter2
+    fields:
+    - host.name
+- always_include: true
+  question: Has this user previously produced this file-write pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user, so the result is the user's 90-day history
+    of this specific firing pattern, aggregated by host. A user who has never produced this pattern is more suspicious than
+    one who does so routinely; weigh the count against the user's role and expected toolset. When the alert fired under a
+    machine or service account, user identity does not attribute behavior - the launch-mechanism history is the meaningful pivot.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        Image|endswith: \svchost.exe
+        TargetFilename|contains: \Personalization\LockScreenImage\
+      filter1:
+        TargetFilename|contains: C:\Windows\
+      filter2:
+        TargetFilename|contains:
+        - .jpg
+        - .jpeg
+        - .png
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection and not filter1 and not filter2) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: Has this program historically driven this file-write pattern here or across the environment, or is the
+    program new for this activity?
+  context: When the alert fires under a service principal, user identity does not attribute behavior; the launch mechanism
+    does. The query mirrors the rule's selection structure scoped to the alerting program, so the result is the 90-day
+    history of this program driving this specific pattern. A new or rare program for this pattern is the deviation worth chasing;
+    a program that already accounts for thousands of prior events is OS or vendor automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        Image|endswith: \svchost.exe
+        TargetFilename|contains: \Personalization\LockScreenImage\
+      filter1:
+        TargetFilename|contains: C:\Windows\
+      filter2:
+        TargetFilename|contains:
+        - .jpg
+        - .jpeg
+        - .png
+      _pb_scope:
+        Image|endswith|expand: '%Image%'
+      condition: (selection and not filter1 and not filter2) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or parallel activity on other endpoints.
+    If the same user drove similar activity on multiple hosts, the scope may be larger. When the alert fired as SYSTEM, LOCAL
+    SERVICE, NETWORK SERVICE, or a computer account, this returns unbounded agent-telemetry noise - the parent-driven history
+    and rollout questions are the meaningful answers in that case.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- always_include: true
+  question: Did this same program-driven pattern fire on other hosts in the same window - a coordinated automation rollout,
+    or activity isolated to this host?
+  context: Under a service principal, asking what else the user did returns agent-telemetry noise because every host runs
+    SYSTEM-owned agents constantly. The meaningful question is whether the same launch mechanism fired elsewhere. The query
+    mirrors the rule's selection structure scoped to the alerting program, fleet-wide, in the alert window. Multiple
+    hosts in the same window points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        Image|endswith: \svchost.exe
+        TargetFilename|contains: \Personalization\LockScreenImage\
+      filter1:
+        TargetFilename|contains: C:\Windows\
+      filter2:
+        TargetFilename|contains:
+        - .jpg
+        - .jpeg
+        - .png
+      _pb_scope:
+        Image|endswith|expand: '%Image%'
+      condition: (selection and not filter1 and not filter2) and _pb_scope
+    fields:
+    - host.name
+- question: What other processes ran on this host around the time of the file write?
+  context: Alerts rarely occur in isolation. Examining process activity around the write reveals what led to it and what happened
+    after - the desktopimgdownldr invocation, the cmd shell that set the SYSTEMROOT override, and any follow-on execution
+    of the downloaded file. Aggregating by process and parent collapses repetitive agent noise into high-count rows while
+    novel parent-child pairs stand out at low counts.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host - reconnaissance, defense tampering, credential
+    access - may reveal the stages that preceded this download and help reconstruct the timeline. A tool-transfer step commonly
+    follows initial access and precedes execution of the retrieved payload.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

@@ -1,0 +1,455 @@
+name: Uncommon File Creation By Mysql Daemon Process
+id: b09fd985-a456-4d0c-b040-f860aea9b54e
+description: |
+  Detects the MySQL daemon (mysqld.exe or mysqld-nt.exe) writing a file whose name ends in a
+  scripting or executable extension (.bat, .dat, .dll, .exe, .ps1, .psm1, .vbe, .vbs). A database
+  engine normally writes data, index, and log files, not executables or scripts, so this file-write
+  pattern is a common signature of User-Defined Function (UDF) abuse: an attacker who has gained
+  access to the database loads a malicious UDF DLL into the server, exposing SQL-callable functions
+  that download files from a remote host and execute operating-system commands - the database
+  equivalent of a web shell. Investigate what the dropped file is, whether it has executed, what the
+  daemon did next (child processes, outbound connections), and whether the activity is isolated to
+  this host or seen across the environment.
+type: detection
+detection_id: c61daa90-3c1e-4f18-af62-8f288b5c9aaf
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-10
+questions:
+- question: Did the MySQL daemon create a file with a scripting or executable extension?
+  context: >-
+    Before investing investigation time, confirm the alert is a true positive. The rule fires when the
+    writing process is mysqld.exe or mysqld-nt.exe AND the created file's name ends in one of .bat,
+    .dat, .dll, .exe, .ps1, .psm1, .vbe, or .vbs. Review the exact TargetFilename, the operation
+    performed, and the responsible process on the triggering event. A database engine writing an
+    executable or script is not routine data-file handling.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - Image
+      - TargetFilename
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this host expected to run a MySQL server that writes executable or script files?
+  context: >-
+    Legitimate database servers write data, index, and log files; they rarely emit .exe, .dll, or
+    .ps1 payloads. Confirm whether this host is a sanctioned MySQL server and whether any local
+    automation, backup, or installer routine would explain the daemon writing an executable or script.
+    User attribution is present on roughly 94% of endpoint file events; when the writing identity is a
+    machine or service account, judge by the writing process and host role instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is the dropped file still on disk, or was it deleted or renamed after the alert?
+  context: >-
+    The file's post-alert lifecycle drives both urgency and next steps. A payload still on disk can be
+    retrieved, hashed, and analyzed; a file deleted seconds after creation suggests anti-forensic
+    cleanup or a self-deleting dropper and shifts the investigation to what executed in between.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What is the content of the file the MySQL daemon wrote?
+  context: >-
+    Read and analyze the actual content of the dropped file. If it is a DLL, check its exports for
+    UDF-interface functions that download files or execute shell commands, and inspect imports,
+    embedded strings, packer signatures, and signing status. If it is a script or batch file, check
+    for base64 or otherwise obfuscated strings, embedded URLs or IP addresses, and calls to command
+    interpreters. A UDF DLL loaded into the database exposes SQL-callable functions that fetch remote
+    files and run operating-system commands. File content is not carried in the file-write event and
+    must be retrieved from the host or an endpoint copy.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: If the dropped file has executed, what is its hash and does it have known threat intel detections?
+  context: >-
+    A file's hash is recorded when it runs, not when it is written, so file-creation events carry no
+    hash. This query looks for the dropped file executing and reads its hash; submit that value to
+    reputation and threat-intelligence services to determine whether it is known malicious, benign, or
+    previously unseen. If the file is present but has not executed, retrieve it from its on-disk path
+    and hash it manually.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_direct:
+        Image|endswith|expand: '%TargetFilename%'
+      selection_interpreter:
+        CommandLine|contains|expand: '%TargetFilename%'
+      condition: selection and 1 of selection_*
+    fields:
+      - Image
+      - CommandLine
+      - Hashes
+- question: What processes did the MySQL daemon spawn after the file was written?
+  context: >-
+    A database engine should not spawn command interpreters. UDF abuse exposes a SQL-callable function
+    that executes operating-system commands, so the daemon launching cmd.exe, powershell.exe, or the
+    file it just dropped is the command-execution stage of the technique. This query returns processes
+    whose parent is the MySQL daemon on this host, which reveals that follow-on activity.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Did the MySQL daemon make outbound network connections around the alert?
+  context: >-
+    The download stage of UDF abuse fetches the payload from a remote host before it is written and
+    executed, and follow-on command execution often reaches out to a command-and-control server. A
+    database engine connecting outbound to arbitrary internet hosts is unusual and may represent the
+    transfer that produced this file or later remote control. Review the destination addresses and
+    ports for anything outside the server's normal replication and client traffic.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Initiated
+- question: What other files did the MySQL daemon write or delete around the alert?
+  context: >-
+    A process that drops one suspicious file often drops several - a UDF DLL plus its downloaded
+    payload, a staging file for captured command output, or multiple tools. The breadth, paths, and
+    extensions of the daemon's other file activity distinguish a single artifact from an in-progress
+    intrusion and enumerate what else needs review.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What other executable or script files were written on this host recently, and by which processes?
+  context: >-
+    The rule pins file extensions rather than a specific directory, so this looks at where scripting
+    and executable payloads land on this host and which processes write them. Most executable and
+    script writes come from a small set of installers, updaters, and management tools; the MySQL daemon
+    appearing as a writer of .exe, .dll, or .ps1 files alongside its normal data output is the
+    deviation, and an unfamiliar writer across several such files widens the scope.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith:
+        - .bat
+        - .dat
+        - .dll
+        - .exe
+        - .ps1
+        - .psm1
+        - .vbe
+        - .vbs
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: Has this file been seen before on this host or in the environment?
+  context: >-
+    A file that has never appeared on a host is more suspicious than one that is part of normal
+    operations. First-time appearance of an executable or script written by a database engine should
+    be checked even if the filename looks benign, since UDF payloads are frequently given innocuous
+    names. Zero or very low historical counts indicate a new or rare artifact.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: When this host has previously produced this daemon-writes-executable pattern, what programs and users drove it, and does the current alert fit?
+  context: >-
+    Even a busy database server rarely writes executables or scripts. This query mirrors the
+    rule's selection scoped to this host, so the resulting program and user distribution
+    reflects how this specific firing pattern - not generic MySQL usage - has historically run
+    here. A new acting program process, an unexpected account, or a first-ever appearance is the
+    anomaly worth chasing; a stable recurring profile points to a repeatable, likely non-
+    malicious cause such as a backup or plugin routine.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        Image|endswith:
+        - \mysqld.exe
+        - \mysqld-nt.exe
+        TargetFilename|endswith:
+        - .bat
+        - .dat
+        - .dll
+        - .exe
+        - .ps1
+        - .psm1
+        - .vbe
+        - .vbs
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - Image
+    - User
+- always_include: true
+  question: Has this user previously produced this daemon-writes-executable pattern, and does that history fit their role?
+  context: >-
+    This query mirrors the rule's exact selection scoped to the alerting user, returning that account's
+    90-day history of this specific drop pattern aggregated by host. A user who has never produced this
+    pattern is more suspicious than one who does so regularly; weigh the count against whether that
+    account administers the database and on how many hosts the pattern appears. On a service-driven
+    write the identity is often a machine or service account, in which case the parent-process history
+    is the more meaningful pivot.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        Image|endswith:
+        - \mysqld.exe
+        - \mysqld-nt.exe
+        TargetFilename|endswith:
+        - .bat
+        - .dat
+        - .dll
+        - .exe
+        - .ps1
+        - .psm1
+        - .vbe
+        - .vbs
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: Has this program driven this drop pattern before on this host or elsewhere?
+  context: >-
+    When the alert fires under a service or machine account, user identity does not attribute the
+    behavior; the launch mechanism does. This query mirrors the rule's selection scoped to the alerting
+    program, returning the 90-day history of that program driving this exact pattern, aggregated
+    by host. A new or rare program for this pattern is the deviation worth chasing, while a program
+    already accounting for many prior events points to a recurring automated cause. Read this alongside
+    the user-history view - one answers whether the account is routine, the other whether the launch
+    mechanism is.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        Image|endswith:
+        - \mysqld.exe
+        - \mysqld-nt.exe
+        TargetFilename|endswith:
+        - .bat
+        - .dat
+        - .dll
+        - .exe
+        - .ps1
+        - .psm1
+        - .vbe
+        - .vbs
+      _pb_scope:
+        Image|endswith|expand: '%Image%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: What else did this user do across the environment around this time?
+  context: >-
+    Tracking the alerting account's activity across all hosts in a tight window reveals whether the
+    activity is confined to this endpoint or the same account is active on several. The same user
+    spawning tools or writing files on multiple hosts around the alert widens the likely scope of
+    compromise and helps distinguish an isolated database abuse from broader movement.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- always_include: true
+  question: Did this same program-driven drop pattern fire on other hosts in this window?
+  context: >-
+    Under a service or machine account, a user-scoped network sweep returns agent-telemetry noise, so
+    the meaningful question is whether the same launch mechanism fired elsewhere. This query mirrors the
+    rule's selection scoped to the alerting program, fleet-wide, within the alert window.
+    Multiple hosts producing the same pattern at once points to a pushed or scripted rollout, such as
+    the same weak-credential database being abused across many servers; a single host points to a local
+    trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        Image|endswith:
+        - \mysqld.exe
+        - \mysqld-nt.exe
+        TargetFilename|endswith:
+        - .bat
+        - .dat
+        - .dll
+        - .exe
+        - .ps1
+        - .psm1
+        - .vbe
+        - .vbs
+      _pb_scope:
+        Image|endswith|expand: '%Image%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Have other hosts produced this daemon-writes-executable pattern in the past week?
+  context: >-
+    This query mirrors the rule's exact selection with no host scope, returning a fleet-wide count of
+    this specific drop pattern rather than generic MySQL usage. Many hosts producing the same pattern
+    points to internet-exposed database servers being abused at scale or to a shared automation; one
+    host or a small unrelated set points to a targeted or opportunistic single case. Use the host
+    distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: file_event
+    detection:
+      selection:
+        Image|endswith:
+        - \mysqld.exe
+        - \mysqld-nt.exe
+        TargetFilename|endswith:
+        - .bat
+        - .dat
+        - .dll
+        - .exe
+        - .ps1
+        - .psm1
+        - .vbe
+        - .vbs
+      condition: selection
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Alerts rarely happen in isolation. Earlier detections on the same host - brute-force or
+    authentication failures against the database, exploitation of a public-facing service, or
+    reconnaissance - may reveal how access to the database was gained and help reconstruct the full
+    timeline leading to the UDF drop.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

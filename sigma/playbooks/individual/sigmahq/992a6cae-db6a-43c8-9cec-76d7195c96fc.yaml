@@ -1,0 +1,423 @@
+name: Outbound Network Connection Initiated By Script Interpreter
+id: 6345207e-f7ee-4e18-bdad-9a2855f90b06
+description: |
+  Detects the Windows script interpreters wscript.exe or cscript.exe opening an outbound network
+  connection to a destination outside the local, link-local, and Microsoft address ranges. Script hosts
+  routinely run login scripts and administrative automation, but they are also a common ingress-tool-transfer
+  path: a .vbs or .js file that reaches out to an external host to pull down a second-stage payload. The
+  rule fires only when the interpreter initiates the connection AND the destination is not in the excluded
+  internal or Microsoft ranges, so the investigation should establish which script ran, what launched it,
+  what destination it contacted, whether a file was written to disk afterward, and whether the transferred
+  tool was executed.
+type: detection
+detection_id: 992a6cae-db6a-43c8-9cec-76d7195c96fc
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-10
+questions:
+- question: Did wscript.exe or cscript.exe initiate the outbound connection to this external destination?
+  context: >-
+    Confirm the alert by reviewing the destination IP and port, the connection direction, and the
+    initiating process against the rule's criteria. The rule fires only when a script interpreter opens an
+    outbound (initiated) connection AND the destination falls outside the local, link-local, and Microsoft
+    address ranges the rule excludes, so a destination inside those ranges would not have triggered it.
+    Verify the process is wscript.exe or cscript.exe and that the destination is a genuine external
+    endpoint rather than an internal service.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationIp|expand: '%dst_ip%'
+      condition: selection
+    fields:
+      - Image
+      - Initiated
+- question: Is this user and host expected to run scripts that make outbound network connections?
+  context: >-
+    Login scripts, packaging tools, and administrative automation legitimately use wscript.exe and
+    cscript.exe, and some of that automation reaches external hosts. Knowing whether this account and host
+    normally run script-driven downloads is often the fastest way to separate sanctioned automation from a
+    script-based download cradle. When user attribution is a machine account, SYSTEM, or missing, pivot on
+    the initiating process instead.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What script did the interpreter run, and what does its command line reveal about the download?
+  context: >-
+    The network_connection event carries no command line, so pivot by ProcessGuid to the interpreter's own
+    process record. wscript.exe and cscript.exe take a script path (.vbs, .js, .wsf) plus optional
+    arguments; decode that command line and, where possible, the script contents to identify the external
+    host or URL being contacted and what the script does with the response. The current directory can point
+    at where the script was staged.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What is this destination, and what do DNS, WHOIS, and threat intelligence reveal about it?
+  context: >-
+    Investigate the external endpoint the script contacted: resolution history, registration age, hosting,
+    TLS certificate details, and any known threat-intel hits. A recently registered domain, a raw IP with
+    no DNS history, or infrastructure already associated with tooling delivery points to an
+    attacker-controlled endpoint. Resolved hostnames are sparsely recorded on connection events in this
+    telemetry, so if the destination hostname is empty, pivot to the DNS lookup that preceded the connection
+    to recover the domain.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationIp|expand: '%dst_ip%'
+      condition: selection
+    fields:
+      - DestinationHostname
+      - DestinationPort
+- question: What process launched the script interpreter, and is that parent chain expected?
+  context: >-
+    Read the interpreter's parent from its own process record. A script host launched by explorer.exe or a
+    scheduled-task/login-script chain is consistent with routine automation; one launched by an Office
+    application, a browser, mshta.exe, or another script host points to a macro or exploit that dropped and
+    ran the script. Known-good updaters and packaging tools are frequent benign parents worth learning for
+    this host so they can be set aside quickly.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - Image
+- question: What child processes did the script interpreter spawn afterward?
+  context: >-
+    A download cradle usually runs what it fetched. Listing the processes the interpreter spawned on this
+    host after the alert reveals whether a transferred tool was executed - cmd.exe, powershell.exe, a
+    dropped binary, or a second LOLBin - and their command lines show what that follow-on activity did.
+    Predictable, empty, or benign children argue against a live transfer-and-execute.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Was a file written to disk after the connection - did the transfer complete?
+  context: >-
+    An outbound connection does not guarantee a file arrived; the request may have failed, been blocked, or
+    returned nothing. Correlating file creation to the interpreter process and its direct children by
+    process lineage establishes whether the transfer landed on disk and where. This catches the writing
+    process and its direct children, not grandchildren or unrelated writers.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: If the transferred payload was executed, what is its hash - and is it known to threat intelligence?
+  context: >-
+    The hash needed for a reputation lookup or sandbox detonation is recorded when a payload runs, not when
+    it is written - file-creation events carry no hash in this telemetry. This returns the processes the
+    interpreter and its parent spawned - its children and siblings - with their executable hashes; for a
+    download-and-execute that is the payload. If the payload was launched later by an unrelated process it
+    will not appear here, in which case retrieve the file from the on-disk path and hash it manually.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_children:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection_children
+    fields:
+      - Image
+      - Hashes
+- question: What other files did the interpreter or its spawned children write to disk around the alert?
+  context: >-
+    A transfer rarely arrives alone - the same process or a child it spawns often writes further files
+    (an unpacked archive, a second-stage download, a staged script). Surfacing the full file-write footprint
+    of the interpreter and its direct children shows the scope of the delivery. Uncommon drop directories
+    such as C:\Users\Public or per-user temp paths are worth particular attention.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Does this host normally communicate with this destination?
+  context: >-
+    A first-time connection to a destination is more suspicious than routine, repeated communication.
+    Aggregating this host's history with the destination IP over a long window distinguishes new
+    attacker infrastructure from an endpoint the host talks to regularly. Zero or very low prior counts
+    indicate a new destination for this host; the port and process breakdown shows whether the traffic
+    fits any established pattern.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationIp|expand: '%dst_ip%'
+      condition: selection
+    fields:
+      - DestinationPort
+      - Image
+- question: When this host has previously fired this rule's pattern, what programs and users drive it, and does the current alert fit?
+  context: >-
+    Even routine automation can produce script-interpreter egress. This query mirrors the rule's
+    selection structure scoped to this host, so the resulting program and user distribution
+    reflects how this specific firing pattern - not generic script-host usage - has historically
+    run here. A new acting program process, an unexpected account, or an unfamiliar invocation
+    structure is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        Initiated: 'true'
+        Image|endswith:
+        - \wscript.exe
+        - \cscript.exe
+      filter_main_local_ranges:
+        DestinationIp|cidr:
+        - 127.0.0.0/8
+        - 10.0.0.0/8
+        - 172.16.0.0/12
+        - 192.168.0.0/16
+        - 169.254.0.0/16
+        - ::1/128
+        - fe80::/10
+        - fc00::/7
+      filter_main_ms_ranges:
+        DestinationIp|cidr: 20.0.0.0/11
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - Image
+    - User
+- question: What other process activity occurred on this host around the time of the alert?
+  context: >-
+    Alerts rarely occur in isolation. Aggregating process activity in a tight window around the connection
+    surfaces what led up to the script running and what happened immediately after. Novel parent-child pairs
+    stand out at low counts against high-count routine telemetry, which points to the tool that staged or
+    followed the transfer.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host - reconnaissance, script execution, or defense tampering - may
+    reveal the stages that preceded this connection and help reconstruct the timeline. Ingress tool transfer
+    is usually a means to stage follow-on activity, so prior alerts help place the download within a larger
+    sequence rather than treating it as an isolated event.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Were any other download-capable LOLBins used on this host recently?
+  context: >-
+    Operators who use one download utility often use several. If a script host pulled a file from an
+    external endpoint, check whether certutil, bitsadmin, curl, or cabinet utilities were also used to
+    transfer content on this host in the same period. Multiple download-capable binaries performing the same
+    objective strengthens the case that a deliberate transfer operation is underway.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\certutil.exe'
+          - '\bitsadmin.exe'
+          - '\curl.exe'
+          - '\esentutl.exe'
+          - '\expand.exe'
+          - '\extrac32.exe'
+          - '\makecab.exe'
+          - '\replace.exe'
+          - '\hh.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- question: Was the script interpreter executed from its expected System32 or SysWOW64 path?
+  context: >-
+    wscript.exe and cscript.exe normally run from System32 or SysWOW64. A copy running from a user profile,
+    temp directory, or other non-standard path may have been relocated or renamed to evade path-based
+    allowlists. Compare the executed path and the original file name to confirm the interpreter is the
+    genuine system binary in its expected location.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- question: How often has this host fired this rule's script-interpreter egress pattern over the past 90 days, and what command-line structures are typical?
+  context: >-
+    A script-interpreter egress pattern with no prior history on a host is more suspicious than one seen
+    regularly under stable parents. This query mirrors the rule's selection structure scoped to this host,
+    so the count reflects the rule's specific firing pattern rather than generic script-host usage. The
+    command-line projection lets the typical invocations be compared against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        Initiated: 'true'
+        Image|endswith:
+        - \wscript.exe
+        - \cscript.exe
+      filter_main_local_ranges:
+        DestinationIp|cidr:
+        - 127.0.0.0/8
+        - 10.0.0.0/8
+        - 172.16.0.0/12
+        - 192.168.0.0/16
+        - 169.254.0.0/16
+        - ::1/128
+        - fe80::/10
+        - fc00::/7
+      filter_main_ms_ranges:
+        DestinationIp|cidr: 20.0.0.0/11
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - CommandLine
+- question: Have other hosts fired this rule's pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: >-
+    This query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide
+    count of the rule's firing pattern rather than generic script-host usage. Many hosts firing the same
+    pattern points to scripted deployment or vendor automation that reaches an external endpoint; one host
+    or a small unrelated set points to hands-on operator activity. Use the host distribution and
+    parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        Initiated: 'true'
+        Image|endswith:
+        - \wscript.exe
+        - \cscript.exe
+      filter_main_local_ranges:
+        DestinationIp|cidr:
+        - 127.0.0.0/8
+        - 10.0.0.0/8
+        - 172.16.0.0/12
+        - 192.168.0.0/16
+        - 169.254.0.0/16
+        - ::1/128
+        - fe80::/10
+        - fc00::/7
+      filter_main_ms_ranges:
+        DestinationIp|cidr: 20.0.0.0/11
+      condition: selection and not 1 of filter_main_*
+    fields:
+    - host.name

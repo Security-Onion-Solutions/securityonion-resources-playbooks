@@ -1,0 +1,334 @@
+name: PrintBrm ZIP Creation of Extraction
+id: 2db77e57-d220-420a-8e1a-6733676a6ee3
+description: |
+  Detects the printer-migration tool PrintBrm.exe (located in C:\Windows\System32\spool\tools) being run with a -f argument and a .zip path, which drives it to either create a ZIP archive from a folder or extract one. The rule fires when the Image ends in PrintBrm.exe AND the command line contains both -f and .zip. PrintBrm is a living-off-the-land binary: it can compress the contents of a local or remote (UNC/SMB) folder into a ZIP for staging or exfiltration, and it can extract a ZIP that has been hidden inside an NTFS Alternate Data Stream. It is not normally run on workstations, so an alert should be confirmed as a real PrintBrm invocation, then investigated for what was archived or extracted, where the .zip lives, whether the source or destination was a remote share, and whether the activity is isolated or repeated across hosts.
+type: detection
+detection_id: cafeeba3-01da-4ab4-b6c4-a31b1d9730c7
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-09
+questions:
+- question: Does this event match the rule — PrintBrm.exe run with a -f argument and a .zip path?
+  context: Confirm the alert is a true positive by reviewing the exact command line and process details against the detection criteria. The rule requires the Image to end in PrintBrm.exe AND the command line to contain both -f and .zip; verify a real PrintBrm invocation is present and note whether the -b (backup/create) or -r (restore/extract) flag is set, since that determines whether data was archived or unpacked.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Is this user and host expected to run PrintBrm.exe?
+  context: PrintBrm is a printer-migration utility that should not appear on a normal workstation and is rarely run interactively even on print servers. Knowing whether the host is a print server or migration system, and whether the user performs printer administration, is often the fastest way to separate routine maintenance from operator-driven archiving or extraction.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What exactly did PrintBrm do? Decode the full command line and identify the operation, the .zip path, and any source or destination folder.
+  context: The full command line reveals the specific action. Identify whether -b (create a ZIP from a folder) or -r (extract a ZIP) was used, the path supplied after -f (including any colon-stream syntax such as file:hidden.zip), and the folder named by -d. A -d pointing at a UNC path (\\host\share) means a remote folder was the source or target; a -f path containing a colon indicates a ZIP stored in an NTFS Alternate Data Stream.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Where is the .zip file located, and is that path a user-writable or staging directory?
+  context: The path supplied to -f determines where the archive is created or read from. ZIPs landing in user-writable or staging locations (C:\Users\Public, %TEMP%, Downloads, ProgramData) are more consistent with data staging or payload delivery than archives written to a controlled migration directory. An uncommon or transient drop path is the file-path signal worth chasing.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Did the .zip actually get written to disk at the destination path?
+  context: A PrintBrm command does not guarantee the archive was produced or extracted; path errors, permissions, or an empty source folder may stop it. Confirming creation of the .zip (or of files extracted from it) at the target path establishes whether the operation completed past the command stage.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What ZIP did PrintBrm create, and can you retrieve and inspect its contents?
+  context: PrintBrm packages files into a .zip — the archive is data (staged content), not an executable, and file-creation events carry no hash. Retrieve the archive from the path below, extract it, and review its contents to determine whether it holds exfiltration-staged data, a malicious payload, or benign migration content; also check for an Alternate Data Stream, since standard tools list only the base file. Hash the archive (or any extracted binary) manually for a reputation lookup.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - EventType
+- question: What other file activity occurred in the same directory as the .zip?
+  context: Archiving and extraction operations often touch many files in one directory — the folder being compressed, the files unpacked from an archive, or additional staged payloads. Examining directory-level file activity around the .zip reveals the broader scope of what was collected or dropped.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Was a ZIP written to or read from an NTFS Alternate Data Stream around the time of this alert?
+  context: PrintBrm can extract a ZIP stored in an Alternate Data Stream (a -f path of the form file.ext:hidden.zip), which hides the archive from ordinary directory listings. The endpoint agent records this as an ordinary file-creation event with the stream name embedded in the file path — there is no stream hash recorded, so this confirms the write and the writing process, not the archive's contents; retrieve and hash the file separately. Correlate the stream timestamp with the PrintBrm execution to confirm they are the same operation.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_stream:
+        TargetFilename|re: ':[A-Za-z0-9_$.]+$'
+      condition: selection and selection_stream
+    fields:
+      - TargetFilename
+      - Image
+- question: Did PrintBrm read from or write to a remote share over SMB around this time?
+  context: PrintBrm can compress the contents of a remote folder on a UNC share (\\host\share) into a local ZIP, or write an archive back to one, which is how it functions as an ingress or exfiltration path. Outbound SMB connections (typically port 445) from the host in the alert window, especially to a destination outside normal file-server use, indicate the archive source or target was remote rather than local.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationPort:
+          - 445
+          - 139
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+- question: What process spawned PrintBrm.exe, and is that parent chain expected?
+  context: The parent process reveals how PrintBrm was invoked. A migration workflow or print-management console launching it is plausible on a print server; shells, script hosts, or remote-access tooling (cmd.exe, powershell.exe, wscript.exe, mshta.exe) spawning PrintBrm with a -f .zip argument point to scripted or operator-driven archiving.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What child processes did PrintBrm.exe spawn afterward?
+  context: Archiving or extraction is usually only one stage. Processes spawned by PrintBrm, or by the same parent shortly after, reveal whether extracted content was executed or staged data was moved — look for interpreters or LOLBins (cmd.exe, powershell.exe, rundll32.exe, regsvr32.exe) starting in the same window.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Does this host normally run PrintBrm.exe?
+  context: A binary that has never been seen on a host is more suspicious than one that runs regularly. Zero or very low historical counts over the baseline window indicate first-time or rare execution of this printer-migration tool, which most endpoints never invoke.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: When this host has previously fired the rule's pattern, what parents and users normally drive it, and does the current alert fit?
+  context: Even rarely abused tools can have a legitimate history on a given host. The query mirrors the rule's selection structure scoped to this host, so the resulting parent/user distribution reflects how this specific firing pattern (PrintBrm with -f and .zip) has historically run here. A new parent process, an unexpected user account, or an unusual command-line structure is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        Image|endswith: \PrintBrm.exe
+        CommandLine|contains|all:
+        - ' -f'
+        - .zip
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        Image|endswith: \PrintBrm.exe
+        CommandLine|contains|all:
+        - ' -f'
+        - .zip
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        Image|endswith: \PrintBrm.exe
+        CommandLine|contains|all:
+        - ' -f'
+        - .zip
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the same user drove similar activity on more than one host in the window, the scope of the operation may be larger than a single archiving event.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        Image|endswith: \PrintBrm.exe
+        CommandLine|contains|all:
+        - ' -f'
+        - .zip
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Have other hosts fired the rule's pattern in the past week, and does the cross-host distribution look like consistent automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of this firing pattern (PrintBrm with -f and .zip) rather than generic use of the binary. Many hosts firing the same pattern points to scripted deployment or migration automation; one host or a small unrelated set points to manual operator activity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        Image|endswith: \PrintBrm.exe
+        CommandLine|contains|all:
+        - ' -f'
+        - .zip
+      condition: selection
+    fields:
+    - host.name

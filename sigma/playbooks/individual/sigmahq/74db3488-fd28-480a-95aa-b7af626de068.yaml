@@ -1,0 +1,508 @@
+name: LockerGoga Ransomware Activity
+id: d29d9a2c-aec6-4ac4-9da1-8a0762696697
+description: |
+  Detects a process whose command line contains the substring `-i SM-tgytutrc -s`. This is the
+  worker-instance invocation used by LockerGoga: a coordinating instance started with `-m` spawns
+  worker copies of itself and passes them the name of a named file-mapping object, through which
+  the workers report encryption progress back. The token is specific enough that routine software
+  is not expected to produce it, but the surrounding pattern — a short randomly-named binary
+  running from a temp directory, spawning copies of itself with an IPC handle argument, alongside
+  shadow-copy and backup deletion, boot-configuration changes, service stops, and account password
+  changes — is common to other encryption-for-impact tooling (T1486), so confirm which family is
+  actually present rather than assuming this one from the string alone.
+  The investigation should establish whether encryption has started and how far it has progressed,
+  which recovery paths were removed (T1490), which services or accounts were taken out of the way
+  (T1489, T1531), how the binary arrived and was executed, and whether the same pattern is present
+  on other hosts.
+type: detection
+detection_id: 74db3488-fd28-480a-95aa-b7af626de068
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-16
+questions:
+- question: Does the alerting command line actually contain the `-i SM-tgytutrc -s` argument pattern?
+  context: >-
+    The rule matches this one substring anywhere in a command line, with no constraint on the image
+    or the parent. Confirm the token is a real argument passed to an executed binary rather than an
+    incidental string — a file path, a sample name, a log line quoted into another tool's arguments,
+    or a security product scanning a stored sample all produce the same match. Note the image path
+    and working directory alongside the arguments; in the genuine pattern the binary is a relocated
+    copy running from a temp directory.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - alert
+  - process_creation
+- question: Is this user and host expected to run a binary that takes a shared-memory mapping handle as a command-line argument?
+  context: >-
+    Very little legitimate software passes a named file-mapping object on the command line, and the
+    specific token here is not associated with any known product. A plausible benign path exists for
+    security researchers, malware-analysis workstations, and detection-engineering hosts where a
+    sample is executed deliberately. Establish whether this host has that function and whether the
+    account is one that would be doing that work.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: What other command lines on this host reference the `tgytutrc` mapping-object name, and what does the full argument set show?
+  context: >-
+    The worker invocation is one step of a three-part sequence. A self-relocation step normally runs
+    first (`cmd.exe /c move /y <original path> %Temp%\tgytutrcNNNN.exe`), the relocated copy is then
+    started with `-m` as the coordinator, and the coordinator spawns the workers that carry the
+    `-i SM-tgytutrc -s` arguments. All three carry the same token, so pulling them together on the
+    host shows whether a full deployment ran or only a single stray process. The original path in the
+    move command is the delivery location, which is the pivot back to how the binary arrived.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_args:
+        CommandLine|contains: 'tgytutrc'
+      condition: selection and selection_args
+    fields:
+      - Image
+      - CommandLine
+      - CurrentDirectory
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: What recovery-inhibiting commands ran on this host, and did each one succeed?
+  context: >-
+    Encryption for impact is normally paired with inhibiting recovery (T1490) so restoration is not
+    an option: shadow copies deleted through vssadmin or wmic, boot recovery disabled through bcdedit
+    (`recoveryenabled no`, `bootstatuspolicy ignoreallfailures`), backup catalogs deleted through
+    wbadmin, and the Windows Recovery Environment disabled through reagentc. This surfaces the full
+    set on the host rather than a single command. Execution of a command is not proof it worked —
+    confirm current state on the host with `vssadmin list shadows`, `bcdedit /enum`, `reagentc /info`,
+    and `wbadmin get versions`, and confirm whether offline, tape, or cloud backup copies survive
+    through the backup owner.
+  range: +24h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_recovery:
+        Image|endswith:
+          - '\vssadmin.exe'
+          - '\wmic.exe'
+          - '\bcdedit.exe'
+          - '\wbadmin.exe'
+          - '\reagentc.exe'
+          - '\diskshadow.exe'
+      selection_cmdline:
+        CommandLine|contains:
+          - 'delete shadows'
+          - 'shadowcopy delete'
+          - 'recoveryenabled'
+          - 'bootstatuspolicy'
+          - 'delete catalog'
+          - 'delete systemstatebackup'
+          - 'boot.ini'
+          - 'winre.wim'
+          - '/disable'
+      condition: selection and (selection_recovery or selection_cmdline)
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+  - manual_review
+  - edr_console
+- question: What other destructive or service-stopping commands ran on this host around the alert?
+  context: >-
+    The pre-encryption stage typically clears obstacles in a fixed order: stopping security and
+    database services (T1489) through `sc stop`, `net stop`, or taskkill; taking ownership and
+    rewriting ACLs on target files through takeown and icacls; and changing local and domain account
+    passwords through `net user` so operators keep access and defenders lose it (T1531). If every one
+    of these shares a single parent, the sequence was scripted rather than typed. A shared parent also
+    gives you the script or shell to recover for the full action list.
+  range: +/-30m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_destructive:
+        Image|endswith:
+          - '\vssadmin.exe'
+          - '\wmic.exe'
+          - '\bcdedit.exe'
+          - '\wbadmin.exe'
+          - '\cipher.exe'
+          - '\fsutil.exe'
+          - '\icacls.exe'
+          - '\takeown.exe'
+          - '\attrib.exe'
+          - '\sc.exe'
+          - '\net.exe'
+          - '\net1.exe'
+          - '\powershell.exe'
+          - '\taskkill.exe'
+      condition: selection and selection_destructive
+    fields:
+      - Image
+      - User
+  answer_sources:
+  - process_creation
+- question: What binaries outside the standard system paths executed on this host after the alert?
+  context: >-
+    Excluding processes launched from Program Files and the core system directories leaves the
+    executables running from temp and user-writable paths, which is where a relocated encryptor copy
+    lives. Look for short random-looking image names, several instances of the same image running
+    concurrently (the coordinator and its workers), and shells launching unknown executables. Ransom
+    notes and renamed files are file-telemetry evidence rather than process evidence — read those from
+    the file-write aggregation or an endpoint console.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      filter_known:
+        Image|startswith:
+          - 'C:\Program Files'
+          - 'C:\Windows\System32\svchost'
+          - 'C:\Windows\System32\wbem'
+      condition: selection and not filter_known
+    fields:
+      - Image
+      - CommandLine
+      - CurrentDirectory
+  answer_sources:
+  - file_event
+  - process_creation
+  - manual_review
+- question: Is this same detection firing on other hosts in the environment?
+  context: >-
+    Encryption is usually pushed to many hosts at once from a single staging point, so the count and
+    the first-to-last timing of this detection across the estate is what sets the scope of the
+    response. Several hosts inside a short window points to a scripted or remotely-pushed rollout and
+    moves the investigation to finding the distribution mechanism; a single host points to a
+    host-local execution.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        rule.uuid|expand: '%rule_uuid%'
+      condition: selection
+    fields:
+      - host.name
+      - rule.name
+      - event.severity_label
+  answer_sources:
+  - process_creation
+  - alert
+- question: What process spawned this instance, and is that parent the coordinating copy or something else?
+  context: >-
+    In the family's own pattern the parent of a worker is the coordinating copy of the same binary,
+    started with `-m` from a temp directory — so a parent that is itself a temp-directory binary
+    confirms the internal master/worker structure and tells you little about delivery. A parent that
+    is instead a shell, a script host, a remote-execution or service-control process, or a scheduled
+    task is the more useful answer: it identifies how the encryptor was placed and launched. Parent
+    process identifiers are not populated on every process event; if this returns nothing, read the
+    process tree from an endpoint console.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: What child processes did this instance spawn afterward?
+  context: >-
+    Worker instances in this pattern mostly perform file I/O and spawn little; a `cmd.exe` used for
+    relocation or cleanup is the common exception. Children that stop services, delete shadow copies,
+    change account passwords, or reach other hosts change what the process is doing and are the
+    pivot into the recovery-inhibition and lateral-movement questions.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Which processes wrote files into user folders, temp directories, or system paths on this host around the alert, and does one process dominate the writes?
+  context: >-
+    Encryption for impact appears in file telemetry as one process writing across a very large number
+    of paths within seconds to minutes, concentrated in user document folders, mapped shares, and
+    system paths such as %System32%, and frequently appending a non-standard or randomly generated
+    extension. A single image whose write count sits far above every other row in this aggregation is
+    the candidate encryptor; drill into its target filenames to read the extension actually being
+    written and to judge how far encryption has progressed. If file telemetry is not collected in
+    this environment, treat an empty result as a visibility gap rather than evidence that no files
+    were written.
+  range: +/-30m
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_paths:
+        TargetFilename|contains:
+          - '\Users\'
+          - '\Documents\'
+          - '\Desktop\'
+          - '\Windows\System32\'
+          - '\AppData\Local\Temp\'
+          - '\Windows\Temp\'
+      condition: selection and selection_paths
+    fields:
+      - Image
+  answer_sources:
+  - file_event
+  - edr_console
+- question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Aggregating every process by image and parent collapses repetitive agent telemetry into single
+    high-count rows and leaves novel parent-child pairs standing out at low counts. Those low-count
+    rows are what to read: remote-execution services spawning shells, archive or transfer utilities,
+    credential-access tooling, and enumeration binaries all commonly sit in the same window as the
+    encryption stage and describe how the operator reached this point.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+  answer_sources:
+  - process_creation
+  - file_event
+  - registry_event
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Encryption is the last stage of an operation, not the first. Earlier detections on the same host
+    covering credential access, remote service creation, defense tampering, or recovery inhibition
+    reconstruct the preceding stages and often name the entry point and the account in use. Read the
+    ordering of the alerts as much as their content.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+  answer_sources:
+  - alert
+- question: When this host has previously produced the rule's pattern, what parents and users drove that activity, and does the current alert fit?
+  context: >-
+    The query mirrors the rule's selection scoped to this host, so the parent/user distribution
+    reflects how this specific argument pattern has run here before rather than generic binary usage.
+    On a normal endpoint the expected result is zero prior events, which makes the current alert the
+    first occurrence. Prior events with a consistent parent and user point at an analysis workstation
+    or a detection-engineering host where the sample is run deliberately; a new parent or a new
+    account against an existing history is the deviation to chase.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains: -i SM-tgytutrc -s
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+  answer_sources:
+  - process_creation
+- always_include: true
+  question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: >-
+    The query mirrors the rule's selection scoped to this user, aggregated by host, so the result is
+    the account's 90-day history of this exact argument pattern rather than generic binary use. Zero
+    prior events is the expected answer for an ordinary account and makes this a first occurrence for
+    that identity. A history spread across many hosts under one account points at that account being
+    the deployment vehicle. Weigh the count against the account's role and normal toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains: -i SM-tgytutrc -s
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+- always_include: true
+  question: Has this parent process historically driven the rule's pattern on this host or across the environment, or is the parent new for this activity?
+  context: >-
+    When the alert fires under SYSTEM or a computer account, user identity does not attribute the
+    behavior and the launch mechanism is the meaningful pivot. The query mirrors the rule's selection
+    scoped to the alerting parent process, so the result is the 90-day history of that parent driving
+    this pattern. A parent that already accounts for a large volume of prior events is automation; a
+    parent that is new for this pattern is the deviation worth reading. In this pattern the parent is
+    normally a copy of the encryptor itself, so an unfamiliar parent name that recurs historically is
+    worth identifying before drawing conclusions.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains: -i SM-tgytutrc -s
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- always_include: true
+  question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the account across all hosts in the alert window shows whether the activity is confined
+    to this endpoint or the same identity is operating elsewhere. Remote-execution utilities, shells
+    on hosts the account does not normally touch, and the same temp-directory binary appearing on
+    several endpoints all indicate the deployment is wider than the alerting host. If the alert fired
+    under SYSTEM or a computer account this returns agent telemetry from every host and carries no
+    signal — read the parent-scoped fleet question instead.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+- always_include: true
+  question: Did this same parent-driven pattern fire on other hosts in the same window, or is the activity isolated to this host?
+  context: >-
+    Under a service principal, asking what else the user did returns agent telemetry from the whole
+    estate. The query instead mirrors the rule's selection scoped to the alerting parent process
+    fleet-wide within the alert window. Multiple hosts in the same window points to a pushed or
+    scheduled rollout and moves the response to finding the distribution point; a single host points
+    to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains: -i SM-tgytutrc -s
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- question: Have other hosts produced the rule's pattern in the past week, and what does the cross-host distribution look like?
+  context: >-
+    The query mirrors the rule's selection with no host scope, so the result is a fleet-wide count of
+    this argument pattern over the week rather than generic binary usage. A set of hosts appearing
+    within a narrow window is a rollout and sets the containment boundary; hosts appearing steadily
+    over the week point instead at a recurring analysis or testing workflow. A week of history also
+    catches earlier hosts that were encrypted before this alert was reviewed.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains: -i SM-tgytutrc -s
+      condition: selection
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation

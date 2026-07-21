@@ -1,0 +1,452 @@
+name: Potentially Suspicious Execution Of Regasm/Regsvcs With Uncommon Extension
+id: 5062344c-f2c3-43f0-91fc-184e963bb64c
+description: |
+  Detects regasm.exe or regsvcs.exe (the .NET Framework assembly registration
+  utilities) executed with a command line that references a file ending in an
+  uncommon extension (.dat, .gif, .jpeg, .jpg, .png, .txt). These signed
+  Microsoft binaries load a target .NET assembly into their own process and run
+  its registration entry point, so an attacker can rename a malicious assembly
+  to a non-.dll extension and pass it to regasm/regsvcs to execute code while
+  bypassing application allow-listing and extension-based static scanning — the
+  file is parsed by managed-assembly header, not by extension. Legitimate
+  developer or installer activity registers .dll assemblies, so the combination
+  of these binaries with an image/text extension on the command line is the
+  pivot. The investigation should confirm what assembly was loaded, what it did
+  after loading (registry, child processes, network), and whether the launch
+  fits normal activity for the host and user.
+type: detection
+detection_id: e9f8f8cc-07cc-4e81-b724-f387db9175e4
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- question: Does the command line show regasm.exe or regsvcs.exe loading a file with an uncommon extension?
+  context: >-
+    Confirm the alert is a true positive by reviewing the triggering event. The
+    rule fires when the image (or original file name) is RegAsm.exe or
+    RegSvcs.exe AND the command line references a file ending in .dat, .gif,
+    .jpeg, .jpg, .png, or .txt. Note which binary fired and the exact path and
+    extension passed to it — a managed assembly renamed to an image or text
+    extension is the abuse pattern, while a genuine .dll argument would not have
+    triggered this rule.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to register .NET assemblies with regasm.exe or regsvcs.exe?
+  context: >-
+    Regasm/regsvcs registration is normally seen on developer workstations and
+    build or installer hosts, driven by setup programs or SDK tooling. If the
+    alerting host is not a development or software-deployment system, or the
+    user is not a developer or installer account, the activity is harder to
+    explain as routine. Pair this with the asset role and the user's normal
+    toolset.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What assembly path and flags did regasm/regsvcs receive, and what does the full command line indicate?
+  context: >-
+    The command line names the file loaded into the registration utility and
+    any switches. Decode the full argument set — the path and extension of the
+    target file, and flags such as /u (unregister), /codebase, or /regfile that
+    change how the assembly is registered. The /u variant still loads the
+    assembly into the process, so an unregister flag does not make the execution
+    benign. Scoping to all regasm/regsvcs runs on this host in the window
+    captures multi-step registration sequences rather than a single invocation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What process spawned regasm/regsvcs and is that parent chain expected?
+  context: >-
+    The parent process shows how the utility was invoked. Genuine registration
+    is usually launched by an installer (setup.exe, msiexec.exe), a build tool,
+    or an interactive shell on a developer host. Parents such as Office
+    applications, script hosts (wscript.exe, mshta.exe, powershell.exe), or a
+    browser or mail-client download path point toward delivery of the renamed
+    assembly rather than legitimate component registration.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What modules did regasm/regsvcs load into its process, and were any from a user-writable or unusual path?
+  context: >-
+    After process creation, the abuse step is the target assembly being loaded
+    into the signed regasm/regsvcs process. Look for a loaded module whose path
+    matches the file named on the command line or that sits in a user-writable
+    location (Downloads, %TEMP%, the user profile, OneDrive, or an SMB share),
+    and check whether it is unsigned or signed by an unexpected publisher. A
+    Microsoft-signed host process loading an unsigned managed module from a user
+    directory is the load-event signature of this technique. If image-load
+    telemetry is not collected in this environment, treat zero results as a
+    visibility gap rather than evidence nothing loaded.
+  range: +/-10m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+- question: Did regasm/regsvcs write COM registration keys under HKCR CLSID or ProgID around the alert time?
+  context: >-
+    The registration entry point invoked by these utilities normally creates or
+    modifies COM class keys under HKCR\CLSID and ProgID entries. Review the keys
+    written on this host in the window to see what CLSIDs or ProgIDs were
+    registered and whether they point back to the loaded assembly. New or
+    unfamiliar CLSID entries tied to a file in a user-writable path indicate the
+    registration code ran with attacker-supplied content rather than a sanctioned
+    install. If registry telemetry is not collected in this environment, treat
+    zero results as a visibility gap.
+  range: +/-10m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains:
+          - \CLSID\
+          - \ProgID
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- question: Did regasm/regsvcs or a process it spawned make outbound network connections after the alert?
+  context: >-
+    The assembly loaded through regasm/regsvcs commonly retrieves a later stage
+    or opens a command-and-control channel. Network activity originating from
+    the registration utility itself is unusual — these tools do not normally
+    transfer data. Review destinations for external addresses, raw-IP endpoints,
+    or non-standard ports, and exclude known enterprise update or telemetry
+    destinations. If network telemetry from the host is not collected, treat
+    zero results as a visibility gap.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- question: Around the alert, was a file with one of the flagged extensions written to a user-writable path that matches the loaded assembly?
+  context: >-
+    The renamed assembly is typically dropped to disk shortly before
+    regasm/regsvcs is run against it. Look for a file ending in .dat, .gif,
+    .jpeg, .jpg, .png, or .txt written into a user-writable directory
+    (Downloads, %TEMP%, the user profile, OneDrive, or an SMB share) whose path
+    matches the argument on the command line, and identify the process that
+    wrote it. Tying the drop to the executing command and to a delivery process
+    (browser, mail client, archiver) reconstructs the file drop to execution
+    sequence. The correlation window between drop, execution, and registration
+    is typically a few minutes.
+  range: +/-10m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains:
+          - .dat
+          - .gif
+          - .jpeg
+          - .jpg
+          - .png
+          - .txt
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - User
+- question: Does this host normally run regasm.exe or regsvcs.exe?
+  context: >-
+    A registration utility that has never or rarely run on this host is more
+    notable than one that runs as part of regular development or software
+    deployment. Zero or very low historical counts indicate first-time or rare
+    execution and raise the weight of the other findings.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: When this host has previously matched this rule's pattern, what parents and users drove it, and does the current alert fit?
+  context: >-
+    The query mirrors the rule's selection — regasm/regsvcs with one of the
+    flagged extensions on the command line — scoped to this host, so the
+    resulting parent and user distribution reflects how this specific firing
+    pattern has run here before, not generic use of the binary. A new parent
+    process, an unexpected user account, or an unusual command-line structure
+    relative to that history is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \Regsvcs.exe
+        - \Regasm.exe
+      - OriginalFileName:
+        - RegSvcs.exe
+        - RegAsm.exe
+      selection_extension:
+        CommandLine|contains:
+        - .dat
+        - .gif
+        - .jpeg
+        - .jpg
+        - .png
+        - .txt
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Have other hosts matched this rule's pattern in the past week, and does the spread look like automation or one-off activity?
+  context: >-
+    The query mirrors the rule's selection with no host scope, giving a
+    fleet-wide count of this firing pattern rather than generic use of the
+    binary. Many hosts matching the same pattern points toward scripted
+    deployment or vendor automation that renames assemblies; one host or a small
+    unrelated set points toward manual operator activity. Use the host
+    distribution and the consistency of parent and binary to calibrate the
+    response.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \Regsvcs.exe
+        - \Regasm.exe
+      - OriginalFileName:
+        - RegSvcs.exe
+        - RegAsm.exe
+      selection_extension:
+        CommandLine|contains:
+        - .dat
+        - .gif
+        - .jpeg
+        - .jpg
+        - .png
+        - .txt
+      condition: all of selection_*
+    fields:
+    - host.name
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \Regsvcs.exe
+        - \Regasm.exe
+      - OriginalFileName:
+        - RegSvcs.exe
+        - RegAsm.exe
+      selection_extension:
+        CommandLine|contains:
+        - .dat
+        - .gif
+        - .jpeg
+        - .jpg
+        - .png
+        - .txt
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \Regsvcs.exe
+        - \Regasm.exe
+      - OriginalFileName:
+        - RegSvcs.exe
+        - RegAsm.exe
+      selection_extension:
+        CommandLine|contains:
+        - .dat
+        - .gif
+        - .jpeg
+        - .jpg
+        - .png
+        - .txt
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the user's activity across all hosts in the window reveals whether
+    the registration is isolated or part of broader movement. The same user
+    triggering similar activity on multiple endpoints widens the potential scope
+    of the activity.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \Regsvcs.exe
+        - \Regasm.exe
+      - OriginalFileName:
+        - RegSvcs.exe
+        - RegAsm.exe
+      selection_extension:
+        CommandLine|contains:
+        - .dat
+        - .gif
+        - .jpeg
+        - .jpg
+        - .png
+        - .txt
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Registration abuse is often a middle stage. Earlier detections on the same
+    host — delivery, reconnaissance, defense tampering, or credential access —
+    may reveal the steps that preceded the assembly load and help place this
+    event on the timeline. The correlation window between a dropped assembly,
+    its execution, and the registration writes is typically only a few minutes,
+    so cluster events tightly around the alert.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

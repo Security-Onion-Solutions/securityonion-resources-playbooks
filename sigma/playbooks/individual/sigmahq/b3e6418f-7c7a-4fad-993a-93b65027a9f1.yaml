@@ -1,0 +1,315 @@
+name: DNS Query To Visual Studio Code Tunnels Domain
+id: ff5a0b09-ebd3-4058-a5e3-d58a034b362f
+description: |
+  Detects a DNS lookup whose QueryName ends in .tunnels.api.visualstudio.com, the domain namespace
+  the Visual Studio Code Remote Tunnels feature (the code.exe tunnel CLI) uses to register and reach
+  its relay. The CLI is Microsoft-signed and, once a tunnel is registered with a GitHub account, exposes
+  an interactive terminal, a full file browser, and port forwarding over Microsoft-hosted infrastructure,
+  which is why it is abused as a signed reverse shell or as persistence that survives reboots. Legitimate
+  developer use of VS Code tunnels produces the same lookup, so the alert alone does not confirm abuse.
+  Investigate which process made the lookup and whether it is code.exe running the tunnel subcommand,
+  whether the host then connected to the resolved relay, whether the process spawned a shell or Node
+  helper tree, whether tunnel state files were written, and whether this account and host are expected
+  to use tunnels at all.
+type: detection
+detection_id: b3e6418f-7c7a-4fad-993a-93b65027a9f1
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-10
+questions:
+- question: Does the queried domain match the tunnel namespace this rule detects, and which process made the lookup?
+  context: >-
+    Confirm the alert before investing time. The rule fires when a DNS QueryName ends in
+    .tunnels.api.visualstudio.com, the relay namespace used by the Visual Studio Code Remote Tunnels
+    CLI. Review the exact QueryName and the querying process on the triggering event. A lookup made by
+    code.exe or a portable code CLI binary is consistent with a tunnel being registered or reached; a
+    lookup from an unrelated process is worth a closer look because that binary should not be reaching
+    this namespace.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: dns_query
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        QueryName|expand: '%dns_query_name%'
+      condition: selection
+    fields:
+      - QueryName
+- question: Is this user and host expected to use Visual Studio Code tunnels?
+  context: >-
+    The fastest way to separate a developer's legitimate remote-development session from abuse is knowing
+    whether this account and host have a reason to run VS Code tunnels at all. A developer workstation
+    with a signed-in user is a plausible source; a server, a service account, or a user with no
+    development role reaching the tunnel relay is not. Pivot on the querying process to read the host and
+    account attribution for the lookup.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What exact domain was queried, and did the lookup resolve?
+  context: >-
+    The alert is a DNS lookup, not a connection. Read the full QueryName to see whether it is the global
+    tunnel domain or a per-cluster relay subdomain under the same namespace, and check whether the lookup
+    resolved to an address. The relay domains themselves are legitimate Microsoft infrastructure, so
+    reputation of the domain is not the signal here; the signal is that the tunnel feature is being used
+    on this host, and the resolved address is the pivot for confirming an actual connection.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: dns_query
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        QueryName|expand: '%dns_query_name%'
+      condition: selection
+    fields:
+      - QueryName
+      - Image
+- question: What was the full command line of the process that made this lookup?
+  context: >-
+    The DNS event names the querying process but not its arguments, so pivot to the process on this host
+    to read the command line. The abuse pattern is code.exe (or a renamed copy of it) invoked with the
+    tunnel subcommand, frequently with a --name flag that sets a persistent tunnel identity and a
+    --cli-data-dir flag that relocates the state directory. Decode the arguments to establish whether the
+    process is registering or reaching a tunnel and where it stores its state. The command line also
+    identifies whether a legitimate network utility or a process that has no business making this lookup
+    was responsible.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What launched the process that made this lookup?
+  context: >-
+    The parent chain distinguishes an interactive developer starting a tunnel from a scripted or staged
+    launch. A tunnel started from explorer.exe or a terminal a user opened is ordinary; the CLI launched
+    by powershell.exe running a download-and-run one-liner, by a script host such as wscript.exe or
+    mshta.exe, or from a shortcut target points to the tunnel being stood up programmatically as a
+    foothold. Pivot on the querying process to read its own parent image and parent command line.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: After the lookup resolved, did this host connect outbound to the resolved relay address?
+  context: >-
+    A DNS lookup only shows intent to resolve; it does not prove a session was established. Pivot to
+    network telemetry on this host for outbound connections to the address the tunnel domain resolved to.
+    An established connection, typically a long-lived WebSocket over 443, is what turns the lookup into a
+    live tunnel. Endpoint network telemetry does not carry user-agent strings, so header anomalies cannot
+    be judged here; the byte pattern of a tunnel is a persistent session with sustained bidirectional
+    traffic rather than a brief request-response, and outbound volume exceeding inbound is consistent with
+    interactive access or data movement over the session.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationIp|expand: '%dns_resolved_ip%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Initiated
+      - Image
+- question: Did the querying process spawn a shell or Node helper tree after the lookup?
+  context: >-
+    An abused tunnel gives the operator an interactive terminal, which appears locally as the tunnel
+    process spawning child processes. The documented tree is the CLI spawning a Node.js helper and then
+    cmd.exe, winpty-agent.exe, or powershell.exe to service the remote terminal. Listing the children of
+    the querying process shows whether the tunnel is idle or actively servicing an interactive session,
+    and what commands were run through it. A signed CLI spawning an interactive shell is the difference
+    between a registered-but-unused tunnel and one being operated.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - User
+- question: What files did the querying process create on this host?
+  context: >-
+    The tunnel CLI writes state files when it registers, most notably code_tunnel.json holding the tunnel
+    name and cluster and license_consent.json recording the accepted terms, under the user profile's
+    VS Code CLI directory by default or wherever --cli-data-dir points. Files created by the querying
+    process reveal whether a persistent tunnel identity was written to disk, which is what lets the tunnel
+    reconnect after a reboot, and surface any additional payloads the process dropped.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+- question: Does this host normally look up the tunnel domain?
+  context: >-
+    A first-time lookup of the tunnel namespace on a host is more notable than a recurring one. A history
+    with no prior queries means the tunnel feature is new to this host and raises the weight of the alert;
+    a steady history points to a developer who routinely uses remote tunnels. The count and its
+    distribution over time separate a newly stood-up tunnel from established, sanctioned use.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: dns_query
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        QueryName|expand: '%dns_query_name%'
+      condition: selection
+    fields:
+      - QueryName
+      - Image
+- question: What other domains did the querying process look up around the same time?
+  context: >-
+    The set of domains the same process resolved in the surrounding window shows whether this lookup is an
+    isolated tunnel registration or part of broader network activity. Lookups for a code-download endpoint
+    or an out-of-band relay alongside the tunnel domain point to the CLI having been fetched and staged on
+    the spot rather than being a pre-installed developer tool. Anchor on the querying process to see every
+    domain it resolved.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: dns_query
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - QueryName
+      - Image
+- question: Did other hosts in the environment look up this same tunnel domain?
+  context: >-
+    The spread across hosts informs the response. Many hosts querying the tunnel namespace suggests either
+    sanctioned developer use of the feature or a tool rolled out widely; a single host doing so in
+    isolation suggests a targeted foothold. Compare which processes on which hosts made the lookup to see
+    whether the pattern looks like consistent developer tooling or a one-off.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: dns_query
+      product: windows
+    detection:
+      selection:
+        QueryName|expand: '%dns_query_name%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Does this host normally run the querying binary?
+  context: >-
+    A process that has never run on a host before is more notable than one that runs regularly. The
+    tunnel CLI is not part of a default Windows install, and a portable copy dropped into a user-writable
+    path and run for the first time is a stronger signal than an installed VS Code that a developer uses
+    daily. Zero or very low historical counts indicate first-time or rare execution of this binary on this
+    host.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: What other process activity occurred on this host around the time of the alert?
+  context: >-
+    A tunnel stood up as a foothold rarely occurs in isolation. Aggregating process activity in a tight
+    window around the lookup surfaces what led up to it and what ran immediately after. Novel parent-child
+    pairs stand out at low counts against high-count routine telemetry, which is what points to a staging
+    tool, a download, or the follow-on actions taken once the tunnel was live.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host - reconnaissance, execution of scripting tools, or defense
+    tampering - may reveal the stages that preceded the tunnel being established and help reconstruct the
+    timeline. A signed remote-access tunnel is typically a means to maintain access after an initial
+    foothold, so prior alerts help place this lookup within a larger sequence.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

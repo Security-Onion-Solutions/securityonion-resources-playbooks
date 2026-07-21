@@ -1,0 +1,468 @@
+name: SQLite Firefox Profile Data DB Access
+id: c7412098-2a20-4d5d-86ef-43ca7f178b1f
+description: |
+  Detects the sqlite or sqlite3 command-line binary being used to query Firefox
+  and other Gecko-based browser profile databases. The rule fires when a process
+  whose product metadata is SQLite (or whose image ends in sqlite.exe / sqlite3.exe)
+  runs with a command line containing cookies.sqlite or places.sqlite - both
+  conditions must hold. cookies.sqlite holds browser session cookies and
+  places.sqlite holds browsing history and bookmarks; reading them with a
+  standalone SQLite client outside the browser is a common way information
+  stealers harvest session tokens and credential-adjacent data for theft. Some
+  developers, browser-forensics workflows, and migration utilities legitimately
+  read these files, so the investigation should confirm the exact command and
+  target file, identify which browser profile was touched, determine what the
+  process did with the extracted data, and establish whether the same pattern
+  appears elsewhere on the host or fleet.
+type: detection
+detection_id: 4833155a-4053-4c9c-a997-777fcea0baa7
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Did a SQLite client run with cookies.sqlite or places.sqlite on its command
+    line, matching what this rule detects?
+  context: Before investing investigation time, confirm the alert is a true positive.
+    The rule fires only when both conditions hold - the image is sqlite.exe or
+    sqlite3.exe (or the file's product metadata is SQLite) AND the command line
+    references cookies.sqlite or places.sqlite. Read the exact command line and note
+    which database was targeted; cookies.sqlite holds session cookies, while
+    places.sqlite holds history and bookmarks, and the two imply different theft
+    objectives.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - Product
+- question: Is this user and host expected to query browser profile databases with a
+    standalone SQLite client?
+  context: Reading cookies.sqlite or places.sqlite with sqlite.exe is normal for a
+    narrow set of browser-forensics, migration, and development workflows. Most users
+    and most endpoints never run a SQLite client against a browser profile. Knowing
+    whether the acting account and host function involve browser data handling is
+    often the fastest path to separating a benign export from session-token theft.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Which browser profile database was targeted, and what does the full command
+    line reveal about the SQLITE query run against it?
+  context: cookies.sqlite and places.sqlite are different credential-access targets -
+    cookies.sqlite stores active session cookies that can be replayed to hijack
+    authenticated web sessions, while places.sqlite holds history and bookmarks used
+    for reconnaissance. Read the full command line to confirm which database was
+    opened, the profile path it lives under, and whether a SQL SELECT or a .dump /
+    file copy was issued, since these determine which sessions may be compromised.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did the SQLite client or a process it spawned write a dump-like artifact
+    to disk, consistent with reading a browser's memory instead of its on-disk profile
+    database?
+  context: When a browser profile database is locked by an open browser, an actor can
+    pivot from reading the on-disk SQLite store to opening the browser process directly
+    and reading its memory for session cookies. That handle-open and memory read is
+    not observable here - there is no cross-process access telemetry on this data
+    source, so a zero result does not mean a memory read did not happen; it only means
+    this process tree did not drop a dump file. Any dump-like artifact written by the
+    SQLite client or its children is the one indirect signal available that the
+    alternate, in-memory collection path was used alongside or instead of the file
+    read.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Were other browser credential or cookie stores read on this host in the
+    same window beyond the alerting database?
+  context: An actor harvesting Firefox session data commonly sweeps additional browser
+    artifacts in the same pass - logins.json, key4.db, and the Chromium Login Data,
+    Web Data, and Cookies stores. Surfacing command lines that reference these
+    additional credential stores on the host shows whether the alerting SQLite read
+    was a single targeted query or part of a broader multi-browser credential sweep.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_stores:
+        CommandLine|contains:
+          - 'cookies.sqlite'
+          - 'logins.json'
+          - 'key4.db'
+          - 'key3.db'
+          - 'signons.sqlite'
+          - 'Login Data'
+          - 'Web Data'
+          - '\Cookies'
+      condition: selection_host and selection_stores
+    fields:
+      - Image
+      - CommandLine
+      - User
+- question: What process spawned the SQLite client, and is that parent chain expected?
+  context: The parent process reveals how the SQLite query was invoked. A browser
+    profile read driven by an interactive console, a forensics tool, or an IDE is a
+    different finding than one spawned by a script host, mshta.exe, an Office
+    application, or an unknown binary in a user-writable directory. The parent is
+    where the decision to read the browser database was made, and an unexpected parent
+    points to automated or stealer-driven invocation rather than deliberate
+    administration.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What other sensitive files did this SQLite client touch on the host?
+  context: 'The file events generated by the SQLite client show what data it actually
+    read or wrote beyond the database named on the command line: copies of the browser
+    profile, exported query output, or staged dumps. The scope of files touched
+    determines how much browser data may have left the profile and whether the read
+    was a narrow lookup or a bulk export of session and history data.'
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - EventType
+- question: Was the same host running broader local-data collection against sensitive
+    file types around this time?
+  context: Browser session theft is frequently one step in a wider local-data
+    collection pass that also targets documents, databases, and other credential
+    files for staging before exfiltration. Surfacing file events that touch
+    high-value extensions on this host in the alert window shows whether the SQLite
+    read sits inside a broader collection effort rather than standing alone.
+  range: +/-30m
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_ext:
+        TargetFilename|endswith:
+          - '.sqlite'
+          - '.db'
+          - '.db3'
+          - '.kdbx'
+          - '.xlsx'
+          - '.docx'
+          - '.pdf'
+          - '.json'
+      condition: selection_host and selection_ext
+    fields:
+      - Image
+      - User
+- question: Was the extracted browser data archived, copied, or staged to another
+    location after the SQLite read?
+  context: Stolen cookie and profile data is typically collected locally, then packed
+    into an archive or copied to a staging path before exfiltration. Checking for
+    archive creation, file copies, or staging writes by the same process on the host
+    reveals whether the read fed a collection-and-exfiltration flow and where the
+    output landed.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Were outbound remote-access connections (RDP, SMB, WinRM, SSH) initiated from this host after
+    this event?
+  context: Credential theft is typically followed by lateral movement. The query returns outbound connections
+    from this host to remote-access ports -- 3389 (RDP), 445 (SMB/PsExec), 5985/5986 (WinRM), 22 (SSH)
+    -- in the hours after the event; the originating Image and User show what drove each connection. Two
+    limits to keep in mind -- credentials exfiltrated and replayed from another machine will not appear
+    here (check security 4624 logons on suspected targets for this account and any accounts with sessions
+    on this host), and the query requires Sysmon network telemetry (EID 3); if that is not collected from
+    this host, treat zero rows as a visibility gap, not as evidence no movement occurred.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
+- question: Whose browser profile was read, and does that account have access to
+    sensitive applications or elevated privileges?
+  context: The severity of browser session theft depends on what the affected account
+    can reach. Cookies for an administrator's cloud console, a privileged SaaS tenant,
+    or an internal admin portal enable immediate session hijack, while a standard
+    user's browsing session is lower impact. Identify the profile owner and
+    cross-reference the account's privileges and the applications whose sessions the
+    stolen cookies authenticate.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_sql:
+      - Product: SQLite
+      - Image|endswith:
+        - \sqlite.exe
+        - \sqlite3.exe
+      selection_firefox:
+        CommandLine|contains:
+        - cookies.sqlite
+        - places.sqlite
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_sql:
+      - Product: SQLite
+      - Image|endswith:
+        - \sqlite.exe
+        - \sqlite3.exe
+      selection_firefox:
+        CommandLine|contains:
+        - cookies.sqlite
+        - places.sqlite
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the acting account's activity across all hosts reveals whether the
+    browser-database read was a single event or part of activity spanning multiple
+    endpoints. If the same user touched browser profiles or staged data on other
+    hosts, the scope of the incident is larger than one machine.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_sql:
+      - Product: SQLite
+      - Image|endswith:
+        - \sqlite.exe
+        - \sqlite3.exe
+      selection_firefox:
+        CommandLine|contains:
+        - cookies.sqlite
+        - places.sqlite
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining the activity surrounding the
+    browser-database read reveals what led to it and what followed - the parent that
+    staged the process, reconnaissance, or follow-on collection and exfiltration. Novel
+    parent-child pairs at low counts are what to scan for against the high-count noise
+    of routine system processes.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: When this host has previously fired the rule's SQLite browser-database
+    pattern, what parents and users normally drive it, and does the current alert fit?
+  context: Even legitimate forensics and migration work can read cookies.sqlite or
+    places.sqlite with a SQLite client. This query mirrors the rule's selection
+    structure scoped to this host, so the resulting parent and user distribution
+    reflects how this specific firing pattern has historically run here, not generic
+    SQLite usage. A new parent process, an unexpected account, or a first-ever
+    occurrence is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_sql:
+      - Product: SQLite
+      - Image|endswith:
+        - \sqlite.exe
+        - \sqlite3.exe
+      selection_firefox:
+        CommandLine|contains:
+        - cookies.sqlite
+        - places.sqlite
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Have other hosts fired the rule's SQLite browser-database pattern in the
+    past week, and does the cross-host distribution look like consistent automation or
+    one-off activity?
+  context: This query mirrors the rule's selection structure with no host scope, so the
+    result is a fleet-wide count of the SQLite browser-database firing pattern rather
+    than generic SQLite usage. Many hosts firing the same pattern points to a
+    forensics or migration tool run by design; one host or a small unrelated set points
+    to manual operator or stealer activity. Use the host distribution to calibrate
+    severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_sql:
+      - Product: SQLite
+      - Image|endswith:
+        - \sqlite.exe
+        - \sqlite3.exe
+      selection_firefox:
+        CommandLine|contains:
+        - cookies.sqlite
+        - places.sqlite
+      condition: all of selection_*
+    fields:
+    - host.name

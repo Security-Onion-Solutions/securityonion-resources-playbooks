@@ -1,0 +1,489 @@
+name: Remote File Download Via Findstr.EXE
+id: c01248ba-cd36-4768-817d-5badd25ee132
+description: |
+  Detects findstr.exe running with the -v and -l flags together with a UNC path
+  (\\) on its command line. This flag combination turns the built-in string
+  search utility into a file-copy primitive: -l forces literal matching and -v
+  prints only non-matching lines, so searching a remote file for an
+  impossible-string emits the entire file content, which output redirection can
+  then write to a local path or into an NTFS Alternate Data Stream
+  (file.ext:stream). The rule fires only when all of these conditions hold at
+  once - a findstr invocation (by command line, image, or original filename) AND
+  the -v flag AND the -l flag AND a UNC reference. This is rarely a legitimate
+  search; it is a Microsoft-signed way to pull a payload from a remote share and
+  optionally hide it in a stream. Investigate which remote source was read, where
+  the output landed (a regular file or a colon-stream destination), whether the
+  written content was later executed by a signed proxy binary, and whether the
+  same pattern appears elsewhere on the host or fleet.
+type: detection
+detection_id: 587254ee-a24b-4335-b3cd-065c0f1f4baa
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the command line show findstr running with both the -v and -l flags
+    and a UNC path, matching what this rule detects?
+  context: Before investing investigation time, confirm the alert is a true positive.
+    The rule fires only when all four conditions hold together - a findstr invocation
+    (by command line, image, or original filename) AND the -v flag AND the -l flag
+    AND a UNC reference (\\). Read the exact command line and confirm all are present.
+    A findstr search missing any one of these is outside the rule's pattern. The
+    presence of all four, especially with a long literal token that is unlikely to
+    appear in the source, is the file-copy primitive rather than an ordinary search.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to copy files from remote shares using
+    command-line utilities?
+  context: Using findstr to read a remote file and redirect its content locally is
+    not a normal search workflow; legitimate file copies use copy, robocopy, or
+    explorer. Most users and most endpoints never invoke findstr this way. Knowing
+    whether the acting account and the host function involve scripted file movement
+    or developer tooling is often the fastest path to separating a benign edge case
+    from deliberate retrieval of a payload from a share.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What remote source did findstr read, and where was its output redirected
+    - to a regular file or into an NTFS data stream?
+  context: The full command line carries the two artifacts that determine intent.
+    The source operand is a UNC path (\\host\share\file) pointing at the remote
+    content being pulled. The redirection target after > is the destination - a
+    normal file path means a straight remote-to-local copy, while a path containing
+    colon-stream syntax (file.txt:payload.exe) means the content was written into an
+    Alternate Data Stream to hide it. The literal token following -l is the
+    impossible-string chosen so the -v non-match emits the entire source file. Decode
+    all three to establish what was retrieved and whether it was hidden.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did the findstr redirection target a colon-stream Alternate Data Stream
+    destination rather than a plain file?
+  context: Writing the retrieved content into an ADS (host.txt:payload.exe) hides it
+    from directory listings and most file scanners while keeping it executable by
+    several signed binaries. The distinguishing artifact is a colon between a file
+    name and a stream name in the redirection target. This query scopes to the
+    alerting host and the rule's findstr download pattern, then surfaces command
+    lines so the analyst can confirm whether the destination used stream syntax. A
+    plain-file destination is a remote copy; a colon-stream destination is a copy
+    plus a hide step.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_findstr:
+        - CommandLine|contains: findstr
+        - Image|endswith: findstr.exe
+        - OriginalFileName: FINDSTR.EXE
+      selection_cli:
+        CommandLine|contains|windash:
+          - ' -v '
+          - ' -l '
+      selection_unc:
+        CommandLine|contains: \\\\
+      selection_host:
+        host.name|expand: '%hostname%'
+      condition: selection_findstr and selection_cli and selection_unc and selection_host
+    fields:
+      - CommandLine
+      - User
+- question: Did a file actually get created at the redirection destination on this
+    host?
+  context: A findstr download command does not guarantee the content was written.
+    The remote share may have been unreachable, the source path wrong, or the write
+    blocked. Confirming a file creation at the destination path established from the
+    command line shows whether the operation actually landed content on disk. If the
+    destination was an ADS, the file-create event records the base host file; the
+    stream itself is confirmed by the create-stream evidence.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: If the file findstr pulled was executed, what is its hash and reputation?
+  context: The hash for a reputation lookup is recorded when the payload runs, not when findstr writes
+    the content to the destination file — file-creation events carry no hash. If the retrieved file is a
+    payload run by the same shell, it appears as a sibling or child process here with its hash. If it was
+    run later by an unrelated process, or staged in an alternate data stream (ADS content must be read
+    explicitly — standard tools list only the base file), retrieve it from disk and hash it manually.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_children:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      selection_siblings:
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - Image
+      - Hashes
+- question: What other file activity occurred in the destination directory around the
+    same time?
+  context: Operators often stage multiple files into one directory, or the retrieved
+    content triggers further writes such as extraction or additional pulls from the
+    share. Examining directory-level file activity around the findstr invocation
+    reveals whether this was a single copy or part of a broader staging operation,
+    and surfaces companion files dropped alongside the retrieved payload.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Did this host open an SMB or WebDAV connection to a remote share around
+    the time findstr ran?
+  context: The UNC path on the findstr command line means the source content lives on
+    a remote share, so the retrieval generates an outbound file-sharing connection
+    from this host. Correlating a network connection on the SMB (445) or WebDAV (80,
+    443) ports in the alert window confirms the transfer reached the network stage
+    and identifies the remote endpoint that hosted the payload. A connection to an
+    unfamiliar or external address is more concerning than one to a known internal
+    file server.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationPort:
+          - 445
+          - 139
+          - 80
+          - 443
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - DestinationHostname
+- question: Was an Alternate Data Stream created on this host in the window around the
+    findstr invocation?
+  context: When findstr redirects its output into a colon-stream destination, the
+    write produces a named stream attached to a base file rather than an ordinary
+    file. Elastic Defend records that write as an ordinary file-creation event, with
+    the stream name embedded in the path (host-file:stream-name) — there is no
+    separate stream-hash field on this telemetry, so the write itself, not a hash, is
+    what confirms the hide step. Reviewing stream creations on this host around the
+    alert confirms whether content was hidden in an ADS and names the host file
+    carrying it, so the stream can be retrieved and read directly.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_ads:
+        TargetFilename|re: ':[^\\]'
+      condition: selection and selection_ads
+    fields:
+      - TargetFilename
+      - Image
+- question: Was content executed from an Alternate Data Stream by a signed proxy
+    binary after the findstr write?
+  context: Hiding a payload in a stream only matters if it is run. Several
+    Microsoft-signed binaries accept colon-stream paths and execute the stored
+    content - wmic process call create, rundll32, regsvr32, cscript, wscript, and
+    forfiles among them. A process creation on this host whose command line contains
+    both one of these binaries and colon-stream syntax indicates the hidden payload
+    was launched, closing the write-then-execute loop. This is the step the ADS hide
+    was meant to enable.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_proxy:
+        Image|endswith:
+          - '\wmic.exe'
+          - '\rundll32.exe'
+          - '\regsvr32.exe'
+          - '\cscript.exe'
+          - '\wscript.exe'
+          - '\mshta.exe'
+          - '\forfiles.exe'
+      selection_stream:
+        CommandLine|contains:
+          - '.txt:'
+          - '.log:'
+          - '.doc:'
+          - '.dat:'
+      condition: selection_host and selection_proxy and selection_stream
+    fields:
+      - Image
+      - CommandLine
+      - User
+- question: What process spawned findstr, and is that parent chain expected for this
+    activity?
+  context: The parent process reveals how the findstr download was invoked. The
+    flags that turn findstr into a copy primitive are set by whatever launched it,
+    so the parent is where the retrieval was decided. Interactive use usually shows
+    a console shell; an unexpected parent such as a script host, mshta.exe, or an
+    Office application points to automated or scripted invocation consistent with
+    payload retrieval rather than a hand-typed search.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: When this host has previously fired the rule's findstr download pattern,
+    what parents and users normally drive it, and does the current alert fit?
+  context: Even on hosts where scripted file movement happens, the findstr -v -l UNC
+    pattern is narrow. This query mirrors the rule's selection structure scoped to
+    this host, so the resulting parent and user distribution reflects how this
+    specific firing pattern has historically run here, not generic findstr usage. A
+    new parent process, an unexpected account, or a first-ever occurrence is the
+    anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_findstr:
+      - CommandLine|contains: findstr
+      - Image|endswith: findstr.exe
+      - OriginalFileName: FINDSTR.EXE
+      selection_cli_download_1:
+        CommandLine|contains|windash: ' -v '
+      selection_cli_download_2:
+        CommandLine|contains|windash: ' -l '
+      selection_cli_download_3:
+        CommandLine|contains: \\\\
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection_findstr and all of selection_cli_download_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Have other hosts fired the rule's findstr download pattern in the past
+    week, and does the cross-host distribution look like automation or one-off
+    activity?
+  context: This query mirrors the rule's selection structure with no host scope, so
+    the result is a fleet-wide count of the findstr download pattern rather than
+    generic findstr activity. Many hosts firing the same pattern points to a script
+    or deployment job that uses findstr to pull files by design; one host or a small
+    unrelated set points to manual operator activity. Use the host distribution to
+    calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_findstr:
+      - CommandLine|contains: findstr
+      - Image|endswith: findstr.exe
+      - OriginalFileName: FINDSTR.EXE
+      selection_cli_download_1:
+        CommandLine|contains|windash: ' -v '
+      selection_cli_download_2:
+        CommandLine|contains|windash: ' -l '
+      selection_cli_download_3:
+        CommandLine|contains: \\\\
+      condition: selection_findstr and all of selection_cli_download_*
+    fields:
+    - host.name
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_findstr:
+      - CommandLine|contains: findstr
+      - Image|endswith: findstr.exe
+      - OriginalFileName: FINDSTR.EXE
+      selection_cli_download_1:
+        CommandLine|contains|windash: ' -v '
+      selection_cli_download_2:
+        CommandLine|contains|windash: ' -l '
+      selection_cli_download_3:
+        CommandLine|contains: \\\\
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection_findstr and all of selection_cli_download_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_findstr:
+      - CommandLine|contains: findstr
+      - Image|endswith: findstr.exe
+      - OriginalFileName: FINDSTR.EXE
+      selection_cli_download_1:
+        CommandLine|contains|windash: ' -v '
+      selection_cli_download_2:
+        CommandLine|contains|windash: ' -l '
+      selection_cli_download_3:
+        CommandLine|contains: \\\\
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection_findstr and all of selection_cli_download_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the acting account's activity across all hosts reveals whether
+    the findstr download was a single event or part of activity spanning multiple
+    endpoints. If the same user triggered similar activity on other hosts, the scope
+    of the incident is larger than one machine.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_findstr:
+      - CommandLine|contains: findstr
+      - Image|endswith: findstr.exe
+      - OriginalFileName: FINDSTR.EXE
+      selection_cli_download_1:
+        CommandLine|contains|windash: ' -v '
+      selection_cli_download_2:
+        CommandLine|contains|windash: ' -l '
+      selection_cli_download_3:
+        CommandLine|contains: \\\\
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection_findstr and all of selection_cli_download_*) and _pb_scope
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host - reconnaissance, credential access,
+    or defense tampering - may reveal the attack stages that preceded the findstr
+    download and help reconstruct the timeline. Pulling a payload from a remote share
+    is often one step in a sequence, so prior alerts give the context for what the
+    retrieved content was meant to support.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

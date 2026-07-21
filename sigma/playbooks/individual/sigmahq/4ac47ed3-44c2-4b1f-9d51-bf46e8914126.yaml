@@ -1,0 +1,358 @@
+name: TrustedPath UAC Bypass Pattern
+id: 6d263ccc-341a-4da4-846f-09e83b3498df
+description: |
+  Detects a process whose Image path contains "C:\Windows \System32\" or "C:\Windows \SysWOW64\" — note the trailing
+  space after "Windows". This is the "mock trusted directory" UAC bypass: an attacker creates a directory literally named
+  with a trailing space, copies a signed, auto-elevate binary into a System32-named subdirectory inside it, and launches
+  it so the elevation service treats the path as the real System32 and runs the binary at High integrity. Because the
+  copied binary loads dependencies by search order, the attacker plants a malicious DLL next to it to gain elevated code
+  execution. Legitimate software does not create or execute from trailing-space directory names, so the investigation
+  should confirm the path, identify the auto-elevate binary that ran, find the planted DLL, and determine what was done
+  with the resulting High-integrity token.
+type: detection
+detection_id: 4ac47ed3-44c2-4b1f-9d51-bf46e8914126
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the process Image path contain a trailing-space "C:\Windows \System32\" or "C:\Windows \SysWOW64\" location?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the full Image path of the
+    triggering event. The rule fires when the path contains "C:\Windows " followed by a space and then "\System32\" or
+    "\SysWOW64\". A genuine system binary lives at "C:\Windows\System32\" with no space; the trailing space is what makes
+    the directory attacker-controlled. Verify the exact byte sequence rather than trusting a rendered path, which may hide
+    the space.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+- question: Is this user and host expected to launch binaries from a non-standard System32-named location?
+  context: Legitimate administrative activity does not run executables out of a trailing-space "C:\Windows \System32"
+    directory. Knowing whether the user role and host function involve any tooling that could plausibly create such a path
+    (it normally cannot be made through Explorer or a normal API call) helps separate a true bypass from an unusual but
+    benign condition.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Which binary ran from the mock directory, and is it a known auto-elevate executable?
+  context: The elevation service only honors the trusted-path trick for binaries it will auto-elevate — those carry an
+    autoElevate manifest flag or match a hard-coded name list (for example winsat.exe, computerdefaults.exe, sdclt.exe,
+    eventvwr.exe, perfmon.exe, mmc.exe). Identify the binary name in the path, confirm it is one of these signed auto-elevate
+    executables, and read the full command line for any arguments that indicate what it was driven to do.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|contains:
+        - 'C:\Windows \System32\'
+        - 'C:\Windows \SysWOW64\'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - CurrentDirectory
+- question: What process spawned the binary in the mock directory, and is that parent lineage normal for an auto-elevate binary?
+  context: The bypass turns on launching the copied binary from the trailing-space path; the parent that did the launching
+    reveals the mechanism. A non-elevated process spawning an auto-elevated one, or an indirect launcher such as a script
+    host, an Office application, or a DCOM/COM surrogate (dllhost.exe), is the parent-child mismatch that distinguishes a
+    deliberate elevation path from normal OS-initiated elevation. Auto-elevate binaries are normally started by the
+    elevation service itself, not by an arbitrary user process.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Were files or a System32-named subdirectory created under a trailing-space "C:\Windows " path?
+  context: The bypass requires staging on disk first — creating the trailing-space directory, a System32 subdirectory inside
+    it, then copying the signed auto-elevate binary and a payload DLL into that subdirectory. File-creation events whose
+    path contains "C:\Windows \" expose the staging step and the exact files planted, including the DLL the elevated binary
+    will load. Such paths cannot be produced through normal directory creation, so any hit is the setup artifact for this
+    technique.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains: 'C:\Windows \'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - User
+- question: Did the binary in the mock directory load an unsigned DLL from that same trailing-space location?
+  context: Trusted-path elevation by itself only relocates a legitimate binary; the attacker code arrives through DLL search
+    order — the relocated binary resolves a dependency (for example WINMM.dll, atl.dll, or another forwarded import) from
+    its own directory and loads the attacker's DLL planted alongside it. A signed auto-elevate binary loading an unsigned
+    DLL out of "C:\Windows \" is the payload-execution step of the technique. Zero unsigned loads does not clear the alert
+    if image-load events are not collected in this environment.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|contains: 'C:\Windows \'
+      filter_signed:
+        Signed: 'true'
+      condition: selection and not filter_signed
+    fields:
+      - Image
+      - ImageLoaded
+      - Signed
+      - Signature
+- question: What action was performed with elevated privileges after the bypass?
+  context: 'UAC bypass is a means to an end: attackers elevate to perform actions that require high integrity — installing
+    persistence, dumping credentials, tampering with security tools, or accessing protected resources. Examining processes
+    that ran at High or System integrity on this host shortly after the relocated binary launched reveals the objective and
+    establishes the time correlation between the elevation and what it enabled.'
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        IntegrityLevel:
+          - 'High'
+          - 'System'
+          - 'S-1-16-16384'
+          - 'S-1-16-12288'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - IntegrityLevel
+- question: Were registry-key based UAC bypass methods also attempted on this host?
+  context: This rule fires on a file-system path trick rather than a registry write, but attackers commonly try several
+    bypass methods until one succeeds. Registry-based variants write a command to a key that an auto-elevated process reads
+    and executes — common targets include HKCU\Software\Classes\ms-settings\Shell, mscfile\shell, exefile, and the
+    DelegateExecute pattern. Finding parallel registry-bypass attempts from the same user or host confirms deliberate
+    privilege-escalation activity rather than an isolated false positive.
+  range: -15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\reg.exe'
+          - '\powershell.exe'
+          - '\cmd.exe'
+        CommandLine|contains:
+          - 'ms-settings'
+          - 'mscfile'
+          - 'Classes\exefile'
+          - 'Classes\Folder'
+          - 'Environment'
+          - 'Shell\Open\command'
+          - 'DelegateExecute'
+      condition: selection
+    fields:
+      - CommandLine
+      - Image
+- question: Were other privilege escalation detections raised on this host?
+  context: Attackers who attempt one UAC bypass often try multiple methods, especially if a given OS build blocks certain
+    techniques. Other sigma detections on this host — additional bypass alerts, defense-tampering alerts, or credential-access
+    alerts in close succession — confirm deliberate escalation and help reconstruct the timeline around the relocated binary.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - rule.name
+      - rule.uuid
+      - event.severity_label
+- question: When this host previously fired the rule's pattern, what parents and users drove it, and does the current alert fit?
+  context: The query mirrors the rule's selection — execution from a trailing-space System32 path — scoped to this host. For
+    almost any host the expected count is zero, because legitimate software never runs from such a path; any historical hits
+    are themselves prior bypass attempts. A non-empty result, or a new parent/user compared with any prior firing, is the
+    anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|contains:
+        - C:\Windows \System32\
+        - C:\Windows \SysWOW64\
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Have other hosts fired the rule's pattern in the past week, and does the distribution look like automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, giving a fleet-wide count of execution from
+    trailing-space System32 paths. Because legitimate software does not run from these locations, any host that appears is a
+    candidate bypass. Many hosts firing in a short window points to a scripted rollout of the same technique; one host or a
+    small unrelated set points to manual operator activity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|contains:
+        - C:\Windows \System32\
+        - C:\Windows \SysWOW64\
+      condition: selection
+    fields:
+    - host.name
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|contains:
+        - C:\Windows \System32\
+        - C:\Windows \SysWOW64\
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|contains:
+        - C:\Windows \System32\
+        - C:\Windows \SysWOW64\
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or staging spread across multiple endpoints.
+    If the same user triggered similar relocation-and-launch activity on more than one host, the scope of the operation is
+    larger than a single endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|contains:
+        - C:\Windows \System32\
+        - C:\Windows \SysWOW64\
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — reconnaissance, defense tampering, or
+    file-staging activity — may reveal the steps that preceded the elevation and help reconstruct the full timeline, including
+    the moment the mock directory and payload DLL were created.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

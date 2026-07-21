@@ -1,0 +1,470 @@
+name: Always Install Elevated Windows Installer
+id: 4cbe5b97-187e-48dc-bff6-4bac1e85b907
+description: |
+  Detects the Windows Installer service running with SYSTEM privileges in a way consistent with the AlwaysInstallElevated policy primitive, where any user can have an MSI execute as NT AUTHORITY\SYSTEM. The rule fires when the User contains an authority/SYSTEM account AND EITHER msiexec.exe runs at System integrity OR an installer temp binary executes from the Windows\Installer directory, while excluding the normal services.exe-launched installer flow, MSI repair operations, and known AV/updater parents. Legitimately this is the OS installer servicing packages; maliciously it is a low-privilege user obtaining SYSTEM execution because both the HKLM and HKCU AlwaysInstallElevated values are set. Determine which branch fired, what package or installer binary ran, who or what launched it, and whether SYSTEM-level actions followed.
+type: detection
+detection_id: cd951fdc-4b2f-47f5-ba99-a33bf61e3770
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- question: Does this event match the rule's pattern — either msiexec.exe at System integrity, or an installer temp binary in Windows\Installer, under an authority account?
+  context: Confirm the alert is a true positive before investing time. This rule fires on an authority/SYSTEM user running EITHER msiexec.exe at System integrity OR a temp binary under the Windows\Installer directory, with the normal services.exe-launched, repair, and AV/updater flows filtered out. Note which branch matched — the msiexec-at-System branch and the Installer-temp-binary branch point to different stages of the same primitive and steer which downstream questions carry weight.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - User
+      - IntegrityLevel
+- question: Is this user and host expected to run the Windows Installer at SYSTEM integrity outside the normal services.exe flow?
+  context: Legitimate package servicing runs under the installer service launched by services.exe, which this rule already excludes. An interactive or standard user account driving msiexec at System integrity, or an installer temp binary running outside that flow, is the deviation. Knowing whether software deployment on this host is expected at this time is often the fastest triage signal.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What package or installer binary did this Windows Installer execution run, and from which path?
+  context: The full command line and image path reveal what was actually installed and from where. An MSI launched from a user-writable path such as the user profile, the public folder, or a temp directory is far more concerning than one serviced from a managed software location, because AlwaysInstallElevated abuse runs an attacker-supplied package as SYSTEM. Decode the package path, any quiet-install flags, and the originating directory.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What process spawned this installer execution, and is that parent chain expected?
+  context: The parent process reveals how the elevated installer was invoked. The rule already excludes the normal services.exe-launched flow, so a parent such as a command interpreter, a script host, an Office application, or a user shell points to a user-initiated MSI install rather than OS servicing. Walk up to what spawned the parent to see whether this began from an interactive session or an automated job.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Were the AlwaysInstallElevated registry values set under both HKLM and HKCU on this host?
+  context: The AlwaysInstallElevated primitive only grants SYSTEM execution when BOTH the HKLM and HKCU Installer policy values are set to 1. Finding registry writes to these keys — especially the HKCU value, which a standard user can set themselves — confirms the misconfiguration that makes this elevation possible and helps date when it was introduced. A registry write shortly before the elevated installer execution is the strongest link between policy state and the SYSTEM-level run.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_key:
+        TargetObject|contains|all:
+          - '\Microsoft\Windows\Installer'
+          - 'AlwaysInstallElevated'
+      condition: selection_host and selection_key
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - User
+- question: Were registry modifications made on this host to enable the elevated-install policy?
+  context: This privilege-escalation primitive is configured through the Installer policy registry values rather than a one-shot command. A standard user can set the per-user AlwaysInstallElevated value, and an operator who controls the machine policy can set the machine-wide one. Look backward for command-line tools writing to the Installer policy keys, which establishes who prepared the elevation and when.
+  range: -15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\reg.exe'
+          - '\powershell.exe'
+          - '\cmd.exe'
+        CommandLine|contains:
+          - 'AlwaysInstallElevated'
+          - 'Windows\Installer'
+          - 'Policies\Microsoft\Windows\Installer'
+      condition: selection
+    fields:
+      - CommandLine
+      - Image
+- question: What actions ran at High or System integrity on this host shortly after the elevated installer execution?
+  context: The elevated install is a means to an end. An MSI running as SYSTEM can execute custom actions that install persistence, dump credentials, tamper with security tooling, or drop additional payloads. Examining processes at High or System integrity in the minutes after this event reveals what the elevation was used for.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        IntegrityLevel:
+          - 'High'
+          - 'System'
+          - 'S-1-16-16384'
+          - 'S-1-16-12288'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - IntegrityLevel
+- question: Were other privilege escalation or elevation detections raised on this host around the same time?
+  context: An operator who reaches for the AlwaysInstallElevated primitive often tries multiple elevation paths, or pairs the elevation with credential access and defense tampering. Other detections on this host in the surrounding window help separate deliberate privilege-escalation activity from a single benign installer event.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - rule.name
+      - rule.uuid
+      - event.severity_label
+- question: Does this host normally run the installer execution that fired this rule?
+  context: An installer running at System integrity outside the normal services.exe flow that has never been seen on this host is more suspicious than one that recurs. Zero or very low historical counts indicate first-time or rare execution and raise the likelihood the policy was abused rather than a routine deployment.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: When this host has previously fired this rule's pattern, what parents and users normally drove it, and does the current alert fit that pattern?
+  context: The query mirrors the rule's selection structure scoped to this host, so the resulting parent and user distribution reflects how this specific elevated-installer pattern has historically run here — not generic msiexec usage. A new parent process or an unexpected account behind the same pattern is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_user:
+        User|contains:
+        - AUTHORI
+        - AUTORI
+      selection_image_1:
+        Image|contains|all:
+        - \Windows\Installer\
+        - msi
+        Image|endswith: tmp
+      selection_image_2:
+        Image|endswith: \msiexec.exe
+        IntegrityLevel:
+        - System
+        - S-1-16-16384
+      filter_installer:
+        ParentImage: C:\Windows\System32\services.exe
+      filter_repair:
+      - CommandLine|endswith: \system32\msiexec.exe /V
+      - ParentCommandLine|endswith: \system32\msiexec.exe /V
+      filter_sophos:
+        ParentImage|startswith: C:\ProgramData\Sophos\
+      filter_avira:
+        ParentImage|startswith: C:\ProgramData\Avira\
+      filter_avast:
+        ParentImage|startswith:
+        - C:\Program Files\Avast Software\
+        - C:\Program Files (x86)\Avast Software\
+      filter_google_update:
+        ParentImage|startswith:
+        - C:\Program Files\Google\Update\
+        - C:\Program Files (x86)\Google\Update\
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (1 of selection_image_* and selection_user and not 1 of filter_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: What child processes did this installer execution spawn afterward?
+  context: MSI custom actions and installer temp binaries can launch further processes, and when the install runs as SYSTEM those children inherit elevated privileges. Unexpected children such as command interpreters, script hosts, or download utilities indicate the installer was a vehicle for post-elevation execution rather than a genuine software install.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Have other hosts fired this rule's pattern in the past week, and does the cross-host distribution look like managed deployment or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, giving a fleet-wide count of this elevated-installer pattern rather than generic installer usage. Many hosts firing the same pattern points to a software-deployment or vendor-automation explanation; one host or a small unrelated set points to manual operator activity worth closer review.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_user:
+        User|contains:
+        - AUTHORI
+        - AUTORI
+      selection_image_1:
+        Image|contains|all:
+        - \Windows\Installer\
+        - msi
+        Image|endswith: tmp
+      selection_image_2:
+        Image|endswith: \msiexec.exe
+        IntegrityLevel:
+        - System
+        - S-1-16-16384
+      filter_installer:
+        ParentImage: C:\Windows\System32\services.exe
+      filter_repair:
+      - CommandLine|endswith: \system32\msiexec.exe /V
+      - ParentCommandLine|endswith: \system32\msiexec.exe /V
+      filter_sophos:
+        ParentImage|startswith: C:\ProgramData\Sophos\
+      filter_avira:
+        ParentImage|startswith: C:\ProgramData\Avira\
+      filter_avast:
+        ParentImage|startswith:
+        - C:\Program Files\Avast Software\
+        - C:\Program Files (x86)\Avast Software\
+      filter_google_update:
+        ParentImage|startswith:
+        - C:\Program Files\Google\Update\
+        - C:\Program Files (x86)\Google\Update\
+      condition: 1 of selection_image_* and selection_user and not 1 of filter_*
+    fields:
+    - host.name
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_user:
+        User|contains:
+        - AUTHORI
+        - AUTORI
+      selection_image_1:
+        Image|contains|all:
+        - \Windows\Installer\
+        - msi
+        Image|endswith: tmp
+      selection_image_2:
+        Image|endswith: \msiexec.exe
+        IntegrityLevel:
+        - System
+        - S-1-16-16384
+      filter_installer:
+        ParentImage: C:\Windows\System32\services.exe
+      filter_repair:
+      - CommandLine|endswith: \system32\msiexec.exe /V
+      - ParentCommandLine|endswith: \system32\msiexec.exe /V
+      filter_sophos:
+        ParentImage|startswith: C:\ProgramData\Sophos\
+      filter_avira:
+        ParentImage|startswith: C:\ProgramData\Avira\
+      filter_avast:
+        ParentImage|startswith:
+        - C:\Program Files\Avast Software\
+        - C:\Program Files (x86)\Avast Software\
+      filter_google_update:
+        ParentImage|startswith:
+        - C:\Program Files\Google\Update\
+        - C:\Program Files (x86)\Google\Update\
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (1 of selection_image_* and selection_user and not 1 of filter_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_user:
+        User|contains:
+        - AUTHORI
+        - AUTORI
+      selection_image_1:
+        Image|contains|all:
+        - \Windows\Installer\
+        - msi
+        Image|endswith: tmp
+      selection_image_2:
+        Image|endswith: \msiexec.exe
+        IntegrityLevel:
+        - System
+        - S-1-16-16384
+      filter_installer:
+        ParentImage: C:\Windows\System32\services.exe
+      filter_repair:
+      - CommandLine|endswith: \system32\msiexec.exe /V
+      - ParentCommandLine|endswith: \system32\msiexec.exe /V
+      filter_sophos:
+        ParentImage|startswith: C:\ProgramData\Sophos\
+      filter_avira:
+        ParentImage|startswith: C:\ProgramData\Avira\
+      filter_avast:
+        ParentImage|startswith:
+        - C:\Program Files\Avast Software\
+        - C:\Program Files (x86)\Avast Software\
+      filter_google_update:
+        ParentImage|startswith:
+        - C:\Program Files\Google\Update\
+        - C:\Program Files (x86)\Google\Update\
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (1 of selection_image_* and selection_user and not 1 of filter_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this account do across the environment around this time?
+  context: Tracking the acting account across all hosts reveals whether the elevation was isolated or part of broader hands-on activity such as lateral movement. If the same account drove similar activity on multiple endpoints, the scope is larger than this single host. This pivot is meaningful for a normal user account; under a service principal it returns agent-telemetry noise.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_user:
+        User|contains:
+        - AUTHORI
+        - AUTORI
+      selection_image_1:
+        Image|contains|all:
+        - \Windows\Installer\
+        - msi
+        Image|endswith: tmp
+      selection_image_2:
+        Image|endswith: \msiexec.exe
+        IntegrityLevel:
+        - System
+        - S-1-16-16384
+      filter_installer:
+        ParentImage: C:\Windows\System32\services.exe
+      filter_repair:
+      - CommandLine|endswith: \system32\msiexec.exe /V
+      - ParentCommandLine|endswith: \system32\msiexec.exe /V
+      filter_sophos:
+        ParentImage|startswith: C:\ProgramData\Sophos\
+      filter_avira:
+        ParentImage|startswith: C:\ProgramData\Avira\
+      filter_avast:
+        ParentImage|startswith:
+        - C:\Program Files\Avast Software\
+        - C:\Program Files (x86)\Avast Software\
+      filter_google_update:
+        ParentImage|startswith:
+        - C:\Program Files\Google\Update\
+        - C:\Program Files (x86)\Google\Update\
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (1 of selection_image_* and selection_user and not 1 of filter_*) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining the surrounding activity reveals what led to the elevated install and what followed — reconnaissance, additional escalation attempts, or persistence. Aggregating by image and parent collapses repetitive agent noise while novel parent-child pairs stand out at low counts.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — defense tampering, reconnaissance, or credential access — may reveal the stages that preceded the elevated install and help reconstruct the timeline. A privilege-escalation primitive is frequently one step in a longer sequence rather than a standalone event.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

@@ -1,0 +1,289 @@
+name: DNS Exfiltration and Tunneling Tools Execution
+id: 91b3c58c-c5c8-44b8-a8bc-d841daa5c02e
+description: |
+  Detects execution of well-known DNS exfiltration and tunneling tools by process image name, firing when a process either ends in iodine.exe or carries dnscat2 in its image path. These tools encode arbitrary data into DNS queries and responses to tunnel traffic or command-and-control over a protocol that is almost universally permitted to leave a network, so the execution of one of these binaries on an endpoint is a strong sign of post-compromise tunneling or exfiltration rather than routine activity. Investigation should confirm the binary and how it was launched, recover the tunnel configuration (attacker domain, mode, encryption), and pivot to the host's DNS and outbound network traffic to determine whether a tunnel actually carried data.
+type: detection
+detection_id: 98a96a5a-64a0-4c42-92c5-489da3866cb0
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the alerting process match one of the known DNS tunneling tools (iodine.exe or a dnscat2 binary)?
+  context: The rule fires when a process image either ends in iodine.exe or contains dnscat2. Confirm the alert is a true positive by reviewing the exact image path and command line of the triggering event and verifying which of the two binary patterns matched before investing further investigation time.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+- question: Is this user and host expected to run a DNS tunneling or exfiltration tool?
+  context: These tools are pentest and tunneling utilities, not standard administrative software. Knowing whether the user role and host function plausibly involve sanctioned tunneling or red-team activity is often the fastest path to distinguishing an authorized test from an intrusion.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What does the full command line reveal about the tunnel configuration?
+  context: The command line for these tools carries the operational configuration. Decode the positional attacker-controlled domain (for example a delegated subdomain), the shared password flag (-P for iodine), the direct-versus-recursive mode (a server IP or the dnscat --dns=server= form indicates direct UDP/53; a bare domain indicates recursive-resolver mode), and any forced transport flags. The configuration tells you whether the operator targeted a specific external domain and how the tunnel was meant to reach it.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What process spawned this tunneling tool and is that parent chain expected?
+  context: The parent process reveals how the tool was launched. A tunneling binary started from explorer.exe or a terminal points to interactive operator use, while a launch from a script host, an Office application, or a download utility points to automated or scripted delivery. An unexpected parent raises the likelihood the binary was dropped and run as part of an intrusion rather than a sanctioned test.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Did this host generate anomalous outbound DNS or UDP/53 traffic around the time the tool ran?
+  context: A launched tunneling tool only matters if it actually moved traffic. Pivot to the host's outbound network connections in the alert window and look for sustained UDP/53 conversations to a single external destination, or a burst of DNS activity, that lines up in time with the process execution. The tunnel manifests as DNS or UDP/53 egress carrying far more volume than this host's normal name resolution. If network connection telemetry is not collected in this environment, treat zero results as a visibility gap rather than evidence no tunnel ran.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationPort: 53
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationHostname
+      - Image
+- question: What is the reputation and registration profile of the external domain or destination IP the tunnel reached toward?
+  context: DNS tunnels depend on an attacker-controlled authoritative domain or a directly addressed external server. Resolve the tunnel domain recovered from the command line and the destination IPs seen in DNS or UDP/53 traffic, then assess them against reputation and registration signals such as newly registered or low-reputation second-level domains, dynamic-DNS providers, and hosting unrelated to any business relationship. A freshly registered or unknown destination strengthens the case that this is operator infrastructure rather than a sanctioned endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: dns_query
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - QueryName
+      - QueryType
+- question: What data on the host was staged or referenced for transfer through the tunnel?
+  context: A DNS tunnel carries whatever the operator feeds it, including files, interactive shell output, or proxied traffic. Examine file activity by the tunneling binary and by any process it interacts with to identify what was read or staged. Specific file types, sensitive directories, or broad wildcards indicate the scope of potential data loss and which business units may need notification.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - EventType
+- question: Where did the tunnel terminate and were files written locally by the tool?
+  context: Tunneling tools open a local endpoint (iodine creates a tun/tap virtual interface) and the operator-side termination is the attacker domain or server. Identify files the binary created on disk and correlate with the outbound destination so the full path of any transfer is visible, whether data left over DNS, over a direct UDP/53 session, or via a tunneled application protocol layered on top.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Was encryption or a shared password applied to the tunnel, and how is the payload encoded?
+  context: These tools differ in payload protection. dnscat2 encrypts its channel by default, while iodine sends data in plaintext but commonly gates the tunnel with a shared password (-P). Either way the on-wire payload appears as long, high-entropy left-most DNS labels rather than normal lookups. Check the command line for password or transport flags and note that an encrypted-by-default channel limits content recovery to traffic-pattern analysis rather than payload decoding.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What child processes did this tunneling tool spawn afterward?
+  context: Once a tunnel is established these tools can expose an interactive shell, file transfer, or TCP port-forwarding into the victim network. Processes spawned by the binary reveal whether the tunnel was used to launch post-exploitation activity such as command interpreters or further tooling, as opposed to a connection that opened but carried no hands-on activity.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Does this host normally run this tunneling tool?
+  context: A tunneling utility that has never been seen on a host is far more suspicious than one that appears regularly. Zero or very low historical counts over the trailing window indicate first-time or rare execution, which for this class of tool is itself notable since they are not standard installed software.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: When this host has previously fired the rule's pattern, what parents and users normally drive that activity, and does the current alert fit that pattern?
+  context: The query mirrors the rule's selection structure scoped to this host, so the resulting parent and user distribution reflects how this specific tunneling-tool pattern has historically run here rather than generic binary usage. A new parent process, an unexpected user account, or an unusual command-line structure relative to that history is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - Image|endswith: \iodine.exe
+      - Image|contains: \dnscat2
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - Image|endswith: \iodine.exe
+      - Image|contains: \dnscat2
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - Image|endswith: \iodine.exe
+      - Image|contains: \dnscat2
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: Tunneling rarely stands alone in an intrusion. Examining the surrounding process activity reveals what led to the execution and what followed, such as reconnaissance, credential access, or data staging, and helps place the tunnel within a larger sequence. The timing of nearby activity also bounds the correlation window between the tool launching and any outbound transfer.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Have other hosts fired the rule's pattern in the past week, and does the cross-host distribution look like consistent automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of this tunneling-tool pattern rather than generic binary usage. Many hosts firing the same pattern points to scripted deployment or a sanctioned testing exercise, while one host or a small unrelated set points to manual operator activity. Use the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - Image|endswith: \iodine.exe
+      - Image|contains: \dnscat2
+      condition: selection
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Tunneling and exfiltration sit late in an intrusion, so earlier detections on the same host such as defense tampering, reconnaissance, or credential access may reveal the stages that preceded this event. Reviewing the prior alert timeline helps reconstruct how the operator reached the point of establishing a covert channel.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

@@ -1,0 +1,433 @@
+name: Registry Persistence via Explorer Run Key
+id: 44dc6f4b-7908-470e-979c-6ed1bfa94c84
+description: |
+  Detects a registry write to a value under ...\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run whose value data
+  points into one of seven commonly staged directories (:\$Recycle.bin\, :\ProgramData\, :\Temp\, :\Users\Default\,
+  :\Users\Public\, :\Windows\Temp\, or \AppData\Local\Temp\). Both conditions must hold for the rule to fire. This is the
+  policy-backed Explorer Run key, not the ordinary CurrentVersion\Run key — it is read at logon exactly like the ordinary
+  Run key, but it is normally populated only by Group Policy, so it carries far less legitimate third-party software than
+  its well-trodden counterpart, and a value pointing at a world- or user-writable staging directory is not a location
+  managed software normally installs to. The investigation should determine what command the value launches, which process
+  wrote it and what launched that process, whether the referenced payload exists on disk and subsequently executed, and
+  whether other persistence was staged in the same session.
+type: detection
+detection_id: b7916c2a-fa2f-4795-9477-32b731f70f11
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-16
+questions:
+- question: Does the alerting write target the Explorer policy Run key with value data pointing into a staging directory?
+  context: >-
+    Before investing investigation time, confirm the alert is a true positive. The rule fires when the value path ends in
+    \Microsoft\Windows\CurrentVersion\Policies\Explorer\Run AND the value data contains any one of :\$Recycle.bin\,
+    :\ProgramData\, :\Temp\, :\Users\Default\, :\Users\Public\, :\Windows\Temp\, or \AppData\Local\Temp\. Review the exact
+    TargetObject, the Details value data, and the writing process on the triggering event. The signer columns say who
+    published the writing process; read them for coherence with the key being written rather than as a verdict, since
+    essentially every alerting process is trusted-signed. Details is populated on roughly 79% of endpoint registry
+    modifications; if it is absent, read the value directly on the host to recover the configured command.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this user or host expected to write autostart entries into the Explorer policy Run key?
+  context: >-
+    The Policies\Explorer\Run key is normally written by Group Policy processing rather than by installers or interactive
+    users, so a write from an ordinary user session or an ad-hoc tool is worth establishing intent for. Determine whether
+    the account has an administrative role and whether the host is subject to a policy that populates this key. User
+    attribution is present on roughly 94% of endpoint registry events; when it is a machine account, SYSTEM, or missing,
+    pivot on the writing process instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: What launched the process that wrote this autostart value?
+  context: >-
+    The process that wrote the registry value is named in the alert, but its lineage is not. Looking that process up by its
+    own identifier returns the parent that started it, which is what separates Group Policy processing or an installer
+    chain from an interactive shell, script host, or Office application spawned by a macro or exploit. Policy-key writes
+    that legitimately originate from Group Policy arrive under the policy processing chain rather than under a user shell.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What other processes did the process that wrote this autostart value spawn?
+  context: >-
+    A process that writes a Run value rarely stops there. Listing the children it launched shows whether the registry write
+    was an isolated change or one step in a longer chain — payload staging into the referenced directory, additional
+    persistence, or follow-on tooling. Note this shows what the writing process started, not what started alongside it:
+    processes running in parallel cannot be identified from this telemetry, because registry events do not record the
+    writing process's own parent.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Was this registry change part of a documented deployment, policy rollout, or maintenance window?
+  context: >-
+    The Policies\Explorer\Run key is a Group Policy surface, so a legitimate write is usually traceable to a policy object,
+    a software deployment, or an approved maintenance activity. A corresponding ticket or policy change record suggests
+    authorized activity; absence of one when the environment manages this key centrally suggests the write did not come
+    from the sanctioned path.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Are autostart entries in this environment normally pushed via group policy rather than written directly?
+  context: >-
+    Organizations that use the Explorer policy Run key normally populate it through Group Policy or a management platform,
+    not through reg.exe, PowerShell, or an application writing the value itself. A direct write may indicate someone
+    bypassing the normal tooling, or it may indicate an administrator taking a shortcut. Knowing which path is standard
+    here narrows which of the two applies.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Which hive and value name were written under the Explorer policy Run key, and does the writing process plausibly own that key?
+  context: >-
+    The value path ends in \Microsoft\Windows\CurrentVersion\Policies\Explorer\Run, which is read at logon and executes
+    whatever its values name. The hive matters: a write under HKLM applies machine-wide and needs administrative rights,
+    while a write under HKCU applies to that user only and does not. The value name itself is attacker-chosen and often
+    mimics a product name. The signer columns say who published the writing process — the discriminating judgment is
+    whether that vendor plausibly owns a Group Policy autostart key, not whether the process is trusted, which is true of
+    essentially every alerting process.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: What command does the written value launch, and where does it run from?
+  context: >-
+    The value data is the payload — it is the command line Explorer executes at logon. Read it for the full invocation:
+    the binary or script path, any arguments, whether a script interpreter is being used to run content from the staging
+    directory, and whether an argument carries base64 or otherwise encoded content that needs decoding. The rule fires
+    only when this data references :\$Recycle.bin\, :\ProgramData\, :\Temp\, :\Users\Default\, :\Users\Public\,
+    :\Windows\Temp\, or \AppData\Local\Temp\ — all directories a non-administrative process can write to, which is why
+    they are used to stage payloads. Details is absent on roughly 21% of endpoint registry modifications; if the query
+    returns the event with no value data, read the value directly on the host.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+        Details|contains:
+          - ':\$Recycle.bin\'
+          - ':\ProgramData\'
+          - ':\Temp\'
+          - ':\Users\Default\'
+          - ':\Users\Public\'
+          - ':\Windows\Temp\'
+          - '\AppData\Local\Temp\'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - User
+- question: Does the registry change survive reboot, and is the referenced executable or script still present on disk?
+  context: >-
+    Registry persistence is only effective if the referenced payload exists at the path written to the value. If the value
+    points to something under C:\Users\Public or C:\Windows\Temp, confirming that a file was created at that path
+    determines whether the mechanism is armed and what it would execute at the next logon. This query correlates file
+    activity by the registry-writing process and its children, which is where the payload usually lands in the same
+    session. The file-write event carries no hash; if the payload is present, hash it from a later execution or retrieve
+    it for a reputation lookup.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Was this autostart value rewritten, replaced, or pointed somewhere else after the alert fired?
+  context: >-
+    Run-key persistence is often adjusted after the initial write — repointed to a second-stage path, overwritten with a
+    different command, or set back to a benign value to reduce the artifact left behind. Registry value deletion is not
+    observable in endpoint telemetry, so removal cannot be confirmed from logs; instead judge the state of the mechanism
+    from the key's re-modification history in the hours after the alert and from whether the configured payload ran. A
+    second write from a different process is a stronger signal of an operator working the host than a single write.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - Details
+      - Image
+      - User
+- question: Did a process actually launch from one of the staging directories the value points into?
+  context: >-
+    A Run value fires at the next interactive logon, so a value written but never executed is a different situation from
+    one whose payload has already run — the first is staged persistence, the second means the code has executed at least
+    once. This query looks for process starts on the host whose image path lies in the same directories the rule pins
+    (:\$Recycle.bin\, :\ProgramData\, :\Temp\, :\Users\Default\, :\Users\Public\, :\Windows\Temp\, \AppData\Local\Temp\).
+    Match the results against the exact path in the value data; if the logon has not occurred yet within this window, a
+    zero result is expected rather than exculpatory.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_paths:
+        Image|contains:
+          - ':\$Recycle.bin\'
+          - ':\ProgramData\'
+          - ':\Temp\'
+          - ':\Users\Default\'
+          - ':\Users\Public\'
+          - ':\Windows\Temp\'
+          - '\AppData\Local\Temp\'
+      condition: selection and selection_paths
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- question: Were other registry modifications made on this host in the same session?
+  context: >-
+    An operator who writes one autostart value often writes several — a second Run key, a service entry, or a policy value
+    that weakens a protection. Registry changes clustered from the same writing process within a short window reveal the
+    full extent of the configuration changes and whether persistence, tampering, and configuration edits landed together,
+    which points to a hands-on session or an installer-style implant rather than an isolated change.
+  range: +/-30m
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - User
+- question: Has the Explorer policy Run key ever been modified on this host before?
+  context: >-
+    The Policies\Explorer\Run key is written only when a policy or a deliberate action populates it, so unlike the ordinary
+    CurrentVersion\Run key it usually has little or no history on a given host. Zero prior modifications over 90 days means
+    this key had never been touched here, which raises the weight of the current write. A steady history of writes with the
+    same value data from the same process points instead toward a managed configuration.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - Details
+      - Image
+- question: Was this same key modified on other hosts in the environment?
+  context: >-
+    The same write across many hosts points to a policy rollout or a management platform; the same write on a handful of
+    hosts with identical value data pointing into a staging directory points to multi-host activity rather than a
+    deployment. A write present only on this host suggests a one-off. Compare the value data and the writing process
+    across hosts — a managed deployment is consistent in both, and consistent in neither is the pattern that warrants
+    further work.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+      - Details
+- question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Alerts rarely occur in isolation. Aggregating process activity around the registry write shows what led to it and what
+    followed — an archive extraction or download that staged the payload, a script host that performed the write, or
+    reconnaissance in the same window. Repetitive management and agent telemetry collapses into a few high-count rows,
+    while novel parent-child pairs stand out at low counts.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Persistence is normally installed after access is obtained, so earlier detections on the same host often name the
+    delivery or execution step that preceded the registry write. Look for an execution or download detection whose
+    artifacts land in the same directory the autostart value references, which ties the two events together.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Were other process-based persistence mechanisms installed on this host?
+  context: >-
+    A single autostart value is rarely the only foothold. Backup mechanisms are commonly installed using different
+    techniques in the same timeframe — scheduled tasks, services, additional registry values, BITS jobs, or WMI
+    subscriptions. This query surfaces executions of the tools that create them within a four-hour window on either side.
+    Multiple persistence installations in the same timeframe indicate intentional stacking rather than an isolated
+    administrative action.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- question: Were files dropped to Startup folders or scheduled-task definition paths on this host?
+  context: >-
+    File-based persistence leaves no registry artifact at all. Dropping an executable or script into a Startup folder, or
+    writing a scheduled-task XML definition directly, achieves logon or timed execution without touching a Run key or
+    running schtasks. File event monitoring captures these drops, so this is a parallel mechanism to check for alongside
+    the autostart value the alert names.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist_paths:
+        TargetFilename|contains:
+          - '\Start Menu\Programs\Startup\'
+          - '\Windows\System32\Tasks\'
+          - '\Windows\Tasks\'
+      condition: selection and selection_persist_paths
+    fields:
+      - TargetFilename
+      - Image

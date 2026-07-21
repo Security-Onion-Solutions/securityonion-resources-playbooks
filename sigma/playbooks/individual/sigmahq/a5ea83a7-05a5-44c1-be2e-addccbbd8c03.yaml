@@ -1,0 +1,453 @@
+name: UAC Bypass With Fake DLL
+id: 63eb82b5-c7b8-48ed-8abb-ff5266ccccf9
+description: |
+  Detects the auto-elevating servicing binary dism.exe loading a module named dismcore.dll from any
+  location other than its legitimate C:\Windows\System32\Dism\dismcore.dll path. The rule fires when
+  the load event matches dism.exe loading dismcore.dll AND the loaded path is NOT the canonical
+  System32\Dism copy. dism.exe is invoked by an auto-elevating parent and resolves dismcore.dll by
+  search order, so planting a fake dismcore.dll in a directory that is searched before System32\Dism
+  causes the elevated process to load attacker-controlled code at high integrity with no consent
+  prompt, achieving a User Account Control bypass via DLL search-order hijacking. Legitimate loads
+  always come from the System32\Dism directory; investigate the exact module path and signature, what
+  launched dism.exe, whether a fake dismcore.dll was dropped and is still on disk, what the elevated
+  process spawned next, and whether the elevation was used to install persistence.
+type: detection
+detection_id: a5ea83a7-05a5-44c1-be2e-addccbbd8c03
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-10
+questions:
+- question: Did dism.exe load dismcore.dll from a path other than the legitimate System32\Dism location?
+  context: >-
+    Confirm the alert is a true positive before investing analysis time. The rule fires when dism.exe
+    loads a module named dismcore.dll AND that module's path is anything other than
+    C:\Windows\System32\Dism\dismcore.dll. Review the exact ImageLoaded path, its code-signature
+    status, and the loading process on the triggering event. On a clean host dismcore.dll is only ever
+    loaded from the System32\Dism directory, so a copy loaded from System32 root, a user-writable
+    directory, or any other path is the search-order hijack the rule targets. DLL load events carry the
+    module hash and signing status directly.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|endswith|expand: '%ImageLoaded%'
+      condition: selection
+    fields:
+      - Image
+      - ImageLoaded
+- question: Is this user and host expected to run DISM servicing operations?
+  context: >-
+    Legitimate DISM servicing is normally driven by administrators or by servicing and imaging
+    automation on specific hosts. Knowing whether the account and host function match a sanctioned
+    servicing activity is often the fastest way to separate a maintenance action from an elevation
+    attempt. User attribution is present on the large majority of endpoint events; when it is a machine
+    account or SYSTEM, pivot to the loading process and its parent instead.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What modules did this dism.exe process load, and which came from non-canonical or user-writable paths?
+  context: >-
+    The set of modules the process loaded shows whether the hijack DLL was the only substituted module
+    or one of several. For a search-order hijack the load-bearing signal is a system DLL name such as
+    dismcore.dll loaded from outside its expected System32\Dism directory. Compare each loaded module's
+    path against the directory it should resolve from: dismcore.dll from System32 root, %TEMP%,
+    AppData, or the working directory of the launching process is the substitution, while the copy from
+    System32\Dism is the legitimate one. Note any additional modules loaded from unexpected locations.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+      - SignatureStatus
+      - Hashes
+- question: What is the signing status, hash, and reputation of the loaded dismcore.dll?
+  context: >-
+    Module reputation distinguishes the genuine Microsoft dismcore.dll from a substituted one. The
+    legitimate module is Microsoft-signed with a valid signature; an unsigned module, one with a
+    SignatureStatus of Unsigned, Expired, Distrusted, or Invalid, or one carrying the dismcore.dll
+    filename without a valid Microsoft signature is a strong substitution indicator. Take the Hashes
+    value for the loaded module and check it against threat intelligence to surface known loaders. A
+    baseline of the legitimate module's hash makes the comparison decisive: a hash that differs from
+    the known-good System32\Dism copy confirms the file was replaced.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Hashes
+      - Signed
+      - Signature
+      - SignatureStatus
+- question: What launched dism.exe, and is that parent chain expected for a servicing operation?
+  context: >-
+    The image_load event carries no command line, so pivot by ProcessGuid to the dism.exe process
+    record to read its command line and parent. Legitimate DISM runs are launched by servicing tooling,
+    an administrator console, or an auto-elevating servicing host; dism.exe launched by an Office
+    application, a script host such as wscript.exe or mshta.exe, an unsigned binary, or a user process
+    from a non-standard directory points to the load being staged programmatically to exploit the
+    binary's auto-elevation. The parent chain distinguishes routine servicing from a triggered bypass.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: Was a fake dismcore.dll dropped to disk, and is it still present for analysis?
+  context: >-
+    The hijack requires a substitute dismcore.dll to be written to a directory that dism.exe searches
+    before System32\Dism. Correlating file writes to the loading process and its direct children shows
+    whether the module was dropped as part of this same operation and whether it remains on disk for
+    hashing or content review. The planting write is frequently made by a separate elevated process, so
+    if no drop appears here, still preserve the module at its loaded path directly. Do not rely on
+    process file-path aggregates, which are not populated in endpoint telemetry; correlation is by
+    process lineage.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What child processes did dism.exe spawn after loading the module?
+  context: >-
+    A substituted dismcore.dll commonly runs its payload from within the elevated dism.exe process and
+    launches a further process at high integrity. Listing the children of this dism.exe instance reveals
+    whether the load led to execution: cmd.exe, powershell.exe, a dropped binary, or any unexpected
+    process spawned by dism.exe ties the module load to attacker code running with elevated privileges.
+    A legitimate servicing run rarely spawns interactive interpreters.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: What actions were performed with elevated privileges shortly after the module load?
+  context: >-
+    A UAC bypass is a means to an end: the elevated context is used to install persistence, dump
+    credentials, tamper with security tools, or reach protected resources. Examining processes running
+    at High or System integrity on this host in the window after the load reveals the objective. Common
+    post-elevation actions include credential dumping, persistence installation via schtasks, sc, or
+    reg, security tampering, and lateral-movement preparation. Correlate the timing of these
+    high-integrity processes against the module load to establish they belong to the same operation.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        IntegrityLevel:
+          - 'High'
+          - 'System'
+          - 'S-1-16-16384'
+          - 'S-1-16-12288'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - IntegrityLevel
+- question: Were registry modifications made that set up a parallel or alternative UAC bypass?
+  context: >-
+    This rule detects a DLL search-order bypass, but many UAC bypass techniques instead write a command
+    to a registry key that an auto-elevating process reads and executes. Finding writes to keys such as
+    ms-settings\Shell\Open\command, mscfile\shell\open\command, the exefile or Folder classes, or the
+    Environment key near this event indicates the operator also staged, or fell back to, a
+    registry-based bypass. Confirming or ruling out these writes shows whether the DLL hijack was an
+    isolated attempt or one method among several.
+  range: -15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\reg.exe'
+          - '\powershell.exe'
+          - '\cmd.exe'
+        CommandLine|contains:
+          - 'ms-settings'
+          - 'mscfile'
+          - 'Classes\exefile'
+          - 'Classes\Folder'
+          - 'Environment'
+          - 'Shell\Open\command'
+          - 'DelegateExecute'
+      condition: selection
+    fields:
+      - CommandLine
+      - Image
+- question: Were registry keys that control DLL loading or execution redirection modified on this host?
+  context: >-
+    DLL hijacking can also be arranged through the registry rather than by file drop alone. Writes to
+    keys that govern which module a process resolves or that redirect execution of a binary make the
+    substitution durable or steer it to attacker code. Modifications to KnownDLLs, Image File Execution
+    Options, App Paths, the AppCertDlls value, or AppInit_DLLs around this event point to a registry
+    component of the same operation. Registry value or key deletions are not observable in this
+    telemetry, so cleanup is judged from later re-modification of these keys rather than from a delete
+    event.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_keys:
+        TargetObject|contains:
+          - '\KnownDLLs'
+          - '\Image File Execution Options'
+          - '\App Paths'
+          - '\Session Manager\AppCertDlls'
+          - '\Windows\AppInit_DLLs'
+      condition: selection and selection_keys
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- question: Has dismcore.dll been loaded on this host before, and under what processes?
+  context: >-
+    A first-time load of this module on the host is a stronger anomaly than a recurring one. If
+    dismcore.dll has been loaded repeatedly by dism.exe over the past 90 days from its normal directory,
+    this load may be routine servicing; if this is the first occurrence, or the module has only ever
+    been loaded from the canonical System32\Dism path and now loads from elsewhere, the current load is
+    anomalous. Compare the historical loading processes and paths against the alert.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|endswith|expand: '%ImageLoaded%'
+      condition: selection
+    fields:
+      - Image
+- question: When this host previously loaded dismcore.dll into dism.exe outside the canonical path, what programs and users drove it, and does the current alert fit that pattern?
+  context: >-
+    The query mirrors the rule's exact firing pattern scoped to this host, so the resulting
+    program and user distribution reflects how this specific hijack pattern has historically
+    appeared here rather than generic DISM usage. A new acting program process, an unexpected
+    user account, or a first-ever occurrence is the deviation worth chasing. If the pattern has
+    never fired on this host before, treat the current load as novel.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \dism.exe
+        ImageLoaded|endswith: \dismcore.dll
+      filter:
+        ImageLoaded: C:\Windows\System32\Dism\dismcore.dll
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - Image
+    - User
+- question: What other process activity occurred on this host around the time of the alert?
+  context: >-
+    An elevation attempt rarely happens in isolation. Aggregating process activity in a tight window
+    around the load surfaces what led up to the hijack and what ran immediately after it. Novel
+    parent-child pairs stand out at low counts against high-count routine telemetry, which is what
+    points to the tooling that staged the fake module and to any high-integrity actions taken once the
+    load succeeded.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Were other privilege escalation or bypass techniques attempted on this host?
+  context: >-
+    Operators who attempt one UAC bypass often try several methods until one succeeds, especially if
+    configuration blocks certain techniques. Other detections on this host around the same time -
+    additional bypass attempts, defense tampering, or credential access - confirm deliberate escalation
+    activity rather than an isolated false positive and help reconstruct the sequence. Look for multiple
+    bypass or escalation alerts in rapid succession from the same account or process.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - rule.name
+      - rule.uuid
+      - event.severity_label
+- question: Have other hosts loaded dismcore.dll into dism.exe outside the canonical path in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: >-
+    The query mirrors the rule's firing pattern with no host scope, so the result is a fleet-wide count
+    of the hijack pattern rather than generic DISM usage. Many hosts showing the same non-canonical load
+    points to a scripted deployment or a mis-staged servicing package; one host or a small unrelated set
+    points to hands-on operator activity. Use the host distribution and the consistency of the loading
+    parent to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \dism.exe
+        ImageLoaded|endswith: \dismcore.dll
+      filter:
+        ImageLoaded: C:\Windows\System32\Dism\dismcore.dll
+      condition: selection and not filter
+    fields:
+    - host.name
+- question: Were process-based persistence mechanisms installed on this host in the same window?
+  context: >-
+    Gaining high integrity through a UAC bypass is frequently followed by establishing a foothold.
+    Scheduled tasks, services, registry Run keys, BITS jobs, or WMI subscriptions created by
+    schtasks.exe, sc.exe, reg.exe, bitsadmin.exe, or wmic.exe near the module load indicate the
+    elevation was used to install persistence rather than being an isolated action. Multiple persistence
+    installations in the same timeframe point to intentional stacking.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- question: Were files dropped to Startup or scheduled-task locations on this host in the same window?
+  context: >-
+    File-based persistence bypasses command-line detection entirely - dropping an executable or script
+    into a Startup folder or a path referenced by a registry Run key achieves persistence without
+    invoking schtasks, sc, or reg. File writes to these locations near the elevation indicate the
+    elevated payload established a parallel persistence mechanism on disk that would survive removal of
+    the hijack DLL.
+    Run-key persistence itself is a registry write, not a file drop, so it does not appear in file telemetry; this query covers Startup folders and scheduled-task definition files, and Run-key writes surface in registry questions instead.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist_paths:
+        TargetFilename|contains:
+          - '\Start Menu\Programs\Startup\'
+          - '\Windows\System32\Tasks\'
+          - '\Windows\Tasks\'
+      condition: selection and selection_persist_paths
+    fields:
+      - TargetFilename
+      - Image
+- question: Does the user or an administrator recall running DISM servicing on this host?
+  context: >-
+    Direct confirmation from the account owner or the team responsible for the host is often the fastest
+    way to resolve the alert. If an administrator was performing servicing or imaging that would explain
+    a DISM run, that context helps close the alert; if no one recalls the activity, the account may be
+    compromised or the load was driven by automated tooling, and the investigation should continue into
+    the loading process, its parent, and any high-integrity follow-on. Ask what operation they intended
+    and whether the module path they expected matches the one that loaded.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine

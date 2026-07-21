@@ -1,0 +1,344 @@
+name: Potential Credential Dumping Via LSASS Process Clone
+id: 5d3f1a8c-9b2e-4c6a-bf17-2e4d8a91c0b3
+description: |
+  Detects a process whose Image and ParentImage both resolve to \Windows\System32\lsass.exe, which occurs when lsass.exe spawns a clone of itself. A copy-on-write clone of LSASS is the legitimate primitive behind Windows Error Reporting snapshots, but it is also used to dump credential material from the clone rather than the original LSASS handle, evading volume-based read detectors. Determine whether the clone was produced by a known system or security tool, whether a memory dump was written and read afterward, and whether the same host shows credential-access follow-on such as new logon sessions or lateral movement.
+type: detection
+detection_id: c8da0dfd-4ed0-4b68-962d-13c9c884384e
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- question: Do both the Image and ParentImage of this event resolve to \Windows\System32\lsass.exe?
+  context: Confirm the alert is real by checking that both the spawned process and its parent are lsass.exe in System32 — the
+    signature of an LSASS self-clone. A clone produced from a path other than \Windows\System32\lsass.exe, or a parent that is
+    not lsass.exe, indicates a masquerade or a different condition that changes the investigation.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+- question: Is this host expected to produce LSASS clones as part of routine software?
+  context: A small set of legitimate components clone LSASS — Windows Error Reporting snapshots, some EDR/AV self-protection
+    checks, crash-reporting agents, and memory-acquisition tools used by administrators. Knowing whether this host runs such
+    software, and whether the timing lines up with maintenance or an incident, is often the fastest way to separate routine
+    snapshots from credential theft.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Is lsass.exe expected to spawn a child here, and what started the lsass.exe instance that did the cloning?
+  context: The parent-child relationship is the core signal for this detection. lsass.exe almost never spawns child processes
+    in normal operation, so tracing the cloning lsass.exe back to its own origin (the grandparent, typically wininit.exe at boot)
+    confirms whether this is the genuine boot-time LSASS or an imposter, and reveals what triggered the snapshot.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: Did this specific LSASS clone, or a process it spawned, write a dump-style file to disk?
+  context: Cloning LSASS for a dump requires a process to first open lsass.exe with snapshot-capable rights — commonly
+    surfacing as the full-access mask 0x1F0FFF — but that handle open is not observable in this environment; there is
+    no process-access telemetry here, so a zero result below does not prove no read occurred. What is observable is
+    the file the clone (or a child it spawns to perform the dump) writes to disk. This narrows the search to the exact
+    clone instance identified by this alert, rather than the broader host-window scan run elsewhere in this playbook.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Was LSASS memory actually read or dumped from the clone, and by what method?
+  context: A clone alone does not prove theft; credential extraction requires reading the cloned memory, typically via a
+    MiniDump write against the clone handle. Identify the dumping method — comsvcs.dll MiniDump, procdump, a custom dumper, or a
+    snapshot-then-dump harness — because the method indicates operator sophistication and which tooling to hunt for elsewhere.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did any process on this host run a known LSASS-dumping command pattern around the time of the clone?
+  context: Dump operations frequently leave a recognizable command line even when the clone primitive itself does not — for
+    example rundll32 invoking comsvcs.dll MiniDump against the LSASS PID, procdump with the -ma flag against lsass, or
+    PowerShell credential-dumping cradles. Matching these patterns near the clone time corroborates intent and points to the
+    operator's tooling.
+  range: +/-10m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_pattern:
+        CommandLine|contains:
+          - 'comsvcs.dll'
+          - 'MiniDump'
+          - 'procdump'
+          - '-ma '
+          - 'lsass'
+          - 'Invoke-Mimikatz'
+          - 'sekurlsa'
+          - 'rundll32'
+      condition: selection_host and selection_pattern
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - User
+- question: Were any memory-dump files written to common dump locations on this host shortly after the clone?
+  context: A successful dump leaves a file on disk before it is read offline by a credential parser. Dumpers commonly write to
+    user-writable or temp paths such as %TEMP%, C:\Windows\Temp, C:\Users\Public, or the user profile, often with a .dmp
+    extension. A dump file appearing within minutes of the clone is strong corroboration of credential extraction. Scope the
+    result to the relevant directories rather than enumerating every file event on the host.
+  range: +/-10m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains:
+          - '\Temp\'
+          - '\Users\Public\'
+          - '\AppData\'
+          - '.dmp'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - ProcessGuid
+      - EventType
+- question: What other activity occurred on this host within a few minutes of the clone, in time order?
+  context: Staged credential theft follows a sequence — handle open, clone, memory dump, file write, then offline parsing or
+    movement — usually inside a short window of a few minutes. Laying out host activity in time order around the clone reveals
+    whether the surrounding events form that chain or whether the clone stands alone as a benign snapshot.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Across the environment, which processes are seen writing memory-dump-style files in the past month, and does the source of any dump tied to this clone match that baseline?
+  context: Tuning LSASS-access detection depends on knowing which processes legitimately produce dump files in this
+    environment — AV/EDR engines, crash-reporting agents, and a few admin tools. There is no handle-open telemetry to
+    baseline directly, so the closest available signal is which processes write .dmp-style files fleet-wide. A dump
+    source that appears nowhere in that baseline is the deviation worth chasing; treat a lack of history as
+    inconclusive rather than as proof nothing was dumped, since the write itself could also go unobserved.
+  range: -30d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        TargetFilename|contains:
+          - '.dmp'
+          - '\Temp\'
+          - '\Users\Public\'
+      condition: selection
+    fields:
+      - Image
+- question: Which accounts had active logon sessions on this host, and do any have elevated privileges?
+  context: An LSASS dump exposes the credentials of every account with cached or active material on the host at dump time.
+    Enumerate who was logged on — interactive users, service accounts, and any cached domain admin — because domain or
+    enterprise admin exposure requires incident escalation and credential resets, while a single standard user is a narrower blast
+    radius.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Were outbound remote-access connections (RDP, SMB, WinRM, SSH) initiated from this host after
+    this event?
+  context: Credential theft is typically followed by lateral movement. The query returns outbound connections
+    from this host to remote-access ports -- 3389 (RDP), 445 (SMB/PsExec), 5985/5986 (WinRM), 22 (SSH)
+    -- in the hours after the event; the originating Image and User show what drove each connection. Two
+    limits to keep in mind -- credentials exfiltrated and replayed from another machine will not appear
+    here (check security 4624 logons on suspected targets for this account and any accounts with sessions
+    on this host), and the query requires Sysmon network telemetry (EID 3); if that is not collected from
+    this host, treat zero rows as a visibility gap, not as evidence no movement occurred.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \Windows\System32\lsass.exe
+        Image|endswith: \Windows\System32\lsass.exe
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \Windows\System32\lsass.exe
+        Image|endswith: \Windows\System32\lsass.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did the acting account do across the environment around the time of the clone?
+  context: After identifying the actor, check their activity across all hosts in the same window. The same account triggering
+    LSASS access or other credential-theft activity on multiple endpoints points to a broader, multi-host operation rather than
+    an isolated event.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \Windows\System32\lsass.exe
+        Image|endswith: \Windows\System32\lsass.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before the clone?
+  context: Credential dumping is usually one stage of a longer intrusion. Earlier detections on the same host — defense
+    tampering, reconnaissance, privilege escalation, or initial execution — help reconstruct how the operator reached LSASS and
+    what stages preceded the dump.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

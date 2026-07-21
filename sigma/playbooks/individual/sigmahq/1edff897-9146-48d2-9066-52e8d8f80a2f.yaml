@@ -1,0 +1,482 @@
+name: Suspicious Invoke-WebRequest Execution With DirectIP
+id: c825270c-a3cb-4b82-92ce-db418f9d36a5
+description: |
+  Detects PowerShell (powershell.exe, pwsh.exe, or powershell_ise.exe) invoking a download
+  cmdlet or command-line transfer tool -- Invoke-WebRequest, Invoke-RestMethod, their irm/iwr
+  aliases, curl, or wget -- against a target addressed by a direct numeric IP rather than a
+  hostname. The rule fires only when all three conditions hold together: the executing image
+  is a PowerShell interpreter AND the command line carries one of the download verbs AND the
+  target URL begins with a numeric IP. Hostname-less, IP-direct fetches bypass DNS-based
+  reputation and blocklists and are a common ingress-tool-transfer pattern, but the same syntax
+  appears in legitimate automation, scripted health checks, and internal tooling. The
+  investigation should determine what was fetched, whether it landed on disk, what the
+  PowerShell parent chain was, and whether the destination IP is internal or external.
+type: detection
+detection_id: 1edff897-9146-48d2-9066-52e8d8f80a2f
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the command line show a PowerShell download cmdlet fetching a direct numeric IP?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule
+    fires only when all three conditions hold together -- the image is a PowerShell interpreter,
+    the command line contains a download verb (Invoke-WebRequest, Invoke-RestMethod, irm, iwr,
+    curl, or wget), and the target URL begins with a numeric IP rather than a hostname. Read the
+    exact command line and confirm all three are present.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to fetch files over the command line via PowerShell?
+  context: Legitimate administrative scripting, package installers, and health checks routinely
+    pull files with Invoke-WebRequest or curl. Knowing whether this user role and host function
+    normally perform command-line downloads is often the fastest path to distinguishing routine
+    automation from operator-driven ingress.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Is the downloaded file still on disk for analysis?
+  context: If the fetch succeeded, the retrieved payload may still be on disk. Confirming it exists
+    enables deeper analysis -- hash lookups, sandbox submission, or content review. The destination
+    path is typically the value passed to -OutFile or the redirect target in the command line.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What exactly did this PowerShell command do? Decode the full command line, including
+    the destination IP and output path.
+  context: The full command line reveals the specific action taken. Decode the download verb, the
+    direct-IP URL, any -OutFile or redirect destination, hidden-window or no-profile flags, and
+    any chained commands. This host+binary scope captures any sequential PowerShell invocations
+    around the alert that together form one logical operation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|contains:
+          - 'Invoke-WebRequest'
+          - 'Invoke-RestMethod'
+          - 'iwr '
+          - ' irm '
+          - 'curl '
+          - 'wget '
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Was the command encoded or obfuscated? What does the download cradle decode to?
+  context: The detected pattern is a plain-text download cradle, but it may be wrapped in
+    base64 -EncodedCommand, backtick escaping, string concatenation, or variable substitution to
+    hide the destination. Decode any encoding and identify the actual URL being fetched, the file
+    being written, and whether the result is piped to Invoke-Expression for in-memory execution.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Were PowerShell or endpoint security controls bypassed or weakened before this execution?
+  context: Operators frequently disable or bypass protection before pulling a payload. Common
+    precursors include AMSI bypass, execution-policy changes (-ExecutionPolicy Bypass or -ep bypass),
+    Defender real-time-monitoring disablement, and PowerShell v2 downgrade to evade logging. Finding
+    these precursor events on the host strengthens the case that the download is operator-driven.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: Did PowerShell script block logging capture the full script content?
+  context: Script block logging records the deobfuscated script content PowerShell actually
+    executes, even when the command line is encoded or obfuscated. This provides ground truth about
+    what ran. If PowerShell operational logs are not ingested in this environment, treat zero
+    results as a visibility gap rather than evidence that nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: What process spawned this PowerShell instance, and is that parent chain expected?
+  context: The parent process reveals how the download was invoked. Interactive use typically has
+    explorer.exe or a console as the parent; scripted automation has a service or scheduler.
+    Unusual parents -- Office applications, mshta.exe, wscript.exe, or a server-side application
+    process spawning PowerShell -- point to exploitation or a malicious launcher rather than an
+    administrator at a prompt.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Did this host make an outbound connection to the direct IP, and is that destination
+    internal or external?
+  context: The detected command line names a numeric-IP target; this confirms whether the fetch
+    actually reached the network and where it went. An external, previously-unseen destination is
+    the concerning case for ingress tool transfer; an internal IP block often reflects a sanctioned
+    distribution point or internal automation. Correlate the connection to the alerting PowerShell
+    instance and note whether the destination falls inside or outside the organization's address
+    space.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - \powershell.exe
+          - \pwsh.exe
+          - \powershell_ise.exe
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+      - Initiated
+- question: Was the download successful? Check for file creation by the PowerShell instance.
+  context: A download command does not guarantee the file was retrieved. Network errors, blocked
+    IPs, or security controls may have prevented the transfer. Confirming file creation at the
+    destination path establishes whether the operation progressed past delivery into a staged
+    payload on disk.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: If the downloaded payload was executed, what is its hash and does it have known threat-intel detections?
+  context: The hash for a reputation lookup is recorded when the payload runs, not when it is written to disk —
+    file-creation events carry no hash. Invoke-WebRequest fetches the file; if PowerShell then runs it, the payload is a
+    child or sibling of the alerting process, so this query returns those processes with their executable hashes.
+    Direct-IP delivery frequently stages installers and second-stage tooling, so match the fetched file name and submit
+    its hash. If it was run later by an unrelated process, retrieve it from disk and hash it manually.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_children:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      selection_siblings:
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - Image
+      - Hashes
+- question: What other file activity occurred in the download's target directory?
+  context: Operators often stage multiple files to the same directory, or the fetched file triggers
+    further writes -- extraction, decompression, or additional downloads. Uncommon drop locations
+    such as C:\Users\Public, %TEMP%, or ProgramData are worth particular attention. Directory-level
+    file activity reveals the broader scope of the delivery operation.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Have other hosts fired this rule's pattern in the past week, and does the cross-host
+    distribution look like consistent automation or one-off activity?
+  context: The query mirrors the rule's full selection structure with no host scope, so the result
+    is a fleet-wide count of this exact firing pattern -- a PowerShell interpreter fetching a
+    direct-IP URL via a download verb -- not generic PowerShell usage. Many hosts firing the same
+    pattern points to scripted deployment or vendor automation; one host or a small unrelated set
+    points to manual operator activity. Use the host distribution to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell_ise.exe
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - powershell_ise.EXE
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_commands:
+        CommandLine|contains:
+        - 'curl '
+        - Invoke-RestMethod
+        - Invoke-WebRequest
+        - ' irm '
+        - 'iwr '
+        - 'wget '
+      selection_ip:
+        CommandLine|contains:
+        - ://1
+        - ://2
+        - ://3
+        - ://4
+        - ://5
+        - ://6
+        - ://7
+        - ://8
+        - ://9
+      condition: all of selection_*
+    fields:
+    - host.name
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell_ise.exe
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - powershell_ise.EXE
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_commands:
+        CommandLine|contains:
+        - 'curl '
+        - Invoke-RestMethod
+        - Invoke-WebRequest
+        - ' irm '
+        - 'iwr '
+        - 'wget '
+      selection_ip:
+        CommandLine|contains:
+        - ://1
+        - ://2
+        - ://3
+        - ://4
+        - ://5
+        - ://6
+        - ://7
+        - ://8
+        - ://9
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell_ise.exe
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - powershell_ise.EXE
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_commands:
+        CommandLine|contains:
+        - 'curl '
+        - Invoke-RestMethod
+        - Invoke-WebRequest
+        - ' irm '
+        - 'iwr '
+        - 'wget '
+      selection_ip:
+        CommandLine|contains:
+        - ://1
+        - ://2
+        - ://3
+        - ://4
+        - ://5
+        - ://6
+        - ://7
+        - ://8
+        - ://9
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity
+    spanning multiple endpoints. If the same user triggered similar download activity on multiple
+    hosts, the scope of the operation may be larger than the single alerting host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell_ise.exe
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - powershell_ise.EXE
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_commands:
+        CommandLine|contains:
+        - 'curl '
+        - Invoke-RestMethod
+        - Invoke-WebRequest
+        - ' irm '
+        - 'iwr '
+        - 'wget '
+      selection_ip:
+        CommandLine|contains:
+        - ://1
+        - ://2
+        - ://3
+        - ://4
+        - ://5
+        - ://6
+        - ://7
+        - ://8
+        - ://9
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name

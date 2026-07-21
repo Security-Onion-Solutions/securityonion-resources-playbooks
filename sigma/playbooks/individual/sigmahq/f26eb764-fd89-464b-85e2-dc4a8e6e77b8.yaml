@@ -1,0 +1,381 @@
+name: Suspicious Electron Application Child Processes
+id: 3ffbcef1-55c0-46d0-8f6b-90fe5a5d87fe
+description: |
+  Detects an Electron-based desktop application (Teams, Slack, Discord, GitHub Desktop, Edge/WebView2, Chrome, Keybase) spawning a child process that is EITHER a command or script interpreter (cmd, powershell, pwsh, cscript, wscript, mshta, regsvr32, whoami) OR an executable running from a user-writable location (ProgramData, Temp, AppData\Local\Temp, Users\Public, Windows\Temp). Electron apps very rarely shell out, so this parent-child relationship is a clean signal. It can indicate tampering with the app's app.asar bundle (which installs to user-writable directories and is not integrity-checked, so injected child_process calls run under the legitimate app each launch) or command-execution proxy through Chromium launcher flags such as --gpu-launcher, --utility-cmd-prefix, --renderer-cmd-prefix, or --browser-subprocess-path, which run an attacker-supplied command under the signed parent. Investigation should confirm which branch fired, decode what the child actually did, and determine whether this app legitimately spawns this child on this host and for this user.
+type: detection
+detection_id: f26eb764-fd89-464b-85e2-dc4a8e6e77b8
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-03
+questions:
+- question: Does this match the rule — an Electron app parent spawning a child that is either a listed interpreter or runs from a user-writable path?
+  context: Confirm the alert before investing time. The rule fires when an Electron application parent spawns a child that EITHER ends in one of the listed interpreters (cmd, powershell, pwsh, cscript, wscript, mshta, regsvr32, whoami) OR runs from a user-writable directory (ProgramData, Temp, AppData\Local\Temp, Users\Public, Windows\Temp). Note which branch fired — a known interpreter from anywhere is the name branch; an unknown binary in a writable path is the path branch, and the path branch makes the child binary's origin and signature far more important downstream.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+- question: Is this Electron application expected to spawn this child, and what started the parent itself?
+  context: The parent-child relationship is the core signal. Tracing the Electron parent's own origin shows whether the chain is legitimate (the user launched the app normally, which then spawned a helper) or whether the app was started or driven in an unusual way. A genuine app.asar tampering or launcher-flag proxy still presents the legitimate app as the parent, so the parent's command line and grandparent are where the abuse becomes visible.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: Is this user and host expected to run interpreters or helpers spawned by an Electron desktop application?
+  context: Some developer and IT workflows do legitimately launch shells or helper scripts from apps like GitHub Desktop or Teams. Knowing whether this user's role and this host's function are consistent with that behavior is often the fastest way to separate a routine action from an anomaly.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What exactly did the child process do? Decode its full command line and arguments.
+  context: The full command line reveals the specific action. Decode any flags, encoded content, file paths, or URLs the child carried. For a child launched through a Chromium launcher flag, the executed command is embedded in the parent's flag value; for a tampered app, the child's own arguments show what the injected code ran.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: If the child was PowerShell, was the command encoded or obfuscated, and what does it decode to?
+  context: When the child is powershell.exe or pwsh.exe, attackers frequently hide intent with -EncodedCommand (-enc), string concatenation, backticks, or variable substitution. Base64-encoded commands are the most common form. Decoding reveals the actual payload — download cradles, reverse shells, or in-memory execution of .NET assemblies.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What other child processes did this same Electron parent instance spawn?
+  context: If the app was tampered with or driven to proxy execution, the same parent instance likely spawned more than one child. Listing the siblings of the detected child reveals the full scope of activity initiated through this parent — multiple suspicious children from one parent strongly suggests orchestration rather than a one-off.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: How often has this Electron application spawned this child binary on this host before?
+  context: Electron desktop apps very rarely shell out to interpreters, so historical frequency is a strong discriminator. Zero or very low counts for this specific app-to-child pairing indicate a novel spawning relationship worth chasing; a pairing that already accounts for many prior events is more likely a built-in updater or helper behavior.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did PowerShell script block logging capture the full deobfuscated script content?
+  context: Script block logging records the deobfuscated script PowerShell actually executed, even when the command line is encoded or obfuscated, providing ground truth about what ran. If PowerShell operational logging is not collected in this environment, that absence is itself a visibility gap worth noting.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Were PowerShell security controls bypassed or weakened on this host shortly before this execution?
+  context: Attackers often disable or bypass PowerShell protections before running a payload — AMSI patching, execution-policy bypass, or a v2 downgrade that lacks logging. Finding these precursor events in the hour before the alert strengthens the case that the Electron-spawned execution is malicious rather than incidental.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: Did other reconnaissance commands run on this host around the same time?
+  context: A single discovery command may be routine troubleshooting, but several reconnaissance binaries in rapid succession — whoami, ipconfig, net user, systeminfo — is a signature of post-compromise enumeration. Because whoami is one of the children this rule fires on, a surrounding burst of recon raises the likelihood that the Electron-spawned process is one step in hands-on enumeration.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_recon:
+        Image|endswith:
+          - '\whoami.exe'
+          - '\systeminfo.exe'
+          - '\ipconfig.exe'
+          - '\net.exe'
+          - '\net1.exe'
+          - '\nltest.exe'
+          - '\dsquery.exe'
+          - '\nbtstat.exe'
+          - '\arp.exe'
+          - '\netstat.exe'
+          - '\tasklist.exe'
+          - '\qprocess.exe'
+          - '\query.exe'
+          - '\quser.exe'
+          - '\hostname.exe'
+          - '\nslookup.exe'
+          - '\adfind.exe'
+          - '\csvde.exe'
+          - '\ldifde.exe'
+          - '\dnscmd.exe'
+          - '\cmdkey.exe'
+          - '\setspn.exe'
+      condition: selection and selection_recon
+    fields:
+      - Image
+      - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent:
+        ParentImage|endswith:
+        - \chrome.exe
+        - \discord.exe
+        - \GitHubDesktop.exe
+        - \keybase.exe
+        - \msedge.exe
+        - \msedgewebview2.exe
+        - \msteams.exe
+        - \slack.exe
+        - \teams.exe
+      selection_child_image:
+        Image|endswith:
+        - \cmd.exe
+        - \cscript.exe
+        - \mshta.exe
+        - \powershell.exe
+        - \pwsh.exe
+        - \regsvr32.exe
+        - \whoami.exe
+        - \wscript.exe
+      selection_child_paths:
+        Image|contains:
+        - :\ProgramData\
+        - :\Temp\
+        - \AppData\Local\Temp\
+        - \Users\Public\
+        - \Windows\Temp\
+      filter_optional_discord:
+        ParentImage|endswith: \Discord.exe
+        Image|endswith: \cmd.exe
+        CommandLine|contains: \NVSMI\nvidia-smi.exe
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection_parent and 1 of selection_child_* and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent:
+        ParentImage|endswith:
+        - \chrome.exe
+        - \discord.exe
+        - \GitHubDesktop.exe
+        - \keybase.exe
+        - \msedge.exe
+        - \msedgewebview2.exe
+        - \msteams.exe
+        - \slack.exe
+        - \teams.exe
+      selection_child_image:
+        Image|endswith:
+        - \cmd.exe
+        - \cscript.exe
+        - \mshta.exe
+        - \powershell.exe
+        - \pwsh.exe
+        - \regsvr32.exe
+        - \whoami.exe
+        - \wscript.exe
+      selection_child_paths:
+        Image|contains:
+        - :\ProgramData\
+        - :\Temp\
+        - \AppData\Local\Temp\
+        - \Users\Public\
+        - \Windows\Temp\
+      filter_optional_discord:
+        ParentImage|endswith: \Discord.exe
+        Image|endswith: \cmd.exe
+        CommandLine|contains: \NVSMI\nvidia-smi.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection_parent and 1 of selection_child_* and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts in a tight window reveals lateral movement or activity spanning multiple endpoints. If the same user triggered similar activity elsewhere, the scope is larger than a single host. This pivot is meaningful only when a real user account fired the alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent:
+        ParentImage|endswith:
+        - \chrome.exe
+        - \discord.exe
+        - \GitHubDesktop.exe
+        - \keybase.exe
+        - \msedge.exe
+        - \msedgewebview2.exe
+        - \msteams.exe
+        - \slack.exe
+        - \teams.exe
+      selection_child_image:
+        Image|endswith:
+        - \cmd.exe
+        - \cscript.exe
+        - \mshta.exe
+        - \powershell.exe
+        - \pwsh.exe
+        - \regsvr32.exe
+        - \whoami.exe
+        - \wscript.exe
+      selection_child_paths:
+        Image|contains:
+        - :\ProgramData\
+        - :\Temp\
+        - \AppData\Local\Temp\
+        - \Users\Public\
+        - \Windows\Temp\
+      filter_optional_discord:
+        ParentImage|endswith: \Discord.exe
+        Image|endswith: \cmd.exe
+        CommandLine|contains: \NVSMI\nvidia-smi.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection_parent and 1 of selection_child_* and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance, credential access — may reveal the stages that preceded this event and help reconstruct the timeline that led to the Electron-spawned child.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

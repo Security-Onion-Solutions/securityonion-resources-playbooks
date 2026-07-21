@@ -1,0 +1,364 @@
+name: Cscript/Wscript Potentially Suspicious Child Process
+id: 2aca2d80-ab62-488d-aef7-63cb84de16b7
+description: |
+  Detects wscript.exe or cscript.exe spawning a child process that is either rundll32.exe directly, or cmd.exe/powershell.exe/pwsh.exe whose command line invokes a proxy-execution binary (mshta together with an HTTP/HTTPS URL, or rundll32/regsvr32/msiexec). Rundll32 invocations using a small set of well-known benign exports are excluded. Script interpreters launched from documents or downloaded scripts commonly chain into these proxy-execution binaries to run code while masking the originating script, so the investigation should establish what the script did, decode the child command line, and confirm whether the spawning chain is expected on this host and user.
+type: detection
+detection_id: b6676963-0353-4f88-90f5-36c20d443c6a
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- question: Does this event show wscript.exe or cscript.exe spawning either rundll32.exe directly, or cmd/powershell/pwsh running mshta with a URL or invoking rundll32/regsvr32/msiexec?
+  context: Confirm the alert is a true positive by reviewing the parent, child Image, and full command line against the rule's two branches. Note which branch fired — a direct rundll32.exe child versus a command interpreter that calls a proxy-execution binary — because that determines which downstream questions carry weight. Confirm the command line is not one of the excluded benign rundll32 exports.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Is this user and host expected to run scripts that spawn command interpreters or proxy-execution binaries?
+  context: Legitimate administrative scripting and software installers can drive wscript/cscript into spawning cmd, powershell, or rundll32. Knowing whether this user role and host function routinely run such scripts is often the fastest way to separate routine automation from an unexpected execution chain.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Is wscript.exe or cscript.exe expected to spawn this child, and what started the script host itself?
+  context: The script-host-to-child relationship is the core signal for this detection. Tracing the script host's own origin reveals whether the chain is legitimate (a user double-clicked a script or an installer ran) or suspicious (a document, archive, or download dropped and executed the script). If the parent identifier resolves to NODATA, fall back to scoping by host and the wscript/cscript Image over a short window.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What other child processes did the same wscript/cscript instance spawn?
+  context: If a script host spawned the detected child, it likely spawned other processes too. Examining siblings of the same parent instance reveals the full scope of what the script did — multiple proxy-execution or interpreter children from one script host points to a staged operation rather than a single benign call.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: What did the child command line actually do? Decode the mshta URL, rundll32/regsvr32/msiexec arguments, and any encoded content.
+  context: The full command line reveals the specific proxy-execution action. For the mshta branch, identify the HTTP/HTTPS URL being fetched and what it serves. For rundll32, regsvr32, or msiexec, identify the DLL, script object, or package being loaded and its export or path. Decode any base64 or obfuscated content to recover the underlying payload.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains:
+          - mshta
+          - rundll32
+          - regsvr32
+          - msiexec
+      condition: selection
+    fields:
+      - CommandLine
+      - Image
+      - CurrentDirectory
+- question: If the child was powershell or pwsh, was the command encoded or obfuscated, and what does it decode to?
+  context: When the child interpreter is powershell.exe or pwsh.exe, the command may use -EncodedCommand (-enc), string concatenation, backtick escaping, or variable substitution to hide what it runs. Base64-encoded commands are the most common form; decoding recovers the actual payload, often a download cradle that fetches and executes remote code via the proxy-execution binary named on the command line.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did PowerShell script block logging capture the full deobfuscated script content?
+  context: Script block logging records the deobfuscated script content PowerShell actually executed, even when the command line is encoded or obfuscated, providing ground truth about what ran. If PowerShell operational logs are not ingested in this environment, treat zero results as a visibility gap rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Were PowerShell security controls bypassed or weakened before this execution?
+  context: Operators often disable or bypass PowerShell security controls before running a payload — AMSI patching, execution-policy changes, constrained language mode escapes, or a downgrade to PowerShell v2 which lacks modern logging. Finding these precursor events on the host strengthens the case that the spawned interpreter activity was malicious.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: Does this script host normally spawn this child binary on this host?
+  context: Some script-host-to-child relationships are routine (deployment scripts launching installers) while others are inherently suspicious (a script host spawning rundll32 to load a remote object). Historical frequency of this specific wscript/cscript-to-child pairing distinguishes routine automation from a novel spawning relationship; zero or very low counts indicate first-time execution.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What other child processes did this script host spawn in the hours after the alert?
+  context: A compromised or scripted parent often spawns multiple tools in sequence — reconnaissance, download cradles, then proxy-execution. Seeing the children the same script host spawned after the alert reveals the full scope of activity initiated through this execution chain.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent:
+        ParentImage|endswith:
+        - \wscript.exe
+        - \cscript.exe
+      selection_cli_script_main:
+        Image|endswith:
+        - \cmd.exe
+        - \powershell.exe
+        - \pwsh.exe
+      selection_cli_script_option_mshta:
+        CommandLine|contains|all:
+        - mshta
+        - http
+      selection_cli_script_option_other:
+        CommandLine|contains:
+        - rundll32
+        - regsvr32
+        - msiexec
+      selection_cli_standalone:
+        Image|endswith: \rundll32.exe
+      filter_main_rundll32_known_exports:
+        Image|endswith: \rundll32.exe
+        CommandLine|contains:
+        - UpdatePerUserSystemParameters
+        - PrintUIEntry
+        - ClearMyTracksByProcess
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection_parent and ( selection_cli_standalone or (selection_cli_script_main and 1 of selection_cli_script_option_*) ) and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent:
+        ParentImage|endswith:
+        - \wscript.exe
+        - \cscript.exe
+      selection_cli_script_main:
+        Image|endswith:
+        - \cmd.exe
+        - \powershell.exe
+        - \pwsh.exe
+      selection_cli_script_option_mshta:
+        CommandLine|contains|all:
+        - mshta
+        - http
+      selection_cli_script_option_other:
+        CommandLine|contains:
+        - rundll32
+        - regsvr32
+        - msiexec
+      selection_cli_standalone:
+        Image|endswith: \rundll32.exe
+      filter_main_rundll32_known_exports:
+        Image|endswith: \rundll32.exe
+        CommandLine|contains:
+        - UpdatePerUserSystemParameters
+        - PrintUIEntry
+        - ClearMyTracksByProcess
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection_parent and ( selection_cli_standalone or (selection_cli_script_main and 1 of selection_cli_script_option_*) ) and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the same user triggered similar script-driven activity on multiple hosts, the scope of the operation may be larger than this single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent:
+        ParentImage|endswith:
+        - \wscript.exe
+        - \cscript.exe
+      selection_cli_script_main:
+        Image|endswith:
+        - \cmd.exe
+        - \powershell.exe
+        - \pwsh.exe
+      selection_cli_script_option_mshta:
+        CommandLine|contains|all:
+        - mshta
+        - http
+      selection_cli_script_option_other:
+        CommandLine|contains:
+        - rundll32
+        - regsvr32
+        - msiexec
+      selection_cli_standalone:
+        Image|endswith: \rundll32.exe
+      filter_main_rundll32_known_exports:
+        Image|endswith: \rundll32.exe
+        CommandLine|contains:
+        - UpdatePerUserSystemParameters
+        - PrintUIEntry
+        - ClearMyTracksByProcess
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection_parent and ( selection_cli_standalone or (selection_cli_script_main and 1 of selection_cli_script_option_*) ) and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining activity around the alert reveals what led to this event, what happened after, and whether it is part of a larger sequence. Aggregating by Image and ParentImage collapses repetitive agent telemetry into high-count rows while novel parent-child pairs stand out at low counts.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — defense tampering, reconnaissance, credential access — may reveal the attack stages that preceded this event and help reconstruct the full timeline. Reconnaissance or tampering followed by proxy-execution is a common ordering.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

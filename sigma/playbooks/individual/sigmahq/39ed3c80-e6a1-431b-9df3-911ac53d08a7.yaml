@@ -1,0 +1,406 @@
+name: UAC Bypass Using NTFS Reparse Point - Process
+id: 5db0e659-5028-4226-8de4-520e19d988a8
+description: |
+  Detects a User Account Control bypass that abuses an NTFS reparse point together with wusa.exe and dism.exe DLL hijacking
+  to silently raise a split-token administrator from medium to high integrity. The rule fires when EITHER wusa.exe extracts
+  an update.msu from a user Temp directory at High or System integrity, OR a DismHost.exe child of a dism.exe add-package
+  command runs from a user Temp directory at High or System integrity. UAC bypass is a means to an end -- legitimately,
+  installers and servicing tools elevate through consented prompts; here elevation happens without a prompt so the analyst
+  should determine what the elevated process did next, whether registry or reparse-point staging preceded it, and whether the
+  user and host are expected to perform package-servicing operations at all.
+type: detection
+detection_id: 39ed3c80-e6a1-431b-9df3-911ac53d08a7
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the command line match either bypass branch this rule detects -- the wusa.exe update.msu extraction or the
+    DismHost.exe child of dism.exe add-package?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the exact command line,
+    parent command line, and integrity level. The rule fires when EITHER wusa.exe runs '/quiet' against an update.msu under
+    a user AppData\Local\Temp path at High or System integrity, OR a DismHost.exe process whose command line contains a user
+    Temp path is launched by a dism.exe '/online /add-package /packagepath:...\pe386' parent at High or System integrity.
+    Note which branch fired -- the wusa branch points the next steps at the .msu artifact, while the dism branch points them
+    at the pe386 package path and the dism parent chain.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentCommandLine
+      - Image
+      - CommandLine
+      - IntegrityLevel
+- question: Is this user and host expected to run package-servicing tools like wusa.exe or dism.exe at high integrity?
+  context: Legitimate software deployment, patching, and OS servicing do run wusa.exe and dism.exe, but normally under managed
+    deployment accounts or maintenance windows and through a consented elevation prompt. Knowing whether this user role and
+    host function include package servicing is often the fastest way to separate routine maintenance from a silent bypass.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Is this parent expected to spawn this child, and what started the parent itself?
+  context: The parent-child relationship is the core signal for this detection -- a dism.exe add-package parent spawning
+    DismHost.exe from a user Temp path, or whatever launched the elevated wusa.exe. Tracing the parent's own origin
+    (grandparent process) reveals whether the chain is a legitimate servicing flow started from an installer or console, or
+    a planted reparse-point/package staging started by an unexpected process.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What other child processes did the same parent spawn around the alert?
+  context: If the dism.exe or other parent that spawned the detected process is part of a bypass, it likely spawned other
+    processes too -- additional servicing helpers, a payload, or a follow-on shell. Examining siblings reveals the full scope
+    of activity from that parent. ParentProcessGuid may resolve to NODATA, so the query also scopes by host.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: What did the dism.exe parent command actually do? Decode its package-path and switches.
+  context: The parent command line shows how the bypass was staged. For the dism branch the parent is a
+    'dism.exe /online /quiet /norestart /add-package /packagepath:...\pe386 /ignorecheck' invocation -- the packagepath and
+    /ignorecheck switch reveal that an attacker-supplied package directory (pe386, a reparse point) was force-added without
+    integrity checking. Decode the parent's full command line to confirm the package path and any non-standard switches.
+    This retrieves the parent's own process_creation event; the long lookback is intentional because a servicing parent can
+    start well before the child fires.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- question: What is in the staged artifact -- the update.msu cabinet or the pe386 package directory referenced in the command
+    line?
+  context: Read and analyze the actual staged content. For the wusa branch the artifact is the update.msu under
+    AppData\Local\Temp -- inspect the cabinet for the planted DLL it carries into a protected directory. For the dism branch
+    the artifact is the pe386 package path, typically an NTFS reparse point redirecting servicing to attacker-controlled
+    content. Check signing, embedded file names, and whether the path is a reparse point. Content retrieval requires manual
+    pull from the endpoint.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What is the hash of the DLL the elevated process loaded, and how do you hash the staged .msu cabinet?
+  context: A DLL's hash is recorded when it is loaded; a cabinet's is not recorded at all when it is written. This reads
+    modules loaded from outside the standard system directories on this host and returns their hashes -- the attacker-planted
+    DLL that wusa or DismHost side-loads during the bypass appears here regardless of which stage loaded it; submit it to
+    VirusTotal, Hybrid Analysis, or internal threat intel. The update.msu cabinet is data that wusa extracts rather than
+    executes, so it has no load or execution hash -- retrieve it from the user Temp path (see the evidence-preservation step),
+    expand it, and hash the contents by hand. The companion image_load question shows which non-standard directory the DLL was
+    loaded from.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      filter_system:
+        ImageLoaded|contains:
+          - ':\Windows\System32\'
+          - ':\Windows\SysWOW64\'
+          - ':\Windows\WinSxS\'
+      condition: selection and not filter_system
+    fields:
+      - ImageLoaded
+      - Hashes
+- question: Are the staged update.msu, pe386 package, or hijacked DLL still on disk for analysis?
+  context: The bypass references files on disk -- the update.msu cabinet under user Temp, the pe386 package path, and any DLL
+    the cabinet drops into a protected directory. Checking whether these still exist enables hash lookups, sandbox submission,
+    and content review. Reparse-point and Temp artifacts are frequently cleaned up after elevation, so capture them quickly.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Did the auto-elevated servicing binary load a DLL from a user-writable or non-standard directory?
+  context: This bypass family works by getting an auto-elevated binary to load an attacker-planted DLL -- the wusa/dism path
+    plants a hijack DLL that the elevated process loads from a directory the medium-integrity user could write. Reviewing
+    image_load events for the alerting host around the elevation surfaces DLLs loaded from user Temp, AppData, or other
+    unexpected paths next to the servicing binary, which confirms the hijack mechanism. If image_load telemetry is not
+    ingested in this environment, treat zero results as a visibility gap rather than evidence no DLL was hijacked.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      filter_system:
+        ImageLoaded|contains:
+          - ':\Windows\System32\'
+          - ':\Windows\SysWOW64\'
+          - ':\Windows\WinSxS\'
+      condition: selection and not filter_system
+    fields:
+      - ImageLoaded
+      - Image
+- question: Were registry modifications made on this host to stage a UAC bypass before the elevation?
+  context: Many UAC bypass methods write a command into an HKCU shell-handler or environment key that an auto-elevated process
+    reads and executes. Common targets include HKCU\Software\Classes\ms-settings\Shell\Open\command, mscfile\shell\open\command,
+    exefile and Folder handler variants, and HKCU\Environment. Finding a registry write shortly before the elevation confirms
+    a registry-based bypass mechanism running alongside the reparse-point method this rule detects.
+  range: -15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\reg.exe'
+          - '\powershell.exe'
+          - '\cmd.exe'
+        CommandLine|contains:
+          - 'ms-settings'
+          - 'mscfile'
+          - 'Classes\exefile'
+          - 'Classes\Folder'
+          - 'Environment'
+          - 'Shell\Open\command'
+          - 'DelegateExecute'
+      condition: selection
+    fields:
+      - CommandLine
+      - Image
+- question: What action was performed with elevated privileges after the UAC bypass?
+  context: UAC bypass is a means to an end -- attackers elevate to perform high-integrity actions such as installing
+    persistence, dumping credentials, tampering with security tools, or accessing protected resources. Examining processes
+    spawned at High or System integrity shortly after the bypass reveals the operator's objective.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        IntegrityLevel:
+          - 'High'
+          - 'System'
+          - 'S-1-16-16384'
+          - 'S-1-16-12288'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - IntegrityLevel
+- question: Were other privilege escalation or UAC bypass techniques attempted on this host?
+  context: Operators who attempt one UAC bypass often try multiple methods until one succeeds, especially if the OS version
+    blocks certain techniques. Finding multiple bypass or escalation detections from the same user or process in a short
+    window confirms deliberate privilege escalation rather than a false positive.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - rule.name
+      - rule.uuid
+      - event.severity_label
+- question: Did the staging step and the elevated process spawn occur within a tight time window of each other?
+  context: A genuine bypass chains its steps quickly -- the registry or reparse-point staging and the resulting elevated
+    process spawn typically happen within seconds to a few minutes, while benign servicing activity is spread out. Correlate
+    the timestamps of any staging writes against the elevated DismHost.exe or wusa.exe spawn; a tight cluster (for example
+    within roughly 30 seconds) supports a deliberate bypass, while a wide gap suggests unrelated maintenance.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Is this dism.exe-to-DismHost.exe or wusa.exe spawning pattern occurring on other hosts?
+  context: The same servicing-tool spawning pattern appearing on multiple hosts may indicate a pushed automation or a
+    repeated bypass attempt across the environment, while a single occurrence is more likely targeted. Enterprise-wide
+    comparison helps calibrate severity and identify scope.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+      - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection1:
+        CommandLine|startswith: '"C:\Windows\system32\wusa.exe"  /quiet C:\Users\'
+        CommandLine|endswith: \AppData\Local\Temp\update.msu
+        IntegrityLevel:
+        - High
+        - System
+        - S-1-16-16384
+        - S-1-16-12288
+      selection2:
+        ParentCommandLine: '"C:\Windows\system32\dism.exe" /online /quiet /norestart /add-package /packagepath:"C:\Windows\system32\pe386" /ignorecheck'
+        IntegrityLevel:
+        - High
+        - System
+        CommandLine|contains|all:
+        - C:\Users\
+        - \AppData\Local\Temp\
+        - \dismhost.exe {
+        Image|endswith: \DismHost.exe
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (1 of selection*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection1:
+        CommandLine|startswith: '"C:\Windows\system32\wusa.exe"  /quiet C:\Users\'
+        CommandLine|endswith: \AppData\Local\Temp\update.msu
+        IntegrityLevel:
+        - High
+        - System
+        - S-1-16-16384
+        - S-1-16-12288
+      selection2:
+        ParentCommandLine: '"C:\Windows\system32\dism.exe" /online /quiet /norestart /add-package /packagepath:"C:\Windows\system32\pe386" /ignorecheck'
+        IntegrityLevel:
+        - High
+        - System
+        CommandLine|contains|all:
+        - C:\Users\
+        - \AppData\Local\Temp\
+        - \dismhost.exe {
+        Image|endswith: \DismHost.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (1 of selection*) and _pb_scope
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host -- defense tampering, reconnaissance, or
+    credential access -- may reveal the stages that preceded this elevation and help reconstruct the timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

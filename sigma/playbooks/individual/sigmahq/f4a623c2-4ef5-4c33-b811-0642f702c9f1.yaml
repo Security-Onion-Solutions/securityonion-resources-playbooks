@@ -1,0 +1,427 @@
+name: Visual Studio Code Tunnel Shell Execution
+id: 771d86d1-6d32-4836-995c-7d725ec1b30b
+description: |
+  Detects a shell (powershell.exe, pwsh.exe, wsl.exe, or bash.exe) spawned by the Visual Studio Code
+  tunnel server (a node.exe under a Stable- server directory whose parent command line references
+  .vscode-server). The rule fires when the tunnel-server parent matches AND EITHER a PowerShell child
+  running the tunnel shell-integration script OR a WSL/bash child is observed. Running "code tunnel"
+  exposes a Microsoft-signed, GitHub-authenticated remote channel that can be used as an interactive
+  terminal over Microsoft infrastructure, which bypasses Mark-of-the-Web and publisher allow-listing
+  because the binary is signed. Legitimate developers use this feature for remote work; the
+  investigation determines whether this tunnel was operator-initiated for command-and-control or is a
+  sanctioned remote-development session.
+type: detection
+detection_id: f4a623c2-4ef5-4c33-b811-0642f702c9f1
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- question: Does the triggering event show a VS Code tunnel server spawning either a PowerShell shell-integration child or a WSL/bash child?
+  context: >-
+    Confirm the alert is real by reviewing the full event. The rule needs the tunnel-server parent
+    (a node.exe under a Stable- server path with .vscode-server in its command line) AND one of two
+    child branches: powershell.exe or pwsh.exe running the terminal shellIntegration.ps1 script, or
+    wsl.exe or bash.exe. Note which branch fired — the PowerShell branch carries a specific script
+    path and points the investigation at PowerShell payload analysis, while the WSL/bash branch
+    points at a Linux subsystem session whose activity lives outside Windows process telemetry.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - Image
+      - CommandLine
+- question: Is this user and host expected to run Visual Studio Code remote tunnels?
+  context: >-
+    Remote tunnels are a developer feature. A workstation belonging to an engineer who works remotely
+    is a different disposition than a server or a non-developer endpoint where no one should be opening
+    an interactive remote terminal. Confirm whether the account and machine have a legitimate reason to
+    run code tunnel before treating the spawned shell as benign.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What started the VS Code tunnel server, and is that origin chain expected on this host?
+  context: >-
+    The tunnel-server node.exe is the core of this detection. Tracing what spawned it shows whether the
+    tunnel began from a sanctioned VS Code install launched by the user, or from a portable CLI dropped
+    into a writable directory and started by a script. A hands-free attack chain downloads the CLI
+    archive, expands it, and launches the tunnel from a temporary path; a developer typically launches
+    it from an installed Code instance or an interactive session.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What other child processes did the same tunnel server spawn?
+  context: >-
+    Once an operator has an interactive terminal through the tunnel, the shell that triggered this alert
+    is usually one of several processes. Reviewing every child of the same tunnel-server instance shows
+    the full scope of hands-on activity — reconnaissance, credential access, or tooling launched through
+    the same remote session.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: What did the spawned shell actually run through the tunnel session?
+  context: >-
+    The PowerShell branch fires on the terminal shellIntegration.ps1 script, which is shell-integration
+    plumbing, not the operator's payload — the payload is whatever commands are typed into the
+    interactive terminal afterward. Review the command lines of shells launched through the tunnel on
+    this host to separate the integration script from operator-issued commands such as download
+    cradles, enumeration, or staging.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains: '\terminal\browser\media\shellIntegration.ps1'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+      - Image
+- question: Was any command run through the tunnel shell encoded or obfuscated, and what does it decode to?
+  context: >-
+    Commands typed into a tunnel terminal can use PowerShell -EncodedCommand, string concatenation,
+    backtick escaping, or variable substitution to hide intent. Base64-encoded commands are the most
+    common form. Decoding reveals the actual payload — download cradles, reverse shells, or in-memory
+    .NET assembly loads.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did PowerShell script block logging capture the full content of what ran in the tunnel session?
+  context: >-
+    Event ID 4104 records the deobfuscated script content PowerShell actually executes, even when the
+    command line is encoded or obfuscated, giving ground truth about what ran in the interactive
+    terminal. If PowerShell operational logs are not ingested in this environment, treat zero results as
+    a visibility gap rather than evidence that nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Were PowerShell security controls bypassed or weakened on this host before the tunnel shell ran?
+  context: >-
+    Because the tunnel binary is Microsoft-signed, it can run under environments that block unsigned
+    code, and operators often pair it with AMSI patching, execution-policy changes, or a PowerShell
+    downgrade to evade logging. Finding these precursor events on the host strengthens the case that the
+    tunnel shell was used for malicious execution rather than routine development.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: Has the VS Code tunnel server spawned this kind of shell on this host before?
+  context: >-
+    A tunnel server that regularly spawns PowerShell or WSL on a developer workstation reflects routine
+    remote-development use. Zero or very low historical counts of this parent spawning this child point
+    to a newly established tunnel, which on a host with no development history is the deviation worth
+    chasing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What activity followed from the tunnel server in the hours after the alert?
+  context: >-
+    An interactive remote session typically produces a sequence of actions over time. Looking at
+    everything the tunnel-server parent launched after the alert reveals whether the operator moved on
+    to enumeration, credential access, or staging once the shell was established.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Is the same tunnel-server-to-shell spawning pattern occurring on other hosts?
+  context: >-
+    The same parent-child pattern across multiple hosts suggests either a coordinated push of tunnel
+    access or a development practice that spans the fleet. A single occurrence is more likely targeted.
+    Enterprise-wide comparison helps calibrate scope and distinguish a sanctioned rollout from operator
+    activity.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+      - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent:
+        ParentImage|contains: \servers\Stable-
+        ParentImage|endswith: \server\node.exe
+        ParentCommandLine|contains: .vscode-server
+      selection_child_1:
+        Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        CommandLine|contains: \terminal\browser\media\shellIntegration.ps1
+      selection_child_2:
+        Image|endswith:
+        - \wsl.exe
+        - \bash.exe
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection_parent and 1 of selection_child_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent:
+        ParentImage|contains: \servers\Stable-
+        ParentImage|endswith: \server\node.exe
+        ParentCommandLine|contains: .vscode-server
+      selection_child_1:
+        Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        CommandLine|contains: \terminal\browser\media\shellIntegration.ps1
+      selection_child_2:
+        Image|endswith:
+        - \wsl.exe
+        - \bash.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection_parent and 1 of selection_child_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around the time of the alert?
+  context: >-
+    Tracking the user's activity across all hosts reveals whether the tunnel session is isolated or part
+    of broader hands-on activity. If the same user triggered similar activity on multiple endpoints, the
+    scope is larger than this one host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent:
+        ParentImage|contains: \servers\Stable-
+        ParentImage|endswith: \server\node.exe
+        ParentCommandLine|contains: .vscode-server
+      selection_child_1:
+        Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        CommandLine|contains: \terminal\browser\media\shellIntegration.ps1
+      selection_child_2:
+        Image|endswith:
+        - \wsl.exe
+        - \bash.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection_parent and 1 of selection_child_*) and _pb_scope
+    fields:
+    - host.name
+- question: What outbound web traffic did the tunnel session generate, and does any of it look like command-and-control rather than ordinary dev-tunnel traffic?
+  context: >-
+    The tunnel carries an interactive session over HTTPS/WebSocket through Microsoft infrastructure, so
+    the host-side network telemetry shows outbound connections from the tunnel-server process. Look for
+    outbound flows from the shell and its parent, and weigh asymmetric volume (outbound far exceeding
+    inbound) and connections to endpoints beyond the expected dev-tunnel service as signs the session is
+    moving data rather than supporting development. Legitimate browser and update utilities can be ruled
+    out by process.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationHostname
+      - DestinationPort
+      - Initiated
+- question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Alerts rarely occur in isolation. Examining activity around the alert reveals what led to the tunnel
+    session and what happened after. Novel parent-child pairs at low counts stand out against the
+    high-count rows of routine agent and OS telemetry.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host — defense tampering, reconnaissance, or credential access — may
+    reveal the stages that preceded the tunnel session and help reconstruct how the operator reached the
+    point of opening an interactive shell.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

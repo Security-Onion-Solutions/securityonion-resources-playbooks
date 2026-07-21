@@ -1,0 +1,445 @@
+name: Shadow Copies Creation Using Operating Systems Utilities
+id: f00848bc-63b4-4406-b5b8-a057ff5b6690
+description: |
+  Detects creation of a volume shadow copy using a built-in operating-system utility
+  (vssadmin.exe, wmic.exe, powershell.exe, or pwsh.exe) where the command line contains
+  both "shadow" and "create". Creating a shadow copy is a routine backup and administration
+  task, but it is also the first step of an offline credential-dumping chain: a shadow copy
+  exposes a stable snapshot of NTDS.dit on a domain controller and of the SAM, SYSTEM, and
+  SECURITY registry hives on any host, which an operator then copies out of the snapshot for
+  offline hash extraction. The investigation should confirm exactly which binary and command
+  fired, determine whether the user, host, and parent process are consistent with sanctioned
+  backup activity, and look for follow-on access to NTDS.dit or the registry hives that would
+  turn shadow-copy creation into actual credential theft.
+type: detection
+detection_id: b17ea6f7-6e90-447e-a799-e6c0a493d6ce
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the command line match what this rule detects — one of vssadmin, wmic, powershell, or pwsh creating a volume shadow copy?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule
+    fires only when the Image (or OriginalFileName) is one of vssadmin.exe, wmic.exe,
+    powershell.exe, or pwsh.exe AND the command line contains both "shadow" and "create".
+    Read the full command line and confirm it is actually creating a shadow copy (for example
+    "vssadmin create shadow", "wmic shadowcopy call create", or a PowerShell
+    Win32_ShadowCopy create call) rather than listing or deleting one.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to create volume shadow copies?
+  context: Legitimate backup software, administrators, and some maintenance scripts create
+    shadow copies routinely. Knowing whether this account performs backup or administration
+    duties, and whether the host is a backup server or domain controller where snapshot
+    creation is expected, is often the fastest path to separating sanctioned activity from
+    credential-dumping preparation. Shadow-copy creation under a standard user or on a host
+    with no backup role is far more concerning.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Which credential store is this shadow copy positioned to expose — NTDS.dit, or the SAM, SYSTEM, and SECURITY hives?
+  context: A shadow copy is created so the snapshot can be read while the live files are locked.
+    On a domain controller this exposes NTDS.dit (all domain account hashes plus the SYSTEM
+    hive needed to decrypt it); on any host it exposes the SAM, SYSTEM, and SECURITY hives for
+    local account and cached-credential extraction. Read the full command line and determine
+    whether the volume and target imply domain-wide or local credential exposure — that
+    determines which accounts may need resets and whether this is a domain-controller incident.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What process spawned this utility, and is that parent chain expected for a backup operation?
+  context: The parent process reveals how the shadow copy was triggered. Scheduled backup
+    software, a backup service, or an interactive administrator shell are expected parents.
+    Unusual parents such as an Office application, a script host, a remote-execution service,
+    or a web-server process suggest the snapshot was created as part of an intrusion rather
+    than a backup job. Walk up the chain to see what spawned the parent.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Was a registry hive saved off (reg save of SAM, SYSTEM, or SECURITY) on this host around the alert?
+  context: Reading the SAM and SYSTEM hives out of the snapshot is what turns shadow-copy
+    creation into local credential theft; saving all of SAM, SYSTEM, and SECURITY is a strong
+    sign of intent to extract hashes offline. This query looks for reg.exe (or powershell)
+    hive-save activity on the same host. A reg save of these hives shortly after shadow-copy
+    creation indicates the credential-extraction stage is underway.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_save:
+        CommandLine|contains|all:
+          - 'save'
+          - 'hklm\'
+      condition: selection and selection_save
+    fields:
+      - Image
+      - CommandLine
+      - User
+- question: Was NTDS.dit or a config-hive file accessed or written on this host in the hour after the shadow copy was created?
+  context: After a shadow copy is created, the operator copies the target files out of the
+    snapshot path. On a domain controller this is NTDS.dit; on any host it is the SAM, SYSTEM,
+    or SECURITY hive under the config directory. File activity touching these paths, or paths
+    containing HarddiskVolumeShadowCopy, shortly after creation confirms the snapshot was used
+    for credential extraction rather than backup. If file events for these paths are not
+    collected in this environment, treat zero results as a visibility gap rather than evidence
+    nothing happened.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_target:
+        TargetFilename|contains:
+          - '\ntds.dit'
+          - '\config\SAM'
+          - '\config\SYSTEM'
+          - '\config\SECURITY'
+          - 'HarddiskVolumeShadowCopy'
+      condition: selection and selection_target
+    fields:
+      - TargetFilename
+      - Image
+- question: When this host has previously created shadow copies with this pattern, what parents and users drove it, and does the current alert fit?
+  context: Even on hosts where shadow-copy creation is routine, the parent process and user
+    that normally drive it form a baseline. The query mirrors the rule's selection scoped to
+    this host, so the resulting parent and user distribution reflects how this exact firing
+    pattern has historically run here. A new parent process, an unexpected user account, or an
+    unusual command-line structure is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        - \wmic.exe
+        - \vssadmin.exe
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+        - wmic.exe
+        - VSSADMIN.EXE
+      selection_cli:
+        CommandLine|contains|all:
+        - shadow
+        - create
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: What child processes did this utility spawn afterward?
+  context: The processes spawned by the shadow-copy utility reveal its actual impact. A backup
+    job typically spawns nothing unexpected. Spawning a copy command, a script host, an
+    archiving tool, or an upload utility immediately after creating the snapshot points to the
+    file being pulled out of the shadow copy and staged for extraction.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        - \wmic.exe
+        - \vssadmin.exe
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+        - wmic.exe
+        - VSSADMIN.EXE
+      selection_cli:
+        CommandLine|contains|all:
+        - shadow
+        - create
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        - \wmic.exe
+        - \vssadmin.exe
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+        - wmic.exe
+        - VSSADMIN.EXE
+      selection_cli:
+        CommandLine|contains|all:
+        - shadow
+        - create
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or hands-on
+    activity on multiple endpoints. If the same account triggered shadow-copy creation or other
+    administrative tooling on several hosts in a short window, the scope of the operation is
+    larger than a single host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        - \wmic.exe
+        - \vssadmin.exe
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+        - wmic.exe
+        - VSSADMIN.EXE
+      selection_cli:
+        CommandLine|contains|all:
+        - shadow
+        - create
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Have other hosts created shadow copies with this pattern in the past week, and does the distribution look like automation or one-off activity?
+  context: The query mirrors the rule's selection with no host scope, so the result is a
+    fleet-wide count of this firing pattern rather than generic use of these binaries. Many
+    hosts firing the same pattern points to scripted deployment or backup automation; one host
+    or a small unrelated set points to manual operator activity. Use the host distribution to
+    calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        - \wmic.exe
+        - \vssadmin.exe
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+        - wmic.exe
+        - VSSADMIN.EXE
+      selection_cli:
+        CommandLine|contains|all:
+        - shadow
+        - create
+      condition: all of selection_*
+    fields:
+    - host.name
+- question: If a PowerShell variant fired the rule, did script block logging capture the full shadow-copy script content?
+  context: When powershell.exe or pwsh.exe is the binary, script block logging records the
+    deobfuscated script content actually executed, even when the command line is built from
+    concatenated strings or variables. This provides ground truth about whether the script only
+    created a snapshot or also read files out of it. If PowerShell operational logs are not
+    ingested in this environment, treat the absence of results as a visibility gap rather than
+    evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Were outbound remote-access connections (RDP, SMB, WinRM, SSH) initiated from this host after
+    this event?
+  context: Credential theft is typically followed by lateral movement. The query returns outbound connections
+    from this host to remote-access ports -- 3389 (RDP), 445 (SMB/PsExec), 5985/5986 (WinRM), 22 (SSH)
+    -- in the hours after the event; the originating Image and User show what drove each connection. Two
+    limits to keep in mind -- credentials exfiltrated and replayed from another machine will not appear
+    here (check security 4624 logons on suspected targets for this account and any accounts with sessions
+    on this host), and the query requires Sysmon network telemetry (EID 3); if that is not collected from
+    this host, treat zero rows as a visibility gap, not as evidence no movement occurred.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
+- question: Which accounts may be exposed by this snapshot, and do any have elevated privileges?
+  context: The severity of this activity depends on what the snapshot exposes. A shadow copy on
+    a domain controller exposes every domain account hash including krbtgt, which enables Golden
+    Ticket forgery and requires incident escalation. A shadow copy on a member host exposes
+    local accounts and any cached domain credentials. Cross-reference the host role and the
+    acting account against directory group memberships to scope the exposure.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Credential access rarely happens in isolation. Earlier detections on the same host —
+    reconnaissance, defense tampering, privilege escalation, or initial execution — may reveal
+    the stages that preceded shadow-copy creation and help reconstruct the full timeline up to
+    the credential-dumping step.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

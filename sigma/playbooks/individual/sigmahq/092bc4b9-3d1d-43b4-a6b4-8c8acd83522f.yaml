@@ -1,0 +1,582 @@
+name: PowerShell Core DLL Loaded By Non PowerShell Process
+id: 21df037b-65d2-466f-8c6a-7b469d936c4c
+description: |
+  Detects the PowerShell engine assembly (System.Management.Automation.dll or its native image)
+  being loaded by a process outside the known PowerShell hosts — powershell.exe, pwsh.exe,
+  powershell_ise.exe, the WinRM hosts, and a set of Microsoft tooling filters. Any .NET
+  application can host a PowerShell runspace by referencing this assembly, which lets a custom
+  EXE or a signed LOLBin (rundll32, InstallUtil, regsvcs, regasm, regsvr32) run PowerShell
+  payloads without ever launching powershell.exe, sidestepping allow-listing and command-line
+  detections aimed at the PowerShell executable. Legitimate loads come from .NET applications
+  and administrative tooling installed in non-standard paths; the investigation identifies the
+  hosting process, how it arrived, what arguments fed it, and what the embedded engine executed.
+type: detection
+detection_id: 092bc4b9-3d1d-43b4-a6b4-8c8acd83522f
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-03
+questions:
+- question: Is the loaded module the PowerShell engine assembly, and is the loading process outside the rule's known PowerShell hosts?
+  context: |
+    The rule fires when a module identifying as System.Management.Automation — by its Description
+    metadata, OriginalFileName, or a path ending in System.Management.Automation.dll or its
+    .ni.dll native image — is loaded by a process not in the filter list (powershell.exe,
+    pwsh.exe, powershell_ise.exe, wsmprovhost.exe, winrshost.exe, mscorsvw.exe, and known
+    Microsoft tooling paths such as SQL Server Management Studio and Visual Studio). Confirm the
+    module identity from the metadata and check the loading image path against those filters.
+  range: +/-5m
+  answer_sources:
+  - alert
+  - image_load
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|endswith|expand: '%ImageLoaded%'
+      condition: selection
+    fields:
+      - OriginalFileName
+      - ImageLoaded
+      - Description
+- question: Is this host and user expected to run applications that embed the PowerShell engine?
+  context: |
+    Many legitimate .NET applications host a PowerShell runspace — management consoles,
+    deployment and configuration agents, database and developer tooling. The rule filters the
+    common install paths, but the same products installed in non-standard locations still fire.
+    On a developer or administration machine whose software set is known to embed the engine,
+    the load is plausibly routine; on an ordinary workstation with no such software, it needs a
+    concrete explanation.
+  range: +/-30d
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What is the actual identity of the process that loaded the PowerShell engine?
+  context: |
+    The image name alone can mislead — the PE metadata (OriginalFileName) and hash still identify
+    the real tool if the binary was renamed. A signed system utility (rundll32.exe,
+    InstallUtil.exe, regsvcs.exe, regasm.exe, regsvr32.exe) hosting the engine points at
+    DLL-based proxy execution of PowerShell; for an unfamiliar binary, a hash reputation lookup
+    distinguishes a known product component from a custom loader that warrants deeper analysis.
+  range: +/-30d
+  answer_sources:
+  - process_creation
+  - external_threat_intel
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Hashes
+- question: How did the loading binary arrive on this host?
+  context: |
+    The file-creation history of the loading binary reveals the delivery mechanism: a browser or
+    command-line download, archive extraction, remote copy, or a package installer. A binary
+    written to a user-writable path (Downloads, Temp, AppData) shortly before the alert fits
+    payload delivery; one placed by a known installer long ago fits an application component. The
+    Image field on the file event shows which process wrote it.
+  range: -30d
+  answer_sources:
+  - file_event
+  - process_creation
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains|expand: '%file_name%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: What child processes did the loading binary spawn after acquiring the PowerShell engine?
+  context: |
+    A hosted runspace runs script in-process, but its payloads frequently spawn follow-on
+    processes — cmd.exe, script hosts, discovery utilities, or a dropped second stage. No
+    children is also common because the engine executes entirely in memory; in that case the
+    module-load, file-write, and script-block views carry the post-execution evidence. Cross-host
+    distribution of the same pattern is covered by the fleet-wide question.
+  range: +4h
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Did the loading process or its children write files that are still on disk for analysis?
+  context: |
+    DLL-hosted PowerShell is often fed by companion artifacts — a hosting DLL passed to rundll32
+    or regsvr32, a script file supplied as an argument, or output the payload staged. Files
+    written by the alerting process and its direct children identify those artifacts; anything
+    still present can be hashed, submitted to a sandbox, or reviewed for the script content it
+    carried.
+  range: +/-15m
+  answer_sources:
+  - file_event
+  - manual_review
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What arguments launched the loading process, and do they carry an embedded, encoded, or downloaded script?
+  context: |
+    DLL-hosted engines take their payload from the host process's command line: a script or file
+    path after a rundll32 entry point, base64 decoded via FromBase64String and piped to iex, or a
+    one-line download-and-execute using iwr or WebClient. InstallUtil /U, regsvcs, regasm, and
+    regsvr32 /s /u invocations naming an unfamiliar DLL are the same technique. Decode any
+    encoded segment to recover the actual script; an empty or bland command line suggests the
+    payload is embedded in the binary itself, making the script-block and module-load views the
+    fallback evidence.
+  range: +/-30d
+  answer_sources:
+  - process_creation
+  - manual_review
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What other modules did this process load alongside the PowerShell engine, and are any unsigned or from user-writable paths?
+  context: |
+    The full module list reconstructs the hosting mechanism: CLR bootstrap DLLs (mscoree.dll,
+    clr.dll) confirm a .NET runtime was spun up inside the process; an unsigned DLL loaded from
+    Temp, AppData, or ProgramData is likely the payload DLL handed to a signed host; and the
+    presence or absence of amsi.dll shows whether the engine's content was subject to antimalware
+    scanning. Also note any module whose name suggests a system DLL but which loads from a
+    non-system path.
+  range: +/-5m
+  answer_sources:
+  - image_load
+  - manual_review
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+      - SignatureStatus
+      - Hashes
+- question: Is the loaded automation assembly the genuine Microsoft-signed copy from a canonical .NET path?
+  context: |
+    The engine assembly should be Microsoft-signed and load from the Global Assembly Cache, the
+    native-image cache, or a PowerShell installation directory. A copy of
+    System.Management.Automation.dll staged in an application folder or user-writable path, or
+    one whose signature status is not Valid, means the operator shipped their own engine rather
+    than using the system's — older engine versions are also attractive because they predate
+    script-block logging. The hash supports a reputation lookup and version identification.
+  range: +/-5m
+  answer_sources:
+  - image_load
+  - external_threat_intel
+  - manual_review
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+        ImageLoaded|endswith|expand: '%dll_basename%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Hashes
+      - Signed
+      - Signature
+      - SignatureStatus
+- question: Did script block logging capture what the embedded engine executed?
+  context: |
+    Event ID 4104 records script content from every process that hosts the PowerShell engine, not
+    just powershell.exe — a hosted runspace's activity lands here even when the command line
+    reveals nothing. Review blocks around the alert time for download cradles, reflective
+    assembly loads, token-manipulation APIs, or credential-access functions. If these logs are
+    not ingested in this environment, or the loaded engine predates script-block logging, treat
+    zero results as a visibility gap rather than evidence nothing ran.
+  range: +/-5m
+  answer_sources:
+  - powershell_script_block
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Were PowerShell security controls bypassed or weakened before this load?
+  context: |
+    Hosting the engine outside powershell.exe is itself a control bypass — it sidesteps
+    constrained language mode and allow-listing aimed at the PowerShell executable. Operators
+    often pair it with further tampering: AMSI bypass via AmsiUtils/amsiInitFailed reflection,
+    execution-policy overrides, real-time monitoring changes, or a downgrade to engine version 2,
+    which lacks modern logging. Commands carrying those markers in the preceding hour show the
+    load was part of deliberate evasion rather than an application's routine engine use.
+  range: -1h
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: What process spawned the one that loaded the PowerShell engine, and is that parent chain expected?
+  context: |
+    The parent shows how the hosting process was invoked: explorer.exe fits a user launching an
+    application, services.exe fits a service host. An Office application, script host, browser,
+    or a parent running from a user-writable path points at a delivery chain — a macro or
+    downloaded loader launching the utility or custom EXE that hosts the engine. The parent's own
+    command line shows what it was doing at invocation.
+  range: +/-30d
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - Image
+      - CommandLine
+- question: What other activity occurred on this host around the time of the alert?
+  context: |
+    Aggregated parent-child process pairs around the alert surface the surrounding sequence — the
+    dropper or document that delivered the hosting binary before the load, and staged execution
+    after it. Novel low-count pairs stand out against repetitive agent noise and help decide
+    whether this was an isolated load or one step in a longer chain.
+  range: +/-15m
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: |
+    Earlier detections — a suspicious download, archive extraction, macro execution, or defense
+    tampering — may capture the delivery of the binary that then hosted the PowerShell engine,
+    and help reconstruct the timeline from arrival to execution.
+  range: -6h
+  answer_sources:
+  - alert
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Has the automation assembly been loaded on this host before, and by which processes?
+  context: |
+    Grouping historical loads of this assembly by loading process shows the host's normal set of
+    PowerShell hosts and engine-embedding applications. If the current image appears regularly in
+    that history, the load is probably routine for this host; if the assembly has only ever been
+    loaded by the standard PowerShell binaries and known tooling, the new loader is the anomaly
+    worth chasing.
+  range: -90d
+  answer_sources:
+  - image_load
+  query: |
+    aggregation: true
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|endswith|expand: '%ImageLoaded%'
+      condition: selection
+    fields:
+      - Image
+- question: Does this host normally run the loading program at all?
+  context: |
+    A first-time-on-host program that immediately hosts the PowerShell engine is a stronger
+    anomaly than an application that has run daily for months. The user grouping also shows
+    whether it historically runs under the same account as the current execution or whether the
+    account is new for this program.
+  range: -90d
+  answer_sources:
+  - process_creation
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: When this host has fired this non-PowerShell engine-load pattern before, what programs and users drove it?
+  context: |
+    The query mirrors the rule's full selection and filter set scoped to this host, so the result
+    reflects the host's history of this specific firing pattern — engine loads by non-PowerShell
+    processes — rather than generic engine usage. Prior fires from a known application may reveal
+    a product behavior worth documenting as a tuning candidate; a first-time fire, or a new
+    hosting executable or user relative to that history, is the deviation worth chasing. Image
+    loads carry no parent lineage — pivot to the hosting process's start event if that matters.
+  range: -14d
+  answer_sources:
+  - image_load
+  query: |
+    aggregation: true
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+      - Description: System.Management.Automation
+      - OriginalFileName: System.Management.Automation.dll
+      - ImageLoaded|endswith:
+        - \System.Management.Automation.dll
+        - \System.Management.Automation.ni.dll
+      filter_main_powershell:
+        Image:
+        - C:\Program Files\PowerShell\7-preview\pwsh.exe
+        - C:\Program Files\PowerShell\7\pwsh.exe
+        - C:\Windows\System32\WindowsPowerShell\v1.0\powershell_ise.exe
+        - C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+        - C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell_ise.exe
+        - C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe
+      filter_main_pwsh_preview:
+        Image|contains:
+        - C:\Program Files\WindowsApps\Microsoft.PowerShellPreview
+        - \AppData\Local\Microsoft\WindowsApps\Microsoft.PowerShellPreview
+        Image|endswith: \pwsh.exe
+      filter_main_generic:
+        Image:
+        - C:\Windows\System32\dsac.exe
+        - C:\WINDOWS\System32\RemoteFXvGPUDisablement.exe
+        - C:\Windows\System32\runscripthelper.exe
+        - C:\WINDOWS\System32\sdiagnhost.exe
+        - C:\Windows\System32\ServerManager.exe
+        - C:\Windows\System32\SyncAppvPublishingServer.exe
+        - C:\Windows\System32\winrshost.exe
+        - C:\Windows\System32\wsmprovhost.exe
+        - C:\Windows\SysWOW64\winrshost.exe
+        - C:\Windows\SysWOW64\wsmprovhost.exe
+      filter_main_dotnet:
+        Image|startswith:
+        - C:\Windows\Microsoft.NET\Framework\
+        - C:\Windows\Microsoft.NET\FrameworkArm\
+        - C:\Windows\Microsoft.NET\FrameworkArm64\
+        - C:\Windows\Microsoft.NET\Framework64\
+        Image|endswith: \mscorsvw.exe
+      filter_optional_sql_server_mgmt:
+        Image|startswith:
+        - C:\Program Files (x86)\Microsoft SQL Server Management Studio
+        - C:\Program Files\Microsoft SQL Server Management Studio
+        Image|endswith: \IDE\Ssms.exe
+      filter_optional_sql_server_tools:
+        Image|startswith:
+        - C:\Program Files (x86)\Microsoft SQL Server\
+        - C:\Program Files\Microsoft SQL Server\
+        Image|endswith: \Tools\Binn\SQLPS.exe
+      filter_optional_citrix:
+        Image|endswith: \Citrix\ConfigSync\ConfigSyncRun.exe
+      filter_optional_vs:
+        Image|startswith:
+        - C:\Program Files (x86)\Microsoft Visual Studio\
+        - C:\Program Files\Microsoft Visual Studio\
+      filter_optional_chocolatey:
+        Image|startswith: C:\ProgramData\chocolatey\choco.exe
+      filter_optional_nextron:
+        Image|startswith: C:\Windows\Temp\asgard2-agent\
+        Image|endswith:
+        - \thor64.exe
+        - \thor.exe
+      filter_optional_aurora:
+        Image: null
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection and not 1 of filter_main_* and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - Image
+    - User
+- question: Have other hosts fired this engine-load pattern in the past week, and does the distribution look like deployed software or isolated activity?
+  context: |
+    The query mirrors the rule's selection with no host scope, so the count is fleet-wide fires
+    of this specific pattern. Many hosts firing with the same loading image points at a deployed
+    application or agent that embeds the engine — a tuning candidate worth documenting; one host,
+    or a small set with differing images, points at operator activity. Compare loading images
+    across firing hosts before dismissing a multi-host result as a software rollout.
+  range: -7d
+  answer_sources:
+  - image_load
+  query: |
+    aggregation: true
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+      - Description: System.Management.Automation
+      - OriginalFileName: System.Management.Automation.dll
+      - ImageLoaded|endswith:
+        - \System.Management.Automation.dll
+        - \System.Management.Automation.ni.dll
+      filter_main_powershell:
+        Image:
+        - C:\Program Files\PowerShell\7-preview\pwsh.exe
+        - C:\Program Files\PowerShell\7\pwsh.exe
+        - C:\Windows\System32\WindowsPowerShell\v1.0\powershell_ise.exe
+        - C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+        - C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell_ise.exe
+        - C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe
+      filter_main_pwsh_preview:
+        Image|contains:
+        - C:\Program Files\WindowsApps\Microsoft.PowerShellPreview
+        - \AppData\Local\Microsoft\WindowsApps\Microsoft.PowerShellPreview
+        Image|endswith: \pwsh.exe
+      filter_main_generic:
+        Image:
+        - C:\Windows\System32\dsac.exe
+        - C:\WINDOWS\System32\RemoteFXvGPUDisablement.exe
+        - C:\Windows\System32\runscripthelper.exe
+        - C:\WINDOWS\System32\sdiagnhost.exe
+        - C:\Windows\System32\ServerManager.exe
+        - C:\Windows\System32\SyncAppvPublishingServer.exe
+        - C:\Windows\System32\winrshost.exe
+        - C:\Windows\System32\wsmprovhost.exe
+        - C:\Windows\SysWOW64\winrshost.exe
+        - C:\Windows\SysWOW64\wsmprovhost.exe
+      filter_main_dotnet:
+        Image|startswith:
+        - C:\Windows\Microsoft.NET\Framework\
+        - C:\Windows\Microsoft.NET\FrameworkArm\
+        - C:\Windows\Microsoft.NET\FrameworkArm64\
+        - C:\Windows\Microsoft.NET\Framework64\
+        Image|endswith: \mscorsvw.exe
+      filter_optional_sql_server_mgmt:
+        Image|startswith:
+        - C:\Program Files (x86)\Microsoft SQL Server Management Studio
+        - C:\Program Files\Microsoft SQL Server Management Studio
+        Image|endswith: \IDE\Ssms.exe
+      filter_optional_sql_server_tools:
+        Image|startswith:
+        - C:\Program Files (x86)\Microsoft SQL Server\
+        - C:\Program Files\Microsoft SQL Server\
+        Image|endswith: \Tools\Binn\SQLPS.exe
+      filter_optional_citrix:
+        Image|endswith: \Citrix\ConfigSync\ConfigSyncRun.exe
+      filter_optional_vs:
+        Image|startswith:
+        - C:\Program Files (x86)\Microsoft Visual Studio\
+        - C:\Program Files\Microsoft Visual Studio\
+      filter_optional_chocolatey:
+        Image|startswith: C:\ProgramData\chocolatey\choco.exe
+      filter_optional_nextron:
+        Image|startswith: C:\Windows\Temp\asgard2-agent\
+        Image|endswith:
+        - \thor64.exe
+        - \thor.exe
+      filter_optional_aurora:
+        Image: null
+      condition: selection and not 1 of filter_main_* and not 1 of filter_optional_*
+    fields:
+    - host.name

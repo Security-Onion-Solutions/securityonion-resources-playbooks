@@ -1,0 +1,288 @@
+name: Potential PowerShell Execution Policy Tampering
+id: 9c454090-b56d-4711-a0a5-21b8cbb30a63
+description: |
+  Detects a registry write setting the PowerShell ExecutionPolicy value - under either the per-user ShellIds path or
+  the machine Policies path - to Bypass or Unrestricted, where the writing process is not a binary in System32 or
+  SysWOW64 (which excludes routine policy processing). Execution policy is not a security boundary, but downgrading
+  it is a standard preparation step so unsigned scripts run without per-invocation flags, and the write persisting in
+  the registry outlives the session. Administrators and developers legitimately relax the policy, so the
+  investigation should establish who made the change, which scope it affects, and what PowerShell activity followed.
+type: detection
+detection_id: fad91067-08c5-4d1a-8d8c-d96a21b37814
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-10
+questions:
+- question: Does the registry write set the ExecutionPolicy value to Bypass or Unrestricted as this rule detects?
+  context: Confirm the alert is a true positive - the TargetObject must end in an ExecutionPolicy value (either the
+    per-user ShellIds\Microsoft.PowerShell path or the machine Policies\Microsoft\Windows\PowerShell path) and the
+    Details must contain Bypass or Unrestricted. The rule already excludes writers running from System32 and
+    SysWOW64, so the writing process on this event is by definition outside the routine policy-processing set.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this user or host expected to relax the PowerShell execution policy?
+  context: Developers running local scripts and administrators automating maintenance are the legitimate audience for
+    Bypass or Unrestricted - typically on workstations they own and often via a documented build or tooling setup. A
+    standard user's session writing the value, or the change landing on a server with no scripting role, has no
+    routine explanation. User attribution is present on most endpoint registry events; when it is a machine account
+    or missing, pivot on the writing process instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Which policy scope was downgraded, to what value, and by which process?
+  context: The key path carries the blast radius - the ShellIds path is the current user's policy, while the Policies
+    path is the machine-wide setting that overrides per-user configuration. Bypass suppresses the policy entirely;
+    Unrestricted allows unsigned scripts with prompts for downloaded ones. The writing process completes the picture,
+    since the rule has already excluded System32/SysWOW64 binaries - expect PowerShell itself (Set-ExecutionPolicy),
+    an installer, or attacker tooling.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: What command drove the policy change, and does it decode to anything further?
+  context: The writing process's command line shows how the downgrade happened - a bare Set-ExecutionPolicy from an
+    interactive session reads as hands-on configuration, while a downgrade embedded in an encoded command, a download
+    cradle, or an installer's script block reads as staging. Decode any base64 payload and extract URLs or file paths
+    for the follow-on checks.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What spawned the process that changed the policy?
+  context: The parent chain separates a person from a payload - explorer and a terminal up the chain indicate an
+    interactive user, while an Office process, script host, or unfamiliar executable driving the change indicates a
+    delivery chain preparing the host for unsigned script execution.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - Image
+      - CommandLine
+- question: What did PowerShell execute after the policy was downgraded?
+  context: The downgrade exists to make something run. PowerShell launches on the host in the following hours show
+    whether that something arrived - script files executed by path, download cradles, or long encoded commands.
+    Command lines that no longer need -ExecutionPolicy flags are exactly what the registry change purchased.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+          - '\powershell_ise.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Did PowerShell script block logging capture what ran around the policy change?
+  context: Script block events record the actual code PowerShell executed - including the Set-ExecutionPolicy call
+    and whatever ran after it - regardless of command-line obfuscation. If PowerShell operational logs are not
+    ingested in this environment, treat zero results as a visibility gap rather than evidence nothing ran, and rely
+    on the command-line questions instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Were new PowerShell scripts written to disk around the policy change?
+  context: A policy downgrade pairs naturally with a script payload arriving - a .ps1 dropped to a user-writable path
+    just before or after the change is the artifact the downgrade was for. The writing process for any new script
+    connects it back to the delivery chain, and the script file itself becomes evidence to retrieve.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith: '.ps1'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: Were other registry modifications made on this host in the same session?
+  context: Execution-policy tampering often travels with other defense-impairment writes - antivirus preference
+    changes, AMSI-related settings, or logging configuration. Clusters of registry writes from the same process in
+    the window show whether this was a lone configuration change or one step in a broader effort to make the host
+    permissive.
+  range: +/-30m
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - User
+- question: Has the ExecutionPolicy value been modified before on this host?
+  context: Developer machines often carry a history of policy toggles - the same value set months ago by the same
+    tooling supports an established workflow. A first-ever write, or a history of RemoteSigned suddenly replaced by
+    Bypass from a new writer, marks a change in the host's posture rather than routine use.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - Details
+      - Image
+- question: Does this host normally run the process that wrote the value?
+  context: If PowerShell wrote the value, its history alone says little - weigh the invocation context from the
+    command-line question instead. If the writer is an installer or an unfamiliar binary, zero or recent-only history
+    marks a freshly introduced tool making defense-relevant changes, which fits staging rather than administration.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: Was the ExecutionPolicy value downgraded on other hosts?
+  context: Managed policy changes arrive via group-policy processing, which the rule's filter excludes - so multiple
+    hosts firing this rule means a non-system writer is repeating the downgrade across machines, consistent with
+    deployment tooling misuse or an operator moving laterally. Compare writers and value data across the affected
+    hosts.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+      - Details
+- question: What other activity occurred on this host around the time of the alert?
+  context: A staged downgrade is usually surrounded by the rest of the chain - payload delivery, script execution, or
+    persistence installation within minutes. Aggregated parent-child pairs collapse repetitive agent noise into
+    high-count rows while novel pairs stand out at low counts; those low-count novel pairs are what to scan for.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Policy tampering mid-intrusion follows initial execution - a phishing payload, script host launch, or
+    download activity may already have tripped rules on this host. The preceding alert timeline helps place the
+    downgrade inside a longer sequence and identify the session that performed it.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

@@ -1,0 +1,323 @@
+name: Potential WMI Lateral Movement WmiPrvSE Spawned PowerShell
+id: 095bb191-f290-4d66-9343-977a9392018c
+description: |
+  Detects PowerShell (powershell.exe or pwsh.exe, matched by image name or OriginalFileName) launched as a child of WmiPrvSE.exe, the WMI provider host. Remote WMI command execution surfaces locally as WmiPrvSE.exe spawning the requested process, so a PowerShell child of WmiPrvSE is a common signature of lateral movement driven from another host. The same pattern is also produced by legitimate management agents (software distribution, configuration management, remote management), so the investigation should determine which remote host or local mechanism initiated the WMI call, what the PowerShell process actually did, and whether the activity fits an approved automation pattern.
+type: detection
+detection_id: 692f0bec-83ba-4d04-af7e-e884a96059b6
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Did WmiPrvSE.exe spawn a PowerShell process matching this rule?
+  context: Confirm the alert is a true positive by reviewing the parent and child details against the detection criteria. The rule fires when the parent Image ends in WmiPrvSE.exe and the child is identified as PowerShell either by its Image ending in powershell.exe or pwsh.exe, or by its OriginalFileName being PowerShell.EXE or pwsh.dll. Note which way the child matched, because an OriginalFileName match with a renamed or relocated Image is more suspicious than a child sitting at the standard System32 path.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - OriginalFileName
+- question: Is this user and host expected to receive PowerShell execution over WMI?
+  context: Remote WMI execution against a host is normally limited to management servers, configuration-management agents, and named administrators. If the destination host is not a managed endpoint, or the acting account is not one that routine automation runs under, the WMI-initiated PowerShell is more likely operator-driven than a sanctioned task.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What started the WmiPrvSE.exe instance that spawned this PowerShell, and is that origin expected?
+  context: WmiPrvSE.exe runs as a provider host under the WMI service and is started on demand to service incoming WMI calls. Tracing the provider host instance and the account it ran under helps separate a benign local management call from a remote operator driving execution through WMI. The parent lookup also shows the command line of the PowerShell child for upward correlation.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What did this PowerShell process actually do? Decode its full command line.
+  context: The full command line reveals the operational purpose. Decode any flags, encoded content, download cradles, file paths, or URLs. Remote WMI execution frequently delivers a one-line PowerShell downloader or in-memory loader rather than an interactive session, so read the arguments for what they fetch or execute, not just whether they look obfuscated. The query is scoped to this triggering process so the result is the exact command that fired.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Was the command encoded or obfuscated? What does it decode to?
+  context: Attackers frequently use PowerShell's -EncodedCommand (-enc) parameter or string concatenation, backtick escaping, and variable substitution to hide intent. Base64-encoded commands are the most common form. Decoding reveals the actual payload — download cradles, reverse shells, or in-memory execution of .NET assemblies — which is the difference between an automation command and a delivered loader.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did PowerShell script block logging capture the full script content?
+  context: Script block logging records the deobfuscated script content PowerShell actually executes, even when the command line is encoded or obfuscated, providing ground truth about what ran. If PowerShell operational logs are not ingested in this environment, treat zero results as a visibility gap rather than evidence nothing ran, and decode the alerting command line directly.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Were PowerShell security controls bypassed or weakened before this execution?
+  context: Operators often disable or bypass PowerShell security controls before running a payload — AMSI bypass, execution policy changes, constrained language mode escape, or a downgrade to PowerShell v2 which lacks modern logging. Finding these precursor events on the host strengthens the case that the WMI-delivered PowerShell is malicious.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: Do the WMI operational logs show a remote provider or activity that initiated this execution?
+  context: >-
+    WMI-Activity events show what the WMI service did around this execution: provider starts
+    (5857) name the provider loaded and its wmiprvse.exe host process, and subscription
+    registrations (5859-5861) carry the event query and consumer definition. Read
+    winlog.user_data.ProviderName, winlog.user_data.Query, winlog.user_data.CONSUMER, and the
+    message narrative - a registration in root\subscription points to event-consumer persistence
+    rather than one-off command execution. If WMI operational logs are not ingested in this
+    environment, treat this as a visibility gap and correlate by timing instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        Channel: 'Microsoft-Windows-WMI-Activity/Operational'
+        host.name|expand: '%hostname%'
+        EventID:
+          - 5857
+          - 5859
+          - 5860
+          - 5861
+      condition: selection
+    fields:
+      - EventID
+      - winlog.user_data.ProviderName
+      - winlog.user_data.CONSUMER
+      - winlog.user_data.ESS
+      - winlog.user_data.Query
+      - message
+- question: Did this PowerShell process make outbound network connections, and to where?
+  context: WMI-driven lateral movement that delivers a downloader will show the spawned PowerShell reaching out to fetch a payload or call back to an operator endpoint. Correlating network connections from this process against the execution window separates a remote download or callback from an empty in-host command. Exclude expected update and management destinations when judging the result.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationHostname
+      - DestinationPort
+- question: What other child processes did this same WmiPrvSE.exe instance spawn?
+  context: A WMI call can request more than one process, and a remote operator often chains reconnaissance, credential access, and follow-on tooling through the same provider host. Examining the other children of this exact WmiPrvSE.exe instance reveals the full scope of what was driven through this WMI session.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Is WmiPrvSE.exe spawning PowerShell on other hosts in the environment?
+  context: The same WMI-to-PowerShell pattern appearing across multiple hosts in a short window points to a management agent's normal behavior or, when unexpected, to an operator moving laterally from host to host. A single isolated occurrence is more likely a targeted call. Cross-host distribution helps calibrate whether this is routine automation or active lateral movement.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+      - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent:
+        ParentImage|endswith: \WmiPrvSE.exe
+      selection_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent:
+        ParentImage|endswith: \WmiPrvSE.exe
+      selection_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the account's activity across all hosts in the alert window reveals lateral movement or activity spanning multiple endpoints. If the same account drove similar activity on several hosts, the scope of the operation is larger than this one alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent:
+        ParentImage|endswith: \WmiPrvSE.exe
+      selection_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Lateral movement rarely arrives first. Earlier detections on the same host — reconnaissance, credential access, defense tampering — may reveal the stages that preceded this WMI execution and help reconstruct the timeline of how the operator reached this host.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

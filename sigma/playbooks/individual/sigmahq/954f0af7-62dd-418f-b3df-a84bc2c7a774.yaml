@@ -1,0 +1,392 @@
+name: New Remote Desktop Connection Initiated Via Mstsc.EXE
+id: 039f7712-84de-48e3-aabb-23c8c2c27de1
+description: |
+  Detects execution of mstsc.exe (the Windows Remote Desktop client) with a /v: argument, which specifies the
+  destination host for an outbound RDP session. The rule fires when the image is mstsc.exe AND the command line
+  contains /v:, excluding the WSLg helper invocation. Operator-initiated RDP is routine for administrators and
+  helpdesk staff, but the same primitive is used to move laterally with valid or stolen credentials; flags such as
+  /restrictedadmin (pass-the-hash over RDP) and /shadow /noconsentprompt (silent session takeover) raise the stakes.
+  Investigation should confirm the destination host, the launching parent and user, and whether post-connection
+  activity on the source or destination indicates hands-on-keyboard lateral movement rather than an interactive admin session.
+type: detection
+detection_id: 954f0af7-62dd-418f-b3df-a84bc2c7a774
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does this mstsc.exe command line carry a /v destination flag, and which host is it connecting to?
+  context: Confirm the alert is a true positive by reviewing the exact command line and process identity. The rule
+    fires when the image is mstsc.exe (or its OriginalFileName is mstsc.exe) AND the command line contains a /v
+    destination argument. Read the host string after /v — that value is the RDP destination and the anchor for the
+    rest of the investigation. Note any credential-mode flags (/restrictedadmin, /remoteguard) or session-shadow
+    flags (/shadow, /control, /noconsentprompt) present in the same command line.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to initiate outbound Remote Desktop connections?
+  context: Administrators, helpdesk staff, and jump-box operators legitimately launch mstsc.exe to reach servers
+    and workstations. A user or host with no operational reason to drive RDP — a standard end-user workstation, a
+    server that normally only receives connections — is a stronger signal that the session is attacker-driven.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What is the full mstsc.exe command line, and does it carry credential-mode or session-shadow flags?
+  context: The full command line reveals exactly how the RDP session was configured. Decode every flag. The /v
+    argument gives the destination, /restrictedadmin disables credential delegation and is the signature of pass-the-hash over RDP,
+    /remoteguard redirects auth back to the client, and /shadow with /control /noconsentprompt is silent
+    session-takeover of a logged-on user. /edit against a .rdp file indicates connection-file authoring rather than
+    a live session. Legitimate operators almost never specify /restrictedadmin or /shadow by hand.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What process spawned mstsc.exe, and is that parent chain expected for an interactive RDP launch?
+  context: Interactive RDP launches normally descend from explorer.exe or a user shell. mstsc.exe spawned by a
+    non-interactive parent — cmd.exe, powershell.exe, wscript.exe, cscript.exe, wmic, or a service host — points to
+    scripted, automated lateral movement rather than a person opening the Remote Desktop client. Walk up from the
+    immediate parent to see what drove the launch.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: When this host has previously fired the rule's pattern, what parents and users normally drive these
+    mstsc.exe RDP connections, and does the current alert fit that pattern?
+  context: Even a routine RDP client can be abused. This query mirrors the rule's selection structure scoped to this
+    host, so the parent and user distribution reflects how the rule's specific firing pattern (mstsc.exe with /v:)
+    has historically run here — not generic mstsc usage. A new parent process, an unexpected user account, or an
+    unusual command-line structure is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \mstsc.exe
+      - OriginalFileName: mstsc.exe
+      selection_cli:
+        CommandLine|contains|windash: ' /v:'
+      filter_optional_wsl:
+        ParentImage: C:\Windows\System32\lxss\wslhost.exe
+        CommandLine|contains: C:\ProgramData\Microsoft\WSL\wslg.rdp
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_* and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: What host initiated this remote connection, and is it an expected administrative source?
+  context: Lateral movement requires a source and a destination. The originating host of an RDP session reveals
+    whether the connection came from a known admin jump box, a compromised workstation, or an unexpected source.
+    Attackers who compromise one host commonly use it as a pivot to reach others over RDP.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+      condition: selection
+    fields:
+      - SourceIp
+      - DestinationPort
+- question: Did a Remote Desktop logon succeed for this user around the time of the connection attempt?
+  context: The process_creation event shows the client launching mstsc.exe; it does not confirm the session
+    authenticated. Native Windows Security logon records (4624 success, 4625 failure) with a RemoteInteractive
+    logon type confirm whether the RDP session actually established and under which account, and reveal repeated
+    failures that suggest credential guessing or a pass-the-hash attempt that did not land. If Security logon
+    events are not ingested in this environment, treat zero results as a visibility gap rather than evidence the
+    session failed.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        EventID:
+          - 4624
+          - 4625
+        TargetUserName|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - IpAddress
+      - EventID
+      - LogonType
+- question: What authentication method backed this connection -- valid credentials, pass-the-hash, or a Kerberos ticket?
+  context: The authentication method reveals how access was obtained. The /restrictedadmin flag disables credential
+    delegation and is the primitive used for pass-the-hash over RDP, where an NTLM hash is injected into a /netonly
+    session rather than a password being typed. Legitimate credential use points to obtained or cached passwords;
+    network logons with no preceding interactive logon suggest hash or ticket reuse.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - User
+      - CommandLine
+- question: What processes ran on the source host immediately after mstsc.exe launched?
+  context: An RDP connection is a means to an end. Activity on the launching host in the minutes after mstsc.exe
+    started — credential tooling, reconnaissance, or additional remote-access utilities — shows whether this was a
+    routine admin session or one stage of hands-on-keyboard operations. Pair this with the destination host's logon
+    record to follow the session onto the target.
+  range: +30m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - User
+      - Image
+- question: Did known reconnaissance or credential-access tooling run on the source host in the minutes around this
+    connection?
+  context: Lateral movement is often bracketed by command interpreters and discovery utilities. Spawns of cmd.exe,
+    powershell.exe, certutil.exe, or similar around the RDP launch indicate scripted operator activity rather than a
+    person interactively driving the Remote Desktop client. A clean window favors a routine session; a cluster of
+    these binaries shifts the disposition toward an active operation.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - \cmd.exe
+          - \powershell.exe
+          - \pwsh.exe
+          - \certutil.exe
+          - \net.exe
+          - \net1.exe
+          - \whoami.exe
+          - \nltest.exe
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Has this user account driven other lateral-movement tooling across the environment recently?
+  context: Attackers rarely stop at one target. If the same account is launching RDP, PsExec, SSH, or WMI across
+    multiple hosts within a short window, the scope of compromise is larger than a single connection. A spread of
+    remote-access tooling from one account is a marker of active movement.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      selection_lateral:
+        Image|endswith:
+          - '\psexec.exe'
+          - '\psexec64.exe'
+          - '\mstsc.exe'
+          - '\ssh.exe'
+          - '\plink.exe'
+          - '\wmic.exe'
+      condition: selection and selection_lateral
+    fields:
+      - host.name
+      - Image
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \mstsc.exe
+      - OriginalFileName: mstsc.exe
+      selection_cli:
+        CommandLine|contains|windash: ' /v:'
+      filter_optional_wsl:
+        ParentImage: C:\Windows\System32\lxss\wslhost.exe
+        CommandLine|contains: C:\ProgramData\Microsoft\WSL\wslg.rdp
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_* and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \mstsc.exe
+      - OriginalFileName: mstsc.exe
+      selection_cli:
+        CommandLine|contains|windash: ' /v:'
+      filter_optional_wsl:
+        ParentImage: C:\Windows\System32\lxss\wslhost.exe
+        CommandLine|contains: C:\ProgramData\Microsoft\WSL\wslg.rdp
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_* and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the account's activity across all hosts reveals lateral movement or parallel activity on
+    multiple endpoints. If the same user drove similar activity on several hosts in the same window, the scope of
+    compromise may be larger than the alerting host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \mstsc.exe
+      - OriginalFileName: mstsc.exe
+      selection_cli:
+        CommandLine|contains|windash: ' /v:'
+      filter_optional_wsl:
+        ParentImage: C:\Windows\System32\lxss\wslhost.exe
+        CommandLine|contains: C:\ProgramData\Microsoft\WSL\wslg.rdp
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_* and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering,
+    reconnaissance, or credential access — may reveal the stages that preceded an RDP-based pivot and help
+    reconstruct the timeline. Reconnaissance or credential access followed by lateral movement is a common ordering.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Is mstsc.exe being launched with a /v destination flag on other hosts in the same window?
+  context: Automated lateral movement often replays the same connection pattern across many systems in a short
+    timeframe. Finding mstsc.exe with a /v destination on multiple hosts beyond the alerting one shows the activity is not
+    isolated and helps scope containment. A wide, consistent spread suggests scripted deployment or staged movement.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \mstsc.exe
+      - OriginalFileName: mstsc.exe
+      selection_cli:
+        CommandLine|contains|windash: ' /v:'
+      filter_self:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and not filter_self
+    fields:
+      - host.name

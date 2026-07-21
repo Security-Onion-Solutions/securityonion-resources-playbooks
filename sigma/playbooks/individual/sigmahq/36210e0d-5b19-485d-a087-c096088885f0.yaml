@@ -1,0 +1,882 @@
+name: Suspicious PowerShell Parameter Substring
+id: 5ec250b5-acce-4326-9c44-454984faf8af
+description: |
+  Detects powershell.exe or pwsh.exe launched with a parameter written as an
+  unusual mid-length abbreviation of a common switch — for example -NoPr / -NoPro
+  / -NoProf for -NoProfile, -encod / -enco for -EncodedCommand, -ex bypass /
+  -ep bypass for -ExecutionPolicy, or -win hidd / -windows h for -WindowStyle
+  Hidden. PowerShell's parameter binder accepts any unique prefix of a switch
+  name, so these in-between substrings are functionally identical to the full
+  flags; the canonical short and long forms are common in legitimate admin
+  scripts, but these intermediate abbreviations are almost never typed by hand
+  and are a characteristic product of automated command-line obfuscation.
+  Investigation should decode the full command line, confirm what the launcher
+  was actually trying to do (hide a window, suppress the profile, bypass
+  execution policy, run an encoded payload), establish the parent and user
+  context, and determine whether the same firing pattern is isolated or recurs
+  across the host and fleet.
+type: detection
+detection_id: 36210e0d-5b19-485d-a087-c096088885f0
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the command line match what this rule detects — an obfuscated PowerShell switch substring?
+  context: Before investing investigation time, confirm the alert is a true positive by reading the exact command line and process details. The rule fires when an Image ending in powershell.exe or pwsh.exe AND a CommandLine containing an abbreviated switch substring (e.g. -NoPr, -encod, -ec, -ep bypass, -win hidd) both match. Identify which abbreviation triggered it, since that tells you what the launcher was abbreviating.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Is this user and host expected to run PowerShell with abbreviated, machine-generated switches?
+  context: Legitimate administrative activity can trigger many detections, but human operators and well-formed admin scripts normally use the canonical switch forms (-NoProfile, -ExecutionPolicy Bypass), not mid-length abbreviations. Knowing whether this user role and host function involve packaged installers, management agents, or automation that emits shortened switches is often the fastest path to distinguishing routine tooling from obfuscated execution.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Was the command encoded or obfuscated, and what does it decode to?
+  context: The abbreviated switch forms this rule catches are themselves a marker of command-line obfuscation, and they frequently accompany an -encod/-ec encoded payload. If an -EncodedCommand variant is present, base64-decode it and read the resulting script; look for download cradles, reverse shells, or in-memory loading of .NET assemblies. If the abbreviated flags only hide a window or suppress the profile, identify the visible script or scriptblock that ran instead.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What did the full PowerShell invocation actually do across the abbreviated switches it used?
+  context: The full command line reveals the operational intent behind the abbreviations. Expand each shortened switch to its canonical meaning (-NoPr → -NoProfile, -nonin → -NonInteractive, -ex bypass / -ep bypass → -ExecutionPolicy Bypass, -win hidd → -WindowStyle Hidden, -ec / -encod → -EncodedCommand) and read them together — a non-interactive, profile-less, hidden-window, policy-bypassing PowerShell is a classic unattended-payload launch pattern. This query scopes to obfuscated-switch PowerShell launches on this host within the window so multi-step launchers are visible together.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|contains:
+          - ' -NoPr '
+          - ' -NoPro '
+          - ' -NoProf '
+          - ' -nonin '
+          - ' -noninte '
+          - ' -enco '
+          - ' -encod '
+          - ' -encoded '
+          - ' -ec '
+          - ' -ep bypass'
+          - ' -exec bypass'
+          - ' -win hidd '
+          - ' -win hidde '
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Did PowerShell script block logging capture the full deobfuscated script content?
+  context: Script block logging records the deobfuscated script content PowerShell actually executed, even when the launch arguments were abbreviated or the payload was encoded. This provides ground truth about what ran, bypassing the command-line obfuscation this rule keys on. If PowerShell operational logs are not ingested in this environment, treat zero results as a visibility gap rather than evidence that nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Were PowerShell security controls bypassed or weakened before this execution?
+  context: Obfuscated launch arguments often travel with explicit control-weakening — execution-policy bypass, AMSI patching, real-time monitoring disable, or a downgrade to PowerShell v2 which lacks scriptblock logging. Note that setting an execution-policy bypass alongside -EncodedCommand is redundant because encoded commands already bypass execution policy, so the presence of both is itself a sign of a packaged obfuscation launcher rather than hand-authored administration. Finding these precursor events strengthens the case for malicious activity.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: What process spawned this PowerShell instance and is that parent chain expected?
+  context: The parent process reveals how PowerShell was invoked. Legitimate usage often has predictable parents (explorer.exe for interactive use, services.exe or a management agent for scheduled work). Office applications, mshta.exe, wscript.exe, or a browser spawning an obfuscated PowerShell launch points to a macro, scriptlet, or exploitation chain rather than administration. Walk one level higher if the immediate parent is itself a generic interpreter.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What .NET and automation assemblies did this PowerShell process load, and are any rare for this host?
+  context: PowerShell abuse is frequently carried out through in-memory .NET execution rather than visible child processes, so the modules loaded by the process expose activity the command line alone hides. System.Management.Automation and the core PowerShell runtime are expected, but reflectively loaded or rarely seen assemblies tied to the same process — especially alongside an encoded launch — indicate a fileless cradle. This crosses into the image-load log source because the launch arguments cannot reveal what was loaded after the process started.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+- question: What child processes did this PowerShell instance spawn afterward?
+  context: The processes spawned after the obfuscated launch reveal its actual impact and timeline. Encoded or hidden PowerShell that goes on to spawn cmd.exe, certutil.exe, rundll32.exe, additional powershell.exe instances, or network utilities is doing post-exploitation; a launch that spawns nothing is more consistent with an in-memory-only action or a benign packaged task.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance, credential access — may reveal the attack stages that preceded an obfuscated PowerShell launch and help reconstruct the timeline. Defense tampering and credential access often precede execution, so a preceding cluster of alerts changes the disposition of this one.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Does this host normally run powershell.exe or pwsh.exe?
+  context: A process that has never been seen on a host is more suspicious than one that runs regularly. Many endpoints run PowerShell constantly for management, so a high count is unremarkable on its own — but a host where PowerShell is rare or absent firing an obfuscated launch is a stronger first-time-execution signal.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: When this host has previously fired this obfuscated-switch pattern, what parents and users normally drive it, and does the current alert fit?
+  context: Even common tools can be abused. The query mirrors the rule's selection structure scoped to this host — the resulting parent/user distribution reflects how the rule's specific firing pattern (not generic PowerShell usage) has historically run here. A new parent process, an unexpected user account, or an unusual command-line structure relative to that history is the anomaly worth chasing; a pattern that already accounts for prior events on this host points to a recurring packaged launcher.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        CommandLine|contains:
+        - ' -windowstyle h '
+        - ' -windowstyl h'
+        - ' -windowsty h'
+        - ' -windowst h'
+        - ' -windows h'
+        - ' -windo h'
+        - ' -wind h'
+        - ' -win h'
+        - ' -wi h'
+        - ' -win h '
+        - ' -win hi '
+        - ' -win hid '
+        - ' -win hidd '
+        - ' -win hidde '
+        - ' -NoPr '
+        - ' -NoPro '
+        - ' -NoProf '
+        - ' -NoProfi '
+        - ' -NoProfil '
+        - ' -nonin '
+        - ' -nonint '
+        - ' -noninte '
+        - ' -noninter '
+        - ' -nonintera '
+        - ' -noninterac '
+        - ' -noninteract '
+        - ' -noninteracti '
+        - ' -noninteractiv '
+        - ' -ec '
+        - ' -encodedComman '
+        - ' -encodedComma '
+        - ' -encodedComm '
+        - ' -encodedCom '
+        - ' -encodedCo '
+        - ' -encodedC '
+        - ' -encoded '
+        - ' -encode '
+        - ' -encod '
+        - ' -enco '
+        - ' -en '
+        - ' -executionpolic '
+        - ' -executionpoli '
+        - ' -executionpol '
+        - ' -executionpo '
+        - ' -executionp '
+        - ' -execution bypass'
+        - ' -executio bypass'
+        - ' -executi bypass'
+        - ' -execut bypass'
+        - ' -execu bypass'
+        - ' -exec bypass'
+        - ' -exe bypass'
+        - ' -ex bypass'
+        - ' -ep bypass'
+        - ' /windowstyle h '
+        - ' /windowstyl h'
+        - ' /windowsty h'
+        - ' /windowst h'
+        - ' /windows h'
+        - ' /windo h'
+        - ' /wind h'
+        - ' /win h'
+        - ' /wi h'
+        - ' /win h '
+        - ' /win hi '
+        - ' /win hid '
+        - ' /win hidd '
+        - ' /win hidde '
+        - ' /NoPr '
+        - ' /NoPro '
+        - ' /NoProf '
+        - ' /NoProfi '
+        - ' /NoProfil '
+        - ' /nonin '
+        - ' /nonint '
+        - ' /noninte '
+        - ' /noninter '
+        - ' /nonintera '
+        - ' /noninterac '
+        - ' /noninteract '
+        - ' /noninteracti '
+        - ' /noninteractiv '
+        - ' /ec '
+        - ' /encodedComman '
+        - ' /encodedComma '
+        - ' /encodedComm '
+        - ' /encodedCom '
+        - ' /encodedCo '
+        - ' /encodedC '
+        - ' /encoded '
+        - ' /encode '
+        - ' /encod '
+        - ' /enco '
+        - ' /en '
+        - ' /executionpolic '
+        - ' /executionpoli '
+        - ' /executionpol '
+        - ' /executionpo '
+        - ' /executionp '
+        - ' /execution bypass'
+        - ' /executio bypass'
+        - ' /executi bypass'
+        - ' /execut bypass'
+        - ' /execu bypass'
+        - ' /exec bypass'
+        - ' /exe bypass'
+        - ' /ex bypass'
+        - ' /ep bypass'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        CommandLine|contains:
+        - ' -windowstyle h '
+        - ' -windowstyl h'
+        - ' -windowsty h'
+        - ' -windowst h'
+        - ' -windows h'
+        - ' -windo h'
+        - ' -wind h'
+        - ' -win h'
+        - ' -wi h'
+        - ' -win h '
+        - ' -win hi '
+        - ' -win hid '
+        - ' -win hidd '
+        - ' -win hidde '
+        - ' -NoPr '
+        - ' -NoPro '
+        - ' -NoProf '
+        - ' -NoProfi '
+        - ' -NoProfil '
+        - ' -nonin '
+        - ' -nonint '
+        - ' -noninte '
+        - ' -noninter '
+        - ' -nonintera '
+        - ' -noninterac '
+        - ' -noninteract '
+        - ' -noninteracti '
+        - ' -noninteractiv '
+        - ' -ec '
+        - ' -encodedComman '
+        - ' -encodedComma '
+        - ' -encodedComm '
+        - ' -encodedCom '
+        - ' -encodedCo '
+        - ' -encodedC '
+        - ' -encoded '
+        - ' -encode '
+        - ' -encod '
+        - ' -enco '
+        - ' -en '
+        - ' -executionpolic '
+        - ' -executionpoli '
+        - ' -executionpol '
+        - ' -executionpo '
+        - ' -executionp '
+        - ' -execution bypass'
+        - ' -executio bypass'
+        - ' -executi bypass'
+        - ' -execut bypass'
+        - ' -execu bypass'
+        - ' -exec bypass'
+        - ' -exe bypass'
+        - ' -ex bypass'
+        - ' -ep bypass'
+        - ' /windowstyle h '
+        - ' /windowstyl h'
+        - ' /windowsty h'
+        - ' /windowst h'
+        - ' /windows h'
+        - ' /windo h'
+        - ' /wind h'
+        - ' /win h'
+        - ' /wi h'
+        - ' /win h '
+        - ' /win hi '
+        - ' /win hid '
+        - ' /win hidd '
+        - ' /win hidde '
+        - ' /NoPr '
+        - ' /NoPro '
+        - ' /NoProf '
+        - ' /NoProfi '
+        - ' /NoProfil '
+        - ' /nonin '
+        - ' /nonint '
+        - ' /noninte '
+        - ' /noninter '
+        - ' /nonintera '
+        - ' /noninterac '
+        - ' /noninteract '
+        - ' /noninteracti '
+        - ' /noninteractiv '
+        - ' /ec '
+        - ' /encodedComman '
+        - ' /encodedComma '
+        - ' /encodedComm '
+        - ' /encodedCom '
+        - ' /encodedCo '
+        - ' /encodedC '
+        - ' /encoded '
+        - ' /encode '
+        - ' /encod '
+        - ' /enco '
+        - ' /en '
+        - ' /executionpolic '
+        - ' /executionpoli '
+        - ' /executionpol '
+        - ' /executionpo '
+        - ' /executionp '
+        - ' /execution bypass'
+        - ' /executio bypass'
+        - ' /executi bypass'
+        - ' /execut bypass'
+        - ' /execu bypass'
+        - ' /exec bypass'
+        - ' /exe bypass'
+        - ' /ex bypass'
+        - ' /ep bypass'
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        CommandLine|contains:
+        - ' -windowstyle h '
+        - ' -windowstyl h'
+        - ' -windowsty h'
+        - ' -windowst h'
+        - ' -windows h'
+        - ' -windo h'
+        - ' -wind h'
+        - ' -win h'
+        - ' -wi h'
+        - ' -win h '
+        - ' -win hi '
+        - ' -win hid '
+        - ' -win hidd '
+        - ' -win hidde '
+        - ' -NoPr '
+        - ' -NoPro '
+        - ' -NoProf '
+        - ' -NoProfi '
+        - ' -NoProfil '
+        - ' -nonin '
+        - ' -nonint '
+        - ' -noninte '
+        - ' -noninter '
+        - ' -nonintera '
+        - ' -noninterac '
+        - ' -noninteract '
+        - ' -noninteracti '
+        - ' -noninteractiv '
+        - ' -ec '
+        - ' -encodedComman '
+        - ' -encodedComma '
+        - ' -encodedComm '
+        - ' -encodedCom '
+        - ' -encodedCo '
+        - ' -encodedC '
+        - ' -encoded '
+        - ' -encode '
+        - ' -encod '
+        - ' -enco '
+        - ' -en '
+        - ' -executionpolic '
+        - ' -executionpoli '
+        - ' -executionpol '
+        - ' -executionpo '
+        - ' -executionp '
+        - ' -execution bypass'
+        - ' -executio bypass'
+        - ' -executi bypass'
+        - ' -execut bypass'
+        - ' -execu bypass'
+        - ' -exec bypass'
+        - ' -exe bypass'
+        - ' -ex bypass'
+        - ' -ep bypass'
+        - ' /windowstyle h '
+        - ' /windowstyl h'
+        - ' /windowsty h'
+        - ' /windowst h'
+        - ' /windows h'
+        - ' /windo h'
+        - ' /wind h'
+        - ' /win h'
+        - ' /wi h'
+        - ' /win h '
+        - ' /win hi '
+        - ' /win hid '
+        - ' /win hidd '
+        - ' /win hidde '
+        - ' /NoPr '
+        - ' /NoPro '
+        - ' /NoProf '
+        - ' /NoProfi '
+        - ' /NoProfil '
+        - ' /nonin '
+        - ' /nonint '
+        - ' /noninte '
+        - ' /noninter '
+        - ' /nonintera '
+        - ' /noninterac '
+        - ' /noninteract '
+        - ' /noninteracti '
+        - ' /noninteractiv '
+        - ' /ec '
+        - ' /encodedComman '
+        - ' /encodedComma '
+        - ' /encodedComm '
+        - ' /encodedCom '
+        - ' /encodedCo '
+        - ' /encodedC '
+        - ' /encoded '
+        - ' /encode '
+        - ' /encod '
+        - ' /enco '
+        - ' /en '
+        - ' /executionpolic '
+        - ' /executionpoli '
+        - ' /executionpol '
+        - ' /executionpo '
+        - ' /executionp '
+        - ' /execution bypass'
+        - ' /executio bypass'
+        - ' /executi bypass'
+        - ' /execut bypass'
+        - ' /execu bypass'
+        - ' /exec bypass'
+        - ' /exe bypass'
+        - ' /ex bypass'
+        - ' /ep bypass'
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the same user triggered similar PowerShell activity on multiple hosts in a short window, the scope of compromise may be larger than the single alerting host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        CommandLine|contains:
+        - ' -windowstyle h '
+        - ' -windowstyl h'
+        - ' -windowsty h'
+        - ' -windowst h'
+        - ' -windows h'
+        - ' -windo h'
+        - ' -wind h'
+        - ' -win h'
+        - ' -wi h'
+        - ' -win h '
+        - ' -win hi '
+        - ' -win hid '
+        - ' -win hidd '
+        - ' -win hidde '
+        - ' -NoPr '
+        - ' -NoPro '
+        - ' -NoProf '
+        - ' -NoProfi '
+        - ' -NoProfil '
+        - ' -nonin '
+        - ' -nonint '
+        - ' -noninte '
+        - ' -noninter '
+        - ' -nonintera '
+        - ' -noninterac '
+        - ' -noninteract '
+        - ' -noninteracti '
+        - ' -noninteractiv '
+        - ' -ec '
+        - ' -encodedComman '
+        - ' -encodedComma '
+        - ' -encodedComm '
+        - ' -encodedCom '
+        - ' -encodedCo '
+        - ' -encodedC '
+        - ' -encoded '
+        - ' -encode '
+        - ' -encod '
+        - ' -enco '
+        - ' -en '
+        - ' -executionpolic '
+        - ' -executionpoli '
+        - ' -executionpol '
+        - ' -executionpo '
+        - ' -executionp '
+        - ' -execution bypass'
+        - ' -executio bypass'
+        - ' -executi bypass'
+        - ' -execut bypass'
+        - ' -execu bypass'
+        - ' -exec bypass'
+        - ' -exe bypass'
+        - ' -ex bypass'
+        - ' -ep bypass'
+        - ' /windowstyle h '
+        - ' /windowstyl h'
+        - ' /windowsty h'
+        - ' /windowst h'
+        - ' /windows h'
+        - ' /windo h'
+        - ' /wind h'
+        - ' /win h'
+        - ' /wi h'
+        - ' /win h '
+        - ' /win hi '
+        - ' /win hid '
+        - ' /win hidd '
+        - ' /win hidde '
+        - ' /NoPr '
+        - ' /NoPro '
+        - ' /NoProf '
+        - ' /NoProfi '
+        - ' /NoProfil '
+        - ' /nonin '
+        - ' /nonint '
+        - ' /noninte '
+        - ' /noninter '
+        - ' /nonintera '
+        - ' /noninterac '
+        - ' /noninteract '
+        - ' /noninteracti '
+        - ' /noninteractiv '
+        - ' /ec '
+        - ' /encodedComman '
+        - ' /encodedComma '
+        - ' /encodedComm '
+        - ' /encodedCom '
+        - ' /encodedCo '
+        - ' /encodedC '
+        - ' /encoded '
+        - ' /encode '
+        - ' /encod '
+        - ' /enco '
+        - ' /en '
+        - ' /executionpolic '
+        - ' /executionpoli '
+        - ' /executionpol '
+        - ' /executionpo '
+        - ' /executionp '
+        - ' /execution bypass'
+        - ' /executio bypass'
+        - ' /executi bypass'
+        - ' /execut bypass'
+        - ' /execu bypass'
+        - ' /exec bypass'
+        - ' /exe bypass'
+        - ' /ex bypass'
+        - ' /ep bypass'
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Have other hosts fired this obfuscated-switch pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of the rule's firing pattern (not generic PowerShell usage). Many hosts firing the same abbreviated-switch pattern points to scripted deployment or vendor automation that happens to emit shortened switches; one host or a small unrelated set points to manual operator activity. Use the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        CommandLine|contains:
+        - ' -windowstyle h '
+        - ' -windowstyl h'
+        - ' -windowsty h'
+        - ' -windowst h'
+        - ' -windows h'
+        - ' -windo h'
+        - ' -wind h'
+        - ' -win h'
+        - ' -wi h'
+        - ' -win h '
+        - ' -win hi '
+        - ' -win hid '
+        - ' -win hidd '
+        - ' -win hidde '
+        - ' -NoPr '
+        - ' -NoPro '
+        - ' -NoProf '
+        - ' -NoProfi '
+        - ' -NoProfil '
+        - ' -nonin '
+        - ' -nonint '
+        - ' -noninte '
+        - ' -noninter '
+        - ' -nonintera '
+        - ' -noninterac '
+        - ' -noninteract '
+        - ' -noninteracti '
+        - ' -noninteractiv '
+        - ' -ec '
+        - ' -encodedComman '
+        - ' -encodedComma '
+        - ' -encodedComm '
+        - ' -encodedCom '
+        - ' -encodedCo '
+        - ' -encodedC '
+        - ' -encoded '
+        - ' -encode '
+        - ' -encod '
+        - ' -enco '
+        - ' -en '
+        - ' -executionpolic '
+        - ' -executionpoli '
+        - ' -executionpol '
+        - ' -executionpo '
+        - ' -executionp '
+        - ' -execution bypass'
+        - ' -executio bypass'
+        - ' -executi bypass'
+        - ' -execut bypass'
+        - ' -execu bypass'
+        - ' -exec bypass'
+        - ' -exe bypass'
+        - ' -ex bypass'
+        - ' -ep bypass'
+        - ' /windowstyle h '
+        - ' /windowstyl h'
+        - ' /windowsty h'
+        - ' /windowst h'
+        - ' /windows h'
+        - ' /windo h'
+        - ' /wind h'
+        - ' /win h'
+        - ' /wi h'
+        - ' /win h '
+        - ' /win hi '
+        - ' /win hid '
+        - ' /win hidd '
+        - ' /win hidde '
+        - ' /NoPr '
+        - ' /NoPro '
+        - ' /NoProf '
+        - ' /NoProfi '
+        - ' /NoProfil '
+        - ' /nonin '
+        - ' /nonint '
+        - ' /noninte '
+        - ' /noninter '
+        - ' /nonintera '
+        - ' /noninterac '
+        - ' /noninteract '
+        - ' /noninteracti '
+        - ' /noninteractiv '
+        - ' /ec '
+        - ' /encodedComman '
+        - ' /encodedComma '
+        - ' /encodedComm '
+        - ' /encodedCom '
+        - ' /encodedCo '
+        - ' /encodedC '
+        - ' /encoded '
+        - ' /encode '
+        - ' /encod '
+        - ' /enco '
+        - ' /en '
+        - ' /executionpolic '
+        - ' /executionpoli '
+        - ' /executionpol '
+        - ' /executionpo '
+        - ' /executionp '
+        - ' /execution bypass'
+        - ' /executio bypass'
+        - ' /executi bypass'
+        - ' /execut bypass'
+        - ' /execu bypass'
+        - ' /exec bypass'
+        - ' /exe bypass'
+        - ' /ex bypass'
+        - ' /ep bypass'
+      condition: selection
+    fields:
+    - host.name

@@ -1,0 +1,348 @@
+name: Potential Windows Defender AV Bypass Via Dump64.EXE Rename
+id: 18413dbc-6d16-4ff8-b71c-f534c717dc66
+description: |
+  Detects an executable named dump64.exe running from a Microsoft Visual Studio directory under Program Files, where the binary's OriginalFileName is procdump or its command line contains procdump's memory-dump flags (' -ma ' or ' -mp '). Renaming procdump to dump64.exe and dropping it inside the trusted Visual Studio path is a known way to evade Windows Defender while dumping LSASS memory for offline credential extraction. Legitimate procdump use does not normally involve renaming the binary to dump64.exe or relocating it into the Visual Studio tree, so the investigation should confirm whether LSASS memory was actually accessed and dumped, what process and user drove it, and whether the resulting dump or stolen credentials were used for follow-on access.
+type: detection
+detection_id: 129966c9-de17-4334-a123-8b58172e664d
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- question: Does the alerting process match this rule — a dump64.exe under a Visual Studio folder whose OriginalFileName is procdump or whose command line carries a memory-dump flag?
+  context: Confirm the alert is a true positive before investing investigation time. Review the full path, OriginalFileName, and command line against the rule's criteria — the binary must be named dump64.exe and live under a Program Files Microsoft Visual Studio directory, and either its OriginalFileName resolves to procdump or its command line contains ' -ma ' (full dump) or ' -mp ' (process-paged dump).
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to run procdump or LSASS-dumping tooling from a Visual Studio directory?
+  context: Developer and IT-support workstations may legitimately run procdump for crash analysis, but doing so under the name dump64.exe relocated into the Visual Studio tree is not a normal developer workflow. Knowing whether the user's role and the host's function involve memory diagnostics is often the fastest way to separate a true positive from an unusual but benign action.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Was LSASS memory successfully accessed or dumped, and by what method?
+  context: This rule targets LSASS memory dumping via renamed procdump. Decode the full command line to confirm the dump flags and identify the target and output path — procdump's ' -ma ' writes a full process dump and ' -mp ' a paged dump, and the target is typically lsass or its PID. The dump method and target determine which credentials may have been exposed and what remediation is needed.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did this specific dump64.exe process, or a process it launched, write a file to disk — narrowing on the alerting process rather than the whole host?
+  context: Memory dumping requires opening lsass.exe with broad access rights, but that handle open is not
+    observable in this environment — there is no cross-process access telemetry available, so a zero result
+    on the LSASS handle itself is never evidence the dump did not happen. This question ties any written file
+    directly to the lineage of the process that triggered this alert (rather than the broader host-wide
+    search in the question above), which helps confirm this specific dump64.exe execution — and not some
+    other activity on the host — produced the artifact.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Was an LSASS dump file written to disk on this host, and where?
+  context: A successful memory dump leaves a file artifact — procdump writes a .dmp by default, and operators commonly drop it in writable staging paths such as %TEMP%, C:\Windows\Temp, or the same Visual Studio directory the binary ran from. Locating the dump file confirms credential material was captured and gives the path to collect for analysis or to scope for exfiltration. Absence of a dump file may mean the access failed or the output was streamed elsewhere.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_dump:
+        - TargetFilename|endswith: .dmp
+        - TargetFilename|contains: lsass
+      condition: selection_host and selection_dump
+    fields:
+      - TargetFilename
+      - Image
+      - User
+- question: What process spawned this dump64.exe, and is that parent chain expected?
+  context: The parent process reveals how the renamed tool was launched. A developer running it from an interactive shell or IDE differs from a launch by a script host, Office application, or remote-execution tooling. Walk up the chain to see what spawned the parent and whether the lineage fits routine activity on this host.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Were outbound remote-access connections (RDP, SMB, WinRM, SSH) initiated from this host after
+    this event?
+  context: Credential theft is typically followed by lateral movement. The query returns outbound connections
+    from this host to remote-access ports -- 3389 (RDP), 445 (SMB/PsExec), 5985/5986 (WinRM), 22 (SSH)
+    -- in the hours after the event; the originating Image and User show what drove each connection. Two
+    limits to keep in mind -- credentials exfiltrated and replayed from another machine will not appear
+    here (check security 4624 logons on suspected targets for this account and any accounts with sessions
+    on this host), and the query requires Sysmon network telemetry (EID 3); if that is not collected from
+    this host, treat zero rows as a visibility gap, not as evidence no movement occurred.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
+- question: Which accounts may be compromised, and do any have elevated privileges?
+  context: An LSASS dump exposes credentials for every account with a session on the host — interactive users, service accounts, and any cached domain credentials. The severity depends on the privilege of those accounts. Domain admin or broadly privileged service-account credentials require incident escalation and credential rotation; a single standard user may only need monitoring. Cross-reference the accounts active on this host with directory group memberships.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Has dump64.exe run from this Visual Studio path on this host before?
+  context: A binary named dump64.exe executing from the Visual Studio tree has no routine purpose, so any prior history matters. Zero or very low counts over the baseline window indicate first-time or rare execution and raise suspicion; a recurring count could reflect an established but still unusual local tool that warrants review.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: When this host has previously fired this rule's pattern, what parents and users normally drive it, and does the current alert fit?
+  context: Even when a dump64.exe has run here before, the parent process and user that drove it carry the signal. The query mirrors the rule's full selection structure scoped to this host, so the resulting parent/user distribution reflects how this specific firing pattern has historically run here. A new parent process, an unexpected user account, or an unusual command-line structure is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_dump:
+        Image|startswith: :\Program Files
+        Image|contains: \Microsoft Visual Studio\
+        Image|endswith: \dump64.exe
+      selection_tools_procdump:
+      - OriginalFileName: procdump
+      - CommandLine|contains:
+        - ' -ma '
+        - ' -mp '
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection_dump and 1 of selection_tools_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Have other hosts fired this rule's pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of this firing pattern rather than generic procdump usage. Many hosts firing the same pattern points to scripted deployment or a vendor build process that drops a renamed procdump; one host or a small unrelated set points to manual operator activity. Use the host distribution and parent/binary consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_dump:
+        Image|startswith: :\Program Files
+        Image|contains: \Microsoft Visual Studio\
+        Image|endswith: \dump64.exe
+      selection_tools_procdump:
+      - OriginalFileName: procdump
+      - CommandLine|contains:
+        - ' -ma '
+        - ' -mp '
+      condition: selection_dump and 1 of selection_tools_*
+    fields:
+    - host.name
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_dump:
+        Image|startswith: :\Program Files
+        Image|contains: \Microsoft Visual Studio\
+        Image|endswith: \dump64.exe
+      selection_tools_procdump:
+      - OriginalFileName: procdump
+      - CommandLine|contains:
+        - ' -ma '
+        - ' -mp '
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection_dump and 1 of selection_tools_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_dump:
+        Image|startswith: :\Program Files
+        Image|contains: \Microsoft Visual Studio\
+        Image|endswith: \dump64.exe
+      selection_tools_procdump:
+      - OriginalFileName: procdump
+      - CommandLine|contains:
+        - ' -ma '
+        - ' -mp '
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection_dump and 1 of selection_tools_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or credential reuse across multiple endpoints. If the same user triggered similar activity on other hosts in the surrounding window, the scope of compromise may be larger than this single dump.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_dump:
+        Image|startswith: :\Program Files
+        Image|contains: \Microsoft Visual Studio\
+        Image|endswith: \dump64.exe
+      selection_tools_procdump:
+      - OriginalFileName: procdump
+      - CommandLine|contains:
+        - ' -ma '
+        - ' -mp '
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection_dump and 1 of selection_tools_*) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate context: what led to this event, what happened after, and whether it is part of a larger sequence. Look for reconnaissance, privilege escalation, or staging activity that surrounds the dump.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance, or initial execution — may reveal the stages that preceded this credential-access event and help reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

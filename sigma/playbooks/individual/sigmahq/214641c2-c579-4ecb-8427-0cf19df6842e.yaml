@@ -1,0 +1,324 @@
+name: Remote File Download Via Desktopimgdownldr Utility
+id: 22f6dd73-62fc-4a10-8ad8-518873ce250e
+description: |
+  Detects desktopimgdownldr.exe, a signed Windows lockscreen/desktop-image helper, invoked with a /lockscreenurl:http argument. The rule fires when the process Image AND its parent both end in desktopimgdownldr.exe AND the command line contains /lockscreenurl:http, treating the invocation as a living-off-the-land file-download alternative to certutil. Note that the outbound transfer is not performed by desktopimgdownldr.exe itself; the actual TCP connection is made by svchost.exe hosting the BITS COM service, so the network and file evidence must be hunted on those processes correlated by time and user. The investigation should determine what the supplied URL points to, whether a file landed on disk, what spawned the chain, and whether the activity is a one-off versus a fleet-wide pattern.
+type: detection
+detection_id: 214641c2-c579-4ecb-8427-0cf19df6842e
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the command line match what this rule detects — desktopimgdownldr.exe with a /lockscreenurl:http argument?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the exact command line and process details. The rule requires the process Image to end in desktopimgdownldr.exe, the parent to also be desktopimgdownldr.exe, and the command line to contain /lockscreenurl:http. Read the full /lockscreenurl value and any /eventName argument from the triggering event.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Is this user and host expected to download files via the desktopimgdownldr lockscreen utility?
+  context: Legitimate use of desktopimgdownldr.exe is almost entirely administrative image provisioning, and even then the /lockscreenurl:http download path is rare. Knowing whether the user role and host function involve lockscreen or desktop-image management is often the fastest way to separate a benign admin action from living-off-the-land file transfer.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What spawned the desktopimgdownldr chain, and is that grandparent expected to launch lockscreen-image tooling?
+  context: The rule fires when desktopimgdownldr.exe runs with a desktopimgdownldr.exe parent, so the meaningful origin is what spawned that parent. A grandparent such as a script interpreter, an Office application, or an unexpected shell points to operator-driven download abuse; a routine provisioning or management process points to legitimate image deployment. If ParentProcessGuid resolves to NODATA, pivot on the parent binary and time window on this host instead.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What other child processes did the same parent spawn around the alert?
+  context: If the parent that launched this desktopimgdownldr invocation also spawned other processes, those siblings reveal the full scope of activity from that execution. Multiple tools launched from the same parent in a short window suggests scripted or hands-on-keyboard orchestration rather than a single benign image download.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: What does the /lockscreenurl value point to, and what is the full command line including any SYSTEMROOT redirection or /eventName argument?
+  context: The full command line reveals the download target and the operating mode. Decode the URL from /lockscreenurl to identify the destination host, port, and file. Watch for a preceding SYSTEMROOT redirect to a writable temp directory, which is the standard-user variant that skips the registry write and lockscreen replacement, and for an /eventName argument that controls the saved filename. The host-scoped window captures any companion desktopimgdownldr invocations that form one logical operation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Was an outbound connection to the /lockscreenurl destination made by svchost.exe hosting the BITS service around the alert?
+  context: The transfer is not performed by desktopimgdownldr.exe; it queues a BITS job and the actual TCP connection is made by svchost.exe running the BITS service. Confirming an outbound connection from svchost to the destination host in the alert window establishes that the download attempt actually reached the network. A connection to an external address is the expected pattern for ingress tool transfer; internal-only destinations may be benign image provisioning. If no svchost outbound connection appears, the job may have failed, been blocked, or targeted an internal host.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: \svchost.exe
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationHostname
+      - DestinationPort
+- question: Was the download successful? Check for file creation at the lockscreen destination path.
+  context: A queued download does not guarantee the file was retrieved. Network errors, blocked URLs, or security controls may have stopped the transfer. Under intended use the file lands at C:\Windows\Personalization\LockScreenImage; the standard-user variant redirects it under a writable temp directory. Confirming file creation at the resolved path establishes whether the activity progressed past delivery.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: If the downloaded file was executed, what is its hash and does it have known threat-intel detections?
+  context: A file's hash for reputation lookup is recorded when it runs, not when desktopimgdownldr writes it to disk — file-creation events carry no hash. The /lockscreenurl mechanism does not validate that the target is an image, so treat the file as an untrusted payload regardless of extension. desktopimgdownldr only downloads, so the payload is usually run by the same shell as a sibling process; this query returns its sibling and child processes with their executable hashes — match the downloaded file name and submit its hash. If it was run later by an unrelated process, retrieve it from disk and hash it manually.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_children:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      selection_siblings:
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - Image
+      - Hashes
+- question: What other file activity occurred in the download target directory?
+  context: Operators often stage multiple files in the same directory, or the first download triggers further writes such as extraction or additional downloads. Examining directory-level file activity around the alert reveals the broader scope of the delivery operation beyond the single file named in the command line.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Is the downloaded file still on disk for analysis?
+  context: If the file referenced through the /lockscreenurl download is still present, it can be hashed, submitted to threat intelligence, or reviewed for content. Capture it before any cleanup, since the admin cleanup variant of this technique deletes the PersonalizationCSP registry key and may remove traces of the operation.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Does this host normally run desktopimgdownldr.exe?
+  context: desktopimgdownldr.exe is a niche provisioning helper that most endpoints never execute. A host with zero or very low historical executions over 90 days makes this a first-time or rare invocation, which raises the weight of the download. A host that runs it routinely points toward managed image deployment.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \desktopimgdownldr.exe
+        ParentImage|endswith: \desktopimgdownldr.exe
+        CommandLine|contains: /lockscreenurl:http
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \desktopimgdownldr.exe
+        ParentImage|endswith: \desktopimgdownldr.exe
+        CommandLine|contains: /lockscreenurl:http
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts in the alert window reveals lateral movement or parallel activity on multiple endpoints. If the same user triggered comparable tool execution elsewhere, the scope of the operation may be larger than the single alerting host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \desktopimgdownldr.exe
+        ParentImage|endswith: \desktopimgdownldr.exe
+        CommandLine|contains: /lockscreenurl:http
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining process activity around the alert reveals what led up to the download and what followed — reconnaissance, additional tool transfers, or persistence. Aggregating by process and parent collapses routine agent noise into high-count rows while novel pairs stand out at low counts.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — reconnaissance, defense tampering, or initial-access activity — may reveal the stages that preceded this download and help reconstruct the timeline. Ingress tool transfer is typically a mid-chain step that follows an initial foothold, so prior alerts often explain how the operator arrived here.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Is this desktopimgdownldr parent-child spawning pattern occurring on other hosts?
+  context: The same parent-child relationship appearing on multiple hosts may indicate a campaign or a pushed automation pattern rather than a one-off. A single occurrence is more likely targeted or accidental. An environment-wide comparison helps calibrate severity and identify the scope.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+      - CommandLine

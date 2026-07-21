@@ -1,0 +1,459 @@
+name: Potential Pikabot Hollowing Activity
+id: e561c7f6-29ea-438d-b1fc-b556d0b652d9
+description: |
+  Detects a process whose parent is rundll32.exe AND whose image is one of a small set of
+  rarely-spawned Windows binaries (SearchFilterHost.exe, SearchProtocolHost.exe, sndvol.exe,
+  wermgr.exe, wwahost.exe); the sndvol.exe case is excluded when the parent command line
+  contains mmsys.cpl, which is how the sound control panel legitimately launches it. These
+  binaries are normally started by the OS component that owns them, not by an exported DLL
+  function running under rundll32.exe, so this parent-child pairing is the signal. Pikabot
+  loaders use this pattern to obtain a signed, unremarkable host process, replace its mapped
+  image with attacker code, and resume it, so that later network and file activity is attributed
+  to a trusted Windows binary. The investigation should establish what DLL and export rundll32.exe
+  was running, whether the spawned binary then behaved like the Windows component it claims to be,
+  and whether the same launch pattern appears elsewhere in the environment.
+type: detection
+detection_id: d8937fe7-42d5-4b4d-8178-e089c908f63f
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-17
+questions:
+- question: Was the parent rundll32.exe, and is the spawned process one of the Windows binaries this rule watches?
+  context: >-
+    The rule fires only when both conditions hold together: the parent image ends in rundll32.exe
+    and the child is SearchFilterHost.exe, SearchProtocolHost.exe, sndvol.exe, wermgr.exe, or
+    wwahost.exe. Confirm both from the event before going further. One legitimate case is carved
+    out already — sndvol.exe launched from a parent command line containing mmsys.cpl — so a
+    sndvol.exe hit here means the parent was running something other than the sound control panel.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+  answer_sources:
+  - alert
+  - process_creation
+- question: Is this user and host expected to run a Windows search, error-reporting, volume, or app-host binary out of rundll32.exe?
+  context: >-
+    None of these binaries have an administrative use that involves rundll32.exe as the launcher —
+    they are started by the indexing service, the error reporting service, the control panel, or
+    the app host. There is effectively no routine workflow, on a workstation or a server, that
+    produces this pairing, so user role and host function rarely explain it. Establish what the
+    host is for and what the user was doing at the time anyway, since that context drives the rest
+    of the investigation.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: What DLL and export was this rundll32.exe running, and what started rundll32.exe itself?
+  context: >-
+    The parent's own command line names the DLL path and the exported function being called, which
+    is the closest thing to a payload identifier available from process telemetry. A DLL under a
+    user-writable path such as the user profile, Temp, or ProgramData, a random-looking file name,
+    or a non-standard export name is the loader itself. The grandparent shows how the loader was
+    reached — msiexec.exe, another rundll32.exe, a script host, an archive utility, or an Office
+    application each point at a different delivery route.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+  answer_sources:
+  - process_creation
+- question: What other processes did this same rundll32.exe instance spawn?
+  context: >-
+    A loader that hollows one process often creates several, either as retries or to split
+    functionality across hosts it trusts to look ordinary. Listing every child of this exact
+    rundll32.exe instance shows whether the alerting process was the only target or one of a
+    set, and whether additional rundll32.exe or cmd.exe children indicate further staging.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: What command line did the spawned binary run with, and does it match how Windows normally launches it?
+  context: >-
+    These binaries carry recognisable arguments when the OS starts them — SearchProtocolHost.exe
+    and SearchFilterHost.exe receive a series of numeric and handle arguments from the indexer,
+    wermgr.exe receives a report or queue switch, wwahost.exe receives an app identifier. A child
+    created to be hollowed is usually started with an empty or truncated command line, because the
+    arguments never mattered to the loader. Compare the command line and working directory against
+    the expected launch pattern for that binary.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: Did any process on this host make the memory-write, APC-queue, or hook-installation API calls that hollowing depends on?
+  context: >-
+    Replacing the image of a suspended process requires writing into its memory and then forcing
+    execution — WriteProcessMemory for the write, QueueUserAPC or SetWindowsHookEx to get the code
+    running. Behavioral API telemetry records these on the injecting side within seconds of the
+    child being created, so a write from the alerting rundll32.exe in the same window corroborates
+    hollowing rather than an ordinary spawn. Two limits apply: the field naming the process being
+    written into is populated on only a small fraction of these records, so it is projected in the
+    results rather than filtered on, and the read side, the suspended-start flag, the unmap call,
+    and the write size have no equivalent record at all — absence here is a visibility gap, not
+    evidence that nothing was written.
+  range: +/-10m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        event.dataset: endpoint.events.api
+        process.Ext.api.name:
+          - WriteProcessMemory
+          - QueueUserAPC
+          - SetWindowsHookEx
+      condition: selection
+    fields:
+      - Image
+      - process.Ext.api.name
+      - Target.process.executable
+  answer_sources:
+  - edr_console
+  - manual_review
+- question: Did the spawned binary make outbound network connections after it started?
+  context: >-
+    Once a hollowed process is resumed, the attacker code runs under the identity of the Windows
+    binary, and its network traffic is the first observable consequence. None of these binaries
+    should be talking to arbitrary external addresses — the search hosts stay local, wermgr.exe
+    contacts Microsoft error-reporting endpoints only, sndvol.exe has no network role. Connections
+    to an unfamiliar address, a non-standard port, or a raw IP with no preceding name resolution
+    point at command-and-control from inside the hollowed process. Record any external address for
+    fleet-wide searching.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Initiated
+  answer_sources:
+  - network_connection
+- question: Did the spawned binary go on to create child processes of its own?
+  context: >-
+    A genuine search host, error-reporting process, or volume applet spawns almost nothing. Code
+    running inside a hollowed instance frequently does — a command interpreter, a script host,
+    another rundll32.exe, or a copy of itself written elsewhere on disk. Children here are the
+    clearest post-resume evidence available from process telemetry, and each child's command line
+    shows what the code did next.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Has rundll32.exe ever spawned this binary on this host before?
+  context: >-
+    Historical frequency of this exact parent-child pairing separates a novel event from a
+    long-standing quirk of some installed software. A zero or near-zero count over 90 days means
+    the pairing is new to this host and the alert is the first instance. A meaningful count with a
+    consistent command line pattern points at something already resident on the host, which still
+    needs explaining but is a different investigation than a first-time execution.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: How often does this binary run on this host at all, and under which accounts?
+  context: >-
+    This measures the binary's normal presence independent of its parent, which calibrates the
+    pairing result. The search hosts run constantly on an indexed workstation under SYSTEM, while
+    sndvol.exe appears only when a user opens the volume mixer. A binary that is otherwise routine
+    under a service account but appeared once under a user account, or one that has never run on
+    this host before, narrows the window that needs reconstructing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+  answer_sources:
+  - process_creation
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: >-
+    The query mirrors the rule's selection structure scoped to this user, so the result is the
+    user's 90-day history of rundll32.exe spawning one of these binaries, aggregated by host —
+    not generic use of rundll32.exe. A user with no prior history of this pattern is the common
+    case and means the alert is not explained by their habits. Weigh any count against the user's
+    role, and note that if the alert fired under SYSTEM or a machine account this pivot attributes
+    nothing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        ParentImage|endswith: \rundll32.exe
+        Image|endswith:
+        - \SearchFilterHost.exe
+        - \SearchProtocolHost.exe
+        - \sndvol.exe
+        - \wermgr.exe
+        - \wwahost.exe
+      filter_main_legit_sndvol:
+        Image|endswith: \sndvol.exe
+        ParentCommandLine|contains: mmsys.cpl
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+  always_include: true
+- question: Has rundll32.exe historically driven this pattern on this host or across the environment, or is this launch mechanism new?
+  context: >-
+    When the alert fires under a service principal, user identity attributes nothing and the launch
+    mechanism is the meaningful pivot. The query mirrors the rule's selection structure scoped to
+    the alerting parent process, so the result is the 90-day history of rundll32.exe driving this
+    specific pattern, aggregated by host. Given how rare this pairing is, any substantial prior
+    count is more likely a persistent local condition than OS behavior, and the hosts it lands on
+    define the population to examine.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        ParentImage|endswith: \rundll32.exe
+        Image|endswith:
+        - \SearchFilterHost.exe
+        - \SearchProtocolHost.exe
+        - \sndvol.exe
+        - \wermgr.exe
+        - \wwahost.exe
+      filter_main_legit_sndvol:
+        Image|endswith: \sndvol.exe
+        ParentCommandLine|contains: mmsys.cpl
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  always_include: true
+- question: What else did this user do across the environment around this time?
+  context: >-
+    Tracking the account's activity across all hosts in the surrounding hour shows whether the
+    hollowing attempt is isolated or one step of activity spanning several endpoints. Look for the
+    same loader pattern, remote execution tooling, or credential access under the same account. If
+    the alert fired under SYSTEM or a machine account, this returns background service noise and
+    the parent-anchored view is the one that carries meaning.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+  always_include: true
+- question: Did this same parent-driven pattern fire on other hosts in the same window, or is the activity isolated to this host?
+  context: >-
+    The query mirrors the rule's selection structure scoped to the alerting parent process,
+    fleet-wide, in the alert window. Several hosts producing the pattern at once points at a
+    pushed or scheduled trigger and widens the response to that whole set. A single host points
+    at a host-local trigger, which sends the investigation back to how the loader arrived here.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        ParentImage|endswith: \rundll32.exe
+        Image|endswith:
+        - \SearchFilterHost.exe
+        - \SearchProtocolHost.exe
+        - \sndvol.exe
+        - \wermgr.exe
+        - \wwahost.exe
+      filter_main_legit_sndvol:
+        Image|endswith: \sndvol.exe
+        ParentCommandLine|contains: mmsys.cpl
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  always_include: true
+- question: What other process activity occurred on this host around the time of the alert?
+  context: >-
+    Aggregating every parent-child pairing on the host in the surrounding window collapses routine
+    service and agent activity into high-count rows and leaves novel pairings standing out at low
+    counts. That is where delivery and follow-on stages show up — a document or installer opening,
+    an archive extracting, additional loader invocations, or persistence being written shortly
+    after the spawn.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+  answer_sources:
+  - process_creation
+  - file_event
+  - registry_event
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Loader activity rarely produces a single detection. Earlier alerts on the same host — an
+    unusual parent for a script host, an installer running from a user path, a signed binary
+    proxying execution — reconstruct how the loader reached this stage and often name the initial
+    access vector. The severity and rule names together give the timeline leading into this event.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+  answer_sources:
+  - alert
+- question: Is this parent-child spawning pattern occurring on other hosts?
+  context: >-
+    Searching the environment for rundll32.exe spawning this same binary over the last day
+    identifies every other host reached by the same loader. Because the pairing has no routine
+    cause, additional hosts define the scope of the response directly rather than needing further
+    triage. A single host keeps the investigation local.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+      - CommandLine
+  answer_sources:
+  - process_creation

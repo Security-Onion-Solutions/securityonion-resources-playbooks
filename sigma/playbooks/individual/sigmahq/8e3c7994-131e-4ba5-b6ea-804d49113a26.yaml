@@ -1,0 +1,345 @@
+name: Uncommon Child Process Spawned By Odbcconf.EXE
+id: d25c9dc7-926e-4882-9fff-2284acbdcee1
+description: |
+  Detects a child process spawned by odbcconf.exe, which under normal operation rarely spawns any child process.
+  odbcconf.exe is a Microsoft-signed ODBC configuration utility that can be abused to proxy-execute arbitrary DLLs:
+  its REGSVR action calls DllRegisterServer on an attacker-supplied module (equivalent to regsvr32.exe), and a
+  loaded DLL can in turn spawn a follow-on process or open a network connection. The investigation should determine
+  what arguments odbcconf.exe ran with, which DLL it loaded, what the spawned child did, and whether the parent chain
+  and host are consistent with legitimate ODBC driver maintenance.
+type: detection
+detection_id: 8e3c7994-131e-4ba5-b6ea-804d49113a26
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Is the parent of the alerting process odbcconf.exe, and what child did it spawn?
+  context: Confirm the alert is a true positive by checking that the parent process is odbcconf.exe and reviewing what
+    child process it spawned. odbcconf.exe normally completes its work in-process and spawns no children, so any child
+    is worth attention. Note the child image, command line, and signing state before proceeding.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+- question: Is this user and host expected to run or configure ODBC drivers via odbcconf.exe?
+  context: Legitimate ODBC driver installation and DSN configuration is normally performed by administrators or
+    installer packages on specific hosts. Knowing whether this user role and host function involve ODBC maintenance is
+    often the fastest way to separate routine driver registration from proxy-execution abuse.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What command line did odbcconf.exe itself run with, and does it use the REGSVR or driver-install actions?
+  context: The parent's own command line reveals how the DLL execution was set up. Look for the REGSVR action (registers
+    a DLL by calling DllRegisterServer, equivalent to regsvr32.exe), INSTALLDRIVER, or a response file loaded with -f or
+    /f that hides the DLL path. Silent mode (/S) combined with REGSVR is the core abuse pattern. The DLL path named here is
+    the artifact to triage next.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- question: What exactly did the child process spawned by odbcconf.exe do? Decode its command-line arguments.
+  context: The spawned child is the follow-on action of the loaded DLL. Decode its full command line, flags, encoded
+    content, file paths, and any URLs. A child such as a command interpreter, script host, or network tool indicates the
+    DLL executed operator-controlled code rather than performing ODBC configuration.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+      - Image
+- question: Did odbcconf.exe run with DLL-execution arguments such as REGSVR, INSTALLDRIVER, or a response file?
+  context: The abuse of odbcconf.exe is driven by specific action verbs that load a DLL. REGSVR calls DllRegisterServer
+    on the named module; INSTALLDRIVER installs a driver whose Driver=/Setup= paths point at a DLL; a response file (-f or
+    /f) carries the same directives off the command line. This query surfaces odbcconf.exe invocations on the host that
+    carry these patterns so the analyst can confirm the proxy-execution intent and extract the DLL path.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_odbcconf:
+        Image|endswith: \odbcconf.exe
+      selection_action:
+        CommandLine|contains:
+          - 'REGSVR'
+          - 'INSTALLDRIVER'
+          - 'CONFIGSYSDSN'
+          - ' -f '
+          - ' /f '
+          - ' -F '
+          - ' /F '
+      condition: selection_host and selection_odbcconf and selection_action
+    fields:
+      - CommandLine
+      - Image
+      - User
+- question: What DLLs did odbcconf.exe load, and are any unsigned or in user-writable locations?
+  context: After odbcconf.exe parses a REGSVR or driver-install action it loads the named DLL into its own process,
+    which is where DllRegisterServer or DllMain executes. A DLL loaded from a user-writable directory, a temporary path,
+    or one that is unsigned or has no enterprise provenance is the payload. If image-load telemetry is not collected in
+    this environment, treat zero results as a visibility gap and identify the DLL from the odbcconf.exe command line
+    instead.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: \odbcconf.exe
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+- question: Did odbcconf.exe or the child it spawned open any outbound network connections?
+  context: A DLL loaded through odbcconf.exe can retrieve a second-stage payload or beacon to operator infrastructure,
+    and the spawned child may do the same. Outbound connections from odbcconf.exe or its child to external addresses are
+    not expected for local ODBC driver configuration. If network telemetry is not collected here, treat zero results as a
+    visibility gap rather than confirmation that no connection occurred.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - \odbcconf.exe
+        Initiated: 'true'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+      - Image
+- question: Has odbcconf.exe spawned this child process on this host before?
+  context: odbcconf.exe rarely spawns any child under normal operation, so a parent-child pairing that has never or
+    seldom occurred here is the anomaly. Zero or very low historical counts indicate a novel spawning relationship;
+    a recurring pairing may reflect a packaged installer or routine driver maintenance.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What other child processes did this odbcconf.exe instance spawn?
+  context: A DLL loaded through odbcconf.exe may launch more than one follow-on process — reconnaissance, credential
+    access, or staging tools in sequence. Listing every child of the same odbcconf.exe parent reveals the full scope of
+    activity initiated through this proxy-execution chain.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Is the same odbcconf.exe parent-child spawning pattern occurring on other hosts?
+  context: The same odbcconf.exe spawning the same child across multiple hosts points to a pushed or scripted rollout
+    rather than a one-off, and helps calibrate scope. A single occurrence is more likely targeted or a host-local
+    misconfiguration.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+      - CommandLine
+- question: Does this host normally run odbcconf.exe at all?
+  context: On most endpoints odbcconf.exe runs rarely or never outside of driver installation events. A host with zero
+    or very low historical odbcconf.exe execution makes this invocation first-of-kind and raises the priority of the DLL
+    and child-process review.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+      condition: selection
+    fields:
+      - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \odbcconf.exe
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \odbcconf.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around the time of this alert?
+  context: Tracking the user's activity across all hosts reveals lateral movement or hands-on-keyboard activity spanning
+    multiple endpoints. If the same user triggered similar proxy-execution or follow-on activity elsewhere, the scope of
+    compromise may be larger than a single host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \odbcconf.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining process activity around the alert reveals what led to the
+    odbcconf.exe execution and what followed it. Look for reconnaissance, the staging of the loaded DLL, privilege
+    escalation, or persistence mechanisms in the surrounding window.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — defense tampering, reconnaissance, or credential access — may reveal the
+    attack stages that preceded this proxy execution and help reconstruct the timeline. The sequence of alerts on a host
+    often tells the larger story behind a single LOLBin invocation.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

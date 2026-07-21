@@ -1,0 +1,551 @@
+name: Axios NPM Compromise Indicators - Windows
+id: d8ac4680-27c1-4ec0-bab1-16a277faf9d2
+description: |
+  Detects the Windows execution pattern left behind by a compromised npm package whose postinstall
+  script acts as a remote-access-tool dropper. The rule fires when at least one of three independent
+  branches matches: either a cmd.exe spawned by node.exe or bun.exe whose command line carries all of
+  cscript, a temp-directory path, a self-deleting `//nologo && del` construct and a numeric .vbs
+  filename; or curl.exe / powershell.exe carrying the flagged command-and-control host in its command
+  line; or a process whose OriginalFileName is PowerShell.EXE running a copy of itself from
+  C:\ProgramData\wt.exe with hidden-window and execution-policy-bypass flags. The generalizable pattern
+  is a build or development toolchain process doing things a package install should never do - spawning
+  a shell, fetching a script from an unexpected host, and re-launching a renamed system interpreter.
+  Developer workstations and build agents run node and npm constantly, so the investigation must
+  determine whether this was a normal build step, and if not, which package pulled the install in, what
+  the second stage retrieved, and whether persistence or further payloads followed.
+type: detection
+detection_id: f6c27ecc-d890-4452-80e6-2e274a10e097
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-17
+questions:
+- question: >-
+    Which of the rule's three branches fired - either the node/bun-spawned cmd.exe VBScript chain, the
+    flagged C2 host in a curl or PowerShell command line, or a renamed PowerShell run with hidden and
+    bypass flags?
+  context: >-
+    The rule fires when at least one of three branches matches, and each branch requires all of its own
+    conditions together. The first branch needs a cmd.exe whose parent is node.exe or bun.exe AND a
+    command line containing all of cscript, AppData\Local\Temp, `//nologo && del` and 6202033.vbs. The
+    second branch needs curl.exe or powershell.exe AND the host sfrclak.com in the command line. The
+    third branch needs OriginalFileName PowerShell.EXE AND the literal string
+    `"C:\ProgramData\wt.exe" -w hidden -ep bypass -file`. Note which branch fired, because it decides
+    what carries weight downstream - the node/bun branch places the activity inside a package install,
+    so the parent-chain and install-origin questions are load-bearing; the C2-host branch makes the
+    egress and payload-hash questions load-bearing; the renamed-PowerShell branch makes the
+    binary-origin, autorun and module-load questions load-bearing.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - OriginalFileName
+      - CommandLine
+  answer_sources:
+  - alert
+  - process_creation
+- question: Is this host and user expected to run package installs or build steps that spawn shells and fetch remote content?
+  context: >-
+    Developer workstations and build agents run node, npm and npx routinely, and a package install
+    legitimately spawns child processes. What a package install should not do is reach an unfamiliar
+    host for a script, re-launch a renamed interpreter, or write into ProgramData. Establish whether a
+    build, install or dependency update was actually running on this host at this time, and whether the
+    account is one that performs that work. If the host has no development or build role, a node-driven
+    install chain is itself the anomaly. Where the account is a service or build principal, the answer
+    comes from the pipeline definition rather than from a person.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: What started the parent process, and is that parent expected to spawn this child?
+  context: >-
+    This retrieves the parent's own execution event, which is where the install origin becomes visible.
+    For the node/bun branch the parent's command line typically names the script the package manager
+    invoked, and the grandparent names the package manager or the pipeline step that ran it. That chain
+    answers whether a dependency install pulled this in, and which project directory it ran from. A
+    package-manager grandparent with an unfamiliar postinstall script is a different finding from a
+    developer running node against their own file.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+  answer_sources:
+  - process_creation
+- question: What other child processes did the same parent spawn?
+  context: >-
+    A dropper driven from a package install rarely produces a single child. The documented pattern for
+    this class of activity is a probe for the interpreter path, a copy of that interpreter to a new
+    location, a script host invocation, and a fetch-and-run step - several siblings under one parent
+    within seconds. Listing every child of the alerting parent shows how much of that sequence ran and
+    whether the stage that actually retrieves a payload is present.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Did other hosts install the same compromised dependency and produce this detection?
+  context: >-
+    A compromised package reaches every machine that resolved it - developer workstations, build agents,
+    and any container image built from the same lockfile. Counting the hosts and accounts this rule
+    fired on gives the installed footprint and tells the responder whether this is one workstation or an
+    estate-wide dependency problem. Pair the result with a registry-side audit of which projects pin the
+    affected package versions, since hosts that installed but did not execute the postinstall will not
+    appear here.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        rule.uuid|expand: '%rule_uuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+  answer_sources:
+  - alert
+- question: What did the alerting command line actually do, and what other commands carrying the same dropper markers ran on this host in the same window?
+  context: >-
+    Read the command line end to end - the script host invocation, the temp path it runs from, the
+    destination it posts to, the file it writes, and the delete that follows. The operation is normally
+    split across several short-lived commands, so the surrounding commands that carry the same markers
+    complete the picture. The query filters on those markers rather than on the binary name, because
+    cmd.exe and powershell.exe run constantly on a build host and a binary-only filter would return
+    noise instead of the operation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_markers:
+        CommandLine|contains:
+          - 'cscript'
+          - '6202033'
+          - 'sfrclak.com'
+          - 'C:\ProgramData\wt.exe'
+          - '-w hidden -ep bypass'
+          - 'where powershell'
+      condition: selection_host and selection_markers
+    fields:
+      - CommandLine
+      - Image
+      - CurrentDirectory
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: What does the fetched PowerShell stage do once it is read, and is any part of it encoded?
+  context: >-
+    The command line here is plain text rather than base64, so the payload is not in the alert - it is
+    the script the fetch step writes to disk and immediately runs, and the response body returned by the
+    remote host. Retrieve that script from its temp path if it still exists and read it. This class of
+    stage-two script typically beacons on a fixed interval, loads a .NET assembly straight into memory,
+    runs further commands through a nested interpreter, and enumerates the host through management
+    instrumentation. Any inner base64 or encoded block should be decoded as well.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: Did any of the dropper's staging paths execute on this host - a wt.exe under ProgramData, a system.bat, or the numbered temp script files?
+  context: >-
+    Execution is the point at which the dropped files become observable with a hash, since file writes
+    carry none. This query looks for the renamed interpreter running from ProgramData, and for any
+    command line that references the staging batch file or the numbered temp .vbs / .ps1 artifacts. A
+    hit on the ProgramData copy means the second stage launched; the returned hash can go to
+    reputation lookup. If nothing executed, retrieve the files from the paths named in the alerting
+    command line and hash them by hand.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_direct:
+        Image|endswith: '\wt.exe'
+      selection_indirect:
+        CommandLine|contains:
+          - 'C:\ProgramData\wt.exe'
+          - 'C:\ProgramData\system.bat'
+          - '6202033.ps1'
+          - '6202033.vbs'
+      condition: selection_host and (selection_direct or selection_indirect)
+    fields:
+      - Image
+      - CommandLine
+      - Hashes
+  answer_sources:
+  - process_creation
+  - external_threat_intel
+  - manual_review
+- question: Which hosts resolved the command-and-control domain named in the alerting command line, and what do registration and reputation data say about it?
+  context: >-
+    The destination is embedded in the command line rather than in a network field, so the domain is the
+    pivot. Query resolution activity for it across the estate to find every host that reached the
+    staging server, including machines where the rule itself did not fire. Then assess the domain
+    directly - registration age, hosting provider, passive DNS history, and threat-intelligence hits.
+    A recently registered domain on low-reputation hosting, contacted over plain HTTP on a
+    non-standard port by a package-install process, is not an update endpoint. If resolution telemetry
+    is not collected in this environment, treat zero results as a visibility gap and pivot to proxy or
+    flow records instead.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: dns_query
+      product: windows
+    detection:
+      selection:
+        QueryName|contains: 'sfrclak.com'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - dns_query
+  - external_threat_intel
+  - manual_review
+- question: Did PowerShell script block logging capture the full script content?
+  context: >-
+    Event ID 4104 records the deobfuscated script text PowerShell actually executed, which for this
+    pattern is the stage-two script fetched from the remote host - content that never appears on a
+    command line and that the dropper deletes from disk immediately after launch. This is often the only
+    surviving copy of the payload. If PowerShell operational logs are not ingested in this environment,
+    treat zero results as a visibility gap rather than evidence that nothing ran, and fall back to
+    retrieving the script from its temp path.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+  answer_sources:
+  - powershell_script_block
+- question: Was the download successful? Check for file creation at the destination.
+  context: >-
+    A fetch command does not prove the transfer completed - the host may have been unreachable, the
+    request blocked, or the response empty. This correlates file writes back to the alerting process and
+    its direct children, which is where the interpreter copy under ProgramData, the temp script, and any
+    staging batch file would appear. File writes carry no hash in this telemetry, so treat the paths
+    returned here as the input to the execution-hash and manual-retrieval steps.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+  answer_sources:
+  - file_event
+- question: If the downloaded payload was executed, what is its hash - and is it known to threat intelligence?
+  context: >-
+    The hash needed for reputation lookup or detonation is recorded when the payload runs, not when it
+    is written. This returns the processes the alerting command and the shell that launched it spawned -
+    its children and siblings - with their executable hashes. For this pattern the interesting rows are
+    a script host and a PowerShell copy launched from a non-standard path; note that when a script runs
+    through an interpreter the hash returned is the interpreter's, not the script's, so the script still
+    has to be pulled from disk and hashed separately. A payload run later by an unrelated process will
+    not appear here.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_children:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      selection_siblings:
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - Image
+      - Hashes
+  answer_sources:
+  - process_creation
+  - external_threat_intel
+- question: Which processes on this host loaded the VBScript or PowerShell scripting-engine modules around the alert, and are those loaders expected?
+  context: >-
+    Script-engine module loads are the execution evidence that survives when the script file itself is
+    deleted. vbscript.dll, scrrun.dll and wshom.ocx load into cscript.exe or wscript.exe when a VBScript
+    runs; System.Management.Automation.dll loads into any process hosting PowerShell, including a
+    renamed copy of the interpreter or a custom host that never appears as powershell.exe on a command
+    line. An unexpected loader for these modules - a binary from ProgramData or a user-writable
+    directory - identifies execution the process-name-based questions miss. Check the signer on the
+    loading image as well as on the module.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|endswith:
+          - '\vbscript.dll'
+          - '\scrrun.dll'
+          - '\wshom.ocx'
+          - '\System.Management.Automation.dll'
+      condition: selection
+    fields:
+      - Image
+      - ImageLoaded
+      - Signed
+      - Signature
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: Was an autorun registry value written on this host around the alert, and what does it launch?
+  context: >-
+    A dropper that only runs during a package install dies with the install unless it registers itself.
+    The persistence step for this class of activity is a Run value under the user hive pointing at a
+    batch or script file staged in ProgramData, which re-fetches the payload at each logon. Compare the
+    value data against the monitored install locations for this environment - C:\Program Files,
+    C:\ProgramData and the local AppData tree - and treat any Run value that launches content from
+    ProgramData or a temp directory as needing an owner. Value deletion is not observable in this
+    telemetry, so an absent key does not prove persistence was never set; check the key's modification
+    history instead.
+  range: +/-24h
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains: '\Software\Microsoft\Windows\CurrentVersion\Run'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+  answer_sources:
+  - manual_review
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  always_include: true
+  context: >-
+    The query mirrors the rule's selection structure scoped to this user, so the result is the user's
+    90-day history of this specific firing pattern rather than generic use of node or PowerShell. A
+    developer who installs dependencies daily will still show zero prior matches here, because the
+    pattern is the dropper chain, not the install. Weigh a non-zero count against the account's role -
+    on a build principal it may mean the compromised dependency has been resolving for some time.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_cscript:
+        ParentImage|endswith:
+        - \node.exe
+        - \bun.exe
+        Image|endswith: \cmd.exe
+        CommandLine|contains|all:
+        - cscript
+        - AppData\Local\Temp
+        - //nologo && del
+        - 6202033.vbs
+      selection_curl:
+        Image|endswith:
+        - \curl.exe
+        - \powershell.exe
+        CommandLine|contains: http://sfrclak.com
+      selection_susp_cli:
+        OriginalFileName: PowerShell.EXE
+        CommandLine|contains: '"C:\ProgramData\wt.exe" -w hidden -ep bypass -file'
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+- question: Has this parent process historically driven the rule's pattern on this host or across the environment, or is the parent new for this activity?
+  always_include: true
+  context: >-
+    When the alert fires under a build service account or a machine principal, user identity attributes
+    nothing - every job runs as the same account. The meaningful pivot is the launch mechanism, so the
+    query mirrors the rule's selection structure scoped to the alerting parent process and returns the
+    90-day history of that parent driving this pattern. A parent that is new for this pattern is the
+    deviation to chase; a parent already accounting for a large prior count points at a long-standing
+    automation that should be identified before anything is contained.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_cscript:
+        ParentImage|endswith:
+        - \node.exe
+        - \bun.exe
+        Image|endswith: \cmd.exe
+        CommandLine|contains|all:
+        - cscript
+        - AppData\Local\Temp
+        - //nologo && del
+        - 6202033.vbs
+      selection_curl:
+        Image|endswith:
+        - \curl.exe
+        - \powershell.exe
+        CommandLine|contains: http://sfrclak.com
+      selection_susp_cli:
+        OriginalFileName: PowerShell.EXE
+        CommandLine|contains: '"C:\ProgramData\wt.exe" -w hidden -ep bypass -file'
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- question: What else did this user do across the network around this time?
+  always_include: true
+  context: >-
+    Tracking the account's activity across every host in the alert window shows whether the same person
+    or pipeline identity was installing dependencies elsewhere at the same moment, which for a shared
+    lockfile is how one compromised package reaches many machines at once. It also surfaces follow-on
+    activity under the same account on other endpoints. When the alert fires under a service or machine
+    principal this view fills with routine agent activity and the parent-scoped view is the readable
+    answer.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+- question: Did this same parent-driven pattern fire on other hosts in the same window, or is the activity isolated to this host?
+  always_include: true
+  context: >-
+    Under a service or machine principal, asking what else the user did returns routine agent activity
+    on every host. The readable question is whether the same launch mechanism produced this pattern
+    elsewhere, so the query mirrors the rule's selection structure scoped to the alerting parent
+    process, fleet-wide, in the alert window. Several hosts in one window fits a shared dependency
+    resolving across a build fleet; a single host fits a local install.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_cscript:
+        ParentImage|endswith:
+        - \node.exe
+        - \bun.exe
+        Image|endswith: \cmd.exe
+        CommandLine|contains|all:
+        - cscript
+        - AppData\Local\Temp
+        - //nologo && del
+        - 6202033.vbs
+      selection_curl:
+        Image|endswith:
+        - \curl.exe
+        - \powershell.exe
+        CommandLine|contains: http://sfrclak.com
+      selection_susp_cli:
+        OriginalFileName: PowerShell.EXE
+        CommandLine|contains: '"C:\ProgramData\wt.exe" -w hidden -ep bypass -file'
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation

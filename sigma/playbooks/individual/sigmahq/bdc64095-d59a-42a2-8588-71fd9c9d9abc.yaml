@@ -1,0 +1,290 @@
+name: Suspicious Unsigned Dbghelp/Dbgcore DLL Loaded
+id: 22d535db-a11c-4681-9da0-f65348ab28e8
+description: |
+  Fires when an unsigned copy of dbghelp.dll or dbgcore.dll is loaded by a process. These DLLs export MiniDumpWriteDump, the Windows API that writes a process memory dump to disk; a signed system copy loaded by a debugger or crash-reporting tool is routine, but an unsigned or side-loaded copy loaded by an unexpected process is a common way credential-dumping tooling calls the dump API directly instead of shelling out to a known utility.
+  Legitimate loads carry a valid Microsoft signature and come from a debugger, an installer, or a crash-reporting agent; the malicious pattern is an unsigned module with a Microsoft-style filename loaded by a process that has no debugging role, typically to read lsass.exe memory and stage a dump for offline credential extraction.
+  Investigate which process loaded the unsigned module, whether it targeted LSASS memory, whether a dump file was written to a staging directory, and whether the host shows related credential-access or lateral-movement activity.
+type: detection
+detection_id: bdc64095-d59a-42a2-8588-71fd9c9d9abc
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-10
+questions:
+- question: Does the loaded module match what this rule detects — path, signature, and loading process?
+  context: Confirm the alert is a true positive by reviewing the module path (ImageLoaded ending in \dbghelp.dll or \dbgcore.dll), its code-signature status (the rule fires only when Signed is false), and the process that loaded it. A DLL load carries its signing status and hash on the load event, so no execution pivot is needed to judge whether an unsigned dump-capable module was pulled into an unexpected process.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|endswith|expand: '%ImageLoaded%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+- question: Is this user and host expected to load debugging or memory-dump libraries?
+  context: Legitimate loads of dbghelp/dbgcore come from developer workstations, crash-reporting agents, and administrative debugging. Knowing whether the loading process, its user, and the host function are consistent with debugging activity is often the fastest way to separate a routine load from credential-dumping tradecraft.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What other modules did this process load, and are any from non-canonical paths, unsigned, or from user-writable directories?
+  context: 'The full set of modules a process loads gives context the DLL name alone cannot. Look for: (1) additional DLLs from %TEMP%, AppData, ProgramData, or Public — a side-loading pattern; (2) other unsigned modules in directories where signed ones are expected; (3) system DLL names loaded from non-system paths — search-order hijacking; (4) modules the loading process would not normally pull in, which points to injection or hooking around the dump.'
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+      - SignatureStatus
+      - Hashes
+- question: For each unsigned module this process loaded, what is its hash and threat-intel reputation?
+  context: Module reputation separates a routine third-party DLL from a side-loaded malicious one. An unsigned module carrying a Microsoft-style filename such as dbghelp.dll or dbgcore.dll is a masquerading pattern, since the genuine system copies are Microsoft-signed. The Hashes field lets you pivot the module hash against threat intelligence to surface known dumping loaders.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+        Signed: 'false'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Hashes
+      - Signature
+      - SignatureStatus
+- question: Did the loading process access or dump LSASS memory, and by what method?
+  context: dbghelp/dbgcore export MiniDumpWriteDump, the API used to write LSASS memory to a dump file for offline credential extraction. Review the loading process command line for the dump method — comsvcs.dll MiniDump via rundll32, procdump, or a custom dumper. Note a telemetry limit — the memory read itself (a handle opened to lsass.exe and the MiniDumpWriteDump call) leaves no cross-process access record under the endpoint model, so confirm the dump through the module load, the loading process, and any dump file rather than a read-side access event.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What process spawned the one that loaded the unsigned module, and is that parent chain expected?
+  context: The parent process shows how the loading process was launched. Debugging and crash-reporting parents are predictable; unusual parents such as script hosts, Office applications, or a freshly written binary in a user-writable path point to the load being part of an intrusion rather than routine debugging. Known security or backup tooling that legitimately reads LSASS can be allowlisted here.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - Image
+      - CommandLine
+- question: Were known LSASS-dumping command patterns run on this host around the alert?
+  context: LSASS dumping often runs through recognizable command syntax even when the dump API is called from an unsigned module. This query surfaces host processes whose command line contains common dumping tokens (comsvcs.dll MiniDump, procdump, Invoke-Mimikatz, sekurlsa) so you can tell whether the unsigned load accompanied a scripted dump or ran on its own.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains:
+          - comsvcs.dll
+          - MiniDump
+          - procdump
+          - Invoke-Mimikatz
+          - sekurlsa
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - User
+- question: Did the loading process or its children write a memory dump file to a staging path?
+  context: A successful LSASS dump lands as a file on disk, commonly under %TEMP% or C:\Windows\Temp and often with a .dmp extension, typically within a few minutes of the memory access. This query correlates file writes to the loading process and its direct children and narrows to those staging paths, so a hit here is strong corroboration that the module load produced a dump rather than benign debugging.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      selection_dump:
+        TargetFilename|contains:
+          - '\Temp\'
+          - '\Windows\Temp\'
+          - .dmp
+      condition: (selection_self or selection_child) and selection_dump
+    fields:
+      - TargetFilename
+      - Image
+- question: Were registry values that weaken LSASS protection modified on this host recently?
+  context: Credential dumping is frequently enabled by first turning off LSASS defenses — disabling RunAsPPL (LSASS protected-process) or setting WDigest UseLogonCredential to force plaintext credentials into memory. A modification to these values on the host in the days before an unsigned dump-capable module loads points to deliberate staging for credential theft.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains:
+          - '\Control\Lsa\RunAsPPL'
+          - '\SecurityProviders\WDigest\UseLogonCredential'
+          - '\Control\Lsa\LsaCfgFlags'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- question: Has this specific module been loaded on this host before, and under what processes?
+  context: A first-time load of this module on the host is a stronger anomaly signal than a recurring one. If the same DLL has been loaded by the same process binary repeatedly over the past 90 days it is likely routine; if this is the first occurrence, or the module has only ever been loaded by unrelated processes, the current load is anomalous.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|endswith|expand: '%ImageLoaded%'
+      condition: selection
+    fields:
+      - Image
+- question: Does this host normally run the process that loaded the unsigned module?
+  context: A loading process that has never been seen on the host is more suspicious than one that runs regularly. Zero or very low historical counts for this binary indicate a first-time or rare execution, which raises the weight of an unsigned dump-capable module appearing under it.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: Were outbound remote-access connections (RDP, SMB, WinRM, SSH) initiated from this host after this event?
+  context: Credential theft is typically followed by lateral movement. This query returns outbound connections from this host to remote-access ports — 3389 (RDP), 445 (SMB), 5985/5986 (WinRM), 22 (SSH) — in the hours after the event, with the originating Image and User showing what drove each. Two limits — credentials replayed from another machine will not appear here (check logon events on suspected targets for the accounts seen on this host), and if endpoint network telemetry is not collected from this host, treat zero rows as a visibility gap rather than evidence no movement occurred.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
+- question: Which accounts may be compromised, and do any have elevated privileges?
+  context: The severity of a successful LSASS dump depends on which credentials were resident in memory on this host — any account with an interactive or service session is potentially exposed. Cross-reference the users and service accounts active on the host against directory group memberships; domain admin or service accounts with broad access require escalation, while a standard user may only need a password reset and monitoring.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity in the minutes around the load reveals the immediate context: what launched the loading process, what ran alongside it, and whether the load sits inside a larger sequence. Look for reconnaissance, defense tampering, or staging that brackets the credential-access step.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Is this module being loaded by other hosts in the environment, especially under unexpected processes?
+  context: 'Cross-host correlation surfaces how far the activity reaches. The same unsigned module loaded on one host may be a localized incident; loaded across several hosts it points to multi-host distribution or shared tooling. Pay attention to the variety of loading processes — a module loaded only by its expected caller is benign, while the same module loaded by unexpected processes on other hosts suggests spreading credential-access activity.'
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        ImageLoaded|endswith|expand: '%dll_basename%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance, or privilege escalation — may reveal the stages that preceded this load and help reconstruct the full timeline of the credential-access attempt.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

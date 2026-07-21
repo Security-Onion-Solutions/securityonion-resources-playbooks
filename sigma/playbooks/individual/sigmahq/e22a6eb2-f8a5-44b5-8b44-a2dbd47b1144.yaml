@@ -1,0 +1,361 @@
+name: Potential MsiExec Masquerading
+id: 994b2b2f-dcbf-4060-af4f-de96345e5503
+description: |
+  Detects msiexec.exe executing from a directory other than the canonical Windows install locations
+  (System32, SysWOW64, WinSxS), matched either by the Image name ending in msiexec.exe or by the PE
+  OriginalFileName metadata being msiexec.exe. Legitimately, msiexec.exe runs only from those system
+  directories; a copy or renamed binary running from a user-writable or non-standard path is a masquerading
+  pattern used to blend a proxy-execution LOLBin into trusted-name traffic. The investigation should
+  confirm the actual on-disk path and metadata, establish how the binary arrived, and determine whether
+  it performed installer-style proxy execution or other post-execution activity.
+type: detection
+detection_id: e22a6eb2-f8a5-44b5-8b44-a2dbd47b1144
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-09
+questions:
+- question: Is the alerting process msiexec.exe (by Image name or OriginalFileName) running from a directory outside System32, SysWOW64, and WinSxS?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule fires when the process is identified as msiexec.exe — either the Image path ends in msiexec.exe or the PE OriginalFileName is msiexec.exe — AND the Image does not start with C:\Windows\System32\, C:\Windows\SysWOW64\, or C:\Windows\WinSxS\. Review the exact Image path and OriginalFileName on the triggering event to confirm both conditions hold.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- question: Is this user and host expected to run msiexec.exe from a non-standard directory?
+  context: Legitimate msiexec.exe activity almost always runs from the canonical system directories. Some software vendors stage and run installer copies from temporary or application-specific paths, so knowing whether this user role and host function routinely perform such installs is often the fastest way to separate a packaged-software install from masquerading.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What did this msiexec.exe instance actually do? Decode its full command line and working directory.
+  context: msiexec.exe is a proxy-execution LOLBin — it can install or invoke MSI packages and DLLs from local paths or URLs. Decode the full command line for the package or transform path, any /i, /package, /y (DLL load), or quiet/no-UI switches, and the working directory, to establish what payload or action this invocation carried out. Because installer operations can span sequential invocations, this query returns all msiexec.exe executions on the host within the window, not only the triggering event.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What is the actual identity of this binary based on its OriginalFileName, signature, and hash?
+  context: When a binary is copied or renamed, the on-disk Image path can be made to say msiexec.exe while the embedded PE OriginalFileName and code-signing details still reflect the true tool. Compare the Image path against OriginalFileName, and confirm whether the file is Microsoft-signed, third-party signed, or unsigned. The file hash enables reputation lookups to determine whether this is the genuine Windows Installer binary, a known-bad sample, or a novel binary requiring deeper analysis.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Hashes
+- question: How did this msiexec.exe binary arrive at its non-standard location, and how long before execution was it created?
+  context: 'A binary running from a non-canonical path was copied, downloaded, extracted, or dropped there. Tracing the file creation event for msiexec.exe by basename reveals the delivery mechanism and the process that wrote it — a download tool, an archive extractor, a remote-admin copy, or a dropper. The interval between file creation and execution also matters: a file created moments before it ran differs from one placed at software-install time weeks earlier.'
+  range: -30d
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains|expand: '%file_name%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: What process spawned this msiexec.exe, and is that parent chain expected for an installer launch?
+  context: The parent process reveals how msiexec.exe was invoked. Legitimate installs are typically launched by explorer.exe, a software-deployment service, or a setup bootstrapper. Script hosts, Office applications, mshta.exe, or other interpreters as the parent point to scripted or macro-driven invocation rather than a user-initiated install.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What child processes did this msiexec.exe spawn, and does the same non-standard binary appear on other hosts?
+  context: The point of running a renamed or misplaced proxy-execution binary is to perform its function while evading name- or path-based controls. Examining the child processes it spawned reveals its actual objective — installer-launched scripts, command interpreters, or network tooling. The same binary appearing at a comparable path on other hosts suggests deliberate distribution rather than an isolated event.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Has this host run msiexec.exe before, and how often over the past 90 days?
+  context: A process that has rarely or never been seen on a host is more suspicious than one that runs regularly. msiexec.exe itself is common from system directories, so use this historical count alongside the path and parent details to judge whether this execution is routine for the host.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: When this host has previously fired the rule's pattern, what parents and users normally drive it, and does the current alert fit?
+  context: Even common tools can be abused. This query mirrors the rule's selection structure — msiexec.exe by Image or OriginalFileName, outside the canonical system directories — scoped to this host, so the resulting parent and user distribution reflects how this specific masquerading pattern has historically run here rather than generic msiexec.exe usage. A new parent process, an unexpected user account, or an unusual launch pattern is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - Image|endswith: \msiexec.exe
+      - OriginalFileName: \msiexec.exe
+      filter:
+        Image|startswith:
+        - C:\Windows\System32\
+        - C:\Windows\SysWOW64\
+        - C:\Windows\WinSxS\
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - Image|endswith: \msiexec.exe
+      - OriginalFileName: \msiexec.exe
+      filter:
+        Image|startswith:
+        - C:\Windows\System32\
+        - C:\Windows\SysWOW64\
+        - C:\Windows\WinSxS\
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - Image|endswith: \msiexec.exe
+      - OriginalFileName: \msiexec.exe
+      filter:
+        Image|startswith:
+        - C:\Windows\System32\
+        - C:\Windows\SysWOW64\
+        - C:\Windows\WinSxS\
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the same user triggered similar activity on several hosts, the scope of the event may be larger than a single host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - Image|endswith: \msiexec.exe
+      - OriginalFileName: \msiexec.exe
+      filter:
+        Image|startswith:
+        - C:\Windows\System32\
+        - C:\Windows\SysWOW64\
+        - C:\Windows\WinSxS\
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate context: what led to this event, what happened after, and whether it is part of a larger sequence. Look for reconnaissance, privilege escalation, or persistence mechanisms near the alert time.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance, or credential access — may reveal the stages that preceded this event and help reconstruct the timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Were any other proxy-execution LOLBins used on this host recently?
+  context: Operators who use one proxy-execution LOLBin often use several. msiexec.exe sits alongside rundll32, regsvr32, mshta, installutil, and similar binaries that can run arbitrary code under a trusted name. Finding several such binaries invoked for the same objective on this host strengthens the case for deliberate proxy execution.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\rundll32.exe'
+          - '\regsvr32.exe'
+          - '\mshta.exe'
+          - '\msbuild.exe'
+          - '\cmstp.exe'
+          - '\installutil.exe'
+          - '\forfiles.exe'
+          - '\pcalua.exe'
+          - '\presentationhost.exe'
+          - '\control.exe'
+          - '\infdefaultinstall.exe'
+          - '\msdt.exe'
+          - '\mavinject.exe'
+          - '\wmic.exe'
+          - '\xwizard.exe'
+          - '\ie4uinit.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- question: From what path did this msiexec.exe run, and is that the expected install location?
+  context: msiexec.exe legitimately runs from System32, SysWOW64, or WinSxS. A copy running from a user-writable or otherwise non-standard directory may have been placed there to evade path-based allowlists. Confirm the exact Image path on the triggering event and compare it against the canonical install locations.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- question: How often has this host fired the rule's msiexec.exe pattern over the past 90 days, and what command-line structures are typical?
+  context: A pattern with no prior history on a host is more suspicious than one used routinely under stable parents. This query mirrors the rule's selection structure — msiexec.exe outside the canonical system directories — scoped to this host, so the count reflects the rule's specific firing pattern rather than generic msiexec.exe usage. The command-line projection lets the analyst compare typical invocation patterns against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - Image|endswith: \msiexec.exe
+      - OriginalFileName: \msiexec.exe
+      filter:
+        Image|startswith:
+        - C:\Windows\System32\
+        - C:\Windows\SysWOW64\
+        - C:\Windows\WinSxS\
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - CommandLine

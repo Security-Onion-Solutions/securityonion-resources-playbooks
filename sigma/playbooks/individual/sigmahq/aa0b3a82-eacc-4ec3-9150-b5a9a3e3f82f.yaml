@@ -1,0 +1,373 @@
+name: Potential Download/Upload Activity Using Type Command
+id: bd9404de-8122-488f-826f-9d12ee9da53d
+description: |
+  Detects the built-in Windows command shell "type" command combined with a UNC/WebDAV path and a redirect operator,
+  which turns cmd.exe into a file-transfer tool with no extra binary required. The rule fires when a command line matches
+  EITHER an upload pattern (type of a local file redirected to a remote UNC path) OR a download pattern (type of a remote UNC
+  path redirected to a local file). Legitimate copies between local paths look similar but do not involve a UNC/WebDAV
+  endpoint; the investigation should determine which transfer direction fired, what remote host was contacted, whether the
+  file landed on or left disk, and whether outbound WebDAV traffic accompanied the command.
+type: detection
+detection_id: aa0b3a82-eacc-4ec3-9150-b5a9a3e3f82f
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the command line use type with a UNC path and a redirect, matching either the upload or download pattern?
+  context: Confirm the alert is a true positive by reviewing the exact command line. The rule fires when the command line
+    matches EITHER the upload pattern (a local file typed and redirected to a remote path beginning with a double backslash)
+    OR the download pattern (a remote double-backslash path typed and redirected to a local file). Note which branch fired,
+    because the transfer direction determines whether downstream questions should focus on a file landing on disk (download)
+    or a local file leaving the host (upload). A type between two local paths does not match and is a routine file copy.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Is this user and host expected to move files with command-line tools to or from remote shares?
+  context: Legitimate administrative file copies can trigger this detection. Knowing whether the user role and host function
+    routinely involve command-line file transfers to UNC or WebDAV endpoints is often the fastest way to separate routine
+    operations from data movement that warrants follow-up.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Decode the type command — what is the exact remote UNC path and which direction is the file moving?
+  context: The full command line reveals the remote host, share, and file name, and which side of the redirect the remote
+    path sits on. A remote path on the right of the redirect (after the greater-than operator) is an upload of local data
+    out to the remote share; a remote path on the left is a download of remote content onto local disk. Record the remote
+    host so it can be checked against known infrastructure.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Did an outbound WebDAV connection leave this host around the time of the command?
+  context: Windows resolves UNC paths to WebDAV servers by sending an HTTP request, typically over port 80 or 443, when a
+    matching SMB share is not found. An outbound connection from this host to an unfamiliar external address in the same
+    window corroborates that the type command actually reached a remote WebDAV endpoint rather than a local share. Absence
+    of an external connection points to a local UNC target instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+      filter_internal:
+        DestinationIp|cidr:
+          - '10.0.0.0/8'
+          - '172.16.0.0/12'
+          - '192.168.0.0/16'
+          - '127.0.0.0/8'
+      condition: selection and not filter_internal
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- question: Did a file get created at the destination path named in the command?
+  context: A type command does not guarantee the transfer completed. For a download, confirming a file was created at the
+    local destination path establishes whether content actually landed on disk. Network errors or a blocked WebDAV request
+    leave the command line present with no resulting file.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Is the transferred file still on disk for analysis?
+  context: If the command referenced a local file path, checking whether it still exists enables deeper analysis such as
+    hash lookups, sandbox submission, or content review. For a download this is the retrieved payload; for an upload it is
+    the local source file that was sent out.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What file did the type command transfer, and can you retrieve and inspect it?
+  context: type copies file bytes over a redirect — the transferred file is data, not an executable, and file-creation events carry no hash. Retrieve it from the path below and inspect its content. For a download this is what was pulled in (hash it manually for reputation, and if it was later executed its hash is on its process event); for an upload it identifies what local data was exposed to the destination share.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - EventType
+- question: What other file activity occurred in the same directory as the transferred file?
+  context: Operators often stage multiple files in the same directory, or a downloaded file triggers further writes such as
+    extraction or additional transfers. Examining directory-level file activity reveals the broader scope of the operation.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What process spawned this cmd.exe instance and is that parent chain expected?
+  context: The parent process reveals how the command was invoked. Interactive administrative use typically descends from
+    explorer.exe or a terminal; invocation from a script host, an Office application, or a remote-execution service points
+    toward automated or operator-driven data movement.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What child processes did this cmd.exe instance spawn afterward?
+  context: A retrieved payload is often executed immediately after it lands. Processes spawned by the same shell shortly
+    after the transfer — script hosts, newly written binaries, or further command interpreters — reveal whether the operation
+    progressed past delivery into execution.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: When this host has previously fired this type-with-UNC pattern, what parents and users drove it, and does the
+    current alert fit?
+  context: Even routine tooling can be abused. This query mirrors the rule's upload-or-download selection scoped to this host,
+    so the resulting parent and user distribution reflects how this specific transfer pattern has historically run here.
+    A new parent process, an unexpected user account, or a first-time appearance of the pattern is the deviation worth
+    chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_upload:
+        CommandLine|contains|all:
+        - 'type '
+        - ' > \\\\'
+      selection_download:
+        CommandLine|contains|all:
+        - type \\\\
+        - ' > '
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Have other hosts fired this type-with-UNC pattern in the past week, and does the cross-host spread look like
+    automation or one-off activity?
+  context: This query mirrors the rule's upload-or-download selection with no host scope, giving a fleet-wide count of the
+    transfer pattern rather than generic cmd.exe usage. Many hosts firing the same pattern suggests scripted deployment or
+    vendor automation; one host or a small unrelated set points to manual operator activity. Use the host spread and parent
+    consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_upload:
+        CommandLine|contains|all:
+        - 'type '
+        - ' > \\\\'
+      selection_download:
+        CommandLine|contains|all:
+        - type \\\\
+        - ' > '
+      condition: 1 of selection_*
+    fields:
+    - host.name
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_upload:
+        CommandLine|contains|all:
+        - 'type '
+        - ' > \\\\'
+      selection_download:
+        CommandLine|contains|all:
+        - type \\\\
+        - ' > '
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_upload:
+        CommandLine|contains|all:
+        - 'type '
+        - ' > \\\\'
+      selection_download:
+        CommandLine|contains|all:
+        - type \\\\
+        - ' > '
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or staging across multiple endpoints. If
+    the same user drove similar activity on more than one host, the scope of the operation may be larger than a single
+    transfer.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_upload:
+        CommandLine|contains|all:
+        - 'type '
+        - ' > \\\\'
+      selection_download:
+        CommandLine|contains|all:
+        - type \\\\
+        - ' > '
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance, or
+    credential access — may reveal the stages that preceded this transfer and help reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

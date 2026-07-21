@@ -1,0 +1,411 @@
+name: Suspicious Execution Of Renamed Sysinternals Tools - Registry
+id: 9b6e4461-26b0-4a38-8eb7-1640d1801cc3
+description: |
+  Detects a write to a Sysinternals licence-consent registry key where the writing binary does not carry the
+  canonical filename of the tool named in the key. The rule fires when the key path contains a Sysinternals tool
+  name (Active Directory Explorer, Handle, LiveKd, ProcDump, Process Explorer, PsExec, PsLoggedon, PsLoglist,
+  PsPasswd, PsPing, PsService, SDelete) AND ends in \EulaAccepted AND the writing process filename is not one of
+  that tool's shipped executables. These utilities write the key on first run, and the key path records which tool
+  ran even when the binary on disk was given another name, so the alert marks a mismatch between the name the
+  process presents and the tool it actually is.
+  Renaming happens in both directions. Administrators repackage these utilities under local naming conventions or
+  embed them in scripts and management bundles, and operators rename them so that name-based controls and
+  detections keyed on the shipped filenames do not match. The tools themselves are signed and legitimate, so the
+  question is not whether the binary is trustworthy but whether this use of it was sanctioned.
+  The investigation should resolve the binary's true identity from its embedded metadata and hash, establish how
+  it reached the host and what it did once it ran, check whether other consent keys were written by non-canonical
+  binaries in the same session, and determine whether an administrator or automation accounts for the activity.
+type: detection
+detection_id: f50f3c09-557d-492d-81db-9064a8d4e211
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-17
+questions:
+- question: Which Sysinternals tool does the alerting key path name, and does the writing binary carry that tool's canonical filename?
+  context: >-
+    The rule fires only when all three conditions hold together — the key path contains a Sysinternals tool name,
+    it ends in \EulaAccepted, and the writing process filename is not one of that tool's shipped executables.
+    Read the tool name out of TargetObject and compare it with the filename in Image; a match means the rule
+    misfired, a mismatch is the finding. The signer columns are context, not a verdict. Nearly every alerting
+    process on Windows endpoint telemetry is trusted-signed, so read them for coherence instead — a binary signed
+    by the Sysinternals publisher under an unrelated filename is a rename of a genuine tool, while an unrelated or
+    absent signer under the same key points at a repackaged or modified copy.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+  answer_sources:
+  - alert
+  - registry_event
+- question: Is this user and host expected to run Sysinternals administrative utilities under a non-standard filename?
+  context: >-
+    These utilities are ordinary administrative tools, and repackaging them under a local naming convention is a
+    normal habit on build servers, jump hosts, and IT workstations. Whether the account and the host function fit
+    that description is usually the fastest way to separate sanctioned administration from unsanctioned use.
+    Registry events carry a user on most endpoints, but a service-driven write often resolves to SYSTEM or a
+    machine account; when the user is uninformative, attribute the activity through the writing process instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: What tool is this binary really — does its embedded OriginalFileName and hash agree with the tool named in the key?
+  context: >-
+    Renaming a file changes the name on disk and nothing inside it. The PE metadata still carries the original
+    filename the vendor compiled in, and the hash still matches the published build, so retrieving the writing
+    process's own start event resolves the tool's identity independently of what the key path implies. Agreement
+    between OriginalFileName and the tool named in the key confirms an unmodified utility that was simply renamed;
+    disagreement, or metadata that names neither, points at a repackaged or trojanised copy and makes the hash
+    lookup the next step.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Hashes
+  answer_sources:
+  - process_creation
+  - external_threat_intel
+- question: How did this renamed binary arrive on the host?
+  context: >-
+    A renamed utility was copied, downloaded, extracted from an archive, or written by an installer, and the file
+    creation event names the process that put it there. A copy from a software distribution share by a management
+    agent reads very differently from an extraction into a user profile by a browser or an archive tool. Matching
+    on the basename over a long window catches the write wherever the file landed, since staged copies move
+    between directories.
+  range: -30d
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains|expand: '%file_name%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+  answer_sources:
+  - file_event
+  - process_creation
+- question: What child processes did the renamed binary spawn after it ran?
+  context: >-
+    The consent key records that the tool started; the children record what it was used for. Several of these
+    utilities work by launching something else — PsExec starts a service and a remote or local command, LiveKd
+    invokes a debugger, Process Explorer and Handle can spawn helpers — so the child list often names the actual
+    objective. An empty child list is normal for the tools that act in-process, such as ProcDump or SDelete, and
+    directs the investigation to the tool's own arguments and to the files it touched instead.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: What does the alerting key and its value data record, and is this location used for persistence or evasion?
+  context: >-
+    A path under \Software\Sysinternals\<Tool> ending in \EulaAccepted is a per-user consent marker written on
+    first run. It is not an autostart, policy, or debugger-hijack location, so nothing executes because of it and
+    the value data itself carries almost no signal — the DWORD is set to 1 whether the tool was renamed or not.
+    What the key does carry is identity, and it is the only field that names the tool independently of the
+    filename. Value data is absent on a portion of registry modifications, so treat a missing Details value as a
+    telemetry property rather than a finding, and read the signer of the writing process for coherence with the
+    tool the key names.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+  answer_sources:
+  - registry_event
+- question: Has this consent key been written again since the alert, and by which binary?
+  context: >-
+    The key is written once per user per tool, so a later write means the tool ran again under another account or
+    from another copy, and the Image values across those writes show whether one renamed binary is in repeated use
+    or several different names resolve to the same tool. Key and value removals are not observable in endpoint
+    registry telemetry, so the absence of a deletion event says nothing about whether an operator cleaned up —
+    judge the record from this re-modification history and from whether the named tool executed again.
+  range: +7d
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - Details
+      - Image
+      - User
+  answer_sources:
+  - registry_event
+  - manual_review
+- question: What process wrote this key, and what launched it?
+  context: >-
+    The registry event names the writing process but not its origin, and the alert carries no command line for it.
+    Retrieving that process's own start event supplies both the parent and the full invocation. An interactive
+    shell, a management agent, or a deployment framework as parent fits sanctioned administration; a browser, an
+    archive tool, a script host, an Office application, or a remote-execution service as parent points at
+    delivery through a user or through another host.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+  answer_sources:
+  - process_creation
+- question: Were consent keys for other Sysinternals tools written on this host, and by which binaries?
+  context: >-
+    Operators rarely stage a single utility. Consent keys for several tools appearing close together, written by
+    binaries that do not carry the shipped filenames, indicate a renamed toolkit rather than one repackaged
+    utility, and the set of tools names the intent — process memory access, file wiping, remote execution, or
+    account enumeration. Keys written by the canonical executables in the same window are the ordinary case and
+    give a useful contrast for what normal use of the suite looks like on this host.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|endswith: '\EulaAccepted'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - User
+  answer_sources:
+  - registry_event
+- question: Were other registry modifications made on this host in the same session?
+  context: >-
+    Tool staging is usually accompanied by other configuration changes — service definitions written by a remote
+    execution utility, debugger or policy values that weaken a security control, or autostart entries that keep a
+    payload resident. Grouping every registry write on the host in the surrounding window by key path and writing
+    process shows what else landed alongside the consent key, and whether the same renamed binary is responsible
+    for more than one of them.
+  range: +/-30m
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - User
+  answer_sources:
+  - registry_event
+- question: How was the renamed binary invoked after the consent key was written, and what did each invocation target?
+  context: >-
+    The consent key is written on the tool's first run, so the executions that follow are where the operational
+    detail is. The arguments name the target — a process or PID for a memory dump, a remote host and account for a
+    service-based execution, a path for a secure delete, a domain controller for a directory snapshot. Repeated
+    invocations against different targets describe a sweep; a single invocation against one target describes a
+    discrete action that can be checked against a change record.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - User
+  answer_sources:
+  - process_creation
+  - registry_event
+- question: Has this consent key been written before on this host?
+  context: >-
+    The key is written once per user on first run, so history is thin by design and the Image values in it are the
+    interesting part. Prior writes by the tool's shipped executable establish that the utility is in routine use
+    here and that only the naming is new; prior writes by other non-canonical names establish a habit of
+    repackaging; no history at all means the tool ran on this host for the first time.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - Details
+      - Image
+  answer_sources:
+  - registry_event
+- question: Has this binary name run on this host before, and under which accounts?
+  context: >-
+    A filename that has executed regularly for months under the same administrative account is part of the local
+    software estate and the rename is a naming convention. A filename first seen on the day of the alert, or seen
+    under an account that does not otherwise run administrative tooling, is a staged copy. Because the name is
+    arbitrary, a zero count here does not clear the tool — it means this particular alias is new, and the identity
+    evidence from the binary's metadata carries the judgment.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+  answer_sources:
+  - process_creation
+- question: Was this consent key written on other hosts in the environment?
+  context: >-
+    The same key written across many hosts describes a deployment — a management bundle or script that carries a
+    renamed copy of the utility to every endpoint it touches. The Image values distinguish that from the other
+    reading: the same renamed binary appearing on a handful of hosts in a short window, written by a
+    remote-execution path, describes an operator moving a tool between systems. A single host with no other
+    occurrence keeps the activity local.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+      - Details
+  answer_sources:
+  - registry_event
+- question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Aggregating process activity on the host in the surrounding window collapses routine service and agent
+    telemetry into high-count rows and leaves novel parent-child pairs standing out at low counts. That is where
+    the context around the tool run sits — the shell or agent that preceded it, archive or transfer utilities that
+    staged it, and any enumeration or credential-access activity that followed it.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+  answer_sources:
+  - process_creation
+  - registry_event
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host place the tool run in a sequence. Remote-service creation or a suspicious
+    logon before it suggests the host was reached from elsewhere; enumeration or defence-tampering detections
+    around it suggest the utility is one step in a longer session. No earlier detections is consistent with local
+    administrative use.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+  answer_sources:
+  - alert

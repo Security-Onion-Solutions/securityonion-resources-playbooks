@@ -1,0 +1,405 @@
+name: Code Execution via Pcwutl.dll
+id: a7dfb588-fc88-4eb5-96c2-0481b5bf278a
+description: |
+  Detects rundll32.exe (by Image name or OriginalFileName) invoked with a command line containing both 'pcwutl' and
+  'LaunchApplication', the entry point exposed by pcwutl.dll that launches an arbitrary executable. This is a proxy-execution
+  pattern: a trusted, signed Microsoft binary is used to start another program, so the launched process inherits rundll32's
+  reputation and can bypass path or signature-based controls. Legitimate use comes from the Program Compatibility
+  Troubleshooter; malicious use chains rundll32 to a downloaded or staged payload. Determine what executable was launched,
+  where it came from, what spawned rundll32, and whether the activity is consistent with troubleshooter usage on this host.
+type: detection
+detection_id: 9386d78a-7207-4048-9c9f-a93a7c2d1c05
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- question: Does the rundll32 command line call pcwutl.dll's LaunchApplication entry point, and what executable does it launch?
+  context: Confirm the alert is a true positive by reviewing the exact command line. The rule fires when rundll32.exe (by Image
+    name or OriginalFileName) runs with a command line containing both 'pcwutl' and 'LaunchApplication'. Read the argument that
+    follows LaunchApplication — that is the executable being proxied — and note its path and any parameters.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to run the Program Compatibility Troubleshooter?
+  context: The documented legitimate source of this pattern is the Program Compatibility Troubleshooter, which a user typically
+    launches interactively when an application fails to run. If the user role and host function are consistent with a person
+    troubleshooting an application, that supports a benign reading; an unattended server or a service account is harder to
+    explain.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What did rundll32 do on this host — decode the full pcwutl.dll command line and the target executable path.
+  context: The full command line reveals what was launched. Identify the executable that follows LaunchApplication, its full
+    path, and any arguments passed to it. A target in a user-writable or temporary location, or a binary unrelated to
+    compatibility troubleshooting, points away from legitimate use.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|contains: 'LaunchApplication'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What process spawned this rundll32, and is that parent chain expected?
+  context: The parent process reveals how rundll32 was invoked. The compatibility troubleshooter is normally reached through
+    explorer.exe or the control panel. Parents such as office applications, script hosts (wscript.exe, mshta.exe), or a shell
+    spawned from a remote-access tool indicate the entry point was used to proxy other code rather than to troubleshoot an
+    application.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What executable did rundll32 launch immediately after this pcwutl invocation, and where does it live?
+  context: The purpose of LaunchApplication is to start another program, so the launched executable is the actual payload of
+    this pattern. Review the child processes of this rundll32 instance — their image path, signer, and command line. A child
+    running from a temporary or user-writable directory, or an unsigned binary, is the behavior this proxy-execution pattern
+    is used to disguise.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - User
+- question: What DLLs did this rundll32 instance map, and were any loaded from outside System32 or SysWOW64?
+  context: rundll32 abuse maps a DLL into memory to expose its entry point; pcwutl.dll itself ships under System32 and SysWOW64.
+    A pcwutl.dll loaded from any other location, or additional unsigned or unusual DLLs loaded by the same process, indicates
+    the trusted name is being used to host non-standard code. If image-load events are not collected in this environment, treat
+    zero results as a visibility gap rather than evidence nothing loaded.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - CommandLine
+- question: Were executable or script files written to this host shortly before the rundll32 launch?
+  context: The executable that LaunchApplication starts is often staged on disk first by a downloader or dropper. The query
+    is limited to files with executable or script extensions written on this host in the hour before the alert, which may
+    identify the payload and the process that placed it. Correlate the write time and path with the target executable seen
+    in the command line; a zero means the target was not freshly staged with one of these extensions, not that it is safe.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith:
+          - '.exe'
+          - '.dll'
+          - '.bat'
+          - '.cmd'
+          - '.ps1'
+          - '.vbs'
+          - '.js'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - User
+      - EventType
+- question: Did rundll32 make any outbound network connections around the time of this alert?
+  context: rundll32 can be used to fetch a remotely hosted payload before or while launching it. Outbound connections from
+    rundll32 are atypical for compatibility troubleshooting; an external destination here suggests the executable or its
+    components were retrieved from a remote source. If network telemetry for this host is not collected, treat zero results
+    as a visibility gap.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- question: When this host has previously fired the pcwutl.dll LaunchApplication pattern, what parents and users drove it, and
+    does the current alert fit?
+  context: Even a legitimate pattern has a normal pattern. This query mirrors the rule's selection scoped to this host, so the
+    resulting parent and user distribution reflects how this specific pcwutl.dll firing pattern has historically run here. A
+    new parent process, an unexpected user account, or an unusual command-line structure is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \rundll32.exe
+      - OriginalFileName: RUNDLL32.EXE
+      selection_cli:
+        CommandLine|contains|all:
+        - pcwutl
+        - LaunchApplication
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \rundll32.exe
+      - OriginalFileName: RUNDLL32.EXE
+      selection_cli:
+        CommandLine|contains|all:
+        - pcwutl
+        - LaunchApplication
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \rundll32.exe
+      - OriginalFileName: RUNDLL32.EXE
+      selection_cli:
+        CommandLine|contains|all:
+        - pcwutl
+        - LaunchApplication
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If
+    the same user triggered similar activity on other hosts, the scope of the activity may be larger than this single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \rundll32.exe
+      - OriginalFileName: RUNDLL32.EXE
+      selection_cli:
+        CommandLine|contains|all:
+        - pcwutl
+        - LaunchApplication
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining activity around the alert reveals what led to this event and what
+    happened after. Look for reconnaissance, downloaders, privilege escalation, or persistence mechanisms that provide broader
+    context for the rundll32 launch.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — defense tampering, reconnaissance, a downloader, or credential access — may
+    reveal the stages that preceded this proxy execution and help reconstruct the timeline of activity.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Was rundll32 executed from its expected System32 or SysWOW64 path?
+  context: rundll32 running from outside System32 or SysWOW64 may indicate the binary was copied or renamed to evade path-based
+    allowlists. The rule also matches on OriginalFileName, so a renamed copy still fires; confirm the actual image path of the
+    process that ran.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- question: Were any other proxy-execution LOLBins used on this host recently?
+  context: Operators who use one proxy-execution LOLBin often use several. If rundll32 proxied a payload here, check whether
+    regsvr32, mshta, msbuild, installutil, or similar binaries were also used to run code in the same window. Multiple
+    proxy-execution LOLBins performing the same objective strengthens the case for deliberate evasion.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\regsvr32.exe'
+          - '\mshta.exe'
+          - '\msbuild.exe'
+          - '\cmstp.exe'
+          - '\installutil.exe'
+          - '\msiexec.exe'
+          - '\forfiles.exe'
+          - '\pcalua.exe'
+          - '\presentationhost.exe'
+          - '\control.exe'
+          - '\infdefaultinstall.exe'
+          - '\msdt.exe'
+          - '\mavinject.exe'
+          - '\wmic.exe'
+          - '\xwizard.exe'
+          - '\ie4uinit.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- question: How often has this host fired the pcwutl.dll LaunchApplication pattern over the past 90 days, and what command-line
+    patterns are typical?
+  context: A LOLBin pattern with no prior history on a host is more notable than one used regularly under stable parents. This
+    query mirrors the rule's selection scoped to this host, so the count reflects this specific pcwutl.dll firing pattern. The
+    command-line projection lets the analyst compare typical invocation patterns against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \rundll32.exe
+      - OriginalFileName: RUNDLL32.EXE
+      selection_cli:
+        CommandLine|contains|all:
+        - pcwutl
+        - LaunchApplication
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - CommandLine

@@ -1,0 +1,369 @@
+name: Kapeka Backdoor Autorun Persistence
+id: e21b01bc-43ce-4d3d-86da-4a875e9e9de0
+description: |
+  Detects a new value under the HKLM/HKCU ...\SOFTWARE\Microsoft\Windows\CurrentVersion\Run key whose value name
+  masquerades as a benign entry (Sens Api or OneDrive) and whose value data invokes rundll32.exe against a file with a
+  .wll extension at ordinal export (#1) — the autorun persistence pattern used by the Kapeka backdoor. Run keys are a
+  legitimate autostart mechanism and .wll is a normal Office add-in extension, so the individual pieces are benign, but
+  the combination of a spoofed value name and rundll32 loading a DLL renamed as an Office add-in at its first ordinal is
+  the malicious loader form. Determine what the value data actually points at, whether the referenced payload exists on
+  disk and executed, which process wrote the key, and whether other persistence or defense-tampering activity accompanied
+  it.
+type: detection
+detection_id: c0c67b21-eb8a-4c84-a395-40473ec3b482
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-10
+questions:
+- question: Does the Run-key value name and value data match what this rule detects?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule fires when a value under
+    ...\CurrentVersion\Run is named Sens Api or OneDrive AND its data contains all of rundll32.exe, a .wll path, and the
+    ordinal marker (#1). Confirm the exact key path (TargetObject) and value data (Details) on the triggering event carry
+    all three data fragments together rather than being inferred from separate writes.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this user and host expected to write autostart Run-key entries?
+  context: Legitimate Run-key entries are normally created by software installers or management tooling, not by an
+    interactive user or an ad-hoc process. Knowing whether this account and host function routinely register autostart
+    entries is often the fastest way to separate a software deployment from persistence. User attribution is present on
+    most endpoint registry events; when it resolves to a machine account or SYSTEM, pivot on the writing process (Image)
+    instead of the user.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is the modified key a known persistence location, and does the value name blend in with legitimate entries?
+  context: The path under ...\CurrentVersion\Run is a per-user or per-machine autostart location — anything named here runs
+    at logon or boot. The value names this rule matches (Sens Api, OneDrive) impersonate a real Windows service API entry
+    and the OneDrive updater so the entry looks routine in a casual review of the Run key. The specific value name and
+    data written determine what executes at startup.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: What does the value data actually launch at startup? Decode the rundll32 command it holds.
+  context: The value data has the form rundll32.exe followed by a path ending in .wll and the ordinal marker (#1). rundll32
+    loads the named DLL and calls its first ordinal export (#1); the .wll extension is normally an Excel/Word web add-in,
+    so a DLL renamed .wll and loaded this way is a loader disguised as an Office add-in. Read the full Details value to
+    recover the exact payload path, then treat that path as the artifact to chase on disk and in execution telemetry.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- question: Does this Run-key value stick, or is it later overwritten or re-set on this host?
+  context: Endpoint telemetry does not emit registry key or value deletion events, so attacker cleanup cannot be seen as a
+    removal; instead read the key's modification history over a longer window. A value that is written once and then left
+    untouched indicates active persistence, while repeated re-writes of the same name can indicate the implant
+    re-asserting the entry or a later change to the payload it points at. Compare the Details value across each
+    modification to see whether the referenced payload path changed.
+  range: +7d
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- question: Is the referenced .wll payload present on disk, and would it survive a reboot?
+  context: Run-key persistence only works if the DLL the value points at exists at that path. Correlating file activity by
+    the process that wrote the key (and its child processes) surfaces the .wll drop that usually lands in the same session
+    as the registry write. The file-write event carries no hash; if the payload is present, hash it from a later
+    execution or retrieve it for a reputation lookup. Because deletion is not observable, judge reboot survival from the
+    value data and the key's re-modification history rather than from a removal event.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Did rundll32.exe execute the .wll payload referenced by the Run-key value?
+  context: Autorun persistence becomes active the first time the referenced command runs — at the next logon or boot, or
+    immediately if the implant launches it directly. Look for rundll32.exe invocations whose command line carries both the
+    .wll path and the ordinal marker (#1), which is the exact launch form written to the Run key. Registry write and payload
+    execution typically fall within the same session, often minutes apart.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: '\rundll32.exe'
+        CommandLine|contains|all:
+          - '.wll'
+          - '#1'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Which process wrote this Run-key value, and what spawned that process?
+  context: The process that created the autostart entry is the immediate lead. Tracing its own parent reveals whether the
+    write came from a legitimate installer chain or from an unexpected loader — for example a document handler, a script
+    host, or rundll32 itself writing its own persistence. An autostart entry created by an interactive shell or an
+    unsigned binary is far more suspicious than one written by a known deployment agent.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What other processes did the responsible process spawn?
+  context: A process that performs this action rarely stops there. Listing the children it launched shows
+    whether the activity was an isolated change or one step in a longer chain - payload execution,
+    additional persistence, or follow-on tooling. Note this shows what the acting process started,
+    not what started alongside it. Sibling processes cannot be identified from this telemetry,
+    because this event type does not record the acting process's parent.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Were other registry modifications made on this host in the same session?
+  context: Operators who set one persistence key often make several changes together — a second autostart entry, a
+    Defender or firewall policy tweak, or a service configuration. All registry modifications on the host in a short window
+    around the write, grouped by key path and writing process, show whether this Run-key change stands alone or landed
+    alongside other tampering. The triggering key appears in the results; the signal is what else was changed by the same
+    process.
+  range: +/-30m
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - User
+- question: What other activity occurred on this host around the time of the alert?
+  context: Autorun persistence rarely occurs in isolation. Examining process activity around the registry write reveals
+    what led to it and what followed — a delivery vector, the .wll drop, or hands-on-keyboard commands. Aggregating by
+    process and parent collapses routine agent noise into high-count rows while novel parent-child pairs stand out at low
+    counts.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Has this Run-key value been written on this host before?
+  context: A first-time write to this specific autostart value is more suspicious than a value that changes routinely.
+    Legitimate autostart entries are usually established once at install time and then stay stable; zero prior history for
+    this key on this host indicates a newly introduced entry. Compare the historical Details values to see whether the
+    same payload path has been set before or whether this write is unique.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - Details
+      - Image
+- question: Is registering an autostart entry this way consistent with how this organization deploys software?
+  context: Organizations typically establish autostart entries through software installers, deployment tooling, or group
+    policy rather than a direct write from an interactive process. A Run-key value pointing at rundll32 loading a .wll add-in
+    does not match any normal deployment path. If the environment has no standard autostart-management procedure, this
+    check adds little; where one exists, a mismatch with it strengthens the case that the write was unauthorized.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — defense tampering, reconnaissance, or credential access — may reveal the
+    stages that preceded the persistence write and help reconstruct the timeline. Persistence is commonly established after
+    an operator has already gained a foothold, so a preceding alert cluster changes how this event should be triaged.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Was this same Run-key value written on other hosts in the environment?
+  context: The same autostart entry appearing on multiple hosts can indicate a widespread implant or lateral movement,
+    while a single-host write suggests a targeted foothold. Omitting the host filter shows network-wide writes to this
+    exact key. Compare the Details value across hosts to see whether the same payload path is being planted everywhere or
+    varies per host.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+      - Details
+- question: Were other process-based persistence mechanisms installed on this host?
+  context: Attackers rarely rely on a single autostart entry. After setting one Run-key foothold they commonly add backups
+    through different techniques — scheduled tasks, services, or additional registry writes. Persistence-tool executions in
+    the same timeframe, grouped by tool and command, indicate intentional stacking of mechanisms rather than an isolated
+    change.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- question: Were files dropped into Startup folders or scheduled-task definition paths on this host?
+  context: File-based persistence bypasses command-line detection entirely — dropping a binary or script into a Startup
+    folder or a path referenced by a Run key achieves autostart without invoking a persistence tool. File-write events
+    capture these drops even when the actor avoids schtasks, sc, or reg, and can surface the .wll payload if it was written
+    into one of these locations.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist_paths:
+        TargetFilename|contains:
+          - '\Start Menu\Programs\Startup\'
+          - '\Windows\System32\Tasks\'
+          - '\Windows\Tasks\'
+      condition: selection and selection_persist_paths
+    fields:
+      - TargetFilename
+      - Image

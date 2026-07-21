@@ -1,0 +1,495 @@
+name: Cred Dump Tools Dropped Files
+id: 448efefa-fa54-4534-b901-49c95509640f
+description: |
+  Detects a file whose name matches a component or output artifact of well-known credential-dumping
+  tools — either a name-fragment such as \pwdump, \kirbi, \pwhashes, \wce_ccache, or \wce_krbtkts, or a
+  full filename such as procdump.exe, cachedump.exe, lsremora.dll, wceaux.dll, SAM.out, SECURITY.out,
+  SYSTEM.out, NTDS.out, or servpw.exe. The rule fires on either a matching name fragment OR a matching
+  full filename, so the alert can be a dumper tool being staged to disk or an output file the tool
+  produced while extracting secrets from LSASS memory, the SAM/SECURITY/SYSTEM hives, LSA secrets,
+  cached domain credentials, or NTDS.dit. A dumped hive or credential file means secrets may already be
+  offline in an attacker's hands, so treat any account exposed on this host as potentially compromised;
+  a rare legitimate cause is an administrator running a password-recovery utility. Determine which
+  artifact matched and whether it is a tool or its output, what process wrote it and how it was launched,
+  which credential store was targeted, whether the tool executed, and what lateral movement or account
+  reuse followed.
+type: detection
+detection_id: 8fbf3271-1ef6-4e94-8210-03c2317947f6
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-09
+questions:
+- question: Does the alerting file match a credential-dump tool name or output-file pattern, and which process wrote it?
+  context: >-
+    Before investing investigation time, confirm the alert is a true positive. The rule fires when a
+    created file matches EITHER a tool/output name-fragment (\pwdump, \kirbi, \pwhashes, \wce_ccache,
+    \wce_krbtkts) OR a full filename (procdump.exe, cachedump.exe, lsremora.dll, wceaux.dll, SAM.out,
+    SECURITY.out, SYSTEM.out, NTDS.out, servpw.exe, and similar). Note which branch matched, because it
+    changes the reading: a tool executable being written means a dumper is being staged, while an
+    output file such as SAM.out or a .kirbi ticket means a dump has likely already run and secrets are
+    on disk. Review the exact TargetFilename, the operation, and the responsible process.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this user and host expected to produce credential-tool files?
+  context: >-
+    Legitimate credential-recovery activity is rare and usually confined to specific administrators and
+    maintenance hosts. Knowing whether the writing account and host function match that expectation is
+    often the fastest way to separate a sanctioned password-recovery run from credential theft. User
+    attribution is present on roughly 94% of endpoint file events; when it is a machine account or
+    SYSTEM, judge by the writing process and the host's role instead. On a domain controller, output
+    files for the SAM/SYSTEM hives or NTDS.dit are especially significant.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Which credential store was targeted, and by what method?
+  context: >-
+    Different artifacts point to different credential stores, and the store determines which accounts
+    are exposed. SAM.out / SECURITY.out / SYSTEM.out indicate the local SAM and LSA hives were saved for
+    offline hash extraction; NTDS.out points at the domain database and every domain account; .kirbi and
+    wce_krbtkts files are Kerberos tickets enabling pass-the-ticket; pwdump/pwhashes/cachedump output
+    holds local and cached domain hashes; procdump against LSASS captures live secrets from memory. Read
+    the responsible process's command line to identify the method and confirm which store was reached.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What is in this artifact — is it a dumper binary or extracted credential material?
+  context: >-
+    Read the artifact's actual content to establish what it is. A tool executable (procdump.exe,
+    cachedump.exe, servpw.exe) or a helper DLL (lsremora.dll, wceaux.dll, DumpExt.dll) is dumping
+    infrastructure; an output file (SAM.out, a .kirbi ticket, pwdump text) is extracted secret material
+    and should be handled as exposed credentials. Because the alert event carries no hash, retrieve the
+    file from the host path for inspection: check whether an .out or hive file contains registry-hive or
+    hash structure, and whether a binary matches a known dumper by strings or imports. Content analysis
+    here is distinct from reputation lookup.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: If this artifact has executed, what is its hash and does it have known threat-intel detections?
+  context: >-
+    A file's hash is recorded when it runs, not when it is written, so a dumper tool staged to disk shows
+    a hash only once it executes. This query looks for the artifact running and reads its hash for
+    reputation lookup against threat intel. A present-but-not-executed file will not appear here — point
+    to the on-disk path for manual hashing. An output file such as SAM.out is data and will not execute;
+    for those, the value is confirming the tool that produced it rather than a hash on the artifact
+    itself.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - Image
+      - Hashes
+- question: Did a process load a known credential-dumping helper DLL on this host around the alert?
+  context: >-
+    Several of the tracked artifacts are helper DLLs (lsremora.dll, lsremora64.dll, wceaux.dll,
+    DumpExt.dll) that a dumper loads in-process to reach LSA secrets or LSASS memory. A DLL carries its
+    hash and signature on the load event, so an unsigned or unusual load of one of these modules
+    confirms the tooling is active rather than merely staged. Check what process loaded such a module,
+    whether it was signed, and where the module lives on disk.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|endswith:
+          - '\lsremora.dll'
+          - '\lsremora64.dll'
+          - '\wceaux.dll'
+          - '\DumpExt.dll'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Image
+      - Signature
+      - SignatureStatus
+      - Hashes
+- question: Did a process request high-access handles or dump behavior against LSASS on this host around the alert?
+  context: >-
+    Live-memory dumping tools open LSASS with full access (0x1F0FFF) and then read or dump its memory to
+    produce credential output. The injection- and access-side of that behavior is partially visible on
+    the endpoint behavioral API channel through calls such as WriteProcessMemory, QueueUserAPC, and
+    SetWindowsHookEx from the dumping process. Note the blind spot: read-side LSASS memory access (for
+    example NtReadVirtualMemory to scrape secrets) has no dedicated telemetry here, so a clean result is
+    not proof no dump occurred — corroborate with the dump output on disk and the tool's command line.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        event.dataset: endpoint.events.api
+        process.Ext.api.name:
+          - WriteProcessMemory
+          - QueueUserAPC
+          - SetWindowsHookEx
+      condition: selection
+    fields:
+      - Image
+      - process.Ext.api.name
+      - User
+- question: Was a dumper artifact executed after it was written on this host?
+  context: >-
+    If the alerting artifact is a tool binary, the pivotal question is whether it ran. A staged
+    procdump.exe or servpw.exe that never executes is a caught-early stage; the same file running turns
+    the investigation to what it dumped and where the output went. This query looks for the artifact
+    executing as a process and its command line. Output files such as SAM.out do not execute, so a clean
+    result for those is expected — for them, the execution to look for is the tool that produced them.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: What other files did the responsible process write or delete around the alert?
+  context: >-
+    A dumper rarely produces a single file. A tool that saves the SAM hive usually also saves SYSTEM and
+    SECURITY, and a memory dumper stages its output alongside its own binary and DLLs. The breadth,
+    paths, and names of the writing process's other file activity enumerate the full set of artifacts
+    that need review and reveal whether all three registry hives were saved together — the combination
+    that confirms offline hash-extraction intent. This covers the writer and its direct children, since
+    droppers often delegate.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Which accounts may be compromised, and do any have elevated privileges?
+  context: >-
+    The severity of a credential dump depends on which accounts the targeted store holds. A local SAM
+    dump exposes local accounts; a cached-credentials or LSASS dump exposes any domain user who logged
+    on to this host; an NTDS.dit or domain-hive dump on a domain controller exposes the entire directory,
+    including Domain Admin and krbtgt. Cross-reference the accounts present on this host — interactive
+    sessions, service accounts, and cached logons — against directory group membership to decide whether
+    this needs incident escalation and which credentials must be rotated.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Were outbound remote-access connections (RDP, SMB, WinRM, SSH) initiated from this host after this event?
+  context: >-
+    Credential theft is typically followed by lateral movement. This query returns outbound connections
+    from this host to remote-access ports — 3389 for RDP, 445 for SMB and PsExec, 5985 and 5986 for
+    WinRM, and 22 for SSH — in the hours after the event, with the originating process and user showing
+    what drove each connection. Two limits to keep in mind: credentials exfiltrated and replayed from
+    another machine will not appear here, so also review network-logon events on suspected targets for
+    the exposed accounts; and if network telemetry is not collected from this host, treat zero results
+    as a visibility gap rather than evidence no movement occurred.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
+- question: What else has been written to this directory recently, and by which processes?
+  context: >-
+    Location drives suspicion for these artifacts. Credential tools and their output are commonly staged
+    in world-writable or transient directories — Temp, ProgramData, Public, or a user profile — where a
+    small set of processes legitimately writes. Other recent arrivals in the same directory reveal
+    whether this is an isolated drop or a staging location under active use, and which additional files
+    (tool binaries, DLLs, hive dumps) belong to the same activity. A single unfamiliar writer across
+    several files in the directory is the signal.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains: '\Temp\'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: Is the same credential-tool artifact present on any other hosts in the environment?
+  context: >-
+    The same tool or output filename appearing on multiple hosts points to an operator working through
+    the estate rather than a single isolated action, and each additional host is another place secrets
+    may have been dumped. If the artifact is confined to one host it may be a targeted or opportunistic
+    action; if it is spread across many, reconstruct the distribution order and timeline to find where
+    the activity began. Compare the writing process across hosts to see whether it is a consistent
+    operator toolset.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        TargetFilename|endswith|expand: '%file_basename%'
+      condition: selection
+    fields:
+      - host.name
+      - TargetFilename
+      - Image
+- always_include: true
+  question: Has this user previously produced this credential-tool file pattern, and does that history fit their role?
+  context: >-
+    This query mirrors the rule's own selection scoped to the alerting user, so the result is that
+    user's 90-day history of producing credential-tool files specifically — not generic file activity.
+    A user who has never produced this pattern is more significant than one who does so as part of a
+    known password-recovery or security-testing role. Weigh the count against what the account is
+    expected to do; when the alert fires under a machine or service account, this axis is
+    non-discriminating and the parent-process history is the better pivot.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+      - TargetFilename|contains:
+        - \fgdump-log
+        - \kirbi
+        - \pwdump
+        - \pwhashes
+        - \wce_ccache
+        - \wce_krbtkts
+      - TargetFilename|endswith:
+        - \cachedump.exe
+        - \cachedump64.exe
+        - \DumpExt.dll
+        - \DumpSvc.exe
+        - \Dumpy.exe
+        - \fgexec.exe
+        - \lsremora.dll
+        - \lsremora64.dll
+        - \NTDS.out
+        - \procdump.exe
+        - \procdump64.exe
+        - \procdump64a.exe
+        - \pstgdump.exe
+        - \pwdump.exe
+        - \SAM.out
+        - \SECURITY.out
+        - \servpw.exe
+        - \servpw64.exe
+        - \SYSTEM.out
+        - \test.pwd
+        - \wceaux.dll
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: Has this program historically driven this credential-tool file pattern, or is the program new for this activity?
+  context: >-
+    When the alert fires under a service principal or machine account, user identity does not attribute
+    the behavior; the launch mechanism does. This query mirrors the rule's selection scoped to the
+    alerting program, giving the 90-day history of this program driving credential-tool file
+    creation — not generic use of the binary. A program that has never driven this pattern
+    is the deviation worth pursuing; a program that produces it routinely points to an established backup
+    or security-tooling workflow.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+      - TargetFilename|contains:
+        - \fgdump-log
+        - \kirbi
+        - \pwdump
+        - \pwhashes
+        - \wce_ccache
+        - \wce_krbtkts
+      - TargetFilename|endswith:
+        - \cachedump.exe
+        - \cachedump64.exe
+        - \DumpExt.dll
+        - \DumpSvc.exe
+        - \Dumpy.exe
+        - \fgexec.exe
+        - \lsremora.dll
+        - \lsremora64.dll
+        - \NTDS.out
+        - \procdump.exe
+        - \procdump64.exe
+        - \procdump64a.exe
+        - \pstgdump.exe
+        - \pwdump.exe
+        - \SAM.out
+        - \SECURITY.out
+        - \servpw.exe
+        - \servpw64.exe
+        - \SYSTEM.out
+        - \test.pwd
+        - \wceaux.dll
+      _pb_scope:
+        Image|endswith|expand: '%Image%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    A credential dump rarely happens in isolation. Aggregating process activity in a tight window around
+    the alert surfaces what led up to the dump and what ran immediately after — reconnaissance, the
+    launch of the dumping tool, archiving of the output, or the start of lateral movement. Novel
+    parent-child pairs stand out at low counts against routine high-count telemetry, which is what points
+    to the operator's surrounding actions.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host — reconnaissance, execution of scripting or LOLBin tools, or
+    defense tampering — may reveal the stages that preceded the credential dump and help reconstruct the
+    timeline. Privilege escalation or defense tampering followed by credential access is a common
+    progression, and prior alerts help place this artifact within it.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: >-
+    Is the file still on disk, or was it deleted or renamed after the alert?
+  context: >-
+    The file's post-alert lifecycle drives both urgency and next steps. A payload still on disk can
+    be retrieved, hashed, and analyzed; a file deleted seconds after creation suggests anti-forensic
+    cleanup or a self-deleting dropper and shifts the investigation to what executed in between.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - EventType

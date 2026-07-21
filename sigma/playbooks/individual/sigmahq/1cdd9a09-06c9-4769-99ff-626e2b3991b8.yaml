@@ -1,0 +1,639 @@
+name: Suspicious Double Extension File Execution
+id: 2e9c8f06-601f-4e82-8287-be21e5b8e68c
+description: |
+  Detects execution of a binary whose image path and command line both end in a deceptive double extension — a benign-looking
+  type such as .pdf, .doc, .xls, .jpg, or .mp4 immediately followed by .exe or .js, or a name padded with leading spaces,
+  underscores, or invisible Braille blank characters that push the real .exe extension out of view in file listings. This
+  masquerading pattern is used to trick a user into launching an executable they believe is a document, image, or media file,
+  most often after the file arrives as a phishing attachment or download. Investigation should confirm the deceptive name,
+  decode the full launch path and command, identify how the file was delivered and which user opened it, and look for the
+  surrounding email-delivery, file-write, and outbound-network activity that frames the execution.
+type: detection
+detection_id: 1cdd9a09-06c9-4769-99ff-626e2b3991b8
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the executed file's name and path actually contain a deceptive double extension or a padded/invisible-character extension?
+  context: Confirm the alert is a true positive by reading the exact Image path and CommandLine. The rule fires when both end
+    in a benign-looking type followed by .exe or .js (for example .pdf.exe, .doc.js, .xls.exe), or when the name is padded
+    with leading spaces, underscores, or Braille blank characters (U+2800) that hide the real .exe from view. A legitimately
+    named binary that merely contains one of these substrings inside a longer path is a false positive.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Is this user and host expected to launch executables that masquerade as documents or media files?
+  context: Double-extension and padded-name executables are almost never produced by legitimate software, which uses honest
+    file names. Knowing whether the user routinely handles unusual file types, or whether the host is a sandbox or malware-analysis
+    machine, is often the fastest way to separate a real user-execution event from a benign one.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What is the full launch path and command line of the masqueraded executable, and what real file type and content does it carry?
+  context: Decode the complete Image path and CommandLine to recover the true file name, the hidden .exe or .js extension, and
+    any arguments, working directory, or referenced paths. Padded names may use leading spaces, underscores, or invisible Braille
+    blank characters (U+2800), so inspect the raw bytes rather than the displayed name. A masqueraded media or document file
+    often sits in a download or temp directory and may be launched with no arguments by a user double-click.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What process spawned this masqueraded executable, and is that parent chain consistent with a user opening a delivered file?
+  context: The parent reveals how the file was launched. A browser, mail client, archive tool (for example 7zfm.exe or explorer.exe
+    extracting an attachment), or a document application as parent points to user-driven execution of a delivered file. An
+    Office application spawning the executable, or an unexpected scripting host, points to a malicious-document or macro launch
+    path worth tracing further up the tree.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What email, download, or document delivered this file to the host?
+  context: This pattern is most often the first on-host action of a phishing attachment or malicious download. Identify the
+    delivery vector — the sending email address, the attachment or download file name, or the originating link — so it can
+    be blocked and other recipients can be searched. The parent command line frequently records the original document or archive
+    name; mail and proxy logs hold the sender and source.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+- question: Was the masqueraded file recently written to disk, and what process and path wrote it?
+  context: A spearphishing attachment is stored on disk before it is run, so the file-write event identifies the saving process
+    (browser, mail client, or archive extractor) and the directory it landed in — commonly a downloads, temp, or user-profile
+    folder. Correlating the write time with the execution time establishes the delivery-to-execution interval and helps confirm
+    the file arrived from outside rather than being built locally.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - TargetFilename
+      - User
+      - EventType
+- question: Did the masqueraded executable make any outbound network connections after launch?
+  context: After a phishing payload executes it commonly reaches out to retrieve a second stage or to establish command and
+    control. Outbound connections initiated by this process — especially to external addresses on uncommon ports — indicate
+    the file is an active payload rather than an inert mislabeled document. Resolve any destinations and pivot on them to find
+    other affected hosts.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+        Initiated: 'true'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- question: What child processes did the masqueraded executable spawn afterward?
+  context: The processes spawned after launch reveal the payload's intent. Phishing droppers frequently spawn command interpreters,
+    scripting hosts (powershell.exe, cmd.exe, wscript.exe, py.exe), or legitimate signed binaries used for DLL side-loading.
+    A masquerading file that immediately launches scripting or staging tools is behaving as a dropper, not a document viewer.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: When this host has previously fired the double-extension pattern, what parents and users normally drove it, and does the current alert fit that pattern?
+  context: The query mirrors the rule's selection structure scoped to this host, so the resulting parent/user distribution reflects
+    how this specific masquerading pattern has fired here before rather than generic binary usage. A new parent process, an
+    unexpected user account, or an unusual command-line structure is the deviation worth chasing. On most hosts this pattern should
+    have little or no history at all.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith:
+        - '      .exe'
+        - ______.exe
+        - .doc.exe
+        - .doc.js
+        - .docx.exe
+        - .docx.js
+        - .gif.exe
+        - .jpeg.exe
+        - .jpg.exe
+        - .mkv.exe
+        - .mov.exe
+        - .mp3.exe
+        - .mp4.exe
+        - .pdf.exe
+        - .pdf.js
+        - .png.exe
+        - .ppt.exe
+        - .ppt.js
+        - .pptx.exe
+        - .pptx.js
+        - .rtf.exe
+        - .rtf.js
+        - .svg.exe
+        - .txt.exe
+        - .txt.js
+        - .xls.exe
+        - .xls.js
+        - .xlsx.exe
+        - .xlsx.js
+        - "⠀⠀⠀⠀⠀⠀.exe"
+        CommandLine|contains:
+        - '      .exe'
+        - ______.exe
+        - .doc.exe
+        - .doc.js
+        - .docx.exe
+        - .docx.js
+        - .gif.exe
+        - .jpeg.exe
+        - .jpg.exe
+        - .mkv.exe
+        - .mov.exe
+        - .mp3.exe
+        - .mp4.exe
+        - .pdf.exe
+        - .pdf.js
+        - .png.exe
+        - .ppt.exe
+        - .ppt.js
+        - .pptx.exe
+        - .pptx.js
+        - .rtf.exe
+        - .rtf.js
+        - .svg.exe
+        - .txt.exe
+        - .txt.js
+        - .xls.exe
+        - .xls.js
+        - .xlsx.exe
+        - .xlsx.js
+        - "⠀⠀⠀⠀⠀⠀.exe"
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Have other hosts fired the double-extension pattern in the past week, and does the cross-host distribution look like a campaign or isolated activity?
+  context: The query mirrors the rule's selection structure with no host scope, giving a fleet-wide count of this masquerading
+    pattern rather than generic binary usage. Several hosts firing the same pattern in a short window points to a phishing campaign
+    that reached multiple recipients; one host or a small unrelated set points to an isolated delivery. Use the host distribution
+    to size the response.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith:
+        - '      .exe'
+        - ______.exe
+        - .doc.exe
+        - .doc.js
+        - .docx.exe
+        - .docx.js
+        - .gif.exe
+        - .jpeg.exe
+        - .jpg.exe
+        - .mkv.exe
+        - .mov.exe
+        - .mp3.exe
+        - .mp4.exe
+        - .pdf.exe
+        - .pdf.js
+        - .png.exe
+        - .ppt.exe
+        - .ppt.js
+        - .pptx.exe
+        - .pptx.js
+        - .rtf.exe
+        - .rtf.js
+        - .svg.exe
+        - .txt.exe
+        - .txt.js
+        - .xls.exe
+        - .xls.js
+        - .xlsx.exe
+        - .xlsx.js
+        - "⠀⠀⠀⠀⠀⠀.exe"
+        CommandLine|contains:
+        - '      .exe'
+        - ______.exe
+        - .doc.exe
+        - .doc.js
+        - .docx.exe
+        - .docx.js
+        - .gif.exe
+        - .jpeg.exe
+        - .jpg.exe
+        - .mkv.exe
+        - .mov.exe
+        - .mp3.exe
+        - .mp4.exe
+        - .pdf.exe
+        - .pdf.js
+        - .png.exe
+        - .ppt.exe
+        - .ppt.js
+        - .pptx.exe
+        - .pptx.js
+        - .rtf.exe
+        - .rtf.js
+        - .svg.exe
+        - .txt.exe
+        - .txt.js
+        - .xls.exe
+        - .xls.js
+        - .xlsx.exe
+        - .xlsx.js
+        - "⠀⠀⠀⠀⠀⠀.exe"
+      condition: selection
+    fields:
+    - host.name
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith:
+        - '      .exe'
+        - ______.exe
+        - .doc.exe
+        - .doc.js
+        - .docx.exe
+        - .docx.js
+        - .gif.exe
+        - .jpeg.exe
+        - .jpg.exe
+        - .mkv.exe
+        - .mov.exe
+        - .mp3.exe
+        - .mp4.exe
+        - .pdf.exe
+        - .pdf.js
+        - .png.exe
+        - .ppt.exe
+        - .ppt.js
+        - .pptx.exe
+        - .pptx.js
+        - .rtf.exe
+        - .rtf.js
+        - .svg.exe
+        - .txt.exe
+        - .txt.js
+        - .xls.exe
+        - .xls.js
+        - .xlsx.exe
+        - .xlsx.js
+        - "\u2800\u2800\u2800\u2800\u2800\u2800.exe"
+        CommandLine|contains:
+        - '      .exe'
+        - ______.exe
+        - .doc.exe
+        - .doc.js
+        - .docx.exe
+        - .docx.js
+        - .gif.exe
+        - .jpeg.exe
+        - .jpg.exe
+        - .mkv.exe
+        - .mov.exe
+        - .mp3.exe
+        - .mp4.exe
+        - .pdf.exe
+        - .pdf.js
+        - .png.exe
+        - .ppt.exe
+        - .ppt.js
+        - .pptx.exe
+        - .pptx.js
+        - .rtf.exe
+        - .rtf.js
+        - .svg.exe
+        - .txt.exe
+        - .txt.js
+        - .xls.exe
+        - .xls.js
+        - .xlsx.exe
+        - .xlsx.js
+        - "\u2800\u2800\u2800\u2800\u2800\u2800.exe"
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith:
+        - '      .exe'
+        - ______.exe
+        - .doc.exe
+        - .doc.js
+        - .docx.exe
+        - .docx.js
+        - .gif.exe
+        - .jpeg.exe
+        - .jpg.exe
+        - .mkv.exe
+        - .mov.exe
+        - .mp3.exe
+        - .mp4.exe
+        - .pdf.exe
+        - .pdf.js
+        - .png.exe
+        - .ppt.exe
+        - .ppt.js
+        - .pptx.exe
+        - .pptx.js
+        - .rtf.exe
+        - .rtf.js
+        - .svg.exe
+        - .txt.exe
+        - .txt.js
+        - .xls.exe
+        - .xls.js
+        - .xlsx.exe
+        - .xlsx.js
+        - "\u2800\u2800\u2800\u2800\u2800\u2800.exe"
+        CommandLine|contains:
+        - '      .exe'
+        - ______.exe
+        - .doc.exe
+        - .doc.js
+        - .docx.exe
+        - .docx.js
+        - .gif.exe
+        - .jpeg.exe
+        - .jpg.exe
+        - .mkv.exe
+        - .mov.exe
+        - .mp3.exe
+        - .mp4.exe
+        - .pdf.exe
+        - .pdf.js
+        - .png.exe
+        - .ppt.exe
+        - .ppt.js
+        - .pptx.exe
+        - .pptx.js
+        - .rtf.exe
+        - .rtf.js
+        - .svg.exe
+        - .txt.exe
+        - .txt.js
+        - .xls.exe
+        - .xls.js
+        - .xlsx.exe
+        - .xlsx.js
+        - "\u2800\u2800\u2800\u2800\u2800\u2800.exe"
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals whether the execution is isolated or part of broader movement.
+    If the same user triggered similar activity on multiple endpoints in the same window, the scope of compromise may be larger
+    than the single alerting host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith:
+        - '      .exe'
+        - ______.exe
+        - .doc.exe
+        - .doc.js
+        - .docx.exe
+        - .docx.js
+        - .gif.exe
+        - .jpeg.exe
+        - .jpg.exe
+        - .mkv.exe
+        - .mov.exe
+        - .mp3.exe
+        - .mp4.exe
+        - .pdf.exe
+        - .pdf.js
+        - .png.exe
+        - .ppt.exe
+        - .ppt.js
+        - .pptx.exe
+        - .pptx.js
+        - .rtf.exe
+        - .rtf.js
+        - .svg.exe
+        - .txt.exe
+        - .txt.js
+        - .xls.exe
+        - .xls.js
+        - .xlsx.exe
+        - .xlsx.js
+        - "\u2800\u2800\u2800\u2800\u2800\u2800.exe"
+        CommandLine|contains:
+        - '      .exe'
+        - ______.exe
+        - .doc.exe
+        - .doc.js
+        - .docx.exe
+        - .docx.js
+        - .gif.exe
+        - .jpeg.exe
+        - .jpg.exe
+        - .mkv.exe
+        - .mov.exe
+        - .mp3.exe
+        - .mp4.exe
+        - .pdf.exe
+        - .pdf.js
+        - .png.exe
+        - .ppt.exe
+        - .ppt.js
+        - .pptx.exe
+        - .pptx.js
+        - .rtf.exe
+        - .rtf.js
+        - .svg.exe
+        - .txt.exe
+        - .txt.js
+        - .xls.exe
+        - .xls.js
+        - .xlsx.exe
+        - .xlsx.js
+        - "\u2800\u2800\u2800\u2800\u2800\u2800.exe"
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Did the same detection fire for other users or hosts in the last day?
+  context: Phishing campaigns rarely target a single recipient. If one user launched a double-extension attachment, others
+    likely received the same lure. Correlating this rule across all hosts reveals the breadth of the delivery and identifies
+    additional systems that need investigation.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        rule.uuid|expand: '%rule_uuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — earlier delivery attempts, reconnaissance,
+    or defense tampering — may reveal the stages that preceded this execution and help reconstruct the timeline from delivery
+    to launch.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: What application or workflow allowed this masqueraded file to reach execution on the host?
+  context: Double-extension files reach a user through email, web download, or removable media, sometimes assisted by mail or
+    browser settings that hide known extensions or permit risky attachment types. Identify the receiving application and whether
+    its filtering and extension-hiding behavior allowed the deception, so the same path can be closed for other users.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage

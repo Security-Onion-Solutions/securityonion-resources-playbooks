@@ -1,0 +1,504 @@
+name: Potential BearLPE Exploitation
+id: ada6522d-df50-489d-9216-810bd158f26d
+description: |
+  Detects schtasks.exe reconfiguring an existing scheduled task with /change together with /TN,
+  /RU and /RP — the task-reassignment step of the BearLPE local privilege escalation, which abuses
+  the Task Scheduler's legacy ".job" import path to obtain an arbitrary DACL write. The rule fires
+  when the command line contains all four flags and the process is identified as schtasks.exe by
+  either an Image path ending in \schtasks.exe or an OriginalFileName of schtasks.exe, so a renamed
+  or relocated copy of the binary still matches on the second branch. The same flag combination is
+  also how an administrator legitimately re-points an existing task at a different service account,
+  so the investigation should establish which task was reassigned, which principal /RU named,
+  whether the task subsequently executed under that principal, and whether the parent process and
+  the acting user are consistent with routine task administration.
+type: detection
+detection_id: 931b6802-d6a6-4267-9ffa-526f57f22aaf
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-17
+questions:
+- question: >-
+    Does the command line carry /change, /TN, /RU and /RP together, and did the process match as
+    schtasks.exe by its image path or by its original file name?
+  context: >-
+    The rule requires all four flags in one command line, plus identification of the process as
+    schtasks.exe through either of two alternative branches — an Image path ending in \schtasks.exe,
+    or an OriginalFileName of schtasks.exe. Note which branch matched. If the image path does not
+    end in schtasks.exe but the original file name does, the binary is a renamed or relocated copy
+    and the image path is the first thing to account for; if both match, the invocation is the
+    stock binary and the argument list carries the investigative weight.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+  answer_sources:
+  - alert
+  - process_creation
+- question: Is this user and host expected to reassign the run-as account on existing scheduled tasks?
+  context: >-
+    Re-pointing a task at a different principal with /RU and /RP is a normal service-account
+    rotation step for administrators and deployment tooling, and an ordinary user account or a
+    workstation with no task-administration role doing it is the faster discriminator than any
+    property of the command line itself. Establish the user's role and the host's function before
+    working through the task definition.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: Which existing task did /TN name, and which account and command does it now run?
+  context: >-
+    Read the task name from /TN, the principal from /RU, and any replacement command from /TR. /RU
+    naming SYSTEM or a privileged service account is the escalation payoff of this pattern, since
+    the task then executes with that principal's rights on its next trigger. /RP supplies the
+    password inline, so the plaintext credential is visible in the command line and in process
+    telemetry for anyone who can read it. If /SC or /TR are present the task's schedule or payload
+    was rewritten in the same call, which widens the change beyond a principal swap.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Is any part of this command line encoded or obfuscated, and what does the decoded content do?
+  context: >-
+    A task name, a run-as password, or a /TR command can be hidden behind base64, hex,
+    URL-encoding, character concatenation, caret or backtick escaping, or environment-variable
+    substitution, all of which survive the flag match the rule performs. Decode each argument until
+    it is readable and identify the operation it performs — a download cradle, a script host
+    invocation, or a binary path in a user-writable directory are the outcomes worth separating
+    from a plain account name. Multi-layer encoding needs iterative decoding.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - process_creation
+  - manual_review
+- question: Which account registered or updated a scheduled task on this host, and what task names does the record show?
+  context: >-
+    Event ID 4698 records task registration and 4702 records task update, each carrying the task
+    name and the account that made the change. This is the authoritative record of the task
+    definition and is independent of the command line, so it also captures task changes made
+    through the scheduler API or a ".job" import rather than through schtasks.exe. Compare the
+    account that made the change against the account the alerting process ran under, and open
+    randomized or product-imitating task names outside the environment's naming conventions first.
+    If the Security channel is not collected in this environment, treat zero results as a
+    visibility gap rather than as evidence no task changed.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID:
+          - 4698
+          - 4702
+      condition: selection
+    fields:
+      - EventID
+      - TaskName
+      - SubjectUserName
+  answer_sources:
+  - manual_review
+  - organizational_knowledge
+- question: When is the reconfigured task set to run, and has the scheduler already launched it?
+  context: >-
+    A reassigned task only delivers the new principal's rights once it fires. Tasks triggered at
+    boot or logon run at the next restart or sign-in; recurring triggers may have executed several
+    times already. Scheduled tasks execute as children of the Task Scheduler service, so processes
+    spawned under it after the reconfiguration show whether the payload ran and what it did. If the
+    task uses a logon trigger, extend the window to cover the next sign-in.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: '\svchost.exe'
+        ParentCommandLine|contains: 'Schedule'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Did a batch or service logon occur for the account named in /RU, and were privileged rights assigned to it?
+  context: >-
+    When the scheduler runs a task under a supplied account it authenticates that account first,
+    producing a 4624 logon with LogonType 4 (batch) or 5 (service), and a 4672 when the resulting
+    token receives administrative privileges. Those two events are the record that the principal
+    swap actually converted into rights on this host, which is the outcome the /RU and /RP
+    combination is aiming at. A 4672 for an account that had no prior privileged logon history
+    here is the transition worth reconstructing against the task's trigger time.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID:
+          - 4624
+          - 4672
+      condition: selection
+    fields:
+      - EventID
+      - TargetUserName
+      - SubjectUserName
+      - LogonType
+  answer_sources:
+  - manual_review
+  - active_directory
+- question: Is the task named by /TN still registered, and does it still carry the reassigned run-as account?
+  context: >-
+    The reconfiguration matters only while the task exists in its modified form. Querying the task
+    by name on the host, or reading its definition through an endpoint console, shows whether the
+    reassigned principal and any rewritten command are still in place, whether the task was reverted,
+    and whether it was removed after firing. A task that is gone but whose payload already executed
+    still needs the execution traced; a task that remains needs remediation.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - manual_review
+  - edr_console
+- question: Were scheduler TaskCache registry entries written on this host around the alert, and do the task names fit local naming conventions?
+  context: >-
+    Every registered or updated task writes a subtree under the scheduler's TaskCache, so these
+    writes corroborate the change from registry telemetry and also surface tasks created by paths
+    that never invoke schtasks.exe. Randomized names, names imitating a vendor or an operating
+    system component, and names placed outside the folders this environment normally uses are the
+    entries to open first. Key deletion is not observable here, so read the write history rather
+    than looking for a removal record. The writing process on each entry attributes the change.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_paths:
+        TargetObject|contains:
+          - '\Schedule\TaskCache\Tree\'
+          - '\Schedule\TaskCache\Tasks\'
+      condition: selection and selection_paths
+    fields:
+      - TargetObject
+      - Details
+      - Image
+  answer_sources:
+  - registry_event
+- question: What process spawned schtasks.exe, and is that parent expected to administer scheduled tasks?
+  context: >-
+    Task administration normally arrives from an interactive shell under explorer.exe, from a
+    management agent, or from a deployment tool's service. An exploit binary, a script host, an
+    Office application, or a process running from a user-writable directory as the parent points at
+    a programmatic driver rather than an administrator at a console. Walk up from the parent to see
+    what started it and what else it launched.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: >-
+    When this host has previously fired the rule's pattern, what parents and users normally drive
+    that activity, and does the current alert fit that pattern?
+  context: >-
+    The query mirrors the rule's selection structure scoped to this host, so the resulting
+    parent/user distribution reflects how this specific flag combination has historically run here
+    rather than generic schtasks.exe usage. A host where a management agent routinely rotates task
+    credentials produces a stable parent and a stable account; a new parent, an unexpected account,
+    or a first-ever occurrence is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \schtasks.exe
+      - OriginalFileName: schtasks.exe
+      selection_cli:
+        CommandLine|contains|all:
+        - /change
+        - /TN
+        - /RU
+        - /RP
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+  answer_sources:
+  - process_creation
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: >-
+    The query mirrors the rule's selection structure scoped to this user, so the result is the
+    user's 90-day history of this specific flag combination rather than generic use of
+    schtasks.exe, aggregated by host. An account that rotates task credentials as part of its job
+    accumulates a steady count across the hosts it manages; an account with no such history
+    producing this pattern once is the case to weigh against the user's role and normal toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \schtasks.exe
+      - OriginalFileName: schtasks.exe
+      selection_cli:
+        CommandLine|contains|all:
+        - /change
+        - /TN
+        - /RU
+        - /RP
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+  always_include: true
+- question: >-
+    Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: >-
+    When the alert fires under SYSTEM or another service principal, user identity does not
+    attribute the behavior and the launch mechanism is the meaningful pivot. The query mirrors the
+    rule's selection structure scoped to the alerting parent process, giving the 90-day history of
+    that parent driving this specific flag combination rather than generic parent-and-binary
+    co-occurrence. A parent already accounting for thousands of prior events is vendor or operating
+    system automation; a parent that is new for this pattern is the deviation to chase.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \schtasks.exe
+      - OriginalFileName: schtasks.exe
+      selection_cli:
+        CommandLine|contains|all:
+        - /change
+        - /TN
+        - /RU
+        - /RP
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  always_include: true
+- question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the account's activity across every host in the alert window shows whether the task
+    reassignment was one step in a wider session or an isolated action. The same account driving
+    comparable activity on several endpoints widens the scope of what needs review. When the alert
+    fires under a service principal this view returns routine agent telemetry, and the
+    parent-driven cross-host view is the meaningful answer instead.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+  always_include: true
+- question: Did this same parent-driven pattern fire on other hosts in the same window, or is the activity isolated to this host?
+  context: >-
+    Under a service principal, asking what else the user did across the network returns agent
+    telemetry from every host, so the useful question is whether the same launch mechanism fired
+    elsewhere. The query mirrors the rule's selection structure scoped to the alerting parent
+    process, fleet-wide, in the alert window. Several hosts in the same window points to scheduled
+    or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \schtasks.exe
+      - OriginalFileName: schtasks.exe
+      selection_cli:
+        CommandLine|contains|all:
+        - /change
+        - /TN
+        - /RU
+        - /RP
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection*) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+  always_include: true
+- question: >-
+    Have other hosts fired the rule's pattern in the past week, and does the cross-host
+    distribution look like consistent automation or one-off activity?
+  context: >-
+    The query mirrors the rule's selection structure with no host scope, so the result is a
+    fleet-wide count of this specific flag combination rather than the binary's generic footprint.
+    Many hosts firing it points to scripted deployment or vendor automation rotating service-account
+    credentials; one host, or a small set with no common owner, points to manual operator activity.
+    Use the host distribution together with parent consistency to calibrate how far to take this.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \schtasks.exe
+      - OriginalFileName: schtasks.exe
+      selection_cli:
+        CommandLine|contains|all:
+        - /change
+        - /TN
+        - /RU
+        - /RP
+      condition: all of selection*
+    fields:
+    - host.name
+  answer_sources:
+  - process_creation
+- question: Were files dropped to persistence locations or task-definition folders on this host?
+  context: >-
+    Task definitions live as files under the scheduler's task folders, and writing or importing one
+    directly registers a task without any command line to match. Writes under those folders in the
+    alert window corroborate the task change and surface tasks that were added rather than
+    reconfigured. Startup-folder drops in the same window are a parallel start mechanism that
+    process-based detection does not see at all. The writing process on each drop attributes it.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist_paths:
+        TargetFilename|contains:
+          - '\Start Menu\Programs\Startup\'
+          - '\Windows\System32\Tasks\'
+          - '\Windows\Tasks\'
+      condition: selection and selection_persist_paths
+    fields:
+      - TargetFilename
+      - Image
+  answer_sources:
+  - file_event
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    A local privilege escalation is usually preceded by the access that made it possible and
+    followed by the use of the rights it produced. Earlier detections on the same host —
+    reconnaissance, script execution, defense tampering, credential access — help place this task
+    reassignment in the sequence and show whether it is the first stage or a later one.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+  answer_sources:
+  - alert

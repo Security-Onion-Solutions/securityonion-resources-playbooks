@@ -1,0 +1,403 @@
+name: Windows Recall Feature Enabled Via Reg.EXE
+id: a3b6d6a3-6564-4f96-ac9c-e28093e6a7b9
+description: |
+  Detects reg.exe writing the WindowsAI policy value DisableAIDataAnalysis under
+  Microsoft\Windows\WindowsAI, the registry-backed control that governs whether the
+  Windows Recall screen-capture-and-OCR feature is allowed to save snapshots. The rule
+  fires when reg.exe targets that policy value AND the command line takes EITHER an add
+  action that sets the value to 0 OR a delete action that removes the existing value —
+  both of which re-enable Recall on a host where it was previously turned off. Recall
+  periodically captures the screen, OCRs the content, and indexes it locally, so an
+  attacker who re-enables it gains a built-in screenshot archive; legitimately, this
+  command appears when IT deliberately turns the feature on. The investigation should
+  determine which branch fired, what exact policy value was written, who and what drove
+  the change, and whether the snapshot store subsequently began collecting data.
+type: detection
+detection_id: 817f252c-5143-4dae-b418-48c3e9f63728
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does this reg.exe command target the WindowsAI DisableAIDataAnalysis value, and did it either add the value as 0 or delete the existing value?
+  context: Confirm the alert is a true positive before investing investigation time. The rule fires when reg.exe writes the Microsoft\Windows\WindowsAI policy path together with DisableAIDataAnalysis AND the command line takes EITHER an add action setting the value to 0 OR a delete action removing it. Note which branch fired — an add-to-0 explicitly flips the snapshot policy on, while a delete drops back to the default that allows Recall — because the branch determines whether you expect a configured value or a removed one downstream.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to enable or reconfigure the Windows Recall snapshot policy?
+  context: Legitimate enablement of Recall is an IT-administrative action, typically performed by a known admin or management tooling on devices being onboarded to the feature. A workstation user or service account flipping the WindowsAI policy outside of a managed rollout is the deviation worth chasing. Knowing whether the role and host function fit a deliberate Recall deployment is often the fastest path to disposition.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What exact WindowsAI policy value and data were written, and is the path the device-scope or user-scope Recall control?
+  context: The registry path and value pin down intent. DisableAIDataAnalysis under Microsoft\Windows\WindowsAI governs whether Recall saves snapshots; a sibling value AllowRecallEnablement controls whether Recall is available at all. Reading TargetObject and Details as structured fields — rather than parsing them out of the reg.exe command line — shows whether the device-scope policy under HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsAI or a user-scope key was written, and what value (0, removed, or 1) was set.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- question: What process spawned this reg.exe, and is that parent chain expected for a policy change?
+  context: The parent process reveals how the registry write was driven. A deliberate Recall rollout usually runs reg.exe under a management agent, deployment script, or an admin's interactive shell. An unusual parent — a browser, an Office application, mshta.exe, wscript.exe, or an unsigned tool — points to operator-driven or scripted abuse rather than sanctioned configuration. The parent process is also the anchor for distinguishing automation from hands-on-keyboard activity downstream.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Were other registry modifications made on this host in the same session, including other WindowsAI policy values?
+  context: An operator who flips DisableAIDataAnalysis often touches related controls in the same window — AllowRecallEnablement (which makes Recall available at all) or AllowRecallExport (which permits exporting snapshot history) — and may also weaken other policy boundaries. Clustering reg.exe and regedit.exe write operations from this host within a short window reveals whether the Recall change was an isolated config edit or one step in a broader set of policy modifications.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_reg:
+        Image|endswith:
+          - '\reg.exe'
+          - '\regedit.exe'
+        CommandLine|contains:
+          - ' add '
+          - ' delete '
+          - ' import '
+          - '/s '
+      condition: selection and selection_reg
+    fields:
+      - CommandLine
+- question: After this policy change, did the Recall snapshot store begin growing or did image files start being written under the AI capture path?
+  context: Re-enabling Recall only matters if it then starts capturing. The snapshot store and its vector database live under %LOCALAPPDATA%\CoreAIPlatform.00\UKP\, and active capture writes indexed image data (commonly .png and .bmp screen content) there. File creation or sustained growth under that path shortly after the policy flip confirms the feature is actively collecting, which raises the severity from a configuration change to an operating screen-capture archive. Zero file activity suggests the policy was set but capture has not started.
+  range: +6h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_recall:
+        TargetFilename|contains:
+          - '\CoreAIPlatform.00\UKP\'
+      selection_image:
+        TargetFilename|endswith:
+          - '.png'
+          - '.bmp'
+      condition: selection and (selection_recall or selection_image)
+    fields:
+      - TargetFilename
+      - Image
+- question: What did this reg.exe invocation spawn afterward, and was further policy or discovery tooling launched?
+  context: reg.exe normally does not spawn children, so any child process is notable and may reveal the next stage — a script launching additional policy changes, a discovery command, or a tool staging the captured data. The processes that follow the registry write help establish whether the enablement was a standalone action or embedded in a larger sequence.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \reg.exe
+      - OriginalFileName: reg.exe
+      selection_value:
+        CommandLine|contains|all:
+        - Microsoft\Windows\WindowsAI
+        - DisableAIDataAnalysis
+      selection_action_add:
+        CommandLine|contains:
+        - add
+        - '0'
+      selection_action_delete:
+        CommandLine|contains: delete
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection_img and selection_value and 1 of selection_action_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \reg.exe
+      - OriginalFileName: reg.exe
+      selection_value:
+        CommandLine|contains|all:
+        - Microsoft\Windows\WindowsAI
+        - DisableAIDataAnalysis
+      selection_action_add:
+        CommandLine|contains:
+        - add
+        - '0'
+      selection_action_delete:
+        CommandLine|contains: delete
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection_img and selection_value and 1 of selection_action_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or parallel activity on multiple endpoints. If the same account drove similar registry or discovery activity elsewhere in the same window, the scope of the operation is larger than a single host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \reg.exe
+      - OriginalFileName: reg.exe
+      selection_value:
+        CommandLine|contains|all:
+        - Microsoft\Windows\WindowsAI
+        - DisableAIDataAnalysis
+      selection_action_add:
+        CommandLine|contains:
+        - add
+        - '0'
+      selection_action_delete:
+        CommandLine|contains: delete
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection_img and selection_value and 1 of selection_action_*) and _pb_scope
+    fields:
+    - host.name
+- question: When this host has previously fired this rule's pattern, what parents and users normally drive it, and does the current alert fit?
+  context: Even routine tools get abused. This query mirrors the rule's selection structure scoped to this host, so the resulting parent and user distribution reflects how this specific Recall-enablement pattern has historically run here, not generic reg.exe usage. A new parent process, an unexpected user account, or an unusual command-line structure is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \reg.exe
+      - OriginalFileName: reg.exe
+      selection_value:
+        CommandLine|contains|all:
+        - Microsoft\Windows\WindowsAI
+        - DisableAIDataAnalysis
+      selection_action_add:
+        CommandLine|contains:
+        - add
+        - '0'
+      selection_action_delete:
+        CommandLine|contains: delete
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection_img and selection_value and 1 of selection_action_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining activity around the alert reveals what led to the registry change and what followed — reconnaissance, privilege escalation, or staging of the captured data. Aggregating by process and parent collapses repetitive agent telemetry into high-count rows while novel parent-child pairs stand out at low counts, which is what to scan for.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Re-enabling a screen-capture feature is usually a post-exploitation collection step, so earlier detections on the same host — defense tampering, privilege escalation, credential access, or reconnaissance — may reveal the stages that preceded it. The alert timeline before this event helps reconstruct how the operator reached the point of reconfiguring host policy.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Were other process-based persistence mechanisms installed on this host around the same time?
+  context: An operator establishing a collection capability often also installs persistence to retain access. After the foothold action, backup mechanisms commonly appear via scheduled tasks, services, registry Run keys, BITS jobs, or WMI subscriptions. Multiple persistence installations in the same timeframe indicate intentional stacking rather than isolated administrative configuration.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- question: Have other hosts fired this rule's pattern in the past week, and does the cross-host distribution look like consistent automation or one-off activity?
+  context: This query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of the Recall-enablement pattern, not generic reg.exe usage. Many hosts firing the same pattern points to a scripted deployment or management rollout enabling Recall; one host or a small unrelated set points to manual operator activity. Use the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \reg.exe
+      - OriginalFileName: reg.exe
+      selection_value:
+        CommandLine|contains|all:
+        - Microsoft\Windows\WindowsAI
+        - DisableAIDataAnalysis
+      selection_action_add:
+        CommandLine|contains:
+        - add
+        - '0'
+      selection_action_delete:
+        CommandLine|contains: delete
+      condition: selection_img and selection_value and 1 of selection_action_*
+    fields:
+    - host.name
+- question: Was reg.exe executed from its expected system path?
+  context: reg.exe run from outside System32 or SysWOW64 may indicate the binary was copied or renamed to evade path-based allowlists, which would shift a policy-modification alert from routine administration toward deliberate evasion. Confirm the image path and original filename for the alerting process.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- question: How often has this host fired the Recall-enablement pattern over the past 90 days, and what command-line structures are typical?
+  context: A policy-write pattern with no prior history on a host is more suspicious than one that recurs under stable parents. This query mirrors the rule's selection structure scoped to this host, so the count reflects the specific Recall-enablement firing pattern rather than generic reg.exe usage. The command-line projection lets you compare typical invocation patterns — add-to-0 versus delete, device-scope versus user-scope path — against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \reg.exe
+      - OriginalFileName: reg.exe
+      selection_value:
+        CommandLine|contains|all:
+        - Microsoft\Windows\WindowsAI
+        - DisableAIDataAnalysis
+      selection_action_add:
+        CommandLine|contains:
+        - add
+        - '0'
+      selection_action_delete:
+        CommandLine|contains: delete
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection_img and selection_value and 1 of selection_action_*) and _pb_scope
+    fields:
+    - CommandLine

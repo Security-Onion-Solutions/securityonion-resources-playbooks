@@ -1,0 +1,372 @@
+name: Potential Privilege Escalation Using Symlink Between Osk and Cmd
+id: 88187af4-04e0-4e1f-8129-63c26c55bcbe
+description: |
+  Detects cmd.exe running an mklink command whose arguments reference both the on-screen keyboard binary (osk.exe) and
+  cmd.exe, the canonical primitive for hijacking a Windows accessibility feature. Replacing osk.exe with a link to cmd.exe
+  lets anyone press the accessibility shortcut at the login screen and receive a command prompt running in the SYSTEM
+  context, providing both privilege escalation and a logon-screen persistence foothold. The rule fires only when the
+  process is cmd.exe (by Image or original filename) AND its command line contains all of mklink, \osk.exe, and \cmd.exe;
+  investigation should confirm the link was actually created, determine who and what drove the action, and check for the
+  related registry- and shadow-copy-based variants of the same accessibility-hijack pattern.
+type: detection
+detection_id: e9b61244-893f-427c-b287-3e708f321c6b
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- question: Does the alerting process run cmd.exe with an mklink command that references both osk.exe and cmd.exe?
+  context: Confirm the alert is a true positive by reviewing the triggering event. The rule fires only when the process is
+    cmd.exe (by Image path or original filename) AND the command line contains all three tokens mklink, osk.exe, and
+    cmd.exe. Verify the arguments form a real symbolic-link creation that targets the accessibility binary rather than an
+    unrelated command that happens to mention these names.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to create symbolic links against system accessibility binaries?
+  context: Linking osk.exe to cmd.exe is not normal administrative activity on workstations or most servers. Creating
+    symlinks against System32 binaries requires the symlink-creation privilege (Administrators by default, or any account
+    on a host where Developer Mode is enabled), so the account context narrows whether this was a privileged operator, a
+    misconfigured low-privilege host, or an attacker who already gained admin rights.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What link type and target did the mklink command create, and did the operation succeed?
+  context: Decode the full command line to determine the link mode and the exact source and target paths. A file symlink or
+    hard link (mklink, or mklink /H) pointing osk.exe at cmd.exe is the login-screen backdoor; a directory symlink (mklink
+    /D) pointing at a GLOBALROOT shadow-copy path is the credential-theft variant that exposes SAM/SYSTEM/NTDS hives.
+    mklink prints success or failure text, so the surrounding output and any follow-on commands indicate whether the link
+    was actually established.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains|all:
+          - 'mklink'
+          - '\osk.exe'
+          - '\cmd.exe'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What spawned the cmd.exe that issued this mklink, and what started that parent?
+  context: The parent process attributes how the symlink command was launched. An interactive shell or a deployment tool
+    spawned by explorer.exe or a service points to hands-on or scripted administration; cmd.exe launched by a script host,
+    Office application, or remote-execution utility points to attacker-driven activity. Walking up to the grandparent helps
+    establish whether the chain is a legitimate session or an exploitation path.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What other child processes did the same parent spawn around this time?
+  context: If the parent that launched this cmd.exe is attacker-controlled, it likely spawned other processes in the same
+    session. Sibling processes such as additional cmd.exe or powershell.exe instances, takeown or icacls (used to seize
+    ownership of the System32 binary before linking), or vssadmin reveal the broader operation surrounding the symlink.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: When this host has previously fired this mklink-osk-cmd pattern, what parents and users drove it, and does the
+    current alert fit?
+  context: The query mirrors the rule's selection structure scoped to this host, so the resulting parent and user
+    distribution reflects how this specific accessibility-symlink pattern has run here before, not generic cmd.exe usage.
+    A new parent process, an unexpected account, or a first-ever occurrence is the deviation worth chasing; a recurring
+    parent and user pair suggests a known build or imaging step.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_img:
+      - Image|endswith: \cmd.exe
+      - OriginalFileName: Cmd.Exe
+      selection_cli:
+        CommandLine|contains|all:
+        - mklink
+        - \osk.exe
+        - \cmd.exe
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: What processes ran under this cmd.exe after the mklink command?
+  context: After establishing the symlink, an operator may take ownership of the target binary, adjust permissions, or test
+    the backdoor. Children of this cmd.exe such as takeown, icacls, reg, or a launched shell reveal whether the link was
+    being prepared for use rather than created and abandoned.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_img:
+      - Image|endswith: \cmd.exe
+      - OriginalFileName: Cmd.Exe
+      selection_cli:
+        CommandLine|contains|all:
+        - mklink
+        - \osk.exe
+        - \cmd.exe
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_img:
+      - Image|endswith: \cmd.exe
+      - OriginalFileName: Cmd.Exe
+      selection_cli:
+        CommandLine|contains|all:
+        - mklink
+        - \osk.exe
+        - \cmd.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around the time of the alert?
+  context: Tracking the account's activity across all hosts reveals whether the symlink creation was an isolated action or
+    part of broader movement. The same user driving accessibility-feature tampering on multiple endpoints widens the scope
+    of the investigation.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_img:
+      - Image|endswith: \cmd.exe
+      - OriginalFileName: Cmd.Exe
+      selection_cli:
+        CommandLine|contains|all:
+        - mklink
+        - \osk.exe
+        - \cmd.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Have other hosts fired this mklink-osk-cmd pattern in the past week, and does the distribution look like
+    automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, returning a fleet-wide count of this
+    specific accessibility-symlink pattern rather than generic cmd.exe usage. Many hosts firing the same pattern points to
+    a scripted deployment or imaging step; one host or a small unrelated set points to manual operator activity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_img:
+      - Image|endswith: \cmd.exe
+      - OriginalFileName: Cmd.Exe
+      selection_cli:
+        CommandLine|contains|all:
+        - mklink
+        - \osk.exe
+        - \cmd.exe
+      condition: all of selection_*
+    fields:
+    - host.name
+- question: Were accessibility binaries redirected via Image File Execution Options debugger keys on this host?
+  context: The symlink trick is one of several ways to hijack an accessibility feature; the registry equivalent sets a
+    Debugger value under an Image File Execution Options key for osk.exe, sethc.exe, utilman.exe, magnify.exe,
+    narrator.exe, displayswitch.exe, or atbroker.exe so the chosen program (often cmd.exe) launches in its place. This
+    query surfaces command-line writes to those keys; absence of rows does not rule out direct registry edits made through
+    other tooling.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_ifeo:
+        CommandLine|contains:
+          - 'Image File Execution Options\osk.exe'
+          - 'Image File Execution Options\sethc.exe'
+          - 'Image File Execution Options\utilman.exe'
+          - 'Image File Execution Options\magnify.exe'
+          - 'Image File Execution Options\narrator.exe'
+          - 'Image File Execution Options\displayswitch.exe'
+          - 'Image File Execution Options\atbroker.exe'
+      selection_debugger:
+        CommandLine|contains: 'Debugger'
+      condition: selection and selection_ifeo and selection_debugger
+    fields:
+      - CommandLine
+      - Image
+      - User
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Accessibility-feature hijacking is usually a step within a larger sequence. Earlier detections on the same host,
+    such as ownership changes, credential access, or defense tampering, may reveal the stages that preceded the symlink and
+    help reconstruct the timeline of how access was obtained.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Were other process-based persistence mechanisms installed on this host around the same time?
+  context: The accessibility-symlink backdoor is one foothold; attackers commonly stack additional persistence using
+    different techniques. Scheduled tasks, services, registry Run keys, BITS jobs, or WMI subscriptions installed in the
+    same timeframe indicate intentional stacking rather than an isolated administrative action.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- question: Was there a change ticket, maintenance window, or documented approval for modifying accessibility binaries on
+    this host?
+  context: Relinking a System32 accessibility binary is a significant system modification that most organizations would
+    require a ticket or maintenance window for. A corresponding record suggests authorized hardening or testing; its
+    absence when policy requires one shifts the disposition toward unauthorized activity and can quickly close or escalate
+    the alert.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine

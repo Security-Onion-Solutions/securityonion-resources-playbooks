@@ -1,0 +1,423 @@
+name: 7Zip Compressing Dump Files
+id: a183c8ec-681b-44bc-9d19-b9e77a327613
+description: |
+  Detects 7-Zip being used to compress a file whose name contains a memory-dump extension (.dmp, .dump, .hdmp). The rule
+  fires when all of two conditions match — the process is identified as 7-Zip (by Description, by an Image ending in 7z.exe /
+  7zr.exe / 7za.exe, or by an OriginalFileName of 7z.exe / 7za.exe) AND the command line references a dump-file extension.
+  Compressing dump files is a routine troubleshooting step (Windows Error Reporting crash dumps), but it is also a common
+  staging step before exfiltrating a credential dump such as an LSASS memory image. Determine which files were archived,
+  whether the archive was password-protected, where it was written next, and whether the 7-Zip binary and its parent chain
+  are consistent with legitimate use on this host and by this user.
+type: detection
+detection_id: ec570e53-4c76-45a9-804d-dc3f355ff7a7
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- question: Does the command line show 7-Zip compressing a file with a .dmp, .dump, or .hdmp extension?
+  context: Confirm the alert is a true positive before investing analysis time. The rule fires only when the process is
+    identified as 7-Zip (Description, Image name, or OriginalFileName) and the command line contains one of the dump-file
+    extensions. Read the full command line and process identity from the triggering event and verify both conditions are
+    actually present.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+      - Description
+- question: Is this user and host expected to compress dump files with 7-Zip?
+  context: Legitimate archiving of crash dumps for troubleshooting is common on workstations and on hosts running developer
+    or support tooling. Knowing whether this user role and host function routinely package .dmp files helps separate routine
+    support activity from staging of a captured memory dump.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What exactly did this 7-Zip command do? Decode the archive operation, source files, and output path.
+  context: The full command line reveals the archive subcommand (a for add), the output archive path, the source file paths
+    and wildcards, the archive format and compression switches, and any password flags. A command that targets a single
+    crash dump in a support directory reads differently from one that pulls a credential dump out of a staging path into a
+    portable archive. Multiple sequential 7-Zip invocations on this host within the window may together form one logical
+    archive operation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What files or directories were written to the archive?
+  context: The command line names the source paths, and file events from the same tool show what was actually read and the
+    archive that was produced. Look for which dump files were targeted, whether the source was a system crash-dump location
+    or a staging directory, and whether additional sensitive files were swept in alongside the dump.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - EventType
+- question: Was a password or header encryption applied to the archive?
+  context: A password (-p) or header encryption (-mhe=on) on the archive prevents inspection of the contents and even the
+    filenames in transit. An encrypted archive of a dump file points more toward deliberate staging for exfiltration than a
+    plain troubleshooting compression. Some passwords are passed via stdin or a config file and will not appear in the
+    command line, so absence of a flag is not proof encryption was not used.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Where was the resulting archive written or moved after creation?
+  context: Staging usually creates the archive locally, then moves it to a staging path or pushes it out over the network.
+    File events from the same tool reveal the output archive location; pair this with outbound network connections from the
+    host in the same window to see whether the archive left the host. An archive written to a removable drive, a shared
+    folder, or a temporary path that is then transferred outbound is the exfiltration path worth tracing.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Is the binary genuinely 7-Zip, or a renamed copy of it placed in a user-writable location?
+  context: The rule identifies 7-Zip by Description, by an Image ending in 7z.exe / 7zr.exe / 7za.exe, or by an OriginalFileName
+    of 7z.exe / 7za.exe — so it also fires on a 7-Zip executable that has been renamed and dropped elsewhere, where
+    OriginalFileName still reveals the true identity while the on-disk name does not. Compare the Image path and name against
+    OriginalFileName and Description. A 7-Zip binary running from a temp, profile, or staging directory under a name that does
+    not match its OriginalFileName indicates the tool was staged rather than installed.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Description
+      - CurrentDirectory
+- question: Did the 7-Zip process load crypt32.dll, indicating an encryption operation?
+  context: Archiving utilities that apply encryption to their output load crypt32.dll for the cryptographic operations. An
+    image-load event for crypt32.dll under the alerting 7-Zip process is corroborating evidence that the archive was
+    encrypted, which strengthens a staging-for-exfiltration interpretation. If image-load events are not collected in this
+    environment, treat zero results as a visibility gap rather than evidence no encryption occurred.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        ImageLoaded|endswith: \crypt32.dll
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Image
+      - ProcessGuid
+- question: What process spawned 7-Zip, and is that parent chain expected for this activity?
+  context: The parent process shows how 7-Zip was invoked. Interactive use launched from explorer.exe or a console reads
+    differently from invocation by a remote-administration tool, a service, or a scripting host. A parent such as cmd.exe or
+    powershell.exe driven by a remote session, or an unexpected service parent, fits an operator staging a dump rather than a
+    user troubleshooting a crash.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What child processes did 7-Zip spawn afterward?
+  context: The processes spawned after the archive operation reveal the next step. Follow-on copy, move, or upload commands,
+    or a scripting host invoked right after, may show the archive being relocated or transferred. Legitimate troubleshooting
+    typically ends with the archive and no further process activity.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Does this host normally run 7-Zip?
+  context: A 7-Zip binary that has never been seen on this host is more suspicious than one that runs regularly as part of
+    installed tooling or scheduled jobs. Zero or very low historical counts indicate first-time or rare execution and raise
+    the weight of the dump-compression activity.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: When this host has previously matched the rule's pattern, what parents and users drove it, and does the current
+    alert fit that pattern?
+  context: The query mirrors the rule's selection structure scoped to this host, so the resulting parent and user
+    distribution reflects how this specific 7-Zip-compressing-dump pattern has historically run here — not generic 7-Zip
+    usage. A new parent process, an unexpected user account, or an unusual command-line structure is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Description|contains: 7-Zip
+      - Image|endswith:
+        - \7z.exe
+        - \7zr.exe
+        - \7za.exe
+      - OriginalFileName:
+        - 7z.exe
+        - 7za.exe
+        - 7zr.exe
+      selection_extension:
+        CommandLine|contains:
+        - .dmp
+        - .dump
+        - .hdmp
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Have other hosts matched the rule's pattern in the past week, and does the cross-host distribution look like
+    automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of this
+    specific dump-compression pattern rather than generic 7-Zip usage. Many hosts matching the same pattern points to a
+    scripted backup or troubleshooting job; one host or a small unrelated set points to manual operator activity. Use the
+    host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Description|contains: 7-Zip
+      - Image|endswith:
+        - \7z.exe
+        - \7zr.exe
+        - \7za.exe
+      - OriginalFileName:
+        - 7z.exe
+        - 7za.exe
+      selection_extension:
+        CommandLine|contains:
+        - .dmp
+        - .dump
+        - .hdmp
+      condition: all of selection_*
+    fields:
+    - host.name
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Description|contains: 7-Zip
+      - Image|endswith:
+        - \7z.exe
+        - \7zr.exe
+        - \7za.exe
+      - OriginalFileName:
+        - 7z.exe
+        - 7za.exe
+        - 7zr.exe
+      selection_extension:
+        CommandLine|contains:
+        - .dmp
+        - .dump
+        - .hdmp
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Description|contains: 7-Zip
+      - Image|endswith:
+        - \7z.exe
+        - \7zr.exe
+        - \7za.exe
+      - OriginalFileName:
+        - 7z.exe
+        - 7za.exe
+        - 7zr.exe
+      selection_extension:
+        CommandLine|contains:
+        - .dmp
+        - .dump
+        - .hdmp
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts in a tight window reveals whether the dump compression is isolated
+    or part of broader hands-on activity such as collection from multiple endpoints. The same user driving similar archiving
+    on several hosts widens the potential scope.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Description|contains: 7-Zip
+      - Image|endswith:
+        - \7z.exe
+        - \7zr.exe
+        - \7za.exe
+      - OriginalFileName:
+        - 7z.exe
+        - 7za.exe
+        - 7zr.exe
+      selection_extension:
+        CommandLine|contains:
+        - .dmp
+        - .dump
+        - .hdmp
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining activity around the archive operation reveals what led to it and what
+    followed — credential-access tooling that produced the dump, reconnaissance, or a subsequent transfer step. Aggregating
+    by parent and child collapses repetitive agent telemetry while novel process pairs stand out at low counts.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage

@@ -1,0 +1,464 @@
+name: Potential COM Objects Download Cradles Usage - PS Script
+id: 3e2c8e29-29b5-4fc6-8858-eae1a9db0ba8
+description: |
+  Fires when PowerShell script-block content (EID 4104) contains [Type]::GetTypeFromCLSID( together with one of ten
+  CLSIDs for COM classes that can retrieve remote content — XMLHTTP/ServerXMLHTTP variants, WinHttpRequest,
+  InternetExplorer.Application, and Word/Excel automation objects. Instantiating these classes by raw CLSID (typically
+  [Activator]::CreateInstance([Type]::GetTypeFromCLSID('<GUID>'))) rather than by friendly ProgID with New-Object
+  -ComObject avoids name-based detection and is the construction pattern of a COM-object download cradle, in which the
+  object fetches a remote script or payload that is then run in memory with IEX or written to disk. Some administrative
+  and vendor automation drives the same COM classes legitimately, so the investigation should read the complete script
+  to identify the URL fetched and what happened to the response, confirm whether a network transfer and file drop
+  actually occurred, and trace any follow-on execution. Script-block capture is policy-gated per host — default
+  installs log only content matching Microsoft's built-in suspicious-strings checks — so absence of surrounding 4104
+  evidence is not absence of activity.
+type: detection
+detection_id: 3c7d1587-3b13-439f-9941-7d14313dbdfe
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-17
+questions:
+- question: Does the script block call [Type]::GetTypeFromCLSID with one of the rule's download-capable CLSIDs?
+  context: >-
+    Confirm the alert is a true positive by reading the complete script. The rule fires only when both criteria appear
+    in the block — the [Type]::GetTypeFromCLSID( call AND one of ten CLSIDs belonging to COM classes usable to fetch
+    remote content (Msxml2.XMLHTTP and ServerXMLHTTP variants, WinHttp.WinHttpRequest, InternetExplorer.Application,
+    and Word/Excel automation). Long scripts are split across multiple 4104 events, so this retrieves every chunk of
+    the alerting block (sequence/total order) and the match is judged on the whole script, not the alerting fragment.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - ScriptBlockText
+- question: Is this user or host expected to run scripts that instantiate COM objects by raw CLSID?
+  context: >-
+    Referencing a COM class by its GUID instead of its friendly ProgID is rare in hand-written administration but does
+    appear in some vendor tooling, installers, and developer test harnesses. The query shows the alerting block's host,
+    user, and on-disk script path (blank for interactive or in-memory execution). A SYSTEM user usually means
+    deployment tooling or an agent — judge by the host's role and the script path; an ordinary user account on a
+    workstation with no automation mandate is harder to explain.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - host.name
+      - user.name
+      - Path
+- question: Is the script on disk, and what process wrote it?
+  context: >-
+    When the block ran from a file, its path is recorded on the 4104 event and this query finds the file-activity
+    records for that name — the creation event identifies the process and account that staged the script, and the file
+    itself can be retrieved for hashing and full review beyond what 4104 captured. In-memory or interactive execution
+    records no path at all, so an empty result for a cradle is itself worth noting as a deliberate fileless choice
+    rather than a dead end.
+  range: +/-24h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What does the complete script do — which URL does it fetch, and what happens to the response?
+  context: >-
+    Script-block content is logged after decoding, so any -EncodedCommand wrapper is already unwrapped; only
+    string-level obfuscation inside the script (concatenation, format operators, backticks) still needs manual work.
+    Read the reassembled script for the CLSID and map it to its class — for example F6D90F16-9C73-11D3-B32E-00C04F990BB4
+    is Msxml2.XMLHTTP, 0002DF01-0000-0000-C000-000000000046 is InternetExplorer.Application, and
+    000209FF-0000-0000-C000-000000000046 is Word.Application — then find the request sequence (open/send/responseText
+    or Navigate/Documents.Open). The URL is the delivery source, and how the response is handled — passed to IEX in
+    memory versus written to disk — determines which follow-on evidence can exist.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - powershell.sequence
+      - powershell.total
+      - ScriptBlockText
+- question: Which parent process launched the PowerShell host that ran this script?
+  context: >-
+    Script-block events carry no process identity, so this pivots by host and user over the preceding day to list the
+    user's PowerShell launches with their parents. A cradle descending from an Office application, browser, or server
+    process points to a delivery step that should be chased; an interactive console under explorer.exe or a terminal
+    reads differently. Software-update services and management agents also spawn scripted downloads routinely — the
+    parent is the axis that separates those from hand-delivered execution.
+  range: -24h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        User|expand: '%User%'
+        Image|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+          - '\powershell_ise.exe'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+- question: What outbound connections did PowerShell processes on this host make around the alert?
+  context: >-
+    The COM object issues its HTTP request inside the PowerShell process, so a real transfer appears as an outbound
+    connection from a PowerShell host binary in this window. Compare the destinations against the URL read from the
+    script; destinations in private address ranges are more consistent with intranet automation, while external
+    addresses corroborate the ingress-transfer reading. Endpoint-recorded connections carry the owning process;
+    network-sensor records of the same traffic may not, so an empty process-anchored result is not proof no traffic
+    occurred.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+          - '\powershell_ise.exe'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+- question: Did the download progress to a file on disk?
+  context: >-
+    A cradle either executes the response in memory (IEX — no file is ever written) or saves it via ADODB.Stream,
+    Out-File, or Office document automation. A file created by a PowerShell process in the minutes after the block
+    establishes that delivery progressed to disk — pay attention to staging locations such as Temp, AppData,
+    ProgramData, and C:\Users\Public. For an in-memory cradle zero results are expected, so an empty result narrows
+    the follow-up to process and network evidence rather than closing the question.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        User|expand: '%User%'
+        Image|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+          - '\powershell_ise.exe'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What processes did the user's PowerShell session spawn after the script ran, and what are their hashes?
+  context: >-
+    The hash needed for a reputation lookup or sandbox detonation is recorded on the execution event, not the file
+    write. Script-block events carry no process link, so this pivots by host and user to the children of PowerShell
+    hosts in the following hour — for a download-and-execute chain those children are the payload, and they double as
+    the follow-on-activity view for the session. If the payload runs later or under a different account it will not
+    appear here; retrieve the dropped file surfaced by the file-write question and hash it manually instead.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        User|expand: '%User%'
+        ParentImage|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+          - '\powershell_ise.exe'
+      condition: selection
+    fields:
+      - Image
+      - Hashes
+- question: Were PowerShell security controls bypassed or weakened before this execution?
+  context: >-
+    Operators commonly weaken controls just before pulling a payload — AMSI tampering (AmsiUtils, amsiInitFailed),
+    execution-policy bypass flags, Defender preference changes, or a downgrade to PowerShell v2 which lacks
+    script-block logging. Any of these on the host in the preceding hour strengthens the deliberate-evasion reading
+    that instantiating COM objects by raw CLSID already suggests, and belongs in the same timeline.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: Is full script block logging enabled on this host, or only suspicious-content logging?
+  context: >-
+    PowerShell logs every script block at verbose level only when the Script Block Logging policy is enabled; by
+    default it logs only content matching Microsoft's built-in suspicious-strings checks, at warning level. On a
+    warning-only host the alerting block is a fragment of the host's PowerShell activity and surrounding benign-looking
+    blocks were simply never recorded. Use the level distribution here to calibrate how complete every other
+    script-channel result in this investigation is.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - log.level
+- question: Has this exact script block run on this host before?
+  context: >-
+    The script block hash matches byte-identical content only — a block that has recurred for months reads as
+    deployment tooling or vendor automation, while zero history means this exact content is new to the host. A
+    trivially edited script produces a different hash, so absence says nothing about near-variants. On hosts without
+    full script-block logging the history contains only automatically flagged blocks, which weakens an empty result.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_hash|expand: '%script_block_hash%'
+      condition: selection
+    fields:
+      - user.name
+      - Path
+- question: What other PowerShell script activity occurred on this host around the alert?
+  context: >-
+    Attacker PowerShell rarely runs as a single block — reconnaissance, staging, the cradle, and follow-on tooling
+    produce a cluster of script blocks in a short window, and surrounding blocks from the same session often contain
+    the plaintext the alerting fragment lacks, such as the fetched URL or a saved path. The log.level column shows
+    whether the host records all blocks (verbose) or only automatically flagged content (warning) — on a warning-only
+    host this view is partial by design.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - user.name
+      - log.level
+      - Path
+      - ScriptBlockText
+- question: Did the same script block run on other hosts in the environment?
+  context: >-
+    Identical script content across many hosts points to deployment tooling, logon scripts, or vendor agents; the same
+    block on a small handful of unrelated hosts is how lateral movement and manual operator activity look. Only hosts
+    shipping the PowerShell channel — and, for content Microsoft's checks did not flag, only hosts with full
+    script-block logging enabled — can appear here, so absence on other hosts is weak evidence on a default-logging
+    fleet.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        powershell.file.script_block_hash|expand: '%script_block_hash%'
+      condition: selection
+    fields:
+      - host.name
+      - user.name
+      - Path
+- always_include: true
+  question: Has this user produced this CLSID-cradle pattern before, and does that history fit their role?
+  context: >-
+    The query mirrors the rule's own selection scoped to this user — a 90-day history of the specific
+    GetTypeFromCLSID-plus-CLSID pattern aggregated by host, not generic PowerShell use. A developer or packaging
+    engineer whose tooling has produced this pattern before reads differently from an account producing it for the
+    first time; weigh the count against the user's role. History covers only hosts logging the PowerShell channel,
+    with non-flagged content visible only where full script-block logging is enabled.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: ps_script
+      definition: Script Block Logging must be enable
+    detection:
+      selection_1:
+        ScriptBlockText|contains: '[Type]::GetTypeFromCLSID('
+      selection_2:
+        ScriptBlockText|contains:
+        - 0002DF01-0000-0000-C000-000000000046
+        - F6D90F16-9C73-11D3-B32E-00C04F990BB4
+        - F5078F35-C551-11D3-89B9-0000F81FE221
+        - 88d96a0a-f192-11d4-a65f-0040963251e5
+        - AFBA6B42-5692-48EA-8141-DC517DCF0EF1
+        - AFB40FFD-B609-40A3-9828-F88BBE11E4E3
+        - 88d96a0b-f192-11d4-a65f-0040963251e5
+        - 2087c2f4-2cef-4953-a8ab-66779b670495
+        - 000209FF-0000-0000-C000-000000000046
+        - 00024500-0000-0000-C000-000000000046
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: Which hosts have produced this script pattern in the last 90 days, and is the alerting host among them?
+  context: >-
+    When the alert fires under a service principal, user identity does not attribute the behavior, and script-block
+    events carry no process identity to pivot on — the pattern itself is the pivot. The query mirrors the rule's
+    selection fleet-wide over 90 days, aggregated by host. A pattern that routinely appears on many hosts suggests
+    packaged automation; one that has never appeared before, or only on this host, is the deviation worth chasing.
+    Coverage is policy-gated per host, so absence elsewhere is weak evidence.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: ps_script
+      definition: Script Block Logging must be enable
+    detection:
+      selection_1:
+        ScriptBlockText|contains: '[Type]::GetTypeFromCLSID('
+      selection_2:
+        ScriptBlockText|contains:
+        - 0002DF01-0000-0000-C000-000000000046
+        - F6D90F16-9C73-11D3-B32E-00C04F990BB4
+        - F5078F35-C551-11D3-89B9-0000F81FE221
+        - 88d96a0a-f192-11d4-a65f-0040963251e5
+        - AFBA6B42-5692-48EA-8141-DC517DCF0EF1
+        - AFB40FFD-B609-40A3-9828-F88BBE11E4E3
+        - 88d96a0b-f192-11d4-a65f-0040963251e5
+        - 2087c2f4-2cef-4953-a8ab-66779b670495
+        - 000209FF-0000-0000-C000-000000000046
+        - 00024500-0000-0000-C000-000000000046
+      condition: all of selection_*
+    fields:
+    - host.name
+- always_include: true
+  question: What else did this user do across the network around this time?
+  context: >-
+    The same account acting on several hosts in the alert window widens the scope — a cradle on one host paired with
+    logons or tooling on others is how staged multi-host activity looks. Hosts this account does not normally touch
+    matter as much as the binaries run there. If the alert fired under SYSTEM or another service principal, this view
+    degrades to agent-telemetry noise; the fleet-wide pattern question is the meaningful substitute in that case.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- always_include: true
+  question: Did this same script pattern fire on other hosts in the same window?
+  context: >-
+    The query mirrors the rule's selection fleet-wide in the alert window, aggregated by host — the
+    service-principal-safe version of the cross-network view, since script-block events carry no process identity to
+    pivot on. Several hosts producing the pattern in the same window points to pushed or scheduled automation; a
+    single host points to a host-local trigger. Only hosts shipping the PowerShell channel can appear, so absence
+    elsewhere remains weak evidence.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: ps_script
+      definition: Script Block Logging must be enable
+    detection:
+      selection_1:
+        ScriptBlockText|contains: '[Type]::GetTypeFromCLSID('
+      selection_2:
+        ScriptBlockText|contains:
+        - 0002DF01-0000-0000-C000-000000000046
+        - F6D90F16-9C73-11D3-B32E-00C04F990BB4
+        - F5078F35-C551-11D3-89B9-0000F81FE221
+        - 88d96a0a-f192-11d4-a65f-0040963251e5
+        - AFBA6B42-5692-48EA-8141-DC517DCF0EF1
+        - AFB40FFD-B609-40A3-9828-F88BBE11E4E3
+        - 88d96a0b-f192-11d4-a65f-0040963251e5
+        - 2087c2f4-2cef-4953-a8ab-66779b670495
+        - 000209FF-0000-0000-C000-000000000046
+        - 00024500-0000-0000-C000-000000000046
+      condition: all of selection_*
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host — initial-access activity, defense tampering, reconnaissance — may reveal how
+    an operator reached the point of running a download cradle at all. A cradle is typically a mid-chain delivery step
+    rather than the start, so the preceding alert timeline helps reconstruct the sequence instead of treating this
+    event in isolation.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

@@ -1,0 +1,311 @@
+name: Potential DLL Sideloading Of DBGHELP.DLL
+id: 8ccd6df9-de1c-46b2-910d-38d9003d92ee
+description: |
+  Detects a process loading a module named dbghelp.dll from a directory outside the standard Windows system and install locations (System32, SysWOW64, WinSxS, Program Files, SoftwareDistribution, SystemTemp) AND outside a small set of known-good application directories. dbghelp.dll is a legitimate Microsoft debug-helper library; loading it from an application's own or a user-writable folder rather than the system path is the search-order-hijack signal, where a malicious copy is planted next to a trusted signed executable so the loader resolves it before the system copy. Some applications legitimately bundle their own dbghelp.dll, so the investigation should determine which process loaded it, from what path, whether the file is signed and reputable, whether it was recently written to disk, and whether the process/DLL pairing is normal for this host and fleet.
+type: detection
+detection_id: 6414b5cd-b19d-447e-bb5e-9f03940b5784
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-09
+questions:
+- question: Does the loaded dbghelp.dll match what this rule detects — a load from a directory outside the standard system and install locations?
+  context: >-
+    The rule fires when a module named dbghelp.dll is loaded (ImageLoaded ends with \dbghelp.dll) AND the load path is NOT under one of the standard prefixes (Program Files, Program Files (x86), System32, SysWOW64, WinSxS, SoftwareDistribution, SystemTemp) AND is NOT one of the excluded application directories that legitimately bundle their own copy. Confirm the exact load path and the process that loaded it. A DLL load carries the module's signing status and hash directly on the event, so those can be read here without pivoting to an execution.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|endswith|expand: '%ImageLoaded%'
+      condition: selection
+    fields:
+      - ImageLoaded
+- question: Is this user and host expected to run the application that loaded this module from a non-standard directory?
+  context: >-
+    Legitimate developer, debugging, and installer activity can load dbghelp.dll from application-local directories, so knowing whether the account role and host function fit that activity is often the fastest way to separate a true positive from routine use. User attribution is present on most endpoint events; when it resolves to a machine account (HOST$) or SYSTEM, pivot on the loading process instead.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What is the full command line and working directory of the process that loaded dbghelp.dll?
+  context: >-
+    Sideloading works by placing a malicious dbghelp.dll in the same directory as the launching executable so the loader finds it before the System32 copy, which makes the working directory a load-bearing field. A process running from a user-writable location (Temp, AppData, Downloads, a mounted archive or extracted folder) that pulls dbghelp.dll from its own directory is the hijack pattern; the command line shows what the process was actually doing.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What other modules did this process load, and are any from non-canonical paths or unsigned?
+  context: >-
+    The complete module set of the loading process gives context the single dbghelp.dll event cannot. Beyond dbghelp.dll, look for additional libraries pulled from the same user-writable directory, unsigned modules in locations where signed system copies are expected, or other system-named DLLs loaded from non-system paths — parallel search-order hijacks frequently plant more than one module in the same folder.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - SignatureStatus
+- question: What is the signing status, hash, and reputation of the dbghelp.dll that was loaded?
+  context: >-
+    The genuine dbghelp.dll is a Microsoft-signed debug helper. A copy from a non-standard directory that is unsigned, signed by a non-Microsoft entity, or carries an Invalid or Distrusted signature is a strong sideloading indicator; a validly Microsoft-signed copy may still be a relocated legitimate file. Take the Hashes value to a reputation lookup. Alternate-data-stream and mark-of-the-web provenance on the file is not captured in this telemetry — retrieve it from the endpoint directly if the origin of the file is in question.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Hashes
+      - Signature
+      - SignatureStatus
+- question: Was the dbghelp.dll written to disk by this process or its children, and is it still present for analysis?
+  context: >-
+    Sideloading requires the attacker to first drop the malicious dbghelp.dll into the directory the trusted process loads from. Correlating file writes to the loading process and its direct children shows whether the DLL was created in the same session — a fresh write into a user-writable application directory shortly before the load is the plant step. File-write events carry no hash; if the file is still present, hash it from a later execution or retrieve it for reputation analysis.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What process spawned the application that loaded dbghelp.dll, and is that parent chain expected?
+  context: >-
+    The parent reveals how the loading process was launched. A trusted signed executable started by explorer.exe from its install directory is routine; the same executable launched from an archive extraction, a script host, an Office application, or a download directory suggests the binary and its planted dbghelp.dll were staged together. If the parent identifier resolves to NODATA, fall back to the loading process name and host with a time window.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - Image
+      - CommandLine
+- question: Has dbghelp.dll been loaded from this path on this host before, and by which processes?
+  context: >-
+    A first-time load of dbghelp.dll from this directory is a stronger anomaly than a recurring one. If the same path has been loaded repeatedly by the same process binary over the past 90 days, it is likely a bundled component of that application; zero history, or a sudden change in which processes load it, marks this occurrence as new.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|endswith|expand: '%ImageLoaded%'
+      condition: selection
+    fields:
+      - Image
+- question: Does this host normally run the application that loaded the module?
+  context: >-
+    A loading binary that has never been seen on the host is more suspicious than one that runs regularly. Zero or very low historical counts indicate first-time or rare execution of the process that pulled in dbghelp.dll, which raises the weight of the non-standard load path.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: Is dbghelp.dll being loaded from this path on other hosts, and by which processes?
+  context: >-
+    Cross-host correlation surfaces how widespread the load is. The same path loaded on many hosts under a consistent parent points to bundled or deployed software; the same DLL name appearing under varied loading processes across hosts is more consistent with distribution of a sideloading payload. Compare the loading processes per host to tell managed software from planted modules.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        ImageLoaded|endswith|expand: '%dll_basename%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Were registry keys that govern DLL search order or module redirection modified on this host near the load?
+  context: >-
+    DLL hijacking is sometimes set up or reinforced through the registry — KnownDLLs entries, per-application execution options, or App Paths that change where a binary resolves its modules. Modifications to these keys in the same window as the anomalous load can indicate the hijack was configured rather than opportunistic. Compare the writing process against the process that loaded dbghelp.dll.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains:
+          - '\Session Manager\KnownDLLs'
+          - '\CurrentVersion\App Paths'
+          - '\Image File Execution Options'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- question: What other process activity occurred on this host around the time of the load?
+  context: >-
+    Loads that are part of an intrusion rarely occur in isolation. Aggregating process activity around the event surfaces what led to it and what followed — an archive extraction, a download or dropper, reconnaissance, or privilege escalation. Novel parent-child pairs stand out at low counts against the high-count agent and operating-system telemetry that dominates the host.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this load?
+  context: >-
+    Earlier detections on the same host — defense tampering, reconnaissance, credential access, or a suspicious download — may reveal the stages that preceded the sideload and help reconstruct the timeline. A dbghelp.dll load following an earlier execution or tampering alert reads very differently from one with no prior activity.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Were other process-based persistence mechanisms installed on this host?
+  context: >-
+    A hijacked DLL that loads into a trusted process is itself an execution and persistence foothold. Attackers rarely rely on a single mechanism; after establishing one, they commonly install backups using different techniques — scheduled tasks, services, registry Run keys, BITS jobs, or WMI subscriptions. Multiple persistence installations in the same timeframe indicate intentional stacking rather than isolated administrative action.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- question: Were files dropped to Startup folders or scheduled-task definition paths on this host?
+  context: >-
+    File-based persistence bypasses process-based detection: dropping an executable or script into a Startup folder or a path named by a Run value achieves autostart without running reg or a scheduling tool. File-event monitoring captures these drops even when standard persistence utilities are avoided, and a Startup-folder drop alongside a sideloaded DLL points to stacked persistence.
+    Run-key persistence itself is a registry write, not a file drop, so it does not appear in file telemetry; this query covers Startup folders and scheduled-task definition files, and Run-key writes surface in registry questions instead.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist_paths:
+        TargetFilename|contains:
+          - '\Start Menu\Programs\Startup\'
+          - '\Windows\System32\Tasks\'
+          - '\Windows\Tasks\'
+      condition: selection and selection_persist_paths
+    fields:
+      - TargetFilename
+      - Image
+- question: Does the user or an administrator recall running the application involved in this load?
+  context: >-
+    Direct confirmation from the person behind the account is often the fastest way to establish legitimacy. If the user recalls running a debugger, installer, or development tool that ships its own dbghelp.dll, the loading process and its directory should match that software; if no one recalls the action, the credentials may be compromised or the activity may be automated. When the action confirms, capture why it was done and what was expected to run.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Does the timing of this activity align with normal work hours or a maintenance window?
+  context: >-
+    Legitimate debugging, software installs, and development activity typically occur during business hours or scheduled maintenance windows. An application loading dbghelp.dll from a user-writable directory at an unusual hour, or on a host where that software is not part of normal operation, is more suspicious than the same activity during a documented change window.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine

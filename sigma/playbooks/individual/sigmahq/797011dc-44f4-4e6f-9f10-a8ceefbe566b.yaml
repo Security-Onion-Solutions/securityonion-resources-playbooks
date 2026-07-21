@@ -1,0 +1,351 @@
+name: WMI Backdoor Exchange Transport Agent
+id: c8c7ac8f-2c84-4066-bbb7-249e6da3a5b3
+description: |
+  Detects any child process spawned by the Exchange transport service binary EdgeTransport.exe, excluding the
+  known-benign conhost.exe and the bundled OleConverter.exe. The rule fires when EdgeTransport.exe is the parent and
+  none of the benign-child filters match. A WMI event subscription backdoor can be bound to mail-flow events so that
+  EdgeTransport.exe launches an attacker command without modifying agents.config, leaving the spawned child as the
+  primary observable. Because EdgeTransport.exe legitimately spawns very few children, any unexpected child warrants
+  identifying what the child does, what user context it ran under, and whether a WMI subscription or other persistence
+  mechanism is driving the execution.
+type: detection
+detection_id: 797011dc-44f4-4e6f-9f10-a8ceefbe566b
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- question: Does this event match what the rule detects, a child process spawned by EdgeTransport.exe that is not conhost.exe or the bundled OleConverter.exe?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule fires when the parent process ends in EdgeTransport.exe AND the child is neither C:\Windows\System32\conhost.exe nor the Exchange-bundled \Bin\OleConverter.exe. Read the actual ParentImage, Image, and CommandLine from the event and confirm the spawned child is genuinely outside those two benign exclusions.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+- question: Is this host an Exchange server, and is the user context that ran the child process expected for it?
+  context: This pattern is only meaningful on hosts that run the Exchange transport role. Confirm the host is an Exchange server rather than a renamed or unrelated process, and check whether the account the child ran under matches the service identity Exchange transport normally uses. An interactive or unfamiliar account spawning from the transport service is a stronger signal than the expected network-service or system identity.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Is EdgeTransport.exe expected to spawn this child, and what started EdgeTransport.exe itself?
+  context: The parent-child relationship is the core signal for this detection. EdgeTransport.exe is normally launched by the Exchange transport service host and spawns only a small set of bundled helpers. Trace EdgeTransport.exe's own origin to confirm it is the genuine Exchange binary started by the service, then judge whether this specific child fits the narrow set of helpers the transport role legitimately invokes.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What exactly did the spawned child process do? Decode its full command line.
+  context: The child's command line reveals the operation the backdoor performed. Decode any flags, encoded content, file paths, or URLs. Script interpreters or living-off-the-land binaries spawned here commonly carry download cradles, in-memory loaders, or reconnaissance commands; identify the full operational purpose rather than just the binary name.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What other child processes did this same EdgeTransport.exe instance spawn?
+  context: If a backdoor is driving EdgeTransport.exe to launch commands, it likely spawned more than one process. Examining siblings of the same parent instance reveals the full scope of activity initiated through the transport service. Multiple unexpected children from the same EdgeTransport.exe instance points to orchestrated execution rather than an isolated benign helper.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Were WMI event filter, consumer, or filter-to-consumer binding objects created or modified on this host?
+  context: >-
+    This persistence technique binds an attacker command to an event through a WMI EventFilter,
+    EventConsumer, and FilterToConsumerBinding so the transport service launches it without
+    changing agents.config. Operational WMI activity logging records these registrations: 5861
+    carries the permanent consumer definition in winlog.user_data.CONSUMER, while 5859 and 5860
+    record filter-to-consumer activity and temporary registrations with the event query. Read
+    CONSUMER, ESS, and Query alongside the message narrative to see what the subscription runs -
+    it is the root mechanism behind an unexpected EdgeTransport.exe child. If WMI activity
+    logging is not collected in this environment, treat zero results as a visibility gap and
+    pivot to the on-host WMI repository and the parent-spawning evidence rather than as proof
+    nothing was registered.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        Channel: 'Microsoft-Windows-WMI-Activity/Operational'
+        host.name|expand: '%hostname%'
+        EventID:
+          - 5859
+          - 5860
+          - 5861
+      condition: selection
+    fields:
+      - EventID
+      - winlog.user_data.CONSUMER
+      - winlog.user_data.ESS
+      - winlog.user_data.Query
+      - winlog.user_data.NamespaceName
+      - message
+- question: Was mofcomp.exe run or Register-WmiEvent invoked on this host to compile or register a WMI subscription?
+  context: WMI event subscriptions are commonly installed by compiling a MOF file with mofcomp.exe or by registering an event consumer through PowerShell. Either action around the alert timeframe ties the unexpected transport-service child to deliberate WMI persistence setup. Decode any command line found here to identify the MOF path or the consumer command the subscription was bound to.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_mof:
+        Image|endswith: '\mofcomp.exe'
+      selection_register:
+        CommandLine|contains:
+          - 'Register-WmiEvent'
+          - '__EventFilter'
+          - 'CommandLineEventConsumer'
+          - 'FilterToConsumerBinding'
+      condition: selection_host and (selection_mof or selection_register)
+    fields:
+      - Image
+      - CommandLine
+      - User
+- question: What non-Microsoft or recently written modules are loaded by EdgeTransport.exe on this host?
+  context: A transport-agent infection can ride in a DLL loaded into EdgeTransport.exe rather than only spawning children. Reviewing modules loaded by the transport process surfaces unsigned, non-Microsoft, or recently dropped DLLs that a malicious agent would load. If image-load telemetry is not collected in this environment, treat zero results as a visibility gap and inspect the loaded modules of EdgeTransport.exe directly on the host.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: '\EdgeTransport.exe'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+- question: Was the Exchange transport agents.config file or other transport configuration modified on this host?
+  context: Transport-agent persistence can be installed either through agents.config or through a WMI subscription that avoids touching that file. Checking for writes to agents.config and the Exchange transport configuration directory distinguishes a configuration-based agent from a WMI-driven one and helps locate the registration that produced the unexpected child. Remediation of a transport-agent infection requires restarting the Exchange service to take effect even after the agent is removed.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains: '\Microsoft\Exchange Server\'
+      filter_config:
+        TargetFilename|endswith:
+          - '\agents.config'
+          - '.dll'
+          - '.config'
+      condition: selection and filter_config
+    fields:
+      - TargetFilename
+      - Image
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \EdgeTransport.exe
+      filter_conhost:
+        Image: C:\Windows\System32\conhost.exe
+      filter_oleconverter:
+        Image|startswith: C:\Program Files\Microsoft\Exchange Server\
+        Image|endswith: \Bin\OleConverter.exe
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection and not 1 of filter_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \EdgeTransport.exe
+      filter_conhost:
+        Image: C:\Windows\System32\conhost.exe
+      filter_oleconverter:
+        Image|startswith: C:\Program Files\Microsoft\Exchange Server\
+        Image|endswith: \Bin\OleConverter.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not 1 of filter_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the account's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the same account triggered similar activity on other hosts, the scope of the operation may be larger than this single Exchange server.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \EdgeTransport.exe
+      filter_conhost:
+        Image: C:\Windows\System32\conhost.exe
+      filter_oleconverter:
+        Image|startswith: C:\Program Files\Microsoft\Exchange Server\
+        Image|endswith: \Bin\OleConverter.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not 1 of filter_*) and _pb_scope
+    fields:
+    - host.name
+- question: Is EdgeTransport.exe spawning unexpected children on other hosts across the environment?
+  context: The same transport-service spawning pattern appearing on multiple Exchange servers may indicate a coordinated persistence deployment across the mail infrastructure. A single occurrence is more likely a targeted backdoor on one server. Environment-wide comparison helps calibrate severity and identify the scope of compromise.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentName|expand: '%ParentName%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+      - CommandLine
+- question: Were other process-based persistence mechanisms installed on this host?
+  context: Attackers rarely rely on a single persistence mechanism. Alongside a WMI-driven transport-agent backdoor, operators commonly install backup footholds using scheduled tasks, services, registry Run keys, BITS jobs, or additional WMI subscriptions. Multiple persistence installations in the same timeframe indicate intentional stacking rather than isolated administrative action.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate context: what led to this event, what happened after, and whether it is part of a larger sequence. Look for reconnaissance, privilege escalation, or additional persistence installation around the transport-service execution.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: 'Alerts rarely happen in isolation. Earlier detections on the same Exchange server, web-shell execution, credential access, or defense tampering, may reveal the stages that preceded this event and help reconstruct the timeline. Look for patterns: exploitation of the mail server followed by persistence installation.'
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

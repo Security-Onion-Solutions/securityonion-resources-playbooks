@@ -1,0 +1,361 @@
+name: Potentially Suspicious Command Targeting Teams Sensitive Files
+id: 21ca3c94-32c9-4b8c-9382-dd65678b51d5
+description: |
+  Detects a command line referencing the Microsoft Teams desktop on-disk credential
+  stores -- the Cookies SQLite database or the Local Storage leveldb -- from a process
+  that is not the Teams.exe client itself. These files hold live, unencrypted
+  authentication tokens for the signed-in account; reading them lets a local actor
+  replay the tokens and access the account without re-authenticating. Legitimate
+  reads come from Teams.exe and its helpers, so a different process touching these
+  paths points to token-harvesting tradecraft. The investigation should confirm
+  which process and command performed the access, which account is exposed, and
+  whether the tokens were subsequently used or exfiltrated.
+type: detection
+detection_id: d2eb17db-1d39-41dc-b57f-301f6512fa75
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- question: Does the command line reference a Teams Cookies or Local Storage leveldb path from a process other than Teams.exe?
+  context: >-
+    Confirm the alert is a true positive before investing time. The rule fires when a command line contains
+    \Microsoft\Teams\Cookies or \Microsoft\Teams\Local Storage\leveldb AND the running process is not
+    \Microsoft\Teams\current\Teams.exe. Read the full command line and the Image path of the running process; a path
+    that resolves to the Teams client itself would have been excluded, so a match here means a non-Teams process
+    referenced the token stores.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Is this user and host expected to read Teams token storage files with a command-line tool?
+  context: >-
+    Routine Teams usage does not require reading the Cookies or leveldb files from a separate process. Backup tooling,
+    forensic collection, or developer debugging can occasionally touch these paths legitimately. Knowing whether the
+    user role and host function explain this access is often the fastest way to separate a benign operation from
+    token theft.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Which Teams token store was targeted, and what did the command do with it?
+  context: >-
+    The two paths hold different artifacts -- the Cookies SQLite database carries session cookies and additional auth
+    tokens, while the Local Storage leveldb holds Outlook and Skype API access tokens. Read the full command line to
+    determine which store was named and what operation ran against it (copy, parse, read, archive, or query). The
+    targeted store determines which tokens are exposed and what replay access an actor would gain.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What process spawned the tool that accessed the Teams files, and is that parent chain expected?
+  context: >-
+    The parent process reveals how the access was initiated. A token read launched from explorer.exe during
+    interactive work reads differently than one launched from a script host, an Office application, or an
+    unrecognized parent. Walk up the chain to see what invoked the accessing process and what else that parent did.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Does this host normally run the process that accessed the Teams token files?
+  context: >-
+    A process that has never been seen on this host is more notable than one that runs regularly. Zero or very low
+    historical counts for the accessing binary indicate first-time or rare execution, which raises the likelihood
+    that this access is operator activity rather than an established routine.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: When this host has previously fired the rule's pattern, what parents and users normally drive that activity, and does the current alert fit?
+  context: >-
+    Some environments legitimately read these paths (backup or migration tooling). The query mirrors the rule's
+    selection scoped to this host, so the parent and user distribution reflects how this specific token-access pattern
+    has historically run here rather than generic process usage. A new parent, an unexpected account, or an unusual
+    command structure is the deviation worth chasing, and the legitimate baseline here is what distinguishes tuned-out
+    routine readers from a one-off access.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        CommandLine|contains:
+        - \Microsoft\Teams\Cookies
+        - \Microsoft\Teams\Local Storage\leveldb
+      filter_main_legit_locations:
+        Image|endswith: \Microsoft\Teams\current\Teams.exe
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: What child processes did the accessing tool spawn afterward?
+  context: >-
+    The processes spawned by the accessing tool reveal what happened to the harvested data. After reading the token
+    stores, an actor may launch archiving utilities, scripting engines, or network tools to parse and move the tokens.
+    Unexpected children point to staging or exfiltration of the stolen material.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Did the accessing host make outbound connections to non-Teams destinations shortly after the token files were read?
+  context: >-
+    Stolen Teams tokens are valuable because they can be replayed against Outlook and Skype APIs, and harvested data
+    is often pushed to an external location. Outbound connections from the accessing host that are not the normal
+    Teams or Microsoft endpoints -- especially to web services, paste sites, or unfamiliar addresses in the minutes
+    after the read -- can indicate token replay or exfiltration. Filter out routine system and update traffic.
+  range: +4h
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      filter_known_good:
+        Image|endswith:
+          - \svchost.exe
+          - \Teams.exe
+          - \msedge.exe
+      condition: selection and not filter_known_good
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationHostname
+      - DestinationPort
+- question: Which account's Teams tokens are exposed, and does that account hold elevated privileges?
+  context: >-
+    Teams stores tokens for the signed-in user, so the exposed account is the one whose profile owns the targeted
+    Cookies and leveldb files. A standard user exposure may need only token revocation and monitoring; an
+    administrator or a privileged service account expands the impact and may require escalation. Cross-reference the
+    account with directory group memberships.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Were outbound remote-access connections (RDP, SMB, WinRM, SSH) initiated from this host after
+    this event?
+  context: Credential theft is typically followed by lateral movement. The query returns outbound connections
+    from this host to remote-access ports -- 3389 (RDP), 445 (SMB/PsExec), 5985/5986 (WinRM), 22 (SSH)
+    -- in the hours after the event; the originating Image and User show what drove each connection. Two
+    limits to keep in mind -- credentials exfiltrated and replayed from another machine will not appear
+    here (check security 4624 logons on suspected targets for this account and any accounts with sessions
+    on this host), and the query requires Sysmon network telemetry (EID 3); if that is not collected from
+    this host, treat zero rows as a visibility gap, not as evidence no movement occurred.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        CommandLine|contains:
+        - \Microsoft\Teams\Cookies
+        - \Microsoft\Teams\Local Storage\leveldb
+      filter_main_legit_locations:
+        Image|endswith: \Microsoft\Teams\current\Teams.exe
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        CommandLine|contains:
+        - \Microsoft\Teams\Cookies
+        - \Microsoft\Teams\Local Storage\leveldb
+      filter_main_legit_locations:
+        Image|endswith: \Microsoft\Teams\current\Teams.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around the time of the token access?
+  context: >-
+    Tracking the user's activity across all hosts reveals whether the token access is isolated or part of broader
+    hands-on activity. If the same account touched credential stores or ran tools on multiple endpoints in the same
+    window, the scope of compromise is larger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        CommandLine|contains:
+        - \Microsoft\Teams\Cookies
+        - \Microsoft\Teams\Local Storage\leveldb
+      filter_main_legit_locations:
+        Image|endswith: \Microsoft\Teams\current\Teams.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Alerts rarely occur in isolation. Examining the surrounding process activity reveals what led to the token access
+    and what happened after. Novel parent-child pairs at low counts stand out against the repetitive system telemetry
+    and may reveal reconnaissance, staging, or persistence accompanying the credential access.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host -- defense tampering, reconnaissance, or other execution activity -- may
+    reveal the stages that preceded the token access and help reconstruct the timeline. The sequence of alerts often
+    tells the story of how the actor reached the credential stores.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

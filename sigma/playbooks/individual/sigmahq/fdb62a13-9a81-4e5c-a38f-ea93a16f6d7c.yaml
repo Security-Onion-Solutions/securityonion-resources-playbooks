@@ -1,0 +1,471 @@
+name: PowerShell Base64 Encoded FromBase64String Cmdlet
+id: 280b9d65-c859-442c-9c10-a7737b7bdd61
+description: |
+  Detects a process command line that carries a base64-encoded form of the PowerShell
+  `::FromBase64String` call. The rule fires when either branch of its single selection matches:
+  a base64 blob encoding the ASCII text of that call (tested at all three base64 alignment
+  offsets), or one of three fixed base64 substrings that encode the same call in UTF-16LE — the
+  encoding PowerShell's `-EncodedCommand` parameter consumes. Either way the command line is a
+  double-encoding pattern: the visible blob decodes to PowerShell that itself decodes a second,
+  inner payload, which is where the download URL, dropped file path, reflectively loaded
+  assembly, or embedded credential actually lives. Investigation should decode the outer blob,
+  decode the inner argument passed to `::FromBase64String`, identify what the recovered code
+  does, and determine whether the payload executed, wrote files, or reached the network.
+type: detection
+detection_id: fdb62a13-9a81-4e5c-a38f-ea93a16f6d7c
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-17
+questions:
+- question: >-
+    Does the alerting command line carry a base64-encoded `::FromBase64String` call, either as
+    encoded ASCII text or as one of the fixed UTF-16LE-encoded substrings?
+  context: >-
+    The rule matches on either of two alternative branches, and which one fired narrows the
+    investigation. The ASCII branch means a base64 blob somewhere in the command line decodes to
+    text containing `::FromBase64String`, which is typical of a payload embedded in a wrapper
+    script or passed to a non-PowerShell launcher. The UTF-16LE branch means the blob is in the
+    encoding `-EncodedCommand` accepts, so the decoded content is very likely the script
+    PowerShell ran directly. Read the exact command line, confirm the encoded substring is really
+    present rather than a coincidental base64 collision, and record which branch matched, because
+    the UTF-16LE branch points the decode work at the `-EncodedCommand` argument while the ASCII
+    branch means the decoder must locate the blob inside the surrounding text first.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Is this user and host expected to run base64-encoded PowerShell that decodes a further payload at runtime?
+  context: >-
+    Build servers, configuration-management agents, and packaged installers legitimately pass
+    encoded PowerShell to avoid quoting problems, and some of that code does call
+    `::FromBase64String` on embedded data. A workstation user, a service account with no
+    automation role, or a host with no scripted deployment tooling has no routine reason to
+    produce this pattern. Establishing the user's role and the host's function is usually the
+    fastest way to separate packaged automation from operator activity.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Did the alerting process or its children write any files that are still on disk for analysis?
+  context: >-
+    Decoded payloads frequently land on disk before or instead of running in memory, and the rule
+    itself carries no file path, so the written artifact has to be recovered from the process
+    lineage rather than from the command line. Files written by the alerting process or by a
+    child it spawned are the candidates for hashing, content review, or detonation. Nothing on
+    disk points toward an in-memory-only decode, which shifts the weight of the investigation
+    onto the decoded script content and any network activity.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: >-
+    Decode the base64 blob in this command line: what does the outer layer decode to, what inner
+    payload does it hand to `::FromBase64String`, and what URL, path, or credential does that
+    inner payload reference?
+  context: >-
+    This is the analytical core of the alert and it is a two-step decode, not a command-line read.
+    First recover the outer layer by base64-decoding the blob from the command line, using UTF-16LE
+    if the blob came from an `-EncodedCommand` argument and ASCII otherwise. The recovered text is
+    PowerShell that calls `::FromBase64String` on a second string; decode that string too. The
+    inner layer is where the operational detail is, and it usually resolves to one of a download
+    cradle with a fetch URL, a byte array written to a named file path, a .NET assembly loaded
+    reflectively into memory, a compressed stream that needs a further inflate step, or embedded
+    credentials and keys. Keep iterating if a layer yields more base64 rather than readable code,
+    and record every URL, host, path, and account name recovered so they can be pivoted on.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did PowerShell script block logging capture the decoded script content on this host?
+  context: >-
+    Event ID 4104 records the script text PowerShell actually compiled, after the encoding layer
+    the command line hides has already been stripped, so it is the highest-value pivot for this
+    pattern. Where those events exist they show the decoded cradle and often the inner decoded
+    content as well, without any manual work. If 4104 events are not collected in this
+    environment, treat an empty result as a visibility gap rather than evidence that nothing ran,
+    and recover the content by base64-decoding the blob from the alerting command line by hand.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Were PowerShell security controls bypassed or weakened on this host before the encoded command ran?
+  context: >-
+    Encoded decode-and-run payloads are commonly preceded by steps that remove the logging and
+    inspection that would expose them, including in-memory AMSI patching through the AmsiUtils
+    and amsiInitFailed fields, execution-policy bypass flags, downgrade to the version 2 engine
+    that predates script block logging, and real-time protection changes. Finding one of these in
+    the hour before the alert both explains why the script content may be missing from the
+    operational logs and establishes that the operator was preparing the host, not just running
+    a packaged installer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: Which PowerShell engine and .NET runtime assemblies loaded on this host around the alert?
+  context: >-
+    A decoded payload that calls `[Reflection.Assembly]::Load` on the output of
+    `::FromBase64String` never writes the assembly to disk, so the module-load record is the only
+    place the loaded code appears. The PowerShell engine assembly indicates a PowerShell session
+    was hosted, and it appearing inside a process that is not powershell.exe or pwsh.exe points to
+    an embedded or indirect .NET invocation. Runtime and JIT module loads clustered at the alert
+    time corroborate in-memory execution of decoded bytes. Note any assembly loaded from a
+    user-writable directory and any module name that is rare or previously unseen on this host,
+    which is the tuning signal this technique's analytics call for.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|endswith:
+          - '\System.Management.Automation.dll'
+          - '\clr.dll'
+          - '\clrjit.dll'
+          - '\mscoree.dll'
+          - '\amsi.dll'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Image
+      - Signed
+- question: Did any process on this host make the memory-write or execution-forcing API calls consistent with running decoded bytes inside another process?
+  context: >-
+    A decoded payload that targets another process leaves no command line of its own, so the
+    behavioral API record is what shows whether decoded bytes were written into a remote process
+    and forced to execute. Writes into another process, queued asynchronous procedure calls, and
+    hook installation around the alert time indicate the decode fed an injection step rather than
+    a local script. This record covers the injection side only. Read-side access, such as a
+    decoded loader opening another process to harvest its memory, produces no equivalent event,
+    so an empty result rules out injection but not credential-style reads, and if this channel is
+    not collected here treat the absence as a visibility gap.
+  range: +/-10m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        event.dataset: endpoint.events.api
+        process.Ext.api.name:
+          - WriteProcessMemory
+          - QueueUserAPC
+          - SetWindowsHookEx
+      condition: selection
+    fields:
+      - Image
+      - process.Ext.api.name
+- question: What process spawned the alerting process, and is that parent chain expected?
+  context: >-
+    The rule constrains only the command line, so the parent is what tells you how the encoded
+    blob was delivered. A scripted-deployment agent, a management service, or an installer parent
+    is consistent with packaged automation. An Office application, a script host such as
+    wscript.exe or mshta.exe, an archive utility, or a browser as the parent means the encoded
+    payload arrived through a document or download rather than through a change-managed process.
+    Walk one level further up the tree if the immediate parent is itself a generic interpreter.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What child processes did the alerting process spawn afterward?
+  context: >-
+    The decoded payload's effect is often visible in what it launched. Children scoped to the
+    alerting process by lineage show whether the decode stayed self-contained or handed off to a
+    second stage. Additional interpreters, transfer utilities, archive tools, or an unfamiliar
+    executable running from a user-writable directory identify the stage that followed the
+    decode, and their command lines are frequently readable where the alerting one was not.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: >-
+    When this host has previously fired the rule's pattern, what parents and users normally drive
+    that activity, and does the current alert fit that history?
+  context: >-
+    The query mirrors the rule's selection structure scoped to this host, so the parent and user
+    distribution it returns reflects how encoded `::FromBase64String` command lines have actually
+    occurred here rather than generic interpreter usage. A host where a management agent or build
+    account has produced this repeatedly over two weeks has an established pattern, and the alert
+    fitting it argues for packaged automation. A new parent process, an unexpected account, or a
+    host with no prior history for this pattern at all is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - CommandLine|base64offset|contains: ::FromBase64String
+      - CommandLine|contains:
+        - OgA6AEYAcgBvAG0AQgBhAHMAZQA2ADQAUwB0AHIAaQBuAGcA
+        - oAOgBGAHIAbwBtAEIAYQBzAGUANgA0AFMAdAByAGkAbgBnA
+        - 6ADoARgByAG8AbQBCAGEAcwBlADYANABTAHQAcgBpAG4AZw
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: >-
+    The query mirrors the rule's selection structure scoped to this user, so the result is the
+    account's 90-day history of encoded `::FromBase64String` command lines, aggregated by host. An
+    account that produces this routinely across many hosts is usually driving automation or
+    packaging tooling. An account with no prior history for this pattern, or one whose history
+    suddenly spreads to hosts it has never touched, is the case to weigh against what the role is
+    actually supposed to do.
+  range: -90d
+  always_include: true
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - CommandLine|base64offset|contains: ::FromBase64String
+      - CommandLine|contains:
+        - OgA6AEYAcgBvAG0AQgBhAHMAZQA2ADQAUwB0AHIAaQBuAGcA
+        - oAOgBGAHIAbwBtAEIAYQBzAGUANgA0AFMAdAByAGkAbgBnA
+        - 6ADoARgByAG8AbQBCAGEAcwBlADYANABTAHQAcgBpAG4AZw
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: >-
+    Has this parent process historically driven the rule's pattern here or across the environment,
+    or is the parent new for this activity?
+  context: >-
+    When the alert fires under a machine account or a built-in service principal, the user field
+    attributes nothing and the launch mechanism becomes the meaningful pivot. The query mirrors
+    the rule's selection structure scoped to the alerting parent, so the result is the 90-day
+    history of that parent producing encoded `::FromBase64String` command lines, aggregated by
+    host. A parent already accounting for thousands of prior events is vendor or operating-system
+    automation; a parent that is new or rare for this pattern is the deviation worth chasing.
+  range: -90d
+  always_include: true
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - CommandLine|base64offset|contains: ::FromBase64String
+      - CommandLine|contains:
+        - OgA6AEYAcgBvAG0AQgBhAHMAZQA2ADQAUwB0AHIAaQBuAGcA
+        - oAOgBGAHIAbwBtAEIAYQBzAGUANgA0AFMAdAByAGkAbgBnA
+        - 6ADoARgByAG8AbQBCAGEAcwBlADYANABTAHQAcgBpAG4AZw
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the environment around this time?
+  context: >-
+    Tracking the account's activity across every host in the alert window shows whether the
+    encoded decode was an isolated action or one step in a sequence that touched several
+    endpoints. The same account running interpreters, transfer utilities, or administrative
+    tooling on hosts it does not normally touch widens the scope. When the alert fires under a
+    machine account or a built-in service principal this view fills with routine agent telemetry
+    and the parent-scoped view is the one that carries meaning.
+  range: +/-1h
+  always_include: true
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window, or is the activity isolated to this host?
+  context: >-
+    The query mirrors the rule's selection structure scoped to the alerting parent process,
+    fleet-wide, within the alert window. Several hosts producing the same parent-driven encoded
+    command line at once points to scheduled or pushed automation reaching them together. A single
+    host points to a host-local trigger, which is the case that justifies deeper work on the
+    decoded payload and the account behind it.
+  range: +/-1h
+  always_include: true
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - CommandLine|base64offset|contains: ::FromBase64String
+      - CommandLine|contains:
+        - OgA6AEYAcgBvAG0AQgBhAHMAZQA2ADQAUwB0AHIAaQBuAGcA
+        - oAOgBGAHIAbwBtAEIAYQBzAGUANgA0AFMAdAByAGkAbgBnA
+        - 6ADoARgByAG8AbQBCAGEAcwBlADYANABTAHQAcgBpAG4AZw
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Decoding rarely stands alone. The analytics for this technique note that decode utilities run
+    within a short window of the staging or download step that put the encoded content there, and
+    that they are often chained to a further execution step, so the fifteen minutes either side of
+    the alert is where the surrounding stages sit. Aggregating parent and child pairs collapses
+    routine agent telemetry into high-count rows while a novel pairing stands out at a low count.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: >-
+    Have other hosts fired the rule's pattern in the past week, and does the cross-host
+    distribution look like consistent automation or one-off activity?
+  context: >-
+    The query mirrors the rule's selection structure with no host scope, so the result counts
+    encoded `::FromBase64String` command lines across the environment rather than generic
+    interpreter usage. Many hosts firing it points to scripted deployment or vendor tooling that
+    ships an encoded payload as part of its normal operation, which is a tuning candidate rather
+    than an incident. One host, or a small set with no functional relationship, points to operator
+    activity and raises the value of the decode work.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - CommandLine|base64offset|contains: ::FromBase64String
+      - CommandLine|contains:
+        - OgA6AEYAcgBvAG0AQgBhAHMAZQA2ADQAUwB0AHIAaQBuAGcA
+        - oAOgBGAHIAbwBtAEIAYQBzAGUANgA0AFMAdAByAGkAbgBnA
+        - 6ADoARgByAG8AbQBCAGEAcwBlADYANABTAHQAcgBpAG4AZw
+      condition: selection
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Encoded content has to reach the host before it can be decoded. Earlier detections covering
+    document-spawned interpreters, remote file transfers, archive extraction, or defense tampering
+    identify the staging step and give the decode a timeline to sit in. An alert with nothing
+    before it argues either for a genuine first observation or for a delivery path that produced
+    no telemetry, and both are worth resolving before closing.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

@@ -1,0 +1,464 @@
+name: Scheduled Task Creation Masquerading as System Processes
+id: 1aa8d583-7865-4b82-a199-a0e2993eaefe
+description: |
+  Detects creation of a scheduled task via schtasks.exe (by image name or PE OriginalFileName) whose command line contains
+  the /create switch together with the name of a core Windows system process (svchost, lsass, services, winlogon, explorer,
+  rundll32, and similar). Naming a task or its run-as target after a trusted system process is a masquerading technique used
+  to blend persistence into the normal task inventory; the same pattern also appears in legitimate administration when a task
+  is built to wrap or restart a system component. The investigation should decode the task's full configuration (name,
+  trigger, run-as account, and the command it executes), confirm whether the task is still registered, and determine whether
+  the activity was authorized.
+type: detection
+detection_id: 9f8573c9-22b4-40e3-89c1-72bc2b8d49ab
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- question: Does the schtasks command line contain /create together with a system-process name this rule matches?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule fires only when schtasks.exe
+    (by image name or PE OriginalFileName) runs with the /create switch AND the command line references a core system-process
+    name such as svchost, lsass, services, winlogon, explorer, rundll32, or msiexec. Read the exact command line and verify
+    both conditions are present rather than an incidental substring match.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to create scheduled tasks that wrap or restart system processes?
+  context: Legitimate administrative activity can trigger this detection. Knowing whether the user role and host function are
+    consistent with hands-on scheduled-task creation referencing system components is often the fastest path to distinguishing
+    routine maintenance from masquerading persistence. Direct command-line schtasks use on a user workstation by a non-admin
+    is more notable than the same on a managed server during a maintenance window.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What scheduled task was created, and what command does it execute? Identify the task name, run-as account, and trigger.
+  context: The schtasks command line carries the full task definition. Identify the task name (/TN), the command or program
+    to run (/TR), the schedule type (/SC, such as ONLOGON, MINUTE, or DAILY), and the run-as account (/RU). A task running as
+    SYSTEM or at logon/startup is higher-risk. The /TR value is the persistence payload -- often a script, binary, or a
+    download cradle wrapped in cmd or powershell. Note whether the task name itself imitates a system process.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Is the task's command (/TR) encoded or obfuscated, and what does the decoded content do?
+  context: 'Operators frequently hide the payload inside the /TR value. Common encodings: base64 (powershell -EncodedCommand,
+    certutil -decode), hex, character concatenation (set-variable chains assembled at runtime), environment-variable
+    substitution, and caret or backtick escaping. Decoding reveals the real intent -- download cradle, reverse shell,
+    in-memory loader, or credential access. Iterate decoding for multi-layer payloads until the command is readable.'
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What is the actual identity of the schtasks binary based on its metadata and hash?
+  context: The rule matches either the image name or the PE OriginalFileName, so a renamed copy of schtasks.exe also fires.
+    Compare the Image path on disk against the embedded OriginalFileName and confirm the binary is the Microsoft-signed
+    System32 schtasks.exe rather than a renamed or relocated copy. The file hash enables a reputation lookup to confirm it is
+    the genuine tool and not a tampered build.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Hashes
+- question: Was schtasks.exe executed from its expected System32 path?
+  context: The legitimate scheduler client lives in C:\Windows\System32 (and SysWOW64). A schtasks.exe running from a user
+    temp directory, AppData, or another non-standard location suggests the binary was copied or relocated to evade path-based
+    allowlisting, which combined with the system-process masquerade raises the likelihood of deliberate evasion.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- question: What process spawned this schtasks invocation, and is that parent chain expected?
+  context: The parent process reveals how the task creation was driven. Interactive administration typically descends from
+    explorer.exe or a console shell; scripted deployment descends from a management agent or installer. Unusual parents such
+    as mshta.exe, wscript.exe, an Office application, or a browser child point to exploitation or a malicious script rather
+    than routine administration.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Does the Security log show a task-registration event for this task, and what user and task content does it record?
+  context: Task creation through schtasks.exe, the COM Task Scheduler API, or PowerShell all converge on a task-registration
+    event in the Security log (event ID 4698) that records the registering account and the serialized task definition,
+    including the action and trigger. This is an independent record of the same task and surfaces a creation path that did not
+    go through a visible schtasks command line. If Security task-creation auditing is not enabled in this environment, treat
+    zero results as a visibility gap rather than evidence the task was not registered.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      service: security
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4698
+      condition: selection
+    fields:
+      - TaskName
+      - SubjectUserName
+      - TaskContent
+- question: When is the task scheduled to run, and has it already executed via the Task Scheduler service?
+  context: The trigger schedule determines when the persistence activates. Tasks set for boot or logon fire on the next
+    restart; recurring tasks (every few minutes, daily) may have already run multiple times. Scheduled tasks execute as
+    children of the Task Scheduler service hosted in svchost.exe, so processes spawned by that service after task creation
+    indicate the payload has already run.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: '\svchost.exe'
+        ParentCommandLine|contains: 'Schedule'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Is the scheduled task still registered on the system?
+  context: Persistence is only effective if the task still exists. Some operators delete a task after execution to reduce
+    forensic artifacts. Confirming the task is still present -- via schtasks /query /tn <taskname> /v or the Task Scheduler
+    interface on the host -- determines whether the persistence mechanism is active and requires remediation.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \schtasks.exe
+      - OriginalFileName: schtasks.exe
+      selection_cli:
+        CommandLine|contains|windash: ' /create '
+        CommandLine|contains:
+        - ' audiodg'
+        - ' conhost'
+        - ' dwm.exe'
+        - ' explorer'
+        - ' lsass'
+        - ' lsm'
+        - ' mmc'
+        - ' msiexec'
+        - ' regsvr32'
+        - ' rundll32'
+        - ' services'
+        - ' spoolsv'
+        - ' svchost'
+        - ' taskeng'
+        - ' taskhost'
+        - ' wininit'
+        - ' winlogon'
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \schtasks.exe
+      - OriginalFileName: schtasks.exe
+      selection_cli:
+        CommandLine|contains|windash: ' /create '
+        CommandLine|contains:
+        - ' audiodg'
+        - ' conhost'
+        - ' dwm.exe'
+        - ' explorer'
+        - ' lsass'
+        - ' lsm'
+        - ' mmc'
+        - ' msiexec'
+        - ' regsvr32'
+        - ' rundll32'
+        - ' services'
+        - ' spoolsv'
+        - ' svchost'
+        - ' taskeng'
+        - ' taskhost'
+        - ' wininit'
+        - ' winlogon'
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or coordinated activity across endpoints. If
+    the same user created similar tasks or ran related tooling on multiple hosts, the scope of the activity is broader than a
+    single endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \schtasks.exe
+      - OriginalFileName: schtasks.exe
+      selection_cli:
+        CommandLine|contains|windash: ' /create '
+        CommandLine|contains:
+        - ' audiodg'
+        - ' conhost'
+        - ' dwm.exe'
+        - ' explorer'
+        - ' lsass'
+        - ' lsm'
+        - ' mmc'
+        - ' msiexec'
+        - ' regsvr32'
+        - ' rundll32'
+        - ' services'
+        - ' spoolsv'
+        - ' svchost'
+        - ' taskeng'
+        - ' taskhost'
+        - ' wininit'
+        - ' winlogon'
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: When this host has previously fired this rule's pattern, what parents and users drove it, and does the current alert fit?
+  context: Even routine schtasks use can be abused. The query mirrors the rule's selection structure scoped to this host, so
+    the resulting parent and user distribution reflects how this specific masquerade-task pattern has historically run here.
+    A new parent process, an unexpected user account, or an unusual command-line structure is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \schtasks.exe
+      - OriginalFileName: schtasks.exe
+      selection_cli:
+        CommandLine|contains|windash: ' /create '
+        CommandLine|contains:
+        - ' audiodg'
+        - ' conhost'
+        - ' dwm.exe'
+        - ' explorer'
+        - ' lsass'
+        - ' lsm'
+        - ' mmc'
+        - ' msiexec'
+        - ' regsvr32'
+        - ' rundll32'
+        - ' services'
+        - ' spoolsv'
+        - ' svchost'
+        - ' taskeng'
+        - ' taskhost'
+        - ' wininit'
+        - ' winlogon'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Have other hosts fired this rule's pattern in the past week, and does the distribution look like automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of this
+    masquerade-task pattern rather than generic schtasks usage. Many hosts firing the same pattern points to scripted
+    deployment or vendor automation; one host or a small unrelated set points to manual operator activity. Use the host
+    distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \schtasks.exe
+      - OriginalFileName: schtasks.exe
+      selection_cli:
+        CommandLine|contains|windash: ' /create '
+        CommandLine|contains:
+        - ' audiodg'
+        - ' conhost'
+        - ' dwm.exe'
+        - ' explorer'
+        - ' lsass'
+        - ' lsm'
+        - ' mmc'
+        - ' msiexec'
+        - ' regsvr32'
+        - ' rundll32'
+        - ' services'
+        - ' spoolsv'
+        - ' svchost'
+        - ' taskeng'
+        - ' taskhost'
+        - ' wininit'
+        - ' winlogon'
+      condition: all of selection_*
+    fields:
+    - host.name
+- question: Were other process-based persistence mechanisms installed on this host around the same time?
+  context: Operators rarely rely on a single persistence mechanism. After establishing one foothold they commonly install
+    backups using different techniques -- additional scheduled tasks, services, registry Run keys, BITS jobs, or WMI
+    subscriptions. Multiple persistence installations in the same timeframe indicate intentional stacking rather than an
+    isolated administrative action.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host -- defense tampering, reconnaissance, or
+    credential access -- may reveal the stages that preceded the task creation and help reconstruct the timeline. Defense
+    tampering and credential access often precede the installation of persistence.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

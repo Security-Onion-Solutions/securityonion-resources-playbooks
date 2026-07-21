@@ -1,0 +1,422 @@
+name: CreateDump Process Dump
+id: 03554a1b-e995-42ff-a3b6-88810da2c819
+description: |
+  Detects use of createdump.exe — a native utility shipped with the .NET Core / .NET 5+
+  runtime for capturing core dumps of crashed .NET processes — invoked with dump flags.
+  The rule fires when the image name ends in createdump.exe OR the PE OriginalFilename
+  metadata is the createdump internal-name string (catching renamed copies), AND the
+  command line carries a dump flag (-u, --full, -f, --name, or a .dmp output path).
+  Legitimate use is rare and usually tied to .NET application crash diagnostics; pointed at
+  a non-.NET process such as lsass.exe with the right flags it produces a full memory dump
+  containing credentials. The investigation should confirm the real identity of the binary,
+  identify what process was dumped and where the dump landed, and determine whether the
+  account and host had any reason to capture process memory.
+type: detection
+detection_id: 515c8be5-e5df-4c5e-8f6d-a4a2f05e4b48
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does the alert match the rule — createdump.exe (by image name or PE OriginalFilename) running with a dump flag such as -u, --full, -f, --name, or a .dmp output path?
+  context: Before investing investigation time, confirm the alert is a true positive. The
+    rule requires both halves to be true. The binary must be createdump.exe by image name or
+    by its embedded OriginalFilename metadata (which also catches a renamed copy), and the
+    command line must carry at least one dump flag. Read the full command line and note which
+    flag fired and what target process or output path it references.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to capture process memory dumps?
+  context: Capturing a process memory dump is a developer or support task tied to .NET crash
+    diagnostics, and createdump.exe is normally only present where a recent .NET runtime is
+    installed. A dump invocation under a developer account on a build or application host is
+    far less concerning than the same activity under a standard user, a service account, or
+    on a server with no .NET workload. Knowing the account role and host function is often
+    the fastest path to separating a true positive from sanctioned diagnostics.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What is the actual identity of this binary based on its metadata and hash?
+  context: createdump.exe is frequently renamed (for example to cdump.exe) so a name-based
+    detection misses it; the rule still fires on the PE OriginalFilename metadata even when
+    the on-disk name differs. Compare the Image path against OriginalFilename to reveal the
+    true tool, and check the signing party — a genuine copy is Microsoft-signed and ships
+    with the .NET runtime. The file hash enables a reputation lookup to confirm whether this
+    is the stock runtime binary, a known-abused copy, or a novel sample.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Hashes
+- question: What process did createdump.exe target, and was its memory successfully dumped?
+  context: createdump.exe dumps the memory of a target process. Pointed at lsass.exe it
+    produces a full dump containing credentials extractable offline; pointed at a normal
+    .NET application it is routine crash diagnostics. Read the command line to identify the
+    target — a PID or process name following -u, --name, or -f — and the output. Common
+    LSASS-dumping syntax across tools includes rundll32 with comsvcs.dll MiniDump, procdump,
+    and Invoke-Mimikatz; here the relevant marker is createdump pointed at a non-.NET
+    process, which reveals credential-theft intent rather than diagnostics.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Did the createdump process or a process it spawned write a dump-like artifact to disk, consistent with a full-access read of lsass.exe memory?
+  context: Memory-dumping tools must open a handle into the target process before reading its
+    memory, but that handle open is not observable here - this data source carries no
+    cross-process access telemetry, so a zero result does not mean LSASS was not read; it only
+    means the createdump process tree did not drop a dump file. Any dump-like artifact written
+    by createdump.exe or its children is the one indirect signal available that the invocation
+    actually reached into a target process's memory rather than exiting before capturing it.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Where was the memory dump written, and what process created the dump file?
+  context: createdump writes its output to a file, and the dump artifact is the recoverable
+    evidence of credential theft even after the process exits. Operators commonly drop dumps
+    into user-writable or temp locations such as %TEMP% and C:\Windows\Temp, then compress
+    and remove them. A file-creation event for a .dmp written by createdump.exe ties the
+    dump to the binary; a dump of LSASS in a temp path is a strong credential-access signal.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection_file:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains:
+          - '.dmp'
+      selection_path:
+        TargetFilename|contains:
+          - '\Temp\'
+          - '\AppData\'
+          - '\ProgramData\'
+          - '\Users\Public\'
+          - '\Windows\Temp\'
+      condition: selection_file and selection_path
+    fields:
+      - TargetFilename
+      - Image
+- question: What process spawned createdump.exe, and is that parent chain expected?
+  context: The parent process reveals how the dump was invoked. Legitimate diagnostics are
+    usually launched interactively (a shell under explorer.exe) or by a build/CI agent.
+    Unusual parents — a web service such as a Java or Tomcat process, a script host, or an
+    Office application — point to exploitation of a server-side process or hands-on-keyboard
+    activity rather than developer crash analysis. Allowlist known legitimate tooling and
+    chase any parent that is new for this binary on this host.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: How did this createdump.exe binary arrive on the host, and from what location?
+  context: A genuine createdump.exe is placed by a .NET runtime installer into a versioned
+    runtime directory; a copy dropped into a user-writable path, or a renamed copy, was
+    delivered for abuse. Tracing the file-creation event by basename over a long window
+    reveals the delivery mechanism — a download tool, an archive extraction, a manual copy,
+    or lateral movement from another host. The creating process in the file event identifies
+    the dropper or installer; a copy outside the expected runtime install paths is the signal.
+  range: -30d
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains|expand: '%file_name%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: What did createdump.exe do after execution, and is the same binary present on other hosts?
+  context: The point of renaming a tool is to perform its function while evading name-based
+    detection. Examining the child processes, file writes, and network activity that followed
+    the dump reveals the operator's objective — compression of the dump for exfiltration,
+    follow-on credential use, or cleanup. The same renamed binary appearing on multiple hosts
+    suggests deliberate distribution rather than an isolated event.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Were outbound remote-access connections (RDP, SMB, WinRM, SSH) initiated from this host after
+    this event?
+  context: Credential theft is typically followed by lateral movement. The query returns outbound connections
+    from this host to remote-access ports -- 3389 (RDP), 445 (SMB/PsExec), 5985/5986 (WinRM), 22 (SSH)
+    -- in the hours after the event; the originating Image and User show what drove each connection. Two
+    limits to keep in mind -- credentials exfiltrated and replayed from another machine will not appear
+    here (check security 4624 logons on suspected targets for this account and any accounts with sessions
+    on this host), and the query requires Sysmon network telemetry (EID 3); if that is not collected from
+    this host, treat zero rows as a visibility gap, not as evidence no movement occurred.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
+- question: Which accounts may be exposed by this dump, and do any have elevated privileges?
+  context: The severity of an LSASS dump depends on what was logged on to the host at dump
+    time. Any account with an active session or cached credential on the machine is
+    potentially exposed; domain admin, service, or other privileged credentials require
+    incident escalation and credential rotation, while a single standard-user session may
+    only need monitoring. Cross-reference the active sessions and the alerting account with
+    directory group memberships.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: When this host has previously fired the createdump dump pattern, what parents and users normally drive it, and does the current alert fit?
+  context: Even legitimately installed tools can be abused. This query mirrors the rule's full
+    selection structure scoped to this host, so the resulting parent and user distribution
+    reflects how the rule's specific firing pattern — not generic binary presence — has run
+    here historically. A new parent process, an unexpected account, or an unusual command-line
+    pattern compared with that history is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \createdump.exe
+      - OriginalFileName: FX_VER_INTERNALNAME_STR
+      selection_cli:
+        CommandLine|contains:
+        - ' -u '
+        - ' --full '
+        - ' -f '
+        - ' --name '
+        - '.dmp '
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Have other hosts fired the createdump dump pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: This query mirrors the rule's selection structure with no host scope, producing a
+    fleet-wide count of the rule's firing pattern rather than generic presence of the binary.
+    Many hosts firing the same pattern points to scripted deployment or a diagnostics tool
+    rolled out widely; one host or a small unrelated set points to manual operator activity.
+    Use the host distribution and parent/binary consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \createdump.exe
+      - OriginalFileName: FX_VER_INTERNALNAME_STR
+      selection_cli:
+        CommandLine|contains:
+        - ' -u '
+        - ' --full '
+        - ' -f '
+        - ' --name '
+        - '.dmp '
+      condition: all of selection_*
+    fields:
+    - host.name
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \createdump.exe
+      - OriginalFileName: FX_VER_INTERNALNAME_STR
+      selection_cli:
+        CommandLine|contains:
+        - ' -u '
+        - ' --full '
+        - ' -f '
+        - ' --name '
+        - '.dmp '
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \createdump.exe
+      - OriginalFileName: FX_VER_INTERNALNAME_STR
+      selection_cli:
+        CommandLine|contains:
+        - ' -u '
+        - ' --full '
+        - ' -f '
+        - ' --name '
+        - '.dmp '
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the environment around this time?
+  context: Tracking the account's activity across all hosts in the surrounding window reveals
+    lateral movement or coordinated activity on multiple endpoints. If the same user triggered
+    credential-access or related activity elsewhere, the scope is larger than this one host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \createdump.exe
+      - OriginalFileName: FX_VER_INTERNALNAME_STR
+      selection_cli:
+        CommandLine|contains:
+        - ' -u '
+        - ' --full '
+        - ' -f '
+        - ' --name '
+        - '.dmp '
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - host.name

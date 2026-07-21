@@ -1,0 +1,403 @@
+name: Renamed Gpg.EXE Execution
+id: a67cdc8f-735e-4c7f-a0a5-79f942386cda
+description: |
+  Detects a process whose embedded PE metadata identifies it as gpg.exe (OriginalFileName gpg.exe) while the on-disk
+  image name is not gpg.exe or gpg2.exe — a renamed GnuPG binary. The rule fires when the OriginalFileName matches AND the
+  image is not the canonical gpg.exe/gpg2.exe filename. Legitimately this can occur with wrapper deployments or repackaged
+  GnuPG installs; maliciously, encrypter Trojans ship a renamed gpg.exe plus a public-key file and call it to perform
+  OpenPGP file encryption (a well-vetted crypto implementation with no recovery bugs) over victim data. Determine whether
+  this binary performed bulk file encryption, what data it targeted, and whether recovery-inhibiting or destructive actions
+  accompanied it.
+type: detection
+detection_id: ec0722a3-eb5c-4a56-8ab2-bf6f20708592
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- question: Does the alerting process carry the gpg.exe OriginalFileName while running under a non-gpg image name?
+  context: Confirm the alert is a true positive by reviewing the triggering event. The rule fires when the embedded
+    OriginalFileName is gpg.exe AND the on-disk image name is neither gpg.exe nor gpg2.exe. A renamed GnuPG binary shows
+    this mismatch directly between its metadata and the name it runs under.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - OriginalFileName
+- question: Is this user and host expected to run OpenPGP encryption tooling?
+  context: Legitimate use of GnuPG exists for signing, encrypting mail, or protecting backups, and some software bundles a
+    renamed gpg binary. Knowing whether the user role and host function involve OpenPGP encryption is often the fastest way
+    to separate a routine wrapper deployment from operator-driven file encryption.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What is the actual identity of this binary based on its metadata, signature, and hash?
+  context: When a binary is renamed, the PE metadata (OriginalFileName) and code-signing details still reflect the original
+    tool. Compare the Image path on disk against OriginalFileName, and check the signing party and signature status — a
+    genuine GnuPG build is signed by the GnuPG project or a repackager, while a tampered or unsigned binary is not. The file
+    hash enables reputation lookups to determine whether this is a known GnuPG build, a known encrypter sample, or a novel
+    binary requiring deeper analysis.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Hashes
+- question: What did this renamed gpg binary actually do? Decode its full command line.
+  context: The full command line reveals whether this invocation performed encryption. Decode the flags and file arguments —
+    --encrypt, --recipient, --batch, --yes, --symmetric, --passphrase, and -c all point to OpenPGP encryption of data, and
+    a recipient public-key identifier with looping over many victim files is the encrypter pattern. The CurrentDirectory and
+    file arguments show what data the operation targeted.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        OriginalFileName: gpg.exe
+      filter_main_img:
+        Image|endswith:
+        - \gpg.exe
+        - \gpg2.exe
+      condition: selection and not filter_main_img
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: Were OpenPGP encryption flags or mass-file arguments present in the gpg invocation?
+  context: Encrypter use of GnuPG centers on a small set of flags — --encrypt, --recipient, --symmetric, --passphrase, -c,
+    --batch, and --yes — often combined with recursion or scripting over many files in user-data directories. Presence of
+    these flags, especially a --recipient pointing at an embedded or fetched public key combined with --batch/--yes
+    automation, distinguishes bulk file encryption from a one-off interactive sign or verify.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        OriginalFileName: gpg.exe
+        CommandLine|contains:
+          - '--encrypt'
+          - '--recipient'
+          - '--symmetric'
+          - '--passphrase'
+          - '--batch'
+          - '--yes'
+          - ' -c '
+          - ' -e '
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - User
+- question: What files or directories did this binary read or write during the operation?
+  context: The file events from this process reveal what data the encryption touched — specific document types, user
+    document folders, network shares, or broad recursive paths indicating bulk encryption. The set of targeted files and
+    directories determines the severity of potential data loss and which business units are affected.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - EventType
+- question: Did file writes on this host produce non-standard or newly-created file extensions in bulk?
+  context: Encryption for impact typically rewrites victim files with non-standard or randomly generated extensions and
+    drops ransom notes alongside them. Look at file-creation activity in user document folders, network shares, and system
+    paths for a wave of writes carrying uncommon extensions or note filenames — that pattern confirms encryption has begun
+    and shows how far it has progressed.
+  range: +30m
+  query: |
+    aggregation: true
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - EventType
+- question: How many file writes did this binary perform, and were they concentrated within a short window?
+  context: Bulk encryption shows up as a high count of file writes and renames clustered within seconds-to-minutes rather
+    than spread evenly. Aggregating this binary's file events by the host shows the burst volume — a rapid, high-count burst
+    is consistent with mass encryption, while a handful of writes spread over time is more consistent with routine signing
+    or a single-file operation.
+  range: +1h
+  query: |
+    aggregation: true
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+      - EventType
+- question: How did this renamed gpg binary arrive on the host?
+  context: A renamed binary does not appear spontaneously — it was copied, downloaded, or dropped by a parent process.
+    Tracing the file-creation event for the binary by its basename over a long window reveals the delivery mechanism — a
+    download tool, an installer, a malware dropper, or a copy from another host. A drop into a user-writable path such as
+    AppData, Temp, ProgramData, or a public directory points to operator delivery rather than a managed install.
+  range: -30d
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains|expand: '%file_name%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: What process spawned this binary, and is that parent chain expected?
+  context: The parent process reveals how the binary was invoked. A script host, a remote-execution service, an archive
+    utility, or an unknown dropper as parent points to automated or operator-driven execution, while a managed installer or
+    interactive shell launched by the user is more consistent with legitimate GnuPG use.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: When this host has previously fired this rule's pattern, what parents and users drove it, and does the current
+    alert fit?
+  context: Even a legitimately deployed wrapper can produce this alert repeatedly. The query mirrors the rule's selection
+    scoped to this host, so the parent/user distribution reflects how the rule's specific firing pattern has historically
+    run here. A new parent process, an unexpected user account, or a first-time appearance is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        OriginalFileName: gpg.exe
+      filter_main_img:
+        Image|endswith:
+        - \gpg.exe
+        - \gpg2.exe
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        OriginalFileName: gpg.exe
+      filter_main_img:
+        Image|endswith:
+        - \gpg.exe
+        - \gpg2.exe
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        OriginalFileName: gpg.exe
+      filter_main_img:
+        Image|endswith:
+        - \gpg.exe
+        - \gpg2.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals whether the same account drove similar activity elsewhere.
+    If the same user triggered comparable encryption or staging activity on multiple endpoints, the scope of compromise may
+    be larger than this host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        OriginalFileName: gpg.exe
+      filter_main_img:
+        Image|endswith:
+        - \gpg.exe
+        - \gpg2.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+- question: What recovery-inhibiting commands were executed on this host?
+  context: 'Encrypter operators chain recovery-inhibiting commands around the encryption phase: deleting shadow copies
+    (vssadmin, wmic), disabling boot recovery (bcdedit), deleting backups (wbadmin), and disabling the Windows Recovery
+    Environment (reagentc). This query surfaces those commands on the host, revealing the scope of recovery destruction.
+    Verify whether each action succeeded by checking system state with vssadmin list shadows, bcdedit /enum, and reagentc
+    /info.'
+  range: +24h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_recovery:
+        Image|endswith:
+          - '\vssadmin.exe'
+          - '\wmic.exe'
+          - '\bcdedit.exe'
+          - '\wbadmin.exe'
+          - '\reagentc.exe'
+          - '\diskshadow.exe'
+      selection_cmdline:
+        CommandLine|contains:
+          - 'delete shadows'
+          - 'shadowcopy delete'
+          - 'recoveryenabled'
+          - 'bootstatuspolicy'
+          - 'delete catalog'
+          - 'delete systemstatebackup'
+          - 'boot.ini'
+          - 'winre.wim'
+          - '/disable'
+      condition: selection and (selection_recovery or selection_cmdline)
+    fields:
+      - Image
+      - CommandLine
+- question: Is this same renamed-gpg detection firing on other hosts in the environment?
+  context: Encryption for impact often executes across many hosts simultaneously or in rapid succession. Finding this same
+    detection on multiple hosts indicates network-wide execution and determines the scope for containment and incident
+    response.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        rule.uuid|expand: '%rule_uuid%'
+      condition: selection
+    fields:
+      - host.name
+      - rule.name
+      - event.severity_label
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance,
+    credential access, or recovery destruction — may reveal the attack stages that preceded encryption and help reconstruct
+    the timeline. Defense tampering and credential access often precede impact.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

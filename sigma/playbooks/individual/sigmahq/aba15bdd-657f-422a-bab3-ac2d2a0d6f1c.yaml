@@ -1,0 +1,449 @@
+name: Potentially Suspicious DMP/HDMP File Creation
+id: 14d93661-6811-4eb9-afcc-4681eaaba5bc
+description: |
+  Detects a shell or scripting interpreter (cmd.exe, cscript.exe, mshta.exe, powershell.exe,
+  pwsh.exe, or wscript.exe) creating a file whose name ends in .dmp, .dump, or .hdmp. The rule fires
+  only when both conditions hold together: the writing process is one of those interpreters AND the
+  written file carries a dump extension. Crash and memory dumps are produced legitimately by Windows
+  Error Reporting and by software during a fault, but a memory dump can also contain plaintext or
+  hashed credentials, tickets, and keys - which makes a dump written by a scripting host, rather than
+  by the crashing application or a debugger, worth checking as possible credential access. Determine
+  which interpreter wrote the file, what its command line did, which process the dump captured, whether
+  the file is still retrievable, and whether the write fits normal activity for this host and user.
+type: detection
+detection_id: aba15bdd-657f-422a-bab3-ac2d2a0d6f1c
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-10
+questions:
+- question: Was a .dmp, .dump, or .hdmp file created by one of the listed shell or scripting interpreters?
+  context: >-
+    Before investing investigation time, confirm the alert is a true positive. The rule fires only when
+    the writing process is cmd.exe, cscript.exe, mshta.exe, powershell.exe, pwsh.exe, or wscript.exe AND
+    the created file ends in .dmp, .dump, or .hdmp. Review the exact TargetFilename, the operation type,
+    and the responsible Image on the triggering event to confirm a scripting host wrote the dump rather
+    than the crashing application itself or a debugger.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - Image
+      - TargetFilename
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this user and host expected to produce memory or crash dumps through a scripting interpreter?
+  context: >-
+    Legitimate crash dumps are usually written by the faulting application or by Windows Error Reporting,
+    not by a script host, so knowing whether the account and host function have a routine reason to dump
+    process memory this way is often the fastest way to separate sanctioned diagnostics or automation from
+    credential-access activity. User attribution is present on roughly 94% of endpoint file events; when it
+    is a machine account or SYSTEM, judge by the writing process and the host role instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: What did the interpreter that created this dump do? Decode its full command line.
+  context: >-
+    The file event carries no command line, so pivot by ProcessGuid to the writing process's execution
+    record and read the arguments. Decode any flags, encoded content, process identifiers, or output paths:
+    a command that names a running process such as lsass.exe, references a minidump routine, or points a
+    debugger or dump utility at live memory reframes the write as deliberate credential access rather than
+    a crash artifact. The working directory shows where the dump landed and from where the tool ran. This
+    is scoped to the exact writing instance because cmd.exe and powershell.exe are too common to scope by
+    binary and host alone.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: If the interpreter was PowerShell, was the command encoded or obfuscated, and what does it decode to?
+  context: >-
+    When the writing interpreter is powershell.exe or pwsh.exe, attackers frequently pass the dump logic
+    through -EncodedCommand (-enc), string concatenation, backtick escaping, or variable substitution to
+    hide that they are reading another process's memory. Base64-encoded commands are the most common form;
+    decoding reveals the actual payload, including which process is being dumped and where the output is
+    written. If the interpreter is a non-PowerShell host, the plain command line from the mechanism decode
+    is already the ground truth.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Which process does this dump capture, and does it contain credential material?
+  context: >-
+    A dump's value to an attacker is what process memory it holds. A dump of lsass.exe or another
+    security-relevant process can contain plaintext or hashed credentials, Kerberos tickets, and keys,
+    while a dump of an ordinary application is more likely a genuine crash artifact. Retrieve the file from
+    its on-disk path and inspect the captured process name, the file size, and embedded strings; content
+    analysis of a memory dump requires manual retrieval from the endpoint, as the file write itself carries
+    no readable payload in this telemetry.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: Did PowerShell script block logging capture the full script that produced the dump?
+  context: >-
+    Script block logging records the deobfuscated script content PowerShell actually executes, even when
+    the command line is encoded or obfuscated, giving ground truth about how the dump was produced and
+    which process was targeted. If PowerShell operational logs are not ingested in this environment, treat
+    zero results as a visibility gap rather than evidence that nothing ran, and fall back to decoding the
+    encoded command from the writing process's arguments.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Is the dump file still on disk, or was it deleted or renamed after the alert?
+  context: >-
+    The dump's post-alert lifecycle drives both urgency and next steps. A dump still on disk can be
+    retrieved, hashed, and examined for credential material; a dump deleted or renamed seconds after
+    creation suggests the operator staged the memory, extracted what they needed, and cleaned up, and
+    shifts the focus to what read or exfiltrated the file in between. Interpret the operation type to
+    distinguish a lingering artifact from a cleanup signature.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What process launched the interpreter that wrote the dump, and is that parent chain expected?
+  context: >-
+    The file event carries no parent details, so pivot by ProcessGuid to the writing process's execution
+    record to read its parent Image and command line. A scripting host launched by explorer.exe for a
+    hands-on user or by a management agent has a predictable lineage; a launch from an Office application,
+    a browser, mshta.exe, wscript.exe, or an unsigned binary points to the dump being produced
+    programmatically as part of an intrusion rather than by deliberate administration.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+      - ParentCommandLine
+- question: What other files did the responsible process write or delete around the alert?
+  context: >-
+    A process that dumps one process's memory often touches several files - dumping multiple processes,
+    staging output for exfiltration, or dropping supporting tooling. The breadth, paths, and extensions of
+    the writing process's other file activity distinguish a single diagnostic dump from a collection run in
+    progress and enumerate what else needs review. The correlation covers the writer and its direct
+    children, since a script often delegates the actual write.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What other dump files have been written on this host recently, and by which processes?
+  context: >-
+    The rule pins a dump extension rather than a directory, so the useful location context is other dump
+    files arriving on the same host. A cluster of .dmp or .hdmp files written by an unfamiliar process, or
+    repeated dumps of the same process, points to an active collection effort rather than an isolated crash;
+    a single dump written by a known diagnostic tool is more benign. The aggregation groups by path and
+    writing process so an unfamiliar writer across many dump files stands out.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith:
+          - .dmp
+          - .dump
+          - .hdmp
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: Has this dump file been written before on this host?
+  context: >-
+    A dump path that has never appeared on this host is more suspicious than one written on a regular
+    cadence. Zero or very low historical counts indicate a first-time or rare write, while a recurring
+    write to the same dump path points to a scheduled diagnostic or a management process. Compare the
+    writing process across the history to see whether the same interpreter has produced this file before.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: When this host has previously produced this dump-write pattern, what programs and users drove it, and does the current alert fit?
+  context: >-
+    Even routine diagnostic tooling can produce dumps, so the meaningful comparison is against
+    this host's own history of the rule's exact pattern - a scripting interpreter writing a dump
+    extension - rather than generic use of the binary. The resulting program and user
+    distribution reflects how this specific firing pattern has run here before; a new acting
+    program, an unexpected account, or a first-time appearance is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        Image|endswith:
+        - \cmd.exe
+        - \cscript.exe
+        - \mshta.exe
+        - \powershell.exe
+        - \pwsh.exe
+        - \wscript.exe
+        TargetFilename|endswith:
+        - .dmp
+        - .dump
+        - .hdmp
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - Image
+    - User
+- always_include: true
+  question: Has this user produced this dump-write pattern before, and does that history fit their role?
+  context: >-
+    Scoped to the alerting user, this shows their 90-day history of the rule's specific pattern - a
+    scripting host writing a dump extension - aggregated by host, rather than generic use of the binary. A
+    user who has never produced this pattern is more suspicious than one who does so regularly; weigh the
+    count against whether the account belongs to someone who legitimately captures process memory as part
+    of their work.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        Image|endswith:
+        - \cmd.exe
+        - \cscript.exe
+        - \mshta.exe
+        - \powershell.exe
+        - \pwsh.exe
+        - \wscript.exe
+        TargetFilename|endswith:
+        - .dmp
+        - .dump
+        - .hdmp
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: Has this program historically driven this dump-write pattern, or is the program new for this activity?
+  context: >-
+    When the alert fires under a service or machine account, user identity does not attribute the behavior;
+    the launch mechanism does. Scoped to the alerting program, this shows the 90-day history of that
+    program driving the rule's specific pattern - a scripting host writing a dump extension - aggregated by
+    host. A program that already accounts for many prior writes is vendor or operating-system automation; a
+    new or rare program for this pattern is the deviation worth chasing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        Image|endswith:
+        - \cmd.exe
+        - \cscript.exe
+        - \mshta.exe
+        - \powershell.exe
+        - \pwsh.exe
+        - \wscript.exe
+        TargetFilename|endswith:
+        - .dmp
+        - .dump
+        - .hdmp
+      _pb_scope:
+        Image|endswith|expand: '%Image%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: What else did this user do across the environment around the time of the alert?
+  context: >-
+    Tracking the user's activity across all hosts in a tight window reveals whether the dump write is
+    isolated or part of broader hands-on activity. If the same account triggered related activity on several
+    endpoints, the scope of the operation is wider than one host and may indicate credential reuse or lateral
+    movement following the memory capture.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- always_include: true
+  question: Did this same program-driven dump-write pattern fire on other hosts in the same window?
+  context: >-
+    Under a service or machine account, network-wide user activity is agent-telemetry noise, so the
+    meaningful question is whether the same launch mechanism produced this pattern elsewhere at the same
+    time. Scoped to the alerting program fleet-wide in the alert window, multiple hosts point to
+    scheduled or pushed automation, while a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        Image|endswith:
+        - \cmd.exe
+        - \cscript.exe
+        - \mshta.exe
+        - \powershell.exe
+        - \pwsh.exe
+        - \wscript.exe
+        TargetFilename|endswith:
+        - .dmp
+        - .dump
+        - .hdmp
+      _pb_scope:
+        Image|endswith|expand: '%Image%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    A dump write rarely happens in isolation. Aggregating process activity in a tight window around the
+    alert surfaces what led up to the write and what ran immediately after - reconnaissance, a credential-
+    access tool, or staging and exfiltration utilities. Novel parent-child pairs stand out at low counts
+    against high-count routine telemetry, which is what points to the tooling behind the memory capture.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host - reconnaissance, defense tampering, or execution of scripting
+    tools - may reveal the stages that preceded the dump write and help reconstruct the timeline. Memory
+    dumping for credential access is typically a mid-chain action, so prior alerts help place this write
+    within a larger sequence rather than treating it as a standalone event.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

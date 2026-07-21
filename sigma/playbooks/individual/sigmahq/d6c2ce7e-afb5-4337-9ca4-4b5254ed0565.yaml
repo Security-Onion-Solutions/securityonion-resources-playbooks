@@ -1,0 +1,375 @@
+name: WinSock2 Autorun Keys Modification
+id: 3739e089-c126-4c90-b8e0-6a0828f89df0
+description: |
+  Detects modification of the WinSock2 Parameters catalog entries under
+  System\CurrentControlSet\Services\WinSock2\Parameters, an autostart extensibility
+  point (ASEP). The rule fires when a registry value is written to the WinSock2
+  Parameters base tree AND to either a Protocol_Catalog9\Catalog_Entries or a
+  NameSpace_Catalog5\Catalog_Entries subkey, and the change is not an empty value or
+  driven by MsiExec. Registering a Layered Service Provider (LSP) or namespace provider
+  points the catalog at a DLL that Windows loads into processes that use the network
+  stack, giving both persistence and code injection into networking processes. Legitimate
+  installers and network/security software register providers here, so the investigation
+  should determine which process wrote the entry, decode the provider path in the value
+  data, confirm the referenced DLL on disk, and check whether it loaded.
+type: detection
+detection_id: d6c2ce7e-afb5-4337-9ca4-4b5254ed0565
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-10
+questions:
+- question: Does the modified key sit under the WinSock2 Parameters catalog and was it written by a non-installer process?
+  context: >-
+    Confirm the alert is a true positive before investing time. The rule fires when the
+    modified key path (TargetObject) is under \System\CurrentControlSet\Services\WinSock2\Parameters
+    AND targets either a \Protocol_Catalog9\Catalog_Entries or a \NameSpace_Catalog5\Catalog_Entries
+    subkey, with the writing process not being MsiExec.exe and the value not empty. Review the
+    exact key path and the writing process in the triggering event against those criteria.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Is this user and host expected to register a WinSock provider?
+  context: >-
+    Provider registration under the WinSock2 catalog is normally performed by installers
+    for VPN clients, endpoint/network security agents, and similar network software, not by
+    interactive users or ad-hoc scripts. The rule already excludes MsiExec-driven writes, so
+    the writing process here is something other than the standard installer path. Knowing whether
+    the user role and host function fit network-software installation is often the fastest way to
+    separate a legitimate deployment from an implant.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: Which WinSock2 catalog subkey was modified, and does the value point at a provider DLL?
+  context: >-
+    The WinSock2 Parameters tree holds two provider catalogs. Protocol_Catalog9\Catalog_Entries
+    registers Layered Service Providers (LSPs) that chain into the transport stack; NameSpace_Catalog5\Catalog_Entries
+    registers namespace providers used for name resolution. Both load a DLL into processes that call
+    Winsock, so which subkey fired and what path the value data references determine what code the
+    entry will run and in which processes it will run.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - process.code_signature.subject_name
+      - process.code_signature.trusted
+- question: What provider DLL path is encoded in the catalog value data?
+  context: >-
+    The catalog entry value data encodes the provider record, including the path of the DLL that
+    Windows loads for that LSP or namespace provider. Decode the Details value to extract that path.
+    A provider DLL under a user-writable or unusual location (Temp, AppData, ProgramData, a user profile)
+    is a strong signal the registration is malicious; a path under System32 backed by a signed network
+    stack component is more consistent with legitimate software. The extracted path becomes the pivot
+    for the on-disk and load-verification questions.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- question: Is the catalog entry still present, and does its re-modification history show tampering or churn?
+  context: >-
+    Registry value deletion is not observable in this telemetry, so the catalog entry cannot be
+    confirmed removed directly. Instead judge persistence from re-modification: an entry written once
+    and left in place behaves like a durable provider registration, while repeated rewrites of the same
+    catalog subkey in a short window can indicate an actor toggling or repairing the provider. Compare the
+    Details values across the writes to see whether the same provider path is being re-set or replaced.
+  range: +4h
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - Details
+      - Image
+- question: What spawned the process that modified the catalog entry?
+  context: >-
+    The parent-child lineage of the writing process shows how the registration was invoked. A provider
+    written by a vendor installer or a service running from a signed binary is routine; a catalog write
+    whose parent chain traces back to a script host, Office application, or a shell launched from an
+    unusual location suggests the registration is part of intrusion activity rather than software
+    installation.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What other processes did the responsible process spawn?
+  context: A process that performs this action rarely stops there. Listing the children it launched shows
+    whether the activity was an isolated change or one step in a longer chain - payload execution,
+    additional persistence, or follow-on tooling. Note this shows what the acting process started,
+    not what started alongside it. Sibling processes cannot be identified from this telemetry,
+    because registry and library events do not record the acting process's parent.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Did a provider DLL load into networking processes on this host after the catalog change?
+  context: >-
+    A newly registered LSP or namespace provider takes effect when a process that uses Winsock loads the
+    provider DLL, so a registration that "worked" shows up as a fresh DLL load across networking processes
+    (svchost, browsers, mail clients, other network-facing binaries). Review the DLLs loaded on this host
+    after the catalog write and check whether any matches the provider path decoded from the catalog value,
+    and whether it is unsigned or signed by an unexpected publisher.
+  range: +4h
+  query: |
+    aggregation: true
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Image
+      - Signed
+      - Signature
+- question: Is the provider DLL referenced by the catalog entry present on disk?
+  context: >-
+    The provider registration is only effective if the DLL it points to exists at the referenced path.
+    Correlating file activity by the registry-writing process and its children surfaces whether that DLL
+    was dropped in the same session as the catalog write. If the provider path decoded from the value data
+    resolves to a file that was just created, the persistence is active and will load on the next network
+    operation. The file-write event carries no hash; if the DLL is present, hash it from a later load or
+    retrieve it for a reputation lookup.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: Were other registry modifications made on this host in the same session?
+  context: >-
+    Actors who register a WinSock provider for persistence frequently make other registry changes in the
+    same session -- adding a Run key, disabling a security control, or altering service configuration.
+    Reviewing all registry modifications on the host in a short window, grouped by key path and writing
+    process, reveals whether the catalog change was an isolated event or one of several configuration changes
+    pursued together.
+  range: +/-30m
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - User
+- question: Has this WinSock2 catalog key been modified before on this host?
+  context: >-
+    Provider catalog entries change rarely -- typically only when network or security software is installed
+    or updated. A first-time modification of this exact key on the host is more suspicious than a routine
+    change. Compare the historical Details values and writing processes to see whether the same provider was
+    previously registered by legitimate software or whether this write is unique.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - Details
+      - Image
+- question: What other activity occurred on this host around the time of the catalog modification?
+  context: >-
+    Registration of a network provider rarely happens in isolation. Examining process activity around the
+    alert reveals what led to the change and what followed -- reconnaissance, payload execution, or other
+    persistence mechanisms. Aggregating by process and parent collapses routine agent noise while novel
+    parent-child pairs stand out at low counts.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Was this WinSock2 catalog key modified on other hosts in the environment?
+  context: >-
+    The same provider registration on many hosts can indicate a software rollout or a widely deployed implant,
+    while a change confined to one host looks targeted. Comparing the Details values across hosts shows whether
+    the same provider DLL path is being set fleet-wide (consistent with managed software) or whether each host
+    received a different or one-off value.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        TargetObject|expand: '%TargetObject%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+      - Details
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host -- defense tampering, reconnaissance, credential access -- may reveal
+    the attack stages that preceded the provider registration and help reconstruct the timeline. Persistence
+    is commonly installed after an initial foothold, so preceding alerts often frame why the catalog was modified.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Were other process-based persistence mechanisms installed on this host?
+  context: >-
+    Attackers rarely rely on a single persistence mechanism. After registering a WinSock provider, they commonly
+    install backup footholds using scheduled tasks, services, registry Run keys, or BITS jobs. Multiple persistence
+    installations in the same timeframe point to intentional stacking rather than isolated administrative action.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- question: Were files dropped to persistence locations (Startup folders, scheduled-task definitions) on this host?
+  context: >-
+    File-based persistence bypasses command-line detection entirely. Dropping an executable or script into the
+    Startup folder or a path referenced by a registry Run key achieves persistence without running standard
+    persistence tools. File event monitoring captures these drops even when the actor avoids schtasks, sc, or reg,
+    and complements the WinSock provider by showing whether additional autostart payloads were staged.
+    Run-key persistence itself is a registry write, not a file drop, so it does not appear in file telemetry; this query covers Startup folders and scheduled-task definition files, and Run-key writes surface in registry questions instead.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist_paths:
+        TargetFilename|contains:
+          - '\Start Menu\Programs\Startup\'
+          - '\Windows\System32\Tasks\'
+          - '\Windows\Tasks\'
+      condition: selection and selection_persist_paths
+    fields:
+      - TargetFilename
+      - Image

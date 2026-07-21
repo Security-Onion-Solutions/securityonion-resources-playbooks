@@ -1,0 +1,423 @@
+name: Shai-Hulud Malicious Bun Execution
+id: 2441fc5c-6364-4ea0-bde8-1934f606afbf
+description: |
+  Detects the Bun JavaScript runtime (bun.exe) being launched by node.exe with a command line that
+  references bun_environment.js or a GitHub Actions runner release download. This is the execution
+  stage of the Shai-Hulud npm supply-chain worm: trojanized package versions carry a preinstall
+  lifecycle hook that runs a setup script under node.exe during dependency installation, the script
+  fetches the Bun runtime if it is not already present, and then runs the bundled bun_environment.js
+  payload. That payload harvests credentials from local config files, environment variables, and
+  cloud metadata endpoints, republishes the maintainer's own packages to propagate, and can register
+  a self-hosted CI runner for persistence.
+  Bun is a legitimate developer runtime and node.exe legitimately spawns it on build and developer
+  machines, so the discriminator is the script being run rather than the binary itself. The
+  investigation should establish what the parent node.exe process was executing, which package or
+  install command pulled the script in, whether the runtime was installed on demand rather than
+  deployed, and whether credential collection, outbound transfer, or runner registration followed.
+type: detection
+detection_id: 5299fadf-f228-4526-8274-251db1960be9
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-16
+questions:
+- question: Did node.exe spawn bun.exe with a command line referencing bun_environment.js or a GitHub Actions runner download?
+  context: >-
+    The rule fires only when both halves are present: the parent is node.exe and the child is bun.exe
+    whose command line carries either the bun_environment.js script name or a GitHub Actions runner
+    release download. Read the exact command line and confirm both halves before going further, and
+    note which of the two command-line values is present — a bun_environment.js run points at payload
+    execution, while a runner download points at CI persistence being set up.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Is this host and user expected to build JavaScript projects and run the Bun runtime?
+  context: >-
+    Bun is a general-purpose JavaScript runtime that developers and build agents install and run
+    routinely, so a developer workstation or CI worker running bun.exe under node.exe is unremarkable
+    on its own. A host with no JavaScript toolchain, or a user with no development role, has no
+    reason to reach this code path at all, which makes this the fastest triage split.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What script was node.exe running when it spawned bun.exe, and what started node.exe itself?
+  context: >-
+    The parent's own command line is the most informative field in this chain. A setup script name
+    such as setup_bun.js indicates the runtime was fetched and invoked by a package lifecycle hook
+    rather than by a developer. Tracing what started node.exe separates an interactive shell or IDE
+    session from a package manager, a build agent, or a scheduled job driving the install unattended.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: Which package install or build command brought this script onto the host?
+  context: >-
+    Delivery here is a dependency, not an email or a document. Trojanized package versions execute a
+    preinstall hook during dependency resolution, so the code runs before the install finishes and
+    without any user action beyond an install or build command. Identify the install command, the
+    project directory, and the dependency tree it resolved; that names the compromised package and
+    version, which is what gets blocked, pinned, and searched for on other hosts.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+- question: What exactly did bun.exe execute? Decode the full command line and working directory.
+  context: >-
+    Parse every argument the runtime was handed and the directory it ran from. The working directory
+    normally resolves to the project or node_modules path the install was running in, which names the
+    package that carried the script. Multiple bun.exe invocations in the same window can indicate the
+    runtime was installed and then immediately used, which is the install-on-demand pattern rather
+    than an existing developer toolchain being exercised.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What external destinations did the alerting bun.exe process contact, and what are they?
+  context: >-
+    The command line carries a code-hosting release download, and the payload itself reaches out to
+    package registries, code-hosting APIs, and cloud metadata endpoints to collect and transfer
+    secrets. Review every address this process connected to and resolve each one before judging it:
+    connections to the package registry and to the runtime's own download host are expected during an
+    install, while API endpoints used to create repositories or register CI runners are not. Endpoint
+    connection records rarely carry a destination hostname, so pivot through DNS lookup records to
+    name the addresses.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- question: What other processes did this same node.exe instance spawn?
+  context: >-
+    The setup stage of this chain is not limited to launching the runtime. On Windows it commonly
+    drives powershell.exe to download and install the runtime, reads the PATH back out of the
+    registry, and may unpack or configure a CI runner. Enumerating every child of the same node.exe
+    instance shows the full set of stages that ran, and whether the activity stopped at the payload
+    or continued into persistence setup.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: What files did the alerting process and its children write, and where did they land?
+  context: >-
+    Every artifact in this chain lands in a user-writable path, never in a managed program directory.
+    Watch for the loader scripts (setup_bun.js, bun_environment.js) inside the project or
+    node_modules tree, a local bun-dist directory, the runtime under %USERPROFILE%\.bun\bin or
+    %LOCALAPPDATA%\bun, JSON collection output such as contents.json, environment.json, and
+    cloud.json, and a hidden runner directory under the user profile. Collection output on disk means
+    secrets were harvested and the rotation scope must be built from what those files contain.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+- question: Are the modules loaded by the alerting runtime signed, and by a publisher this environment already trusts?
+  context: >-
+    A tampered or update-chain compromise shows up on first run as modules loaded from user-writable
+    paths or carrying signatures outside the approved publisher set. A runtime pulled down on demand
+    during a package install has not passed through the environment's software deployment path, so
+    its modules will not match the publishers approved for programs and services here. Compare each
+    loaded module's path and signer against what a managed install of this runtime would produce.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+      - SignatureStatus
+- question: Was the user's PATH environment variable modified to add a runtime directory around this activity?
+  context: >-
+    Installing the runtime on demand writes its bin directory into the user's PATH so that later
+    invocations resolve it, and the setup stage reads PATH back out of the registry to pick the
+    change up in the current session. A PATH value gaining %USERPROFILE%\.bun\bin or
+    %LOCALAPPDATA%\bun minutes before this alert confirms the runtime was fetched as part of the
+    install rather than deployed through a managed software channel. Read the written value to see
+    exactly which directory was added and which process wrote it.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains: \Environment\Path
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- question: Has bun.exe run on this host before, and under which accounts?
+  context: >-
+    This is the strongest false-positive discriminator for this rule. A developer workstation or
+    build agent that genuinely uses this runtime shows months of prior executions under the
+    developer's or the build service's account. Zero or near-zero history, with the first execution
+    of the runtime arriving under a package install, matches the install-on-demand pattern the rule
+    targets. Weigh the account distribution too — the runtime appearing under an account that does
+    no development is the same finding.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- always_include: true
+  question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: >-
+    The query mirrors the rule's selection scoped to this user, so the result is this account's
+    90-day history of node.exe driving the runtime with these specific script arguments, aggregated
+    by host — not generic use of the runtime. Even an active JavaScript developer should have little
+    or no history of this particular pattern, because it belongs to the install hook rather than to
+    normal build work. Weigh any prior occurrences against the user's role and the projects they
+    build.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent:
+        ParentImage|endswith: \node.exe
+      selection_child_bun_script:
+        Image|endswith: \bun.exe
+        CommandLine|contains:
+        - bun_environment.js
+        - https://github.com/actions/runner/releases/download/v2.330.0
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection_parent and 1 of selection_child_*) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: Has node.exe historically driven this pattern on this host or across the environment, or is the parent new for this activity?
+  context: >-
+    When the install runs under a build service account or a machine identity, user identity does not
+    attribute the behavior and the launch mechanism is the meaningful pivot. The query mirrors the
+    rule's selection scoped to the alerting parent, giving the 90-day history of node.exe driving
+    this specific pattern. A parent that has never produced it before is the deviation to chase; a
+    parent already accounting for a long run of prior events points at an existing build pipeline
+    whose behavior needs explaining rather than a first infection.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent:
+        ParentImage|endswith: \node.exe
+      selection_child_bun_script:
+        Image|endswith: \bun.exe
+        CommandLine|contains:
+        - bun_environment.js
+        - https://github.com/actions/runner/releases/download/v2.330.0
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection_parent and 1 of selection_child_*) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: What else did this user do across the environment around this time?
+  context: >-
+    A developer identity whose workstation ran a credential-harvesting payload is also an identity
+    whose tokens and keys were on that workstation. Reviewing what this account did on every host in
+    the same window shows whether the activity is confined to one machine or the account was active
+    elsewhere at the same time. If the alert fired under a service or machine identity, expect this
+    view to fill with routine agent activity and rely on the parent-driven fleet view instead.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- always_include: true
+  question: Did this same node.exe-driven pattern fire on other hosts in the same window?
+  context: >-
+    The query mirrors the rule's selection scoped to the alerting parent, fleet-wide, in the alert
+    window. Because this worm propagates through republished dependencies, several hosts resolving
+    the same package version will reach this code path within minutes of each other, so multiple
+    hosts in the window points at a shared dependency or a build fleet pulling the same tree. A
+    single host points at a host-local install.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent:
+        ParentImage|endswith: \node.exe
+      selection_child_bun_script:
+        Image|endswith: \bun.exe
+        CommandLine|contains:
+        - bun_environment.js
+        - https://github.com/actions/runner/releases/download/v2.330.0
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection_parent and 1 of selection_child_*) and _pb_scope
+    fields:
+    - host.name
+- question: Did this same detection fire on other hosts or under other users?
+  context: >-
+    A compromised dependency reaches every host that installs it, so this rule firing on one machine
+    rarely means one machine was affected. Correlating the same detection across the environment over
+    the last day shows how far the compromised package spread, which build agents and developer
+    workstations pulled it, and which accounts were sitting on those hosts when the payload ran.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        rule.uuid|expand: '%rule_uuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Which dependency versions are installed on this host, and are any of them known-compromised releases?
+  context: >-
+    Nothing here is fixed by patching a client application — the exploited component is the
+    dependency tree itself, and the compromise ships as a version bump of an otherwise trusted
+    package. Establish which packages and versions the project resolved, compare them against
+    published lists of affected releases, and pin the tree back to builds predating the compromise.
+    Lockfiles and package caches on this host are the record of what was actually installed.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    The install stage of this chain often trips other rules before the runtime executes — a
+    powershell.exe download of the runtime, registry reads of the environment block, or a credential
+    scanner reading local secrets. Earlier detections on this host reconstruct the order of the
+    install-to-payload sequence and can show how long the toolchain has been reaching this code path.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

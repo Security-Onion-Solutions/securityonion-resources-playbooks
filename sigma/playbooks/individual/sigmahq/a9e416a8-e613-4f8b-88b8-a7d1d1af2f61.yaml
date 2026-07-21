@@ -1,0 +1,337 @@
+name: Suspicious Use of CSharp Interactive Console
+id: f3eabbfe-9328-4ea6-9a19-fede3de95345
+description: |
+  Detects csi.exe, the Microsoft-signed C# interactive console shipped with Visual Studio, being spawned by a
+  PowerShell host (powershell.exe, pwsh.exe, or powershell_ise.exe) while its embedded OriginalFileName metadata
+  is csi.exe. The rule fires when all of these match together. csi.exe is a fully scripting-capable REPL that can
+  run inline C#, execute a .csx script file, and reflectively load .NET assemblies into its own process to reach
+  Windows API surface without dropping additional tooling. Because it is signed and portable, it can be relocated
+  onto hosts without Visual Studio and used as a "bring your own land" execution proxy. Legitimate use exists on
+  developer and build systems; investigation should determine whether this host and user are a development context,
+  what the console actually executed, and whether csi.exe subsequently loaded unusual modules, wrote files, or
+  made outbound connections.
+type: detection
+detection_id: a9e416a8-e613-4f8b-88b8-a7d1d1af2f61
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Was csi.exe spawned by a PowerShell host with OriginalFileName csi.exe?
+  context: Confirm the alert is a true positive by reviewing the triggering event. The rule requires the child image
+    to end in csi.exe, its embedded OriginalFileName to be csi.exe, and the parent image to be powershell.exe,
+    pwsh.exe, or powershell_ise.exe. Note which PowerShell host is the parent, since that frames whether this looks
+    like an interactive developer session or a scripted launch.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - OriginalFileName
+- question: Is this user and host expected to run a C# interactive console?
+  context: csi.exe is a developer tool. Legitimate use concentrates on developer and build systems and on users
+    who write or debug .NET code. A general-purpose workstation or a user with no development role running the C#
+    interactive console is a meaningful deviation worth chasing.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Is this PowerShell host expected to spawn csi.exe, and what started the PowerShell host itself?
+  context: The PowerShell-to-csi.exe parent-child relationship is the core signal. Tracing the PowerShell host's
+    own origin reveals whether the chain is a developer launching the console interactively or a scripted launch
+    initiated by a macro, scheduled task, or remote tooling. If ParentProcessGuid resolves to NODATA, pivot on the
+    host plus the parent image name within a short window around the alert.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What did csi.exe execute? Decode its command line to determine interactive REPL versus a script file.
+  context: An empty command line (no arguments) is a strong indication of an interactive REPL session, where the
+    operator types statements directly into the console. A .cs, .csx, .fs, or .fsx file passed as an argument
+    indicates a script was run; record the script path and review its contents. Either form can reflectively load
+    .NET assemblies and reach Windows API surface from inside the process.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What modules did csi.exe load, and were any unsigned or loaded from user-writable paths?
+  context: The console can reflectively load .NET assemblies into its own process to call Windows APIs without
+    dropping additional binaries on disk. Module loads from user-writable directories, or unsigned and
+    invalid-signature modules, point to operator-supplied tooling rather than the standard managed runtime an
+    interactive developer session would load. If module-load telemetry is not collected in this environment, treat
+    zero results as a visibility gap rather than evidence nothing loaded.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+- question: Did csi.exe write any files to user-writable paths around the time of the alert?
+  context: A console that drops a new executable or script to a user-writable location such as a temp, appdata,
+    public-profile, or recycle-bin path is consistent with staging a payload to run, rather than an interactive
+    developer session. Review any files written by the console for executable content and reputation.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - CommandLine
+      - EventType
+- question: Did csi.exe make any outbound network connections after launch?
+  context: Outbound connections originating from the C# interactive console are atypical for a development tool and
+    are a documented detection lever for this binary being abused. A connection to a rare or unknown destination,
+    shortly after the console started, points to command-and-control or staging rather than legitimate use. Review
+    the destination address and reputation.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- question: Is csi.exe running from the canonical Visual Studio install path or from an atypical location?
+  context: Legitimate csi.exe lives under the Microsoft Visual Studio program-files install path. A copy running
+    from a user-writable or otherwise atypical directory suggests the signed binary was relocated and brought to a
+    host that may not have Visual Studio installed, which is the "bring your own land" pattern. The full image path
+    distinguishes a routine developer install from a transported LOLBin.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CurrentDirectory
+- question: Does this host normally run csi.exe?
+  context: A binary that has never run on a host is more suspicious than one that runs regularly. On a developer or
+    build system, csi.exe may appear routinely; on a general-purpose endpoint, zero or very low historical counts
+    indicate first-time or rare execution and raise the priority of this alert.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: Does this PowerShell host normally spawn csi.exe on this host?
+  context: A PowerShell host launching the C# interactive console is an unusual pairing outside of developer
+    tooling. Historical frequency of this specific parent-child combination on this host distinguishes a routine
+    development workflow from a novel spawning relationship worth investigating.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What other child processes did the same PowerShell host spawn?
+  context: If the PowerShell host that launched csi.exe also spawned other processes, examining its siblings reveals
+    the full scope of activity from that parent instance. Multiple tools launched from the same parent in a short
+    window suggests orchestrated execution rather than a single interactive console launch.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \csi.exe
+        ParentImage|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        - \powershell_ise.exe
+        OriginalFileName: csi.exe
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \csi.exe
+        ParentImage|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        - \powershell_ise.exe
+        OriginalFileName: csi.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple
+    endpoints. If the same user triggered similar developer-tool execution on several hosts in the same window, the
+    scope of activity may be larger than this single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \csi.exe
+        ParentImage|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        - \powershell_ise.exe
+        OriginalFileName: csi.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host, such as defense tampering,
+    reconnaissance, or credential access, may reveal the attack stages that preceded this execution and help
+    reconstruct the timeline leading to the console launch.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

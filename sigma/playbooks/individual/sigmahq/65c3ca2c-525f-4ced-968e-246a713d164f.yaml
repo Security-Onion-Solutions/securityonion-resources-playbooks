@@ -1,0 +1,326 @@
+name: Visual Studio NodejsTools PressAnyKey Renamed Execution
+id: 66968735-45a8-42c3-a779-61dd264c88b3
+description: |
+  Detects a process whose embedded PE metadata (OriginalFileName) is Microsoft.NodejsTools.PressAnyKey.exe but whose
+  on-disk Image path does not end in that filename, indicating the signed Visual Studio NodejsTools helper has been renamed.
+  The rule fires when the OriginalFileName matches AND the legitimately-named-and-located instance is NOT present. This helper
+  is a proxy-execution LOLBIN: given at least three arguments, it writes the second argument as a PID file and passes the
+  third argument directly to Process.Start, so any local or file-share binary named on the command line runs as a child of
+  the helper. Renaming it lets an operator launch an arbitrary payload under the cover of a Microsoft-signed parent.
+  Investigation should decode the command line to recover the proxied binary path, confirm the user and host are expected to
+  run Visual Studio tooling, and determine whether the child process is benign or stages further execution.
+type: detection
+detection_id: 65c3ca2c-525f-4ced-968e-246a713d164f
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- question: Does this event match the rule, with OriginalFileName Microsoft.NodejsTools.PressAnyKey.exe while the Image path does not end in that same filename?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule fires only when the embedded OriginalFileName is Microsoft.NodejsTools.PressAnyKey.exe AND the on-disk Image path does NOT end in \Microsoft.NodejsTools.PressAnyKey.exe. Confirm both halves hold in the actual event, the metadata identifies the NodejsTools helper while the file on disk carries a different name.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - OriginalFileName
+- question: Is this user and host expected to run Visual Studio NodejsTools helper binaries?
+  context: The legitimate Microsoft.NodejsTools.PressAnyKey.exe ships inside a Visual Studio Node.js Tools installation and runs from the IDE Extensions directory. A renamed copy on a developer workstation with the toolchain installed is far more plausible than one on a server or general-purpose endpoint. Knowing whether the user role and host function involve Visual Studio development is often the fastest path to distinguishing routine tooling from proxy-execution abuse.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What is the actual identity of this binary based on its metadata, signature, and hash?
+  context: The file on disk is named something other than Microsoft.NodejsTools.PressAnyKey.exe, but the embedded OriginalFileName and the code-signing chain still reflect the original Visual Studio helper. Compare the Image path against OriginalFileName to confirm the rename, then check the signature, a genuine copy is Microsoft-signed, while a tampered or trojanized copy may be unsigned or signed by an unrelated party. The file hash enables a reputation lookup to confirm whether this is the known-good helper or a modified binary.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Hashes
+- question: How did this renamed helper binary arrive on the host, and what process wrote it?
+  context: 'A renamed copy of the NodejsTools helper does not appear spontaneously, it was copied from the Visual Studio install tree, extracted from an archive, downloaded, or dropped by a parent process. Tracing the file-creation event for the binary by basename over a long window reveals the delivery mechanism: a copy operation, a download tool, an installer, or a malware dropper. A user-writable destination such as Desktop, Downloads, Temp, or AppData points to manual relocation or staging rather than a normal install.'
+  range: -30d
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains|expand: '%file_name%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: Decode the command line. Which binary path is being passed as the third argument for proxied execution, and what is in the PID file argument?
+  context: 'The helper proxies execution by deterministic argument positions: the first argument is a mode token, the second is a path it writes the launched process PID into, and the third is the path passed straight to Process.Start and executed. Recover all three from the command line. The third argument is the actual payload, a local executable or one on a file share, and is the most important field to identify. The second argument shows where a PID-tracking file was dropped. Anything after the third argument is forwarded to the launched binary.'
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What process spawned this renamed helper, and is that parent chain expected?
+  context: The parent process reveals how the helper was invoked. Legitimate Visual Studio tooling descends from the IDE or its build processes; interactive abuse typically descends from explorer.exe or a shell, while staged execution may descend from an Office application, a script host such as wscript.exe or mshta.exe, or a remote-administration tool. Walk up the tree to see what spawned the parent.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What child processes did this renamed helper spawn, and do those children match the binary path named on its command line?
+  context: The whole point of this LOLBIN is to launch the binary named in its third argument, which then runs as a direct child of the renamed helper. Enumerate the children and compare their Image paths against the proxied path recovered from the command line. A child that is a shell, a script host, certutil.exe, rundll32.exe, or a binary from a user-writable or file-share location is the proxied payload and the core of the investigation. No children at all may indicate a failed or test invocation.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Did the renamed helper or its child process make outbound network connections, and were they to an internal file share or an external endpoint?
+  context: This helper can launch a binary located on a file share, and the proxied payload itself may retrieve further code or beacon outbound. Network connections initiated by the helper or its children show whether the proxied binary was pulled from a remote location or is communicating after launch. Connections to internal SMB file shares fit the file-share execution pattern; connections to external addresses point to download or command-and-control activity. Correlate by the helper and child ProcessGuid through the same host window.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- question: Does this host normally run the NodejsTools helper, renamed or not?
+  context: A binary that has never been seen on a host is more suspicious than one that runs regularly. On a host without Visual Studio Node.js tooling installed, any execution of this helper is unexpected. Zero or very low historical counts indicate first-time or rare execution and raise the priority of the decode result.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: When this host has previously fired the rule's pattern, what parents and users normally drive that activity, and does the current alert fit that pattern?
+  context: Even a legitimately installed helper can be renamed and abused. The query mirrors the rule's selection structure scoped to this host, so the resulting parent and user distribution reflects how this specific renamed-helper firing pattern has historically run here, not generic execution of the binary. A new parent process, an unexpected user account, or an unusual command structure is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        OriginalFileName: Microsoft.NodejsTools.PressAnyKey.exe
+      filter_main_legit_name:
+        Image|endswith: \Microsoft.NodejsTools.PressAnyKey.exe
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        OriginalFileName: Microsoft.NodejsTools.PressAnyKey.exe
+      filter_main_legit_name:
+        Image|endswith: \Microsoft.NodejsTools.PressAnyKey.exe
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        OriginalFileName: Microsoft.NodejsTools.PressAnyKey.exe
+      filter_main_legit_name:
+        Image|endswith: \Microsoft.NodejsTools.PressAnyKey.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity across multiple endpoints. If the same user triggered similar activity on multiple hosts, the scope of the operation may be larger than a single endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        OriginalFileName: Microsoft.NodejsTools.PressAnyKey.exe
+      filter_main_legit_name:
+        Image|endswith: \Microsoft.NodejsTools.PressAnyKey.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - host.name
+- question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate context: what led to this event, what happened after, and whether it is part of a larger sequence. Look for reconnaissance, privilege escalation, persistence installation, or data staging surrounding the proxied execution.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Have other hosts fired the rule's pattern in the past week, and does the cross-host distribution look like consistent automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of this renamed-helper firing pattern, not generic execution of the binary. Many hosts firing the same pattern points to scripted deployment or build automation that legitimately relocates the helper; one host or a small unrelated set points to manual operator activity. Use host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        OriginalFileName: Microsoft.NodejsTools.PressAnyKey.exe
+      filter_main_legit_name:
+        Image|endswith: \Microsoft.NodejsTools.PressAnyKey.exe
+      condition: selection and not 1 of filter_main_*
+    fields:
+    - host.name
+- question: Is the same renamed helper, identified by OriginalFileName, present on other hosts in the environment?
+  context: The purpose of renaming a signed helper is to proxy execution while evading name-based detection. The same renamed binary, matched by its embedded OriginalFileName rather than the on-disk name, appearing on multiple hosts suggests deliberate distribution rather than an isolated developer artifact. Pair the cross-host spread with the parent and child consistency to judge whether this is an automation rollout or operator activity.
+  range: +4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        OriginalFileName: Microsoft.NodejsTools.PressAnyKey.exe
+      filter_main_legit_name:
+        Image|endswith: \Microsoft.NodejsTools.PressAnyKey.exe
+      condition: selection and not 1 of filter_main_*
+    fields:
+      - host.name
+      - Image
+- question: Did other detections fire on this host in the hours before this alert?
+  context: 'Alerts rarely happen in isolation. Earlier detections on the same host, defense tampering, reconnaissance, or credential access, may reveal the stages that preceded this event and help reconstruct the timeline. Look for patterns: tampering followed by execution, or reconnaissance followed by exploitation.'
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

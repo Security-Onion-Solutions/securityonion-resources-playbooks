@@ -1,0 +1,478 @@
+name: Potential MuddyWater APT Activity
+id: 91106645-56d6-4256-806a-3297467220b3
+description: |
+  Detects three command-line patterns associated with MuddyWater tooling. The rule fires when a process command line
+  matches EITHER an mshta-style `vbscript:Close(Execute("CreateObject(` launcher that starts powershell with
+  `-w 1 -exec Bypass` against content staged under `\ProgramData\`, OR a scripted host survey that reads
+  Win32_OperatingSystem, Win32_NetworkAdapterConfiguration, root\SecurityCenter2 and [System.Net.DNS] in one command,
+  OR an encoded PowerShell backdoor that combines [Convert]::ToBase64String, [System.Net.HttpWebRequest]::Create(,
+  GetResponse().GetResponseStream() and a `-bxor ` decode loop. Only one branch has to match, and each branch is a
+  different stage of the same tooling pattern — staged launch, environment survey, and encoded HTTP command-and-control.
+  The investigation should establish which branch fired, decode the command line, identify the parent that launched it
+  and the payload it staged or contacted, and determine whether the same pattern appears elsewhere on the host or fleet.
+type: detection
+detection_id: 36222790-0d43-4fe8-86e4-674b27809543
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-16
+questions:
+- question: Does the command line match one of the three patterns this rule detects, and which one matched?
+  context: >-
+    Read the full command line and confirm it contains one of the rule's three groups of strings, all of which must be
+    present together within their own branch. The branches are the mshta-style vbscript launcher starting powershell with
+    `-w 1 -exec Bypass` from `\ProgramData\`, or the survey combining Win32_OperatingSystem,
+    Win32_NetworkAdapterConfiguration, root\SecurityCenter2 and [System.Net.DNS], or the encoded HTTP backdoor combining
+    Base64 conversion, HttpWebRequest creation, response-stream reads and a `-bxor ` decode. Note which branch matched —
+    it determines where the rest of the investigation goes, since a launcher points at a staged payload on disk, a survey
+    points at reconnaissance output, and a backdoor points at outbound command-and-control.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Is this user and host expected to run script-host-launched or heavily encoded PowerShell?
+  context: >-
+    Administrative and vendor automation does use PowerShell, but the combinations this rule matches are narrow — a
+    script host building a bypass command line against `\ProgramData\`, a single command enumerating OS, network adapter,
+    security-product and DNS data together, or inline XOR-decoded HTTP traffic. Knowing whether this account and this
+    host have any sanctioned reason to produce that kind of command is the fastest way to separate rare automation from
+    intrusion tooling.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: Is this execution part of an authorized penetration test or red team engagement?
+  context: >-
+    Offensive-security teams replay published intrusion tooling during authorized assessments, including staged
+    PowerShell loaders and XOR-encoded HTTP implants. Check whether a pentest or red team exercise is active on this host
+    or network segment with timing that matches the alert. An authorized engagement with matching activity resolves the
+    alert; its absence means the command line should be treated as operator activity and decoded.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What operation does the matched command line actually carry out?
+  context: >-
+    Each branch of this rule is a different capability and drives a different response. A vbscript launcher that hands
+    powershell a bypass command line against `\ProgramData\` is a loader — find the staged file. A single command reading
+    Win32_OperatingSystem, Win32_NetworkAdapterConfiguration, root\SecurityCenter2 and [System.Net.DNS] is host and
+    security-product reconnaissance — the output tells the operator which defenses are present. A command building an
+    HttpWebRequest, reading the response stream and XOR-decoding it is an implant loop — the destination is the
+    command-and-control channel. Identify which one ran before scoping the response.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: What do the encoded and obfuscated parts of the command line resolve to?
+  context: >-
+    This tooling pattern layers obfuscation over an otherwise ordinary command — Base64 strings, single-byte XOR with an
+    inline key, environment-variable fragments assembled into method names such as IEX, and file paths held in variables.
+    Decode each layer in a safe environment and record the concrete artifacts it produces — the file path read from or
+    written to `\ProgramData\`, the URL or IP contacted, the XOR key, and any follow-on command. Those artifacts are the
+    pivots for the rest of the investigation. The working directory shows where the command was launched from.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- question: What process spawned this command, and is that parent chain expected?
+  context: >-
+    The parent tells you how the command was reached. A document application, a script host such as wscript.exe or
+    cscript.exe, mshta.exe, or a signed configuration binary invoked with an INF or scriptlet parent points at
+    macro-delivered execution or signed-binary proxy execution rather than an operator at a console. A scheduled-task or
+    service parent points at established persistence. Retrieve the parent's own command line and, if the chain is still
+    unclear, walk one level further up.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What child processes did this command spawn afterward?
+  context: >-
+    The children reveal what the command line achieved. A launcher branch typically hands off to powershell, which in
+    turn may start further script hosts or signed binaries used to run configuration or scriptlet files. A backdoor loop
+    spawns whatever the operator sends it, so the children are the command history of the session. Unexpected children
+    such as cmd.exe, certutil.exe, or reconnaissance utilities mark the next stage to investigate.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: What outbound connections did script hosts and signed proxy binaries make on this host around the alert?
+  context: >-
+    The backdoor branch of this pattern retrieves its instructions over HTTP and decodes them in memory, and the loader
+    branch commonly pulls its next stage the same way, so the outbound connection is the part of the activity that leaves
+    the host. Connections from script hosts or from signed binaries used for proxy execution, close to the alert,
+    identify the command-and-control destination. Check the destinations against known-good infrastructure; addresses
+    with no business relationship and a regular connection interval indicate an active channel.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+          - '\mshta.exe'
+          - '\wscript.exe'
+          - '\cscript.exe'
+          - '\cmstp.exe'
+          - '\rundll32.exe'
+          - '\regsvr32.exe'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+- question: What files were written under C:\ProgramData on this host around the alert, and which process wrote them?
+  context: >-
+    The launcher branch of this rule names `\ProgramData\` directly, because this tooling pattern stages its encoded
+    payload, configuration, and scriptlet files in that world-writable location before executing them. Files arriving
+    there near the alert — encoded text files with innocuous product-sounding names, configuration files, or scriptlets —
+    are the staged payload set. The writing process identifies the delivery mechanism, which is often a document
+    application or a script host rather than the alerting process itself.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains: '\ProgramData\'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: What files did the alerting program write on this host after the command ran?
+  context: >-
+    Even after the process exits, the files it produced map the operation. Look for the decoded payload written back to
+    disk, reconnaissance output collected from the survey branch, staged archives awaiting exfiltration, and
+    configuration or scriptlet files supporting proxy execution. The paths and names of these files are the artifacts to
+    collect for confirmation and to sweep for on other hosts.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Each branch of this rule sits inside a longer sequence — document-borne delivery, staged loading, survey, then an
+    encoded channel. Activity around the alert shows which stages are present on this host. Aggregating by program and
+    parent collapses routine agent telemetry into high-count rows, so scan the low-count novel parent-child pairs, which
+    is where script hosts, document applications, and signed proxy binaries appear.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    This activity is rarely the first stage. Earlier detections involving document applications spawning script hosts,
+    signed-binary proxy execution, or PowerShell execution-policy bypasses may show how the host was reached and let you
+    reconstruct the timeline from delivery to the alerting command.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: When this host has previously fired the rule's pattern, what parents and users normally drive that activity, and does the current alert fit?
+  context: >-
+    The query mirrors the rule's selection scoped to this host, so the resulting parent and user distribution reflects
+    how these specific command-line patterns have run here over the past two weeks, not generic PowerShell usage. Because
+    all three branches are narrow, any prior history is itself worth reading; a first-ever occurrence, a new parent, or
+    an unexpected account is the deviation to chase.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_mshta:
+        CommandLine|contains|all:
+        - vbscript:Close(Execute("CreateObject(
+        - powershell
+        - -w 1 -exec Bypass
+        - \ProgramData\
+      selection_survey:
+        CommandLine|contains|all:
+        - Win32_OperatingSystem
+        - Win32_NetworkAdapterConfiguration
+        - root\SecurityCenter2
+        - '[System.Net.DNS]'
+      selection_pwsh_backdoor:
+        CommandLine|contains|all:
+        - '[Convert]::ToBase64String'
+        - '[System.Text.Encoding]::UTF8.GetString]'
+        - GetResponse().GetResponseStream()
+        - '[System.Net.HttpWebRequest]::Create('
+        - '-bxor '
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Have other hosts fired the rule's pattern in the past week, and does the cross-host distribution look like automation or targeted activity?
+  context: >-
+    The query mirrors the rule's selection with no host scope, so the result is a fleet-wide count of these command-line
+    patterns rather than generic PowerShell usage. Several unrelated hosts firing within a short window points at a
+    delivery campaign reaching multiple recipients; a single host or a small related set points at hands-on activity
+    against specific targets. Use the host list to build the sweep and containment scope.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_mshta:
+        CommandLine|contains|all:
+        - vbscript:Close(Execute("CreateObject(
+        - powershell
+        - -w 1 -exec Bypass
+        - \ProgramData\
+      selection_survey:
+        CommandLine|contains|all:
+        - Win32_OperatingSystem
+        - Win32_NetworkAdapterConfiguration
+        - root\SecurityCenter2
+        - '[System.Net.DNS]'
+      selection_pwsh_backdoor:
+        CommandLine|contains|all:
+        - '[Convert]::ToBase64String'
+        - '[System.Text.Encoding]::UTF8.GetString]'
+        - GetResponse().GetResponseStream()
+        - '[System.Net.HttpWebRequest]::Create('
+        - '-bxor '
+      condition: 1 of selection_*
+    fields:
+    - host.name
+- always_include: true
+  question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: >-
+    The query mirrors the rule's selection scoped to this user, giving their 90-day history of producing these specific
+    command lines, aggregated by host. These patterns have no routine administrative equivalent, so any prior history is
+    itself investigable; a first-ever occurrence under an account with no scripting or engineering role points at
+    delivery to that user rather than activity they initiated.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_mshta:
+        CommandLine|contains|all:
+        - vbscript:Close(Execute("CreateObject(
+        - powershell
+        - -w 1 -exec Bypass
+        - \ProgramData\
+      selection_survey:
+        CommandLine|contains|all:
+        - Win32_OperatingSystem
+        - Win32_NetworkAdapterConfiguration
+        - root\SecurityCenter2
+        - '[System.Net.DNS]'
+      selection_pwsh_backdoor:
+        CommandLine|contains|all:
+        - '[Convert]::ToBase64String'
+        - '[System.Text.Encoding]::UTF8.GetString]'
+        - GetResponse().GetResponseStream()
+        - '[System.Net.HttpWebRequest]::Create('
+        - '-bxor '
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: Has this parent process historically driven the rule's pattern on this host or across the environment, or is the parent new for this activity?
+  context: >-
+    When the alert fires under SYSTEM or another service principal, user identity does not attribute the behavior and the
+    launch mechanism is the meaningful pivot. The query mirrors the rule's selection scoped to the alerting parent,
+    giving the 90-day history of that parent driving these command lines, aggregated by host. A parent that has never
+    produced this pattern before is the deviation; a parent already accounting for a large steady count across many hosts
+    is automation to be identified and ruled out.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_mshta:
+        CommandLine|contains|all:
+        - vbscript:Close(Execute("CreateObject(
+        - powershell
+        - -w 1 -exec Bypass
+        - \ProgramData\
+      selection_survey:
+        CommandLine|contains|all:
+        - Win32_OperatingSystem
+        - Win32_NetworkAdapterConfiguration
+        - root\SecurityCenter2
+        - '[System.Net.DNS]'
+      selection_pwsh_backdoor:
+        CommandLine|contains|all:
+        - '[Convert]::ToBase64String'
+        - '[System.Text.Encoding]::UTF8.GetString]'
+        - GetResponse().GetResponseStream()
+        - '[System.Net.HttpWebRequest]::Create('
+        - '-bxor '
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: What else did this user do across the environment around this time?
+  context: >-
+    Tracking the account's activity across every host in the surrounding hour shows whether the activity is confined to
+    one endpoint or the account is being used to reach others. Interactive logons, remote execution utilities, or the
+    same script hosts appearing on additional hosts under this account widen the scope. If the alert fired under a
+    service principal, this view fills with routine agent telemetry and the parent-driven view is the meaningful answer.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- always_include: true
+  question: Did this same parent-driven pattern fire on other hosts in the same window, or is the activity isolated to this host?
+  context: >-
+    Under a service principal, asking what else the user did returns agent-telemetry noise from every host. The
+    meaningful question is whether the same launch mechanism produced these command lines elsewhere in the alert window.
+    The query mirrors the rule's selection scoped to the alerting parent, fleet-wide. Multiple hosts in the same window
+    points at pushed or scheduled execution reaching many endpoints at once; a single host points at a host-local
+    trigger such as a document opened by this user.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_mshta:
+        CommandLine|contains|all:
+        - vbscript:Close(Execute("CreateObject(
+        - powershell
+        - -w 1 -exec Bypass
+        - \ProgramData\
+      selection_survey:
+        CommandLine|contains|all:
+        - Win32_OperatingSystem
+        - Win32_NetworkAdapterConfiguration
+        - root\SecurityCenter2
+        - '[System.Net.DNS]'
+      selection_pwsh_backdoor:
+        CommandLine|contains|all:
+        - '[Convert]::ToBase64String'
+        - '[System.Text.Encoding]::UTF8.GetString]'
+        - GetResponse().GetResponseStream()
+        - '[System.Net.HttpWebRequest]::Create('
+        - '-bxor '
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - host.name

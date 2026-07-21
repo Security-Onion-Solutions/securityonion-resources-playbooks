@@ -1,0 +1,313 @@
+name: Suspicious VBoxDrvInst.exe Parameters
+id: dd2559b8-07e8-45f7-81fd-b59b69ae19b0
+description: |
+  Detects VBoxDrvInst.exe (a VirtualBox Guest Additions utility) invoked with both
+  the 'driver' and 'executeinf' arguments, which directs it to process an INF file.
+  An INF file can create registry values and install drivers, so this binary can be
+  abused to write persistence keys (Run/RunOnce) or other registry settings while
+  borrowing a signed, trusted utility's reputation. Legitimate use occurs during
+  VirtualBox Guest Additions installation; outside that context, determine which INF
+  file was processed, what registry keys or driver it wrote, and whether the result
+  establishes persistence or modifies a security-relevant setting.
+type: detection
+detection_id: b7b19cb6-9b32-4fc4-a108-73f19acfe262
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- question: Does the command line match the rule's pattern — VBoxDrvInst.exe run with both 'driver' and 'executeinf'?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule fires only when the image ends in VBoxDrvInst.exe AND the command line contains both 'driver' and 'executeinf'. Read the full command line and identify the INF file path passed to the utility, since that file defines what registry values or driver get installed.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Is this user and host expected to install drivers or process INF files via VirtualBox Guest Additions tooling?
+  context: Legitimate use of this utility is tied to VirtualBox Guest Additions installation, which is normal on virtualization hosts and developer workstations but unexpected on most servers and end-user endpoints. Knowing whether the host runs VirtualBox and whether this user performs driver installs is often the fastest path to distinguishing a true positive from routine setup.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What process spawned VBoxDrvInst.exe, and what started that parent?
+  context: The parent process reveals how the utility was invoked. A VirtualBox installer or setup process is the expected parent; a shell, script host, Office application, or download utility as the parent suggests the LOLBin was driven by an operator or script rather than a genuine install. Tracing the parent's own origin shows whether the chain traces back to a user action or an automated/malicious launch.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- question: What other child processes did the same parent spawn around this time?
+  context: If the parent that launched the utility is suspicious, it likely spawned other processes too. Sibling processes reveal the full scope of activity from that parent — multiple staging, download, or reconnaissance children from the same parent point to malicious orchestration rather than an isolated install step.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: What specific registry key and value did the INF processing write, and is it a known persistence or evasion location?
+  context: The registry path reveals intent. Run/RunOnce keys (HKCU or HKLM \Software\Microsoft\Windows\CurrentVersion\Run) indicate persistence. Service keys install or alter drivers and services. Keys under security-tool policy paths indicate tampering. The value name and data written determine what executes at logon/boot or what setting changed. Build the environment-specific list of critical keys to watch (Run, Services, security policy, LSASS-related) so the write here can be classified.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- question: Were other registry modifications made on this host in the same session?
+  context: Actors who modify one registry key often modify several — setting a Run key for persistence while also installing a driver service or disabling a security setting. Finding clusters of registry write operations on this host within a short window reveals the full scope of the configuration changes and whether multiple objectives were pursued alongside the INF processing.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_reg:
+        Image|endswith:
+          - '\reg.exe'
+          - '\regedit.exe'
+        CommandLine|contains:
+          - ' add '
+          - ' delete '
+          - ' import '
+          - '/s '
+      condition: selection and selection_reg
+    fields:
+      - CommandLine
+- question: Does the registry change survive reboot, and is the referenced executable or script still present on disk?
+  context: Registry persistence is only effective if the referenced payload exists at the path written to the registry value. If the INF processing wrote a Run/RunOnce value or a service ImagePath pointing to a file, checking whether that file exists and analyzing its hash determines whether the persistence mechanism is active and what it would execute on next logon or boot. Examine the registry value data to identify the referenced path, then verify it on disk.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: Does this host normally run VBoxDrvInst.exe?
+  context: A binary that has never been seen on a host is more suspicious than one that runs regularly. On a host without VirtualBox installed, any execution of this utility is anomalous; zero or very low historical counts indicate first-time or rare execution worth scrutinizing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- question: When this host has previously fired this rule's pattern, what parents and users normally drive it, and does the current alert fit?
+  context: Even a signed utility can be abused. This query mirrors the rule's selection (VBoxDrvInst.exe with 'driver' and 'executeinf') scoped to this host, so the resulting parent/user distribution reflects how this specific firing pattern has historically run here — not generic binary usage. A new parent process, an unexpected user account, or an unusual command-line structure is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \VBoxDrvInst.exe
+        CommandLine|contains|all:
+        - driver
+        - executeinf
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Have other hosts fired this rule's pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: This query mirrors the rule's selection with no host scope, giving a fleet-wide count of the firing pattern rather than generic usage of the binary. Many hosts firing the same pattern points to scripted deployment or a vendor/Guest-Additions automation rollout; one host or a small unrelated set points to manual operator activity. Use the host distribution and parent/binary consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \VBoxDrvInst.exe
+        CommandLine|contains|all:
+        - driver
+        - executeinf
+      condition: selection
+    fields:
+    - host.name
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \VBoxDrvInst.exe
+        CommandLine|contains|all:
+        - driver
+        - executeinf
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \VBoxDrvInst.exe
+        CommandLine|contains|all:
+        - driver
+        - executeinf
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the environment around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or staging across multiple endpoints. If the same user triggered similar driver-install or registry-modification activity on multiple hosts in this window, the scope of the operation may be larger than the single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  always_include: true
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \VBoxDrvInst.exe
+        CommandLine|contains|all:
+        - driver
+        - executeinf
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance, or credential access — may reveal the stages that preceded this registry-modification activity and help reconstruct the full timeline leading to the persistence attempt.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- question: Were other process-based persistence mechanisms installed on this host?
+  context: Actors rarely rely on a single persistence mechanism. After establishing one foothold via INF-driven registry writes, they commonly install backups using different techniques — scheduled tasks, services, registry Run keys, BITS jobs, or WMI subscriptions. Multiple persistence installations in the same timeframe indicate intentional stacking rather than an isolated install action.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine

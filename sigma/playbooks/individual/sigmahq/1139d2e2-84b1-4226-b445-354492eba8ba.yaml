@@ -1,0 +1,535 @@
+name: Usage Of Web Request Commands And Cmdlets - ScriptBlock
+id: 561e8f06-3349-4227-bb49-f7d56255d175
+description: |
+  Detects PowerShell script-block (Event ID 4104) content containing web-request commands and cmdlets: Invoke-WebRequest, Invoke-RestMethod, the iwr/irm/wget/curl aliases, Start-BitsTransfer/Resume-BitsTransfer, the .NET [System.Net.WebRequest] class, or the WinHttp.WinHttpRequest COM object, excluding scripts running from the Azure Guest Configuration plugin path. These primitives are routine in administrative and deployment scripting, but they are also the standard download-cradle building blocks used to fetch second-stage payloads from remote infrastructure. The investigation should read the full script to identify the request URL and output path, determine whether the retrieved content was executed, and judge the user, host, and launch context against expected automation.
+type: detection
+detection_id: 1139d2e2-84b1-4226-b445-354492eba8ba
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-17
+questions:
+- question: Does the script block use one of the web-request commands or cmdlets this rule detects?
+  context: >-
+    Confirm the alert is a true positive by reading the full script block against
+    the rule's criteria. It fires on script content containing
+    [System.Net.WebRequest]::create, WinHttp.WinHttpRequest, Invoke-WebRequest,
+    Invoke-RestMethod, the iwr/irm/wget/curl aliases, or
+    Start-BitsTransfer/Resume-BitsTransfer, unless the script runs from the Azure
+    Guest Configuration plugin directory (a filtered known-benign source). Long
+    scripts are split across multiple 4104 events, so this retrieves every chunk
+    of the alerting block (sequence/total order) and the match is judged on the
+    complete script, not the alerting fragment. References to these cmdlets inside
+    Get-Help or Get-Command usage are a known benign trigger.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - ScriptBlockText
+  answer_sources:
+  - alert
+  - ps_script
+- question: Is this user and host expected to download files or call web services with PowerShell?
+  context: >-
+    Web-request cmdlets are everyday tooling for administrators and deployment
+    automation - software installs, module fetches, API calls - so user role and
+    host function are often the fastest discriminator. The query displays the
+    alerting block's host, user, and on-disk script path (when file-based). A
+    SYSTEM or machine-account user usually means deployment tooling or a vendor
+    agent; judge by the host role and the script path rather than the account
+    alone.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - host.name
+      - user.name
+      - Path
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- question: What does the full script block do, and does any of it remain encoded or obfuscated?
+  context: >-
+    Script-block logging records what PowerShell actually compiles, so
+    -EncodedCommand wrappers are already unwrapped in the logged text; only
+    string-level obfuscation inside the script (concatenation, format operators,
+    backtick escaping) still needs manual decoding. Read the reassembled block for
+    the download logic: the source URL or IP, the output path (-OutFile or
+    DownloadFile arguments), credentials passed to the request, and whether the
+    retrieved content is executed directly (Invoke-Expression/IEX, or a loaded
+    .NET assembly) rather than saved to disk. The decoded intent determines
+    everything downstream.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - powershell.sequence
+      - powershell.total
+      - ScriptBlockText
+  answer_sources:
+  - ps_script
+  - manual_review
+- question: Does the alerting script exist on disk, and what process staged it there?
+  context: >-
+    When a script block runs from a file, its path is recorded on the event, and
+    this query finds the file activity that wrote it - identifying the process
+    and account that staged the script. A downloader script sitting in Temp,
+    AppData, ProgramData, or Downloads implies a delivery step worth tracing to
+    its origin. If the alert carries no script path, the block ran interactively
+    or in memory; for a download cradle that is itself worth noting, since
+    fileless execution avoids leaving a script artifact, and this query will
+    return nothing in that case.
+  range: +/-24h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - EventType
+      - TargetFilename
+      - Image
+      - User
+  answer_sources:
+  - file_event
+  - manual_review
+- question: How was PowerShell launched on this host around the alert time?
+  context: >-
+    Script-block events carry no process identity, so the launch context comes
+    from process telemetry on the same host in the same window. Review the
+    parents of PowerShell starts: user sessions launch from explorer.exe or a
+    terminal, automation from services or scheduled tasks. An Office application
+    (WINWORD, EXCEL), script host (wscript, mshta), or browser spawning
+    PowerShell that then fetches remote content is the classic document-macro
+    delivery pattern.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+          - '\powershell_ise.exe'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - CommandLine
+      - User
+  answer_sources:
+  - process_creation
+- question: Did a PowerShell process make outbound network connections from this host around the alert?
+  context: >-
+    The matched cmdlets exist to fetch remote content, so the corresponding
+    connection confirms the request actually executed and identifies the remote
+    endpoint. Compare destinations against any URL in the script text, and treat
+    an unfamiliar external endpoint as the download source to investigate. BITS
+    transfers (Start-BitsTransfer/Resume-BitsTransfer) are performed by the BITS
+    service inside svchost.exe rather than the PowerShell process, so a BITS-based
+    script may show no PowerShell-owned connection here even when the transfer
+    ran.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+      condition: selection
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationPort
+      - User
+  answer_sources:
+  - network_connection
+- question: Did the PowerShell session spawn follow-on processes after the script ran?
+  context: >-
+    A script-block event records content, not outcome. If a downloaded payload
+    was executed, that activity appears as child processes of the same user's
+    PowerShell hosts shortly after the block was logged - installers, rundll32,
+    additional interpreters, or the fetched binary itself. The channel carries no
+    process link, so this pivots by host, user, and time; when the alert fired
+    under SYSTEM the user anchor is broad, and results need reading against the
+    host's normal automation.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        User|expand: '%User%'
+        ParentImage|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+          - '\powershell_ise.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+  answer_sources:
+  - process_creation
+- question: Were PowerShell security controls bypassed or weakened before this execution?
+  context: >-
+    Attackers often disable or bypass PowerShell security controls before
+    fetching a payload. Common techniques include AMSI bypass (patching amsi.dll
+    in memory), execution policy changes (Set-ExecutionPolicy or the -ep bypass
+    flag), constrained language mode escape, and downgrade to PowerShell v2,
+    which lacks script-block logging. Finding these precursor commands on the
+    same host indicates deliberate evasion preceding the download activity.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+  answer_sources:
+  - process_creation
+- question: Did a process other than a standard PowerShell host load the PowerShell engine on this host?
+  context: >-
+    PowerShell can run inside an arbitrary .NET process by loading the
+    System.Management.Automation engine - script-block events are still logged,
+    but the hosting binary is not powershell.exe. An unfamiliar executable
+    loading the engine around the alert points at unmanaged-PowerShell tooling
+    rather than a normal console session; check the loader's signature, path,
+    and whether it belongs to known management software.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|contains: 'System.Management.Automation'
+      filter_known_hosts:
+        Image|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+          - '\powershell_ise.exe'
+      condition: selection and not filter_known_hosts
+    fields:
+      - Image
+      - ImageLoaded
+      - Signed
+      - Signature
+- question: What other PowerShell script activity occurred on this host around the alert?
+  context: >-
+    Attacker PowerShell rarely runs as a single block - reconnaissance, staging,
+    and follow-on tooling produce a cluster of script blocks in a short window,
+    and surrounding blocks often contain plaintext the alerting fragment lacks.
+    The log level tells you how complete this picture is: verbose events mean
+    full script-block logging is enabled, while only warning-level events means
+    the host records just automatically-flagged suspicious content, so absence
+    of surrounding blocks is not absence of activity.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - user.name
+      - log.level
+      - Path
+      - ScriptBlockText
+  answer_sources:
+  - ps_script
+- question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Alerts rarely occur in isolation. Examining activity around the alert
+    reveals the immediate context: what led to this event, what happened after,
+    and whether it is part of a larger attack sequence. Novel parent-child
+    process pairs at low counts stand out against the repetitive automation
+    noise the aggregation collapses; look for reconnaissance, privilege
+    escalation, or persistence mechanisms.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+  answer_sources:
+  - process_creation
+- question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the user's activity across all hosts reveals lateral movement or
+    activity across multiple endpoints; the same user triggering similar
+    activity on several hosts widens the scope of the investigation. If the
+    alert fired under a service principal (SYSTEM, LOCAL SERVICE, a machine
+    account), this user pivot returns broad agent noise - the fleet-wide
+    script-pattern question is the meaningful companion view in that case.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+  always_include: true
+- question: Did this same script pattern fire on other hosts in the same window?
+  context: >-
+    Under a service principal, user identity does not attribute behavior, and
+    PowerShell channel events carry no process identity to pivot on. The
+    meaningful question is whether the same script pattern fired elsewhere at
+    the same time: the query mirrors the rule's selection fleet-wide in the
+    alert window, aggregated by host. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local
+    trigger. Only hosts shipping the PowerShell channel (and, for non-flagged
+    content, with full script-block logging enabled) can appear, so absence
+    elsewhere is weak evidence.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: ps_script
+      definition: 'Requirements: Script Block Logging must be enabled'
+    detection:
+      selection:
+        ScriptBlockText|contains:
+        - '[System.Net.WebRequest]::create'
+        - 'curl '
+        - Invoke-RestMethod
+        - Invoke-WebRequest
+        - ' irm '
+        - 'iwr '
+        - Resume-BitsTransfer
+        - Start-BitsTransfer
+        - 'wget '
+        - WinHttp.WinHttpRequest
+      filter:
+        Path|startswith: C:\Packages\Plugins\Microsoft.GuestConfiguration.ConfigurationforWindows\
+      condition: selection and not filter
+    fields:
+    - host.name
+  answer_sources:
+  - ps_script
+  always_include: true
+- question: Is full script block logging enabled on this host, or is only suspicious-content logging active?
+  context: >-
+    PowerShell logs script blocks at verbose level when the Script Block Logging
+    policy is enabled, and only Microsoft's automatically-flagged suspicious
+    blocks (at warning level) when it is not. On a warning-only host this alert
+    shows a fragment of the host's PowerShell activity, not all of it -
+    surrounding benign-looking blocks may simply not have been logged. The level
+    distribution tells you how complete your view is and calibrates every other
+    script-block query in this playbook.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - log.level
+  answer_sources:
+  - ps_script
+- question: Has this exact script block run on this host before?
+  context: >-
+    A script that has run routinely for months (deployment tooling, vendor
+    agents, admin automation) reads very differently from one appearing for the
+    first time. The script block hash matches byte-identical content only, so
+    zero history means this exact content is new to the host - though a
+    trivially modified script would hash differently. On hosts without full
+    script-block logging the history contains only automatically-flagged
+    suspicious blocks, so an empty result is weaker evidence there.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_hash|expand: '%script_block_hash%'
+      condition: selection
+    fields:
+      - user.name
+      - Path
+  answer_sources:
+  - ps_script
+- question: Has this user previously produced this rule's web-request pattern, and does that history fit their role?
+  context: >-
+    The query mirrors the rule's selection scoped to this user - the result is
+    the user's 90-day history of script blocks containing these web-request
+    commands (not generic PowerShell use), aggregated by host. A user who has
+    never produced this pattern before is more notable than one who does so
+    regularly as part of deployment or administration work; weigh the count
+    against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: ps_script
+      definition: 'Requirements: Script Block Logging must be enabled'
+    detection:
+      selection:
+        ScriptBlockText|contains:
+        - '[System.Net.WebRequest]::create'
+        - 'curl '
+        - Invoke-RestMethod
+        - Invoke-WebRequest
+        - ' irm '
+        - 'iwr '
+        - Resume-BitsTransfer
+        - Start-BitsTransfer
+        - 'wget '
+        - WinHttp.WinHttpRequest
+      filter:
+        Path|startswith: C:\Packages\Plugins\Microsoft.GuestConfiguration.ConfigurationforWindows\
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - host.name
+  answer_sources:
+  - ps_script
+  - organizational_knowledge
+  always_include: true
+- question: Which hosts have historically produced this script pattern, and is the alerting host among them?
+  context: >-
+    When the alert fires under a service principal, user identity does not
+    attribute behavior, and PowerShell channel events carry no process identity
+    to pivot on. The meaningful pivot is the pattern itself: the query mirrors
+    the rule's selection fleet-wide over 90 days, aggregated by host. A pattern
+    that routinely appears on many hosts is deployment tooling or vendor
+    automation; one that has never appeared before, or only on this host, is
+    the deviation worth chasing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: ps_script
+      definition: 'Requirements: Script Block Logging must be enabled'
+    detection:
+      selection:
+        ScriptBlockText|contains:
+        - '[System.Net.WebRequest]::create'
+        - 'curl '
+        - Invoke-RestMethod
+        - Invoke-WebRequest
+        - ' irm '
+        - 'iwr '
+        - Resume-BitsTransfer
+        - Start-BitsTransfer
+        - 'wget '
+        - WinHttp.WinHttpRequest
+      filter:
+        Path|startswith: C:\Packages\Plugins\Microsoft.GuestConfiguration.ConfigurationforWindows\
+      condition: selection and not filter
+    fields:
+    - host.name
+  answer_sources:
+  - ps_script
+  always_include: true
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Alerts rarely happen in isolation. Earlier detections on the same host -
+    defense tampering, reconnaissance, credential access - may reveal the attack
+    stages that preceded this download activity and help reconstruct the full
+    timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+  answer_sources:
+  - alert

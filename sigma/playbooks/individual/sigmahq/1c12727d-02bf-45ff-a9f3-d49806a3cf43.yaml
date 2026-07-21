@@ -1,0 +1,316 @@
+name: Renamed Plink Execution
+id: dc4abd2a-8ef9-42a6-a7c2-e8afbc539176
+description: |
+  Detects execution of a renamed copy of the Plink command-line SSH client. The rule fires when a
+  process carries the PE OriginalFileName 'Plink' OR a command line that combines the reverse-forward
+  tunnel flags ' -l forward', ' -P ', and ' -R ' together, while the on-disk image name is NOT
+  plink.exe. Plink is built for automated/scripted SSH connections; a renamed copy invoked with
+  reverse-port-forward flags is a common pivot pattern that tunnels RDP, SMB, or other internal
+  services back to an external endpoint. Investigation should confirm the metadata mismatch, decode
+  the tunnel arguments to identify the forwarded service and remote endpoint, determine how the renamed
+  binary arrived, and establish whether the activity is isolated or part of broader lateral movement.
+type: detection
+detection_id: 1c12727d-02bf-45ff-a9f3-d49806a3cf43
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- question: Does this process match the renamed-Plink pattern — PE OriginalFileName of 'Plink', or a command line combining ' -l forward', ' -P ', and ' -R ' — while the image name is not plink.exe?
+  context: Confirm the alert is a true positive before investing further time. The rule fires on either branch — the embedded PE OriginalFileName resolving to 'Plink', or a command line that contains all three reverse-forward tunnel tokens together. The filter excludes the genuine plink.exe, so the image on disk should be some other name. Note which branch fired. A metadata-only match means the binary was renamed but the flags may differ, while a flag-only match means the tunnel arguments are present regardless of metadata.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - OriginalFileName
+      - CommandLine
+- question: Is this user and host expected to run a command-line SSH tunneling client?
+  context: Plink and other SSH tunnel clients are normal on developer or system-administrator endpoints and rare elsewhere. If the user role and host function involve remote administration or automated SSH connections, a renamed client may still be unusual but has a plausible benign explanation; on a general-purpose workstation it is harder to account for.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What is the actual identity of this binary based on its metadata and hash?
+  context: When Plink is renamed, the on-disk Image name changes but the embedded PE OriginalFileName still reads 'Plink' and the signing details still reflect the original tool. Comparing Image against OriginalFileName confirms the rename, and the signing party and signature status indicate whether this is the authentic PuTTY-signed client copied under a new name or an unsigned/tampered build. The file hash enables a reputation lookup to determine whether this is a known-good Plink build or a flagged sample.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Hashes
+- question: Decode the Plink command line — which remote endpoint and port does it connect to, and which internal service is being reverse-forwarded?
+  context: The full command line reveals the tunnel topology. Decode the target host and port (attackers commonly use ' -P 443' to blend with HTTPS egress), the authentication method (' -pw ' for cleartext password, ' -i ' for a key file), and the ' -R listen:host:port' reverse-forward mapping that exposes an internal service back to the remote endpoint. A mapping ending in ':3389' forwards RDP; ':445' forwards SMB. A leading 'echo y|' pipes acceptance of the host-key prompt for unattended use.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains|all:
+          - ' -P '
+          - ' -R '
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+      - Image
+- question: How did this renamed binary arrive on the host, and which process wrote it?
+  context: A renamed Plink copy does not appear spontaneously — it is downloaded, extracted from an archive, copied from another host, or dropped by a loader. Tracing the file-creation event for this binary by basename over a long window reveals the delivery mechanism and the writing process. A user-writable landing directory (Temp, Downloads, AppData) points to download or extraction; a system directory points to compromise of a privileged process. The gap between file creation and execution also indicates whether the binary was staged in advance or run immediately.
+  range: -30d
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains|expand: '%file_name%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- question: What process spawned this renamed binary, and is that parent chain expected?
+  context: The parent process reveals how the tunnel client was launched. A batch script, a web-shell-spawned interpreter, or a remote-access tool as parent points to scripted or operator-driven invocation; an interactive shell launched by explorer.exe is more consistent with hands-on administration. Walk up to the parent's own parent if the immediate parent is itself a generic interpreter.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: What did this renamed binary do after execution?
+  context: A tunnel client's impact shows in what it spawns and connects to. Child processes, file operations, or follow-on connections from the renamed binary reveal whether the tunnel was used to relay an interactive session, stage tooling, or pivot further. Persistent or long-running execution is consistent with an open reverse tunnel held for the duration of an intrusion.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- question: Did outbound network connections originate from this renamed binary, and to which remote endpoint and port?
+  context: A successful reverse-forward tunnel produces an outbound SSH connection to the remote endpoint, frequently on port 443 to evade egress filtering. Correlating the alerting process with its outbound connections confirms whether the tunnel actually established and identifies the external endpoint and port for blocking and scoping. Zero connection records with the process still running may indicate the tunnel failed to connect or that network telemetry is not collected for this host.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+      - Initiated
+- question: Is the same renamed binary present on other hosts in the environment?
+  context: The same renamed Plink copy appearing on multiple hosts points to deliberate distribution rather than an isolated drop. Matching by the embedded OriginalFileName across the fleet surfaces every host running a binary that identifies as Plink under any image name, which scopes how far the tooling has spread independently of the file name chosen on each host.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        OriginalFileName: Plink
+      condition: selection
+    fields:
+      - host.name
+- question: When this host has previously fired this rule's pattern, what parents and users normally drove it, and does the current alert fit that pattern?
+  context: Even legitimate tunneling can recur on the same host. The query mirrors the rule's selection structure scoped to this host, so the parent/user distribution reflects how this specific firing pattern — not generic SSH usage — has historically run here. A new parent process, an unexpected user account, or an unusual command-line structure is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - OriginalFileName: Plink
+      - CommandLine|contains|all:
+        - ' -l forward'
+        - ' -P '
+        - ' -R '
+      filter:
+        Image|endswith: \plink.exe
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Have other hosts fired this rule's pattern in the past week, and does the cross-host distribution look like consistent automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, producing a fleet-wide count of the renamed-Plink firing pattern rather than generic SSH usage. Many hosts firing the same pattern suggests scripted deployment or sanctioned automation; one host or a small unrelated set points to manual operator activity. Use the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - OriginalFileName: Plink
+      - CommandLine|contains|all:
+        - ' -l forward'
+        - ' -P '
+        - ' -R '
+      filter:
+        Image|endswith: \plink.exe
+      condition: selection and not filter
+    fields:
+    - host.name
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - OriginalFileName: Plink
+      - CommandLine|contains|all:
+        - ' -l forward'
+        - ' -P '
+        - ' -R '
+      filter:
+        Image|endswith: \plink.exe
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - OriginalFileName: Plink
+      - CommandLine|contains|all:
+        - ' -l forward'
+        - ' -P '
+        - ' -R '
+      filter:
+        Image|endswith: \plink.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals whether the tunnel is one step in broader lateral movement. If the same user triggered similar activity on multiple hosts, the scope of the operation may be larger than the alerting endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - OriginalFileName: Plink
+      - CommandLine|contains|all:
+        - ' -l forward'
+        - ' -P '
+        - ' -R '
+      filter:
+        Image|endswith: \plink.exe
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — exploitation of a public-facing application, web-shell activity, credential access, or reconnaissance — may reveal the stages that preceded the tunnel and help reconstruct the timeline. Reverse tunnels are typically established after a foothold exists, so preceding alerts often explain how the operator reached this point.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

@@ -1,0 +1,395 @@
+name: PowerShell Write-EventLog Usage
+id: 769a79f5-da26-43bd-8508-c8e20a149d12
+description: |
+  Fires when PowerShell script-block content (EID 4104) contains the Write-EventLog cmdlet together with the
+  -RawData argument. Write-EventLog creates an event log entry with a chosen log name, source, event ID, and
+  message, and -RawData additionally embeds arbitrary binary bytes in the entry's EventData — which lets an
+  operator use the event log as a covert payload store: write the payload once, then retrieve and execute it
+  later with a log-reading tool, leaving no file on disk. Legitimate applications and admin scripts do write
+  operational events through this cmdlet, though most omit -RawData. The investigation should read the full
+  script to establish which log, source, and event ID were targeted and what the RawData bytes contain, check
+  whether the script was staged on disk, and look for the retrieval side — log-query tooling or follow-on
+  execution on the same host. Script-block capture is policy-gated per host: default installs log only content
+  matching built-in suspicious-strings checks, so absence of surrounding 4104 evidence is not absence of activity.
+type: detection
+detection_id: 35f41cd7-c98e-469f-8a02-ec4ba0cc7a7e
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-07-17
+questions:
+- question: Does the script block call Write-EventLog with the -RawData argument?
+  context: Confirm the alert is a true positive by reading the complete script. The rule fires when a script
+    block contains both Write-EventLog and '-RawData ' — the combination that embeds binary data in an event
+    log entry rather than just writing a text message. Long scripts are split across multiple 4104 events, so
+    this retrieves every chunk of the alerting block (sequence/total order) and the match is judged on the
+    whole script, not the alerting fragment.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - ScriptBlockText
+- question: Is this user and host expected to write custom event log entries from PowerShell?
+  context: Some monitoring agents, installers, and admin automation legitimately write operational events via
+    Write-EventLog, though most write plain messages without -RawData. The query shows the alerting block's
+    host, user, and on-disk script path (blank for interactive or in-memory execution). A service account on a
+    server running known instrumentation reads differently from an interactive user on a workstation with no
+    logging-related role; a SYSTEM user usually means deployment tooling or a vendor agent — judge by the host
+    role and script path.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - host.name
+      - user.name
+      - Path
+- question: What does the full script write to the event log, and what do the -RawData bytes contain?
+  context: Script-block content is logged after decoding, so any -EncodedCommand wrapper is already unwrapped;
+    only string-level obfuscation inside the script (concatenation, format operators, backticks) still needs
+    manual work. Read the complete reassembled script for the Write-EventLog arguments — the target log
+    (-LogName), source, event ID, entry type, and message — and decode whatever the script feeds to -RawData.
+    A byte array that decodes to a PE header, shellcode, or a compressed or encrypted blob is a staged payload;
+    message strings are capped at 31,839 characters, which is why binary payloads go into the RawData EventData
+    field instead. Note the log/source/event ID values — they are the retrieval key for whatever reads the
+    entry back.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_id|expand: '%script_block_id%'
+      condition: selection
+    fields:
+      - powershell.sequence
+      - powershell.total
+      - ScriptBlockText
+- question: Does the script exist on disk, and what created it?
+  context: When the script block ran from a file, its path is recorded on the 4104 event. A script on disk in a
+    user-writable or staging location (Temp, AppData, ProgramData, Downloads) implies a delivery step that
+    wrote it — find the file-creation event to identify the process and account that staged the script. The
+    path is populated on roughly 60% of script blocks; interactive or in-memory execution logs no path at all,
+    and for a payload-staging script that is itself notable — fileless execution pairs naturally with a
+    technique whose whole point is to avoid leaving the payload on disk.
+  range: +/-24h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%TargetFilename%'
+      condition: selection
+    fields:
+      - EventType
+      - TargetFilename
+      - Image
+      - User
+- question: Did event-log reading tools run on this host after the script wrote its entry?
+  context: Writing the payload is only the staging half of the technique — its value comes when something reads
+    the entry back for execution. Command-line and PowerShell retrieval surfaces here as wevtutil, Get-WinEvent,
+    Get-EventLog, or direct System.Diagnostics.EventLog use on the same host. A custom retrieval program using
+    the .NET EventLog API need not produce a distinctive command line, so an empty result does not rule out
+    retrieval; any hit should be checked for the same log name or event ID the script targeted.
+  range: +24h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_read:
+        CommandLine|contains:
+          - 'wevtutil'
+          - 'Get-WinEvent'
+          - 'Get-EventLog'
+          - 'System.Diagnostics.EventLog'
+      condition: selection and selection_read
+    fields:
+      - Image
+      - CommandLine
+      - User
+- question: Is full script block logging enabled on this host, or is only suspicious-content logging active?
+  context: PowerShell logs every script block at verbose level only when the Script Block Logging policy is
+    enabled; by default it logs only content matching built-in suspicious-strings checks, at warning level. On
+    a warning-only host the alerting block is a fragment of the host's PowerShell activity, not all of it —
+    surrounding benign-looking blocks, including a later retrieval script, may simply not have been logged. Use
+    the level distribution here to calibrate how complete every other script-channel result in this
+    investigation is.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - log.level
+- question: Were PowerShell security controls bypassed or weakened before this execution?
+  context: Operators often weaken controls before running meaningful PowerShell — AMSI tampering (AmsiUtils,
+    amsiInitFailed), execution policy changes (-ExecutionPolicy Bypass, -ep bypass), Defender preference
+    changes, or a downgrade to PowerShell v2 which lacks script-block logging. Any of these on the same host in
+    the preceding hour makes the routine-instrumentation explanation harder to sustain and belongs in the
+    timeline alongside the event-log write.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: Did the PowerShell session spawn follow-on activity after the script ran?
+  context: A 4104 event records script content, not execution outcome, and carries no process link — this
+    pivots by host, user, and time to the children of the user's PowerShell hosts in the half hour after the
+    block was logged. If the staged payload was retrieved and executed, or the script launched other tooling,
+    that activity appears here. If the alert fired under SYSTEM or another service principal, the user anchor
+    is broad; read the results with that in mind rather than dropping it.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        User|expand: '%User%'
+        ParentImage|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+          - '\powershell_ise.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- question: What other PowerShell script activity occurred on this host around the alert?
+  context: Attacker PowerShell rarely runs as a single block — reconnaissance, staging, and follow-on tooling
+    produce a cluster of script blocks in a short window, and surrounding blocks from the same session often
+    contain the plaintext payload preparation or the retrieval logic the alerting fragment lacks. The log.level
+    column shows whether the host logs all blocks (verbose) or only automatically flagged content (warning) —
+    on a warning-only host this view is partial by design.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - user.name
+      - log.level
+      - Path
+      - ScriptBlockText
+- question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Aggregating the host''s process activity by image and parent
+    collapses repetitive agent noise into high-count rows while novel parent-child pairs stand out at low
+    counts. Look for the immediate context around the event-log write: what led to it, what happened after,
+    and whether it sits inside a longer sequence of reconnaissance, staging, or persistence activity.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- question: Has this exact script block run on this host before?
+  context: A script that has run routinely for months (deployment tooling, vendor agents, admin automation)
+    reads very differently from one appearing for the first time. The script block hash matches byte-identical
+    content only — zero history means this exact content is new to the host, though a trivially edited variant
+    would produce a different hash. On hosts without full Script Block Logging the history contains only
+    automatically flagged blocks, so an empty result is weaker evidence there.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        powershell.file.script_block_hash|expand: '%script_block_hash%'
+      condition: selection
+    fields:
+      - user.name
+      - Path
+- always_include: true
+  question: Has this user run Write-EventLog with -RawData before, and does that history fit their role?
+  context: The query mirrors the rule's selection scoped to this user — a 90-day history of this specific
+    pattern aggregated by host, not generic PowerShell use. An operations engineer whose scripts have written
+    instrumentation events for months reads differently from an account producing this pattern for the first
+    time; weigh the count against the user's role. History covers only hosts logging the PowerShell channel,
+    and non-flagged content appears only where full script-block logging is enabled, so zero history is weaker
+    evidence on a default-logging fleet.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        ScriptBlockText|contains|all:
+        - Write-EventLog
+        - '-RawData '
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- always_include: true
+  question: Which hosts have produced this Write-EventLog -RawData pattern in the last 90 days, and is the alerting host among them?
+  context: 'When the alert fires under a service principal, user identity does not attribute the behavior, and
+    script-block events carry no process identity to pivot on — the pattern itself is the pivot. This mirrors
+    the rule''s selection fleet-wide over 90 days, aggregated by host. A pattern appearing routinely across
+    many hosts suggests monitoring or deployment automation writing operational events; one that has never
+    appeared before, or only on this host, is the deviation worth chasing. Only hosts shipping the PowerShell
+    channel (and, for non-flagged content, with full logging enabled) can appear, so absence elsewhere is weak
+    evidence.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        ScriptBlockText|contains|all:
+        - Write-EventLog
+        - '-RawData '
+      condition: selection
+    fields:
+    - host.name
+- always_include: true
+  question: What else did this user do across the network around this time?
+  context: Tracking the account's activity across all hosts in the surrounding window reveals lateral movement
+    or coordinated activity on multiple endpoints. If the same user staged event-log entries or ran similar
+    tooling elsewhere, the scope is larger than this one host. If the alert fired under SYSTEM or another
+    service principal, this view degrades to agent-telemetry noise; the fleet-wide pattern question is the
+    meaningful substitute in that case.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- always_include: true
+  question: Did the same Write-EventLog -RawData pattern fire on other hosts in the same window?
+  context: The query mirrors the rule's selection fleet-wide in the alert window, aggregated by host — the
+    service-principal-safe version of the cross-network view, since these events carry no process identity to
+    pivot on. Several hosts producing the pattern in the same window points to pushed or scheduled automation;
+    a single host points to a host-local action. Coverage is policy-gated per host, so absence elsewhere
+    remains weak evidence on a default-logging fleet.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        ScriptBlockText|contains|all:
+        - Write-EventLog
+        - '-RawData '
+      condition: selection
+    fields:
+    - host.name
+- question: Did this exact script block run on other hosts in the environment?
+  context: Identical script content across many hosts points to deployment tooling, GPO logon scripts, or
+    vendor agents; the same block on a small handful of unrelated hosts is how lateral movement and manual
+    operator activity look. This anchors on the block hash, so it matches byte-identical content only —
+    complementary to the pattern-anchored fleet views, which also catch edited variants. Only hosts with the
+    PowerShell channel shipping (and, for non-flagged content, full logging enabled) can appear.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: ps_script
+      product: windows
+    detection:
+      selection:
+        powershell.file.script_block_hash|expand: '%script_block_hash%'
+      condition: selection
+    fields:
+      - host.name
+      - user.name
+      - Path
+- question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering,
+    reconnaissance, credential access — may reveal the stages that preceded the event-log write and help
+    reconstruct the timeline. Payload staging is typically a mid-chain step: something delivered the script,
+    and something is expected to consume the staged entry later.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

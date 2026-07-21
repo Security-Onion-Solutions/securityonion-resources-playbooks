@@ -1,0 +1,342 @@
+name: Potential PowerShell Console History Access Attempt via History File
+id: 5d96d9c2-e4d6-48bb-a019-8279746a94b3
+description: |
+  Detects a command line that references the PowerShell console history file, either by the literal name ConsoleHost_history.txt or by resolving its location through (Get-PSReadLineOption).HistorySavePath. PSReadline records every command typed in an interactive PowerShell console to a plaintext per-user file, so this file frequently contains pasted credentials, file paths, and administrative commands and is a common target for credential harvesting and reconnaissance. Legitimate access happens during forensics, troubleshooting, or scripted log collection; malicious access reads or copies the file to mine it for secrets. Determine who ran the command, what they did with the file contents, and whether the access fits the user and host.
+type: detection
+detection_id: f4ff7323-b5fc-4323-8b52-6b9408e15788
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- question: Does the command line reference the PowerShell console history file by name or by resolving its save path?
+  context: Confirm the alert is a true positive by reviewing the exact command line. The rule fires when the command contains the literal ConsoleHost_history.txt or the expression (Get-PSReadLineOption).HistorySavePath, so check which of the two forms appears and what operation surrounds it.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Is this user and host expected to read or collect the PowerShell console history file?
+  context: Legitimate access occurs during forensics, troubleshooting, or scripted log gathering. A user or host with no incident-response or administrative role accessing another account's history file is harder to explain and shifts the disposition toward credential harvesting.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- question: What operation was performed against the history file -- was it read, copied, searched for secrets, or exfiltrated?
+  context: The history file is a plaintext credential store. The full command reveals intent -- Get-Content or type reads it, Select-String or findstr searches it for passwords, Copy-Item or a network upload stages it for exfiltration. The specific operation determines whether secrets were likely harvested and which accounts may be exposed.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Was the command encoded or obfuscated, and what does it decode to?
+  context: References to the history file can be hidden behind base64 -EncodedCommand payloads, string concatenation, or backtick escaping to obscure that the credential store is the target. Decoding reveals whether the access reads the file in place or pipes its contents to a search, copy, or upload operation.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: Is the console history file still on disk for analysis, and was a copy of it written elsewhere?
+  context: The history file lives under each user's AppData PSReadLine directory. Confirming it still exists lets analysts review which commands and any plaintext credentials it captured. A copy written to a staging or temp path indicates the contents were collected for exfiltration.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_activity
+      product: windows
+    detection:
+      selection_self:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_child:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: 1 of selection_*
+    fields:
+      - TargetFilename
+      - Image
+      - EventType
+- question: What process spawned the PowerShell that accessed the history file, and is that parent chain expected?
+  context: The parent process shows how the access was launched. An interactive explorer.exe or a console session is consistent with hands-on administration; an Office application, a script host such as wscript.exe or mshta.exe, or a remote-execution service as the parent points to automated or attacker-driven access.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- question: Did PowerShell script block logging capture the full content of the command that touched the history file?
+  context: Event ID 4104 records the deobfuscated script content PowerShell actually executed, providing ground truth even when the command line is encoded. This confirms whether the history file was read, searched, or copied, and surfaces surrounding commands in the same session. If PowerShell operational logs are not ingested in this environment, treat zero results as a visibility gap rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- question: Were PowerShell security controls bypassed or weakened on this host before the history file was accessed?
+  context: Credential harvesting is often preceded by steps that reduce logging or scanning -- AMSI bypass, an execution-policy bypass flag, or a downgrade to PowerShell v2. Finding these precursor commands in the hour before the access strengthens the case that the history-file read was part of hands-on-keyboard activity rather than routine use.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- question: Did any successful or explicit-credential logons occur on this host shortly after the history file was accessed?
+  context: T1552.001 detection correlates access to an unsecured credential file with subsequent use of the retrieved credentials. Security logon events recorded shortly after the history-file read may show an account authenticating with credentials mined from that file. Match the timing to the access and note any account that differs from the one that ran the command.
+  range: +4h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID:
+          - 4624
+          - 4648
+      condition: selection
+    fields:
+      - TargetUserName
+      - LogonType
+      - IpAddress
+- question: Were outbound remote-access connections (RDP, SMB, WinRM, SSH) initiated from this host after
+    this event?
+  context: Credential theft is typically followed by lateral movement. The query returns outbound connections
+    from this host to remote-access ports -- 3389 (RDP), 445 (SMB/PsExec), 5985/5986 (WinRM), 22 (SSH)
+    -- in the hours after the event; the originating Image and User show what drove each connection. Two
+    limits to keep in mind -- credentials exfiltrated and replayed from another machine will not appear
+    here (check security 4624 logons on suspected targets for this account and any accounts with sessions
+    on this host), and the query requires Sysmon network telemetry (EID 3); if that is not collected from
+    this host, treat zero rows as a visibility gap, not as evidence no movement occurred.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
+- question: Which accounts had commands recorded in the accessed history file, and do any of them hold elevated privileges?
+  context: The exposure depends on whose history was read and what it contained. A standard user's history may only leak that user's secrets; an administrator's or service account's history can leak domain or privileged credentials that require escalation. Cross-reference the owning account and any credentials visible in the captured commands against directory group memberships.
+  range: +/-30d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- question: When this host has previously fired this history-access pattern, what parents and users normally drive it, and does the current alert fit?
+  context: The query mirrors the rule's command-line pattern scoped to this host, so the resulting parent and user distribution reflects how this specific access pattern has run here before. A new parent process, an unexpected user account, or a first-time appearance of the pattern is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - ConsoleHost_history.txt
+        - (Get-PSReadLineOption).HistorySavePath
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - ConsoleHost_history.txt
+        - (Get-PSReadLineOption).HistorySavePath
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - ConsoleHost_history.txt
+        - (Get-PSReadLineOption).HistorySavePath
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: What else did this user do across the network around the time of the history-file access?
+  context: Tracking the user's activity across all hosts reveals whether the access was isolated or part of broader activity such as lateral movement or multi-host collection. The same user touching credential stores on several endpoints widens the scope of potential compromise.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - ConsoleHost_history.txt
+        - (Get-PSReadLineOption).HistorySavePath
+      _pb_scope:
+        ParentName|expand: '%ParentName%'
+      condition: (selection) and _pb_scope
+    fields:
+    - host.name
+- question: Have other hosts fired this history-access pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: The query mirrors the rule's command-line pattern with no host scope, giving a fleet-wide count of the access pattern rather than generic PowerShell usage. Many hosts firing the same pattern suggests scripted collection or vendor automation; one host or a small unrelated set suggests manual operator activity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - ConsoleHost_history.txt
+        - (Get-PSReadLineOption).HistorySavePath
+      condition: selection
+    fields:
+    - host.name
+- question: Did other detections fire on this host in the hours before the history file was accessed?
+  context: Earlier detections on the same host -- defense tampering, reconnaissance, or other credential access -- may reveal the stages that preceded this access and help reconstruct the timeline. Reading a credential store is often a mid-stage action that follows initial execution.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: alert
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid

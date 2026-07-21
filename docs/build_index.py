@@ -80,14 +80,15 @@ def techniques_of(meta):
     return out
 
 
-def data_sources_of(meta, data):
-    """Distinct logsource categories used across the playbook's question queries."""
-    diversity = (meta.get("generation_stats") or {}).get("logsource_diversity") or {}
-    if diversity:
-        return sorted(diversity.keys())
-    # Fallback: parse each question query's logsource. Use category when present,
-    # else product (honeypot/auth playbooks are scoped by product: alert / linux
-    # with no category, so a category-only read would drop them entirely).
+def data_sources_of(data):
+    """Distinct logsource categories used across the playbook's question queries.
+
+    Always parsed from the queries themselves — the generation_stats
+    logsource_diversity labels are free-text from authoring and inconsistent
+    (powershell_script_block / powershell_logging / security_log ... for the
+    same telemetry). Use category when present, else product (honeypot/auth
+    playbooks are scoped by product: alert / linux with no category, so a
+    category-only read would drop them entirely)."""
     cats = set()
     for q in data.get("questions") or []:
         try:
@@ -96,7 +97,7 @@ def data_sources_of(meta, data):
             continue
         if isinstance(qq, dict):
             ls = qq.get("logsource") or {}
-            cat = ls.get("category") or ls.get("product")
+            cat = ls.get("category") or ls.get("service") or ls.get("product")
             if cat:
                 cats.add(cat)
     return sorted(cats)
@@ -120,7 +121,7 @@ def main():
             "description": first_line(data.get("description"))[:400],
             "questions": len(data.get("questions") or []),
             "techniques": techniques_of(meta),
-            "data_sources": data_sources_of(meta, data),
+            "data_sources": data_sources_of(data),
             "source": source,
             "source_group": group,
             "path": str(path.relative_to(REPO)),

@@ -1,3 +1,11 @@
+# Deprecation Notice
+
+7/29/2026
+
+This branch has been superseded and is being phased out. Use `published` instead.
+
+------------------------
+
 # Security Onion Playbooks
 
 ## Directory Structure
